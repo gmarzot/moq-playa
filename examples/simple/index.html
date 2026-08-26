@@ -90,15 +90,32 @@
       padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
     }
 
-    /* Stats overlay */
-    .stats {
-      font-size: 0.8rem;
-      color: #888;
-      padding: 12px 0;
+    /* Diagnostics strip — always visible beneath the playback window */
+    .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
+    .diag-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+      gap: 6px 18px;
       font-variant-numeric: tabular-nums;
-      line-height: 1.6;
     }
-    .stats span { color: #bbb; }
+    .diag-grid .cell {
+      color: #778; text-transform: uppercase; letter-spacing: .04em;
+      font-size: .66rem;
+    }
+    .diag-grid .cell b {
+      display: block; color: #ddd; font-weight: 600; font-size: .92rem;
+      text-transform: none; letter-spacing: 0;
+    }
+    .diag-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .chart-label {
+      font-size: .68rem; color: #778; text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .chart-label b { color: #4d4; font-variant-numeric: tabular-nums; }
+    .chart canvas {
+      width: 100%; height: 56px; background: #161622;
+      border-radius: 6px; display: block; margin-top: 4px;
+    }
 
     /* State badge */
     .state-badge {
@@ -152,7 +169,19 @@
       <span class="state-badge" id="state">idle</span>
     </div>
 
-    <div class="stats" id="stats"></div>
+    <div class="diag">
+      <div class="diag-grid" id="diag-grid"></div>
+      <div class="diag-charts">
+        <div class="chart">
+          <span class="chart-label">e2e latency ms (capture→arrival) <b id="lat-val">—</b></span>
+          <canvas id="lat-spark"></canvas>
+        </div>
+        <div class="chart">
+          <span class="chart-label">arrival jitter ms <b id="jit-val">—</b></span>
+          <canvas id="jit-spark"></canvas>
+        </div>
+      </div>
+    </div>
     <pre id="log"></pre>
   </div>
 
