@@ -117,6 +117,42 @@
       border-radius: 6px; display: block; margin-top: 4px;
     }
 
+    /* Catalog panel — the MSF/CMSF catalog as delivered, redrawn on deltas */
+    .catalog-panel {
+      margin-top: 12px; background: #1a1a2e;
+      border-radius: 8px; padding: 10px 14px;
+    }
+    .cat-head {
+      display: flex; align-items: baseline;
+      justify-content: space-between; gap: 12px;
+    }
+    .cat-head button {
+      background: #333; color: #bbb; border: 1px solid #555;
+      border-radius: 6px; padding: 2px 10px;
+      font-size: .7rem; cursor: pointer;
+    }
+    .cat-tracks {
+      display: grid; gap: 5px; margin-top: 9px;
+      font-size: .72rem; font-variant-numeric: tabular-nums;
+    }
+    .cat-track {
+      display: flex; flex-wrap: wrap; gap: 9px;
+      align-items: baseline; color: #99a;
+    }
+    .cat-track .nm { color: #ddd; font-weight: 600; min-width: 68px; }
+    .cat-track .pk {
+      color: #4d4; text-transform: uppercase;
+      font-size: .62rem; letter-spacing: .04em;
+    }
+    .cat-json {
+      margin: 9px 0 0; padding: 8px 10px; background: #12121f;
+      border-radius: 6px; font-family: monospace; font-size: .7rem;
+      line-height: 1.45; max-height: 220px; overflow: auto;
+      white-space: pre; color: #8899aa;
+    }
+    .catalog-panel.collapsed .cat-tracks,
+    .catalog-panel.collapsed .cat-json { display: none; }
+
     /* State badge */
     .state-badge {
       font-size: 0.8rem;
@@ -173,15 +209,26 @@
       <div class="diag-grid" id="diag-grid"></div>
       <div class="diag-charts">
         <div class="chart">
-          <span class="chart-label">e2e latency ms (capture→arrival) <b id="lat-val">—</b></span>
+          <span class="chart-label">e2e latency ms (capture→arrival)
+            p50 <b id="lat-val">—</b> p95 <b id="lat-p95">—</b></span>
           <canvas id="lat-spark"></canvas>
         </div>
         <div class="chart">
-          <span class="chart-label">arrival jitter ms <b id="jit-val">—</b></span>
+          <span class="chart-label">interarrival jitter ms (RFC 3550) <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
       </div>
     </div>
+
+    <div class="catalog-panel" id="catalog-panel">
+      <div class="cat-head">
+        <span class="chart-label">MSF / CMSF catalog <b id="cat-meta">waiting…</b></span>
+        <button id="cat-toggle" type="button">hide</button>
+      </div>
+      <div class="cat-tracks" id="cat-tracks"></div>
+      <pre class="cat-json" id="cat-json"></pre>
+    </div>
+
     <pre id="log"></pre>
   </div>
 
