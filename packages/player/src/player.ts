@@ -1798,7 +1798,7 @@ export class MoqtPlayer {
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
-    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj) => {
+    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, headers) => {
       // Liveness: stamp before every early return (gates, staging, drops).
       this.stampMediaArrival(BigInt(obj.trackAlias));
 
@@ -1817,8 +1817,9 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
-      // Emit media_object for CMAF too — sparkline jitter chart needs
-      // inter-arrival timing from all video objects regardless of packaging.
+      // Emit media_object for CMAF too — arrival timing and capture
+      // timestamps are packaging-independent, so latency and jitter are
+      // measured the same way on both paths.
       this.emitter.emit('media_object', {
         type: 'media_object',
         mediaType,
@@ -1828,6 +1829,8 @@ export class MoqtPlayer {
         kind: obj.kind,
         ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
         ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+        ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
+        ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
       });
 
       if (obj.kind !== 'data' || !obj.payload) return;

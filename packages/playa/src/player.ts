@@ -577,7 +577,26 @@ export class Player {
   // ─── Private: Event Bridging ─────────────────────────────────────
 
   private wireEngineEvents(): void {
+    // Pass-through: catalog state and per-object arrivals carry no UI
+    // semantics of their own, but diagnostics and measurement need them
+    // and the engine is not public.
+    this.engine.on('catalog_updated', (e) => {
+      this.emitter.emit('catalog_updated', { catalog: e.catalog });
+    });
+    this.engine.on('media_object', (e) => {
+      this.emitter.emit('media_object', {
+        mediaType: e.mediaType,
+        trackName: e.trackName,
+        groupId: e.groupId,
+        objectId: e.objectId,
+        kind: e.kind,
+        captureTimestamp: e.captureTimestamp,
+        isKeyframe: e.isKeyframe,
+      });
+    });
+
     this.engine.on('catalog_received', (e) => {
+      this.emitter.emit('catalog_received', { catalog: e.catalog });
       this._levels = mapLevels(e.catalog);
       this._audioTracks = mapAudioTracks(e.catalog);
       const hasCmaf = e.catalog.tracks.some(track => track.packaging === 'cmaf');

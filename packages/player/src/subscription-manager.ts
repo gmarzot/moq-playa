@@ -86,7 +86,10 @@ export class SubscriptionManager {
 
   /**
    * Callback: CMAF object routed to MediaSource adapter.
-   * Called with (mediaType, trackName, object). No LOC header parsing.
+   * Called with (mediaType, trackName, object, parsedHeaders). The payload
+   * carries its own timing; the headers carry MOQ object properties, which
+   * are transport-level annotations independent of payload packaging — a
+   * capture timestamp on a CMSF object measures wire latency.
    * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging)
    */
   onCmafObject:
@@ -94,6 +97,7 @@ export class SubscriptionManager {
         mediaType: 'video' | 'audio',
         trackName: string,
         obj: MoqtObject,
+        headers: LocHeaders,
       ) => void)
     | null = null;
 
@@ -275,28 +279,31 @@ export class SubscriptionManager {
         if (!transformed) return; // Transform dropped the object
       }
 
+      // Object properties ride every packaging: LOC needs them to decode,
+      // CMAF carries its own payload timing but still reports transport
+      // annotations (capture timestamp, frame marking) through them.
+      const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
+      // Draft-aware property wire profile: draft-14 absolute QUIC-varint,
+      // draft-16 delta QUIC-varint, draft-18 delta vi64. draft-18's vi64 codec
+      // diverges from the QUIC varint at value 64, so it MUST be selected
+      // explicitly — deltaEncoded alone cannot express it. Unset draftVersion
+      // keeps today's draft-16 default.
+      // @see draft-ietf-moq-transport-14 §1.4.2
+      // @see draft-ietf-moq-transport-16 §1.4.2
+      // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
+      const opts: LocHeaderOptions | undefined =
+        draft !== undefined
+          ? { wireProfile: locWireProfileForDraft(draft) }
+          : undefined;
+      const parse = this.extensionParser
+        ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
+      const headers = parse(extensions);
+
       if (info.packaging === 'cmaf') {
-        // CMAF path: skip LOC header parsing, route directly to MediaSource
-        // §3.3: payload contains moof+mdat pairs
-        this.onCmafObject?.(mediaType, info.trackName, transformed);
+        // §3.3: payload contains moof+mdat pairs — routed to MediaSource
+        // rather than the decode pipeline.
+        this.onCmafObject?.(mediaType, info.trackName, transformed, headers);
       } else {
-        // LOC path: parse extension headers and route to PlaybackPipeline
-        const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
-        // Draft-aware property wire profile: draft-14 absolute QUIC-varint,
-        // draft-16 delta QUIC-varint, draft-18 delta vi64. draft-18's vi64 codec
-        // diverges from the QUIC varint at value 64, so it MUST be selected
-        // explicitly — deltaEncoded alone cannot express it. Unset draftVersion
-        // keeps today's draft-16 default.
-        // @see draft-ietf-moq-transport-14 §1.4.2
-        // @see draft-ietf-moq-transport-16 §1.4.2
-        // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
-        const opts: LocHeaderOptions | undefined =
-          draft !== undefined
-            ? { wireProfile: locWireProfileForDraft(draft) }
-            : undefined;
-        const parse = this.extensionParser
-          ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
-        const headers = parse(extensions);
         this.onObject?.(mediaType, info.trackName, transformed, headers);
       }
     } catch (error) {

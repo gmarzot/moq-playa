@@ -9,6 +9,7 @@
  * @module
  */
 
+import type { CatalogState } from '@moqt/msf';
 import type { Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 
 /** Event map for Player.on() / Player.off(). */
@@ -54,6 +55,32 @@ export interface PlayerEventMap {
 
   /** Player state changed. */
   'statechange': StatechangeEvent;
+
+  /** Catalog received and parsed. */
+  'catalog_received': CatalogEvent;
+  /** Delta catalog update applied. */
+  'catalog_updated': CatalogEvent;
+
+  /**
+   * One media object arrived. Fires per object — measurement and
+   * diagnostics only; playback needs none of it.
+   */
+  'media_object': MediaObjectEvent;
+}
+
+export interface CatalogEvent {
+  readonly catalog: CatalogState;
+}
+
+export interface MediaObjectEvent {
+  readonly mediaType: 'video' | 'audio';
+  readonly trackName: string;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
+  readonly kind: string;
+  /** Publisher capture time, µs since the epoch, when the object carries it. */
+  readonly captureTimestamp?: bigint | undefined;
+  readonly isKeyframe?: boolean | undefined;
 }
 
 export interface ReadyEvent {

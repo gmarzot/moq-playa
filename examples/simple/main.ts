@@ -22,7 +22,13 @@ const diagGrid = document.getElementById('diag-grid')!;
 const latSpark = document.getElementById('lat-spark') as HTMLCanvasElement;
 const jitSpark = document.getElementById('jit-spark') as HTMLCanvasElement;
 const latVal = document.getElementById('lat-val')!;
+const latP95 = document.getElementById('lat-p95')!;
 const jitVal = document.getElementById('jit-val')!;
+const catalogPanel = document.getElementById('catalog-panel')!;
+const catMeta = document.getElementById('cat-meta')!;
+const catTracks = document.getElementById('cat-tracks')!;
+const catJson = document.getElementById('cat-json')!;
+const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
 const logEl = document.getElementById('log')!;
 const playerContainer = document.getElementById('player-container')!;
 
@@ -116,8 +122,7 @@ async function main(): Promise<void> {
       cell('dropped', String(s.framesDropped ?? 0)),
       cell('buf v/a s', `${(s.videoBufferDepth ?? 0).toFixed(2)}/${(s.audioBufferDepth ?? 0).toFixed(2)}`),
       cell('dec queue', String(s.videoDecoderQueueDepth ?? 0)),
-      cell('objects', String(s.objectsReceived ?? 0)),
-      cell('mb rx', ((s.bytesReceived ?? 0) / 1e6).toFixed(1)),
+      cell('obj events', `${objEvents} (${objEventsWithTs} ts)`),
       cell('gaps', String(s.gapsReceived ?? s.gapCount ?? 0)),
       cell('stalls', `${s.stallCount ?? 0} (${((s.totalStallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
       cell('a/v skew ms', s.avSkewEwmaMs != null ? s.avSkewEwmaMs.toFixed(0) : '—'),
@@ -126,33 +131,68 @@ async function main(): Promise<void> {
 
   // ── Latency & jitter sparklines (from media_object arrivals) ─────
 
+  // Latency is wall-clock: arrival minus the publisher's capture stamp,
+  // so it reads true only when both clocks agree. A systematic negative
+  // offset is reported as clock skew rather than silently dropped.
+  //
+  // Jitter is RFC 3550 §6.4.1 interarrival jitter — the smoothed
+  // deviation between arrival spacing and capture spacing, which
+  // separates network jitter from the publisher's own pacing. Without
+  // capture timestamps it degrades to arrival-interval deviation.
+
   const latSamples: number[] = [];
   const jitSamples: number[] = [];
-  let lastArrivalMs = 0;
+  let prevArrivalMs = 0;
+  let prevCaptureMs = 0;
+  let jitterEwma = 0;
   let expectedIntervalMs = 0;
+  let skewSamples = 0;
+  let objEvents = 0;
+  let objEventsWithTs = 0;
+  (window as any).__player = player;
   const pushSample = (a: number[], v: number) => {
     a.push(v);
     if (a.length > 180) a.shift();
   };
 
-  player.on('media_object', (e: any) => {
+  const percentile = (a: number[], p: number): number => {
+    const s = [...a].sort((x, y) => x - y);
+    return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0;
+  };
+
+  (player as any).on('media_object', (e: any) => {
+    objEvents++;
+    if (e.captureTimestamp) objEventsWithTs++;
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
-    const now = performance.now();
-    if (lastArrivalMs) {
-      const interval = now - lastArrivalMs;
+
+    const arrivalMs = performance.now();
+    const captureMs = e.captureTimestamp && e.captureTimestamp > 0n
+      ? Number(e.captureTimestamp) / 1000
+      : 0;
+
+    if (captureMs && prevCaptureMs) {
+      // D = (Rj - Ri) - (Sj - Si);  J += (|D| - J) / 16
+      const d = (arrivalMs - prevArrivalMs) - (captureMs - prevCaptureMs);
+      jitterEwma += (Math.abs(d) - jitterEwma) / 16;
+      pushSample(jitSamples, jitterEwma);
+    } else if (prevArrivalMs) {
+      const interval = arrivalMs - prevArrivalMs;
       if (expectedIntervalMs) pushSample(jitSamples, Math.abs(interval - expectedIntervalMs));
       expectedIntervalMs = expectedIntervalMs
         ? expectedIntervalMs * 0.9 + interval * 0.1 : interval;
     }
-    lastArrivalMs = now;
-    if (e.captureTimestamp && e.captureTimestamp > 0n) {
-      const latencyMs = Date.now() - Number(e.captureTimestamp) / 1000;
-      if (latencyMs > -1000 && latencyMs < 30_000) pushSample(latSamples, latencyMs);
+
+    prevArrivalMs = arrivalMs;
+    if (captureMs) {
+      prevCaptureMs = captureMs;
+      const latencyMs = Date.now() - captureMs;
+      if (latencyMs < -250) skewSamples++;
+      else if (latencyMs < 30_000) pushSample(latSamples, latencyMs);
     }
   });
 
   function drawSpark(canvas: HTMLCanvasElement, data: number[],
-                     valEl: HTMLElement, color: string): void {
+                     color: string): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const w = canvas.width = canvas.clientWidth * devicePixelRatio;
@@ -169,13 +209,79 @@ async function main(): Promise<void> {
     ctx.strokeStyle = color;
     ctx.lineWidth = devicePixelRatio;
     ctx.stroke();
-    valEl.textContent = data[data.length - 1].toFixed(0);
   }
 
   setInterval(() => {
-    drawSpark(latSpark, latSamples, latVal, '#4d4');
-    drawSpark(jitSpark, jitSamples, jitVal, '#da4');
+    drawSpark(latSpark, latSamples, '#4d4');
+    drawSpark(jitSpark, jitSamples, '#da4');
+    if (latSamples.length) {
+      latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
+      latP95.textContent = percentile(latSamples, 0.95).toFixed(0);
+    } else if (skewSamples) {
+      // Every sample landed before its own capture stamp: the clocks
+      // disagree, so the difference is offset, not latency.
+      latVal.textContent = 'clock skew';
+      latP95.textContent = '—';
+    }
+    jitVal.textContent = jitSamples.length
+      ? jitSamples[jitSamples.length - 1]!.toFixed(1)
+      : '—';
   }, 250);
+
+  // ── CMSF / MSF catalog panel ──────────────────────────────────────
+  // Redrawn only on catalog events (initial + deltas), never per frame.
+  // Catalog values are remote input: built as text nodes, never HTML.
+
+  function renderCatalog(cat: any): void {
+    const tracks: any[] = cat?.tracks ?? [];
+    const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
+    catMeta.textContent = [
+      `v${cat?.version ?? '?'}`,
+      `${tracks.length} track${tracks.length === 1 ? '' : 's'}`,
+      packagings,
+      cat?.initDataList?.length ? `${cat.initDataList.length} initData` : '',
+    ].filter(Boolean).join(' · ');
+
+    catTracks.replaceChildren(...tracks.map((t) => {
+      const row = document.createElement('div');
+      row.className = 'cat-track';
+      const name = document.createElement('span');
+      name.className = 'nm';
+      name.textContent = t.name ?? '(unnamed)';
+      const pkg = document.createElement('span');
+      pkg.className = 'pk';
+      pkg.textContent = t.packaging ?? '?';
+      const detail = document.createElement('span');
+      detail.textContent = [
+        t.codec,
+        t.width && t.height ? `${t.width}×${t.height}` : '',
+        t.framerate ? `${t.framerate}fps` : '',
+        t.samplerate ? `${t.samplerate}Hz` : '',
+        t.channelConfig ? `${t.channelConfig}ch` : '',
+        t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',
+        t.initRef ? `init=${t.initRef}` : '',
+        t.targetLatency ? `target=${t.targetLatency}ms` : '',
+      ].filter(Boolean).join(' · ');
+      row.append(name, pkg, detail);
+      return row;
+    }));
+
+    catJson.textContent = JSON.stringify(cat, null, 2);
+  }
+
+  player.on('catalog_received', ({ catalog }) => {
+    log(`Catalog received: ${catalog?.tracks?.length ?? 0} track(s)`);
+    renderCatalog(catalog);
+  });
+  player.on('catalog_updated', ({ catalog }) => {
+    log('Catalog delta applied');
+    renderCatalog(catalog);
+  });
+
+  catToggle.addEventListener('click', () => {
+    const collapsed = catalogPanel.classList.toggle('collapsed');
+    catToggle.textContent = collapsed ? 'show' : 'hide';
+  });
 
   // ── Controls ──────────────────────────────────────────────────────
 
