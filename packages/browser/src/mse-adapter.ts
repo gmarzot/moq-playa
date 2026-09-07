@@ -559,8 +559,22 @@ export class MseMediaSource implements MediaSourceLike {
   private objectUrl: string | null = null;
   private destroyed = false;
   private initialized = false;
+  /** Deferred initialization owned by the current buffer generation. */
+  private sourceOpenListener: (() => void) | null = null;
 
   // ─── Callbacks ──────────────────────────────────────────────────
+
+  /**
+   * True once the media element has attached the MediaSource (`sourceopen`)
+   * and initialize() has created the SourceBuffers. Browsers defer the
+   * attachment while the document is hidden; until then appendChunk() has
+   * nothing to append to. Cleared by reset().
+   */
+  private _attached = false;
+  get attached(): boolean { return this._attached; }
+
+  /** Callback: the MediaSource attached and SourceBuffers now exist. */
+  onAttached: (() => void) | null = null;
 
   onFirstFrame: (() => void) | null = null;
   onError: ((error: Error) => void) | null = null;
@@ -603,6 +617,8 @@ export class MseMediaSource implements MediaSourceLike {
   onGapJump: ((info: GapJumpInfo) => void) | null = null;
 
   private firstFrameFired = false;
+  /** One-shot guard for the "no SourceBuffer yet" drop diagnostic in appendChunk(). */
+  private preInitDropLogged = false;
   private playTriggered = false;
   private stallStartTime: number | null = null;
   /** True once this episode has been reported as detected. */
@@ -908,7 +924,13 @@ export class MseMediaSource implements MediaSourceLike {
     }
     this.initialized = true;
 
+    const generation = this.bufferGen;
     const doInit = () => {
+      if (this.sourceOpenListener === doInit) {
+        this.ms.removeEventListener('sourceopen', doInit);
+        this.sourceOpenListener = null;
+      }
+      if (this.destroyed || this.bufferGen !== generation || !this.initialized) return;
       try {
         if (config.video) {
           const mimeType = `video/mp4; codecs="${config.video.codec}"`;
@@ -954,6 +976,9 @@ export class MseMediaSource implements MediaSourceLike {
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
         }
+        // SourceBuffers exist from here on: appendChunk() can take effect.
+        this._attached = true;
+        this.onAttached?.();
       } catch (err) {
         this.onError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -962,6 +987,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.ms.readyState === 'open') {
       doInit();
     } else {
+      this.sourceOpenListener = doInit;
       this.ms.addEventListener('sourceopen', doInit, { once: true });
     }
     return true;
@@ -982,6 +1008,18 @@ export class MseMediaSource implements MediaSourceLike {
 
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
+      // No SourceBuffer yet: either initialize() hasn't been called, or it has
+      // and we are still waiting for `sourceopen`. The latter is normal for a
+      // hidden tab — browsers defer the media load (and so the MediaSource
+      // attachment) until the document is visible — but it must not be silent:
+      // every chunk dropped here is media the element will never see.
+      if (!this.preInitDropLogged) {
+        this.preInitDropLogged = true;
+        const doc = (globalThis as { document?: { visibilityState?: string } }).document;
+        this.logDebug('[MSE] dropping %s chunk: no SourceBuffer yet (initialized=%s, ms.readyState=%s, '
+          + 'document.visibilityState=%s) — waiting for sourceopen; further drops not logged',
+          mediaType, String(this.initialized), this.ms.readyState, doc?.visibilityState ?? 'n/a');
+      }
       return;
     }
 
@@ -1213,6 +1251,10 @@ export class MseMediaSource implements MediaSourceLike {
     // Cancel any in-flight startup FIRST: a late seeked/play from the
     // superseded generation must not resurrect playback against new buffers.
     this.cancelStartup();
+    if (this.sourceOpenListener) {
+      this.ms.removeEventListener('sourceopen', this.sourceOpenListener);
+      this.sourceOpenListener = null;
+    }
     this.diag('reset (buffer generation %d → %d)', this.bufferGen, this.bufferGen + 1);
     this.bufferGen++;
     // New session: stale facts must never join a later summary.
@@ -1232,6 +1274,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
     this.initialized = false;
+    this._attached = false;
+    this.preInitDropLogged = false;
     // Timeline-owned append state.
     this.videoTimelines.clear();
     this.audioTimelines.clear();
@@ -1285,6 +1329,7 @@ export class MseMediaSource implements MediaSourceLike {
     (this.video as any).srcObject = null;
     this.video.load();
     this.onFirstFrame = null;
+    this.onAttached = null;
     this.onError = null;
     this.onStall = null;
     this.onStallRecovered = null;

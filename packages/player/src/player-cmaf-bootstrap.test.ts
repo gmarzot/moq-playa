@@ -10,7 +10,7 @@
  * @module
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
 import { PlayerState } from './state.js';
@@ -124,6 +124,45 @@ async function bootPlayer(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) 
     return idx >= 0 ? await adapter.subscribe.mock.results[idx]?.value : undefined;
   };
   return { player, adapter, mockMs, assembler, errors, subscribedNames, reqIdFor };
+}
+
+/** Boot a player while exposing the assembler's emitted-segment callback. */
+async function bootPlayerCapturingAssembler(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) {
+  let onSegment: ((mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void) | null = null;
+  const adapter = createMockAdapter();
+  const mockMs = makeMockMs();
+  const assembler = { push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(), setInitSegment: vi.fn(), clearPending: vi.fn() };
+  const player = new MoqtPlayer({
+    url: 'https://relay.example.com/moq',
+    namespace: 'live/broadcast',
+    createTransport: vi.fn(async () => ({}) as any),
+    createConnection: () => adapter as unknown as MoqtConnection,
+    createMediaSource: () => mockMs,
+    createCmafAssembler: (callbacks: any) => { onSegment = callbacks.onSegment; return assembler; },
+    catalogBootstrap: 'subscribe',
+    ...cfg,
+  });
+  const errors: any[] = [];
+  player.on('error', (e) => errors.push(e.error));
+
+  const loadPromise = player.load();
+  await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
+  adapter._connectResolve?.();
+  await loadPromise;
+  const catalogReqId = await adapter.subscribe.mock.results[0]?.value;
+  adapter._triggerMessage({
+    type: 'SUBSCRIBE_OK', requestId: catalogReqId, trackAlias: catalogReqId, parameters: new Map(),
+  } as unknown as ControlMessage);
+  adapter._triggerObject(0n, {
+    kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+    objectId: varint(0), payload: new TextEncoder().encode(catalogJson),
+  } as MoqtObject);
+  await new Promise((r) => setTimeout(r, 30));
+
+  return {
+    player, adapter, mockMs, assembler, errors,
+    sendVideoSegment: () => onSegment?.('video', new Uint8Array([0]), 'video', 0n),
+  };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -300,6 +339,266 @@ describe('CMAF bootstrap deadlines', () => {
     await sleep(150);
     expect(errors).toEqual([]);
     expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});
+
+describe('CMAF first-frame deadline renewal (false-positive fix)', () => {
+  it('video segments arriving keep renewing the deadline — no false-positive fatal past cmafBootstrapTimeoutMs', async () => {
+    const { player, errors, mockMs, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 100, cmafFirstFrameMaxWaitMs: 2_000 });
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1); // cmaf_init armed cmaf_first_frame
+
+    // Renew immediately (the bootPlayer harness's own async fan-out wait
+    // already consumes part of the very first deadline window), then keep
+    // renewing well inside the 100ms deadline on every pass. Total span
+    // (≈320ms) exceeds cmafBootstrapTimeoutMs several times over but stays
+    // under the 2000ms ceiling.
+    sendVideoSegment();
+    for (let i = 0; i < 8; i++) {
+      await sleep(40);
+      sendVideoSegment();
+    }
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+
+    mockMs.onFirstFrame?.(); // frame finally renders — clean shutdown
+    await sleep(150);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    await player.destroy();
+  });
+
+  it('delivery genuinely stalling (no more segments) still fires the fatal after a renewed deadline', async () => {
+    const { player, errors, mockMs, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60, cmafFirstFrameMaxWaitMs: 1_000 });
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+
+    sendVideoSegment(); // one renewal, then delivery stops entirely
+    await sleep(150); // > cmafBootstrapTimeoutMs since the last renewal
+
+    const err = errors.find((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT);
+    expect(err).toBeDefined();
+    expect(err.message).toMatch(/no frame rendered/i);
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('renewal stops past cmafFirstFrameMaxWaitMs — a stream that never renders still surfaces fatal eventually', async () => {
+    const { player, errors, mockMs, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60, cmafFirstFrameMaxWaitMs: 120 });
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+
+    // Keep renewing past the 120ms ceiling — segments never stop arriving,
+    // but no frame ever renders (a genuine codec/init-mismatch class bug).
+    for (let i = 0; i < 10; i++) {
+      await sleep(30);
+      sendVideoSegment();
+    }
+
+    const err = errors.find((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT);
+    expect(err).toBeDefined();
+    expect(err.message).toMatch(/no frame rendered/i);
+    await player.destroy();
+  });
+});
+
+describe('CMAF bootstrap deadlines while the document is hidden (browser defers media load)', () => {
+  /**
+   * Minimal `document` stand-in: browsers defer a media element's resource
+   * load (for MSE, the attachment that fires `sourceopen`) while the tab is
+   * hidden, so a bootstrap deadline expiring in that state is not a
+   * codec/init failure. These tests run in Node, where no `document` exists.
+   */
+  function stubDocument(state: 'hidden' | 'visible') {
+    const listeners = new Set<() => void>();
+    const doc = {
+      visibilityState: state,
+      addEventListener: (type: string, fn: () => void) => { if (type === 'visibilitychange') listeners.add(fn); },
+      removeEventListener: (_type: string, fn: () => void) => { listeners.delete(fn); },
+      hide() { this.visibilityState = 'hidden'; for (const fn of [...listeners]) fn(); },
+      show() { this.visibilityState = 'visible'; for (const fn of [...listeners]) fn(); },
+      listenerCount: () => listeners.size,
+    };
+    (globalThis as any).document = doc;
+    return doc;
+  }
+  afterEach(() => { delete (globalThis as any).document; });
+
+  it('hidden: the first-frame deadline is suspended (no fatal); visible again → re-armed and escalates normally', async () => {
+    const doc = stubDocument('hidden');
+    const { player, errors } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(200); // several deadlines' worth, all while hidden
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    expect(doc.listenerCount()).toBe(1); // waiting on visibilitychange
+
+    doc.show();
+    expect(doc.listenerCount()).toBe(1); // remains while the re-armed deadline is active
+    await sleep(150); // > cmafBootstrapTimeoutMs after becoming visible, still no frame
+    const err = errors.find((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT);
+    expect(err).toBeDefined();
+    expect(err.message).toMatch(/no frame rendered/i);
+    expect(doc.listenerCount()).toBe(0);
+    await player.destroy();
+  });
+
+  it('hidden → visible → frame renders inside the re-armed deadline: no fatal', async () => {
+    const doc = stubDocument('hidden');
+    const { player, errors, mockMs } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(150);
+    doc.show();
+    mockMs.onFirstFrame?.(); // sourceopen → init → first paint, as a foregrounded tab does
+    await sleep(150);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('foregrounding just before the original deadline grants a fresh visible deadline', async () => {
+    const doc = stubDocument('hidden');
+    const { player, errors } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 500 });
+
+    await sleep(200);
+    doc.show();
+    await sleep(350);
+
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('suspends an active deadline when a visible document becomes hidden', async () => {
+    const doc = stubDocument('visible');
+    const { player, errors } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 120 });
+
+    await sleep(40);
+    doc.hide();
+    await sleep(40);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+
+    doc.show();
+    await sleep(50);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    await player.destroy();
+  });
+
+  it('does not charge hidden time against the first-frame renewal ceiling', async () => {
+    const doc = stubDocument('hidden');
+    const { player, errors, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60, cmafFirstFrameMaxWaitMs: 120 });
+
+    await sleep(180);
+    doc.show();
+    await sleep(35);
+    sendVideoSegment();
+    await sleep(40);
+
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    await player.destroy();
+  });
+
+  it('hidden: the cmaf_init deadline is suspended too', async () => {
+    stubDocument('hidden');
+    const { player, adapter, errors, reqIdFor } =
+      await bootPlayer(cmafCatalog([VIDEO_BASE]), { cmafBootstrapTimeoutMs: 60 });
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: await reqIdFor('video'), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(1), payload: boxPayload(['moof', 32]),
+    } as MoqtObject);
+    await sleep(200);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('destroy() while deferred removes the visibilitychange listener', async () => {
+    const doc = stubDocument('hidden');
+    const { player } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(150);
+    expect(doc.listenerCount()).toBe(1);
+    await player.destroy();
+    expect(doc.listenerCount()).toBe(0);
+  });
+
+  it('a visible document keeps the historical escalation (regression guard)', async () => {
+    stubDocument('visible');
+    const { player, errors } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(150);
+    expect(errors.some((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toBe(true);
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});
+
+describe('CMAF media is held until the MediaSource attaches (resume at the live edge)', () => {
+  const videoObj = (alias: unknown, groupId: number, objectId: number): MoqtObject => ({
+    kind: 'data', trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0),
+    objectId: varint(objectId), payload: boxPayload(['moof', 24], ['mdat', 32]),
+  } as MoqtObject);
+
+  it('an adapter that does not report attachment is treated as attached (back-compat)', async () => {
+    const { player, adapter, assembler, reqIdFor } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]));
+    const vid = await reqIdFor('video');
+    adapter._triggerObject(0n, videoObj(vid, 7, 0)); // group start → synced → pushed
+    expect(assembler.push).toHaveBeenCalledTimes(1);
+    await player.destroy();
+  });
+
+  it('attached=false: media is held (not fed to the assembler); on attach the assembler is reset, ' +
+     're-seeded with init, and video re-syncs to the next group start', async () => {
+    const { player, adapter, mockMs, assembler, reqIdFor } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const vid = await reqIdFor('video');
+    assembler.setInitSegment.mockClear();
+
+    // Browser has deferred the attachment (hidden tab): nothing may reach MSE.
+    (mockMs as { attached?: boolean }).attached = false;
+    adapter._triggerObject(0n, videoObj(vid, 7, 0));
+    adapter._triggerObject(0n, videoObj(vid, 7, 1));
+    adapter._triggerObject(0n, videoObj(vid, 8, 0));
+    expect(assembler.push).not.toHaveBeenCalled();
+    expect(assembler.reset).not.toHaveBeenCalled();
+
+    // Tab foregrounded → sourceopen → SourceBuffers → attached.
+    (mockMs as { attached?: boolean }).attached = true;
+    (mockMs as { onAttached?: () => void }).onAttached?.();
+    expect(assembler.reset).toHaveBeenCalledTimes(1);
+    expect(assembler.setInitSegment).toHaveBeenCalledWith('video', expect.any(Uint8Array)); // re-seeded
+
+    // Mid-group objects after attach are skipped until the next group start…
+    adapter._triggerObject(0n, videoObj(vid, 8, 3));
+    adapter._triggerObject(0n, videoObj(vid, 8, 4));
+    expect(assembler.push).not.toHaveBeenCalled();
+    // …then the keyframe-led group at the live edge is the first thing fed.
+    adapter._triggerObject(0n, videoObj(vid, 9, 0));
+    adapter._triggerObject(0n, videoObj(vid, 9, 1));
+    expect(assembler.push).toHaveBeenCalledTimes(2);
+    expect(assembler.push.mock.calls[0]![2]).toBe(9n);
+    await player.destroy();
+  });
+
+  it('onAttached without a preceding hold is a no-op (normal visible startup)', async () => {
+    const { player, mockMs, assembler } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]));
+    (mockMs as { onAttached?: () => void }).onAttached?.();
+    expect(assembler.reset).not.toHaveBeenCalled();
     await player.destroy();
   });
 });
