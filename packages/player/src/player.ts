@@ -393,14 +393,10 @@ export class MoqtPlayer {
    */
   private cmafHoldingForAttach = false;
 
-  /**
-   * CMAF bootstrap deadlines suspended because the document is hidden, keyed
-   * by watchdog event name → the timeout to re-arm once visible. See
-   * {@link deferCmafBootstrapDeadline}.
-   */
-  private readonly cmafDeadlinesDeferredForHidden = new Map<string, number>();
+  /** First-frame timeout to re-arm when a hidden document becomes visible. */
+  private cmafFirstFrameDeferredTimeoutMs: number | undefined;
 
-  /** `visibilitychange` listener installed while any CMAF deadline is pending. */
+  /** `visibilitychange` listener installed while the first-frame deadline is pending. */
   private visibilityListener: (() => void) | null = null;
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
@@ -932,8 +928,8 @@ export class MoqtPlayer {
           // exists and nothing can render, no matter how healthy delivery is.
           // That is not a codec/init mismatch: suspend the deadline instead of
           // escalating, and re-arm it fresh once the document is visible.
-          if (this.documentHidden()) {
-            this.deferCmafBootstrapDeadline(e.event, e.timeoutMs);
+          if (e.event === 'cmaf_first_frame' && this.documentHidden()) {
+            this.deferCmafFirstFrameDeadline(e.timeoutMs);
             return;
           }
           if (e.event === 'cmaf_first_frame') {
@@ -4620,7 +4616,7 @@ export class MoqtPlayer {
     this.cmafInitDeadlineArmed = false;
     this.cmafFirstFrameDeadlineStartedAt = undefined;
     this.cmafFirstFrameHiddenAt = undefined;
-    this.cmafDeadlinesDeferredForHidden.clear();
+    this.cmafFirstFrameDeferredTimeoutMs = undefined;
     this.removeVisibilityListener();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
@@ -6499,16 +6495,15 @@ export class MoqtPlayer {
   }
 
   /** Suspend a CMAF bootstrap deadline while the document is hidden. */
-  private deferCmafBootstrapDeadline(event: string, timeoutMs: number): void {
-    if (!this.cmafDeadlinesDeferredForHidden.has(event)) {
+  private deferCmafFirstFrameDeadline(timeoutMs: number): void {
+    if (this.cmafFirstFrameDeferredTimeoutMs === undefined) {
       this.log.warn(
         'CMAF bootstrap deferred: document is hidden (background tab) — the browser '
-        + 'defers media loading until the tab is visible; waiting for %s', event);
+        + 'defers media loading until the tab is visible; waiting for cmaf_first_frame');
     }
-    this.watchdog.fulfill(event);
-    this.cmafDeadlinesDeferredForHidden.set(event, timeoutMs);
-    if (event === 'cmaf_first_frame'
-        && this.cmafFirstFrameDeadlineStartedAt !== undefined
+    this.watchdog.fulfill('cmaf_first_frame');
+    this.cmafFirstFrameDeferredTimeoutMs = timeoutMs;
+    if (this.cmafFirstFrameDeadlineStartedAt !== undefined
         && this.cmafFirstFrameHiddenAt === undefined) {
       this.cmafFirstFrameHiddenAt = Date.now();
     }
@@ -6517,20 +6512,21 @@ export class MoqtPlayer {
 
   /** Arm a CMAF deadline, or park it immediately when the document is hidden. */
   private expectCmafBootstrapDeadline(event: string, timeoutMs: number): void {
-    this.installVisibilityListener();
-    if (this.documentHidden()) {
-      this.deferCmafBootstrapDeadline(event, timeoutMs);
-      return;
+    if (event === 'cmaf_first_frame') {
+      this.installVisibilityListener();
+      if (this.documentHidden()) {
+        this.deferCmafFirstFrameDeadline(timeoutMs);
+        return;
+      }
     }
-    this.cmafDeadlinesDeferredForHidden.delete(event);
     this.watchdog.expect(event, timeoutMs);
   }
 
   /** Fulfill a CMAF deadline and release its visibility bookkeeping. */
   private fulfillCmafBootstrapDeadline(event: string): void {
     this.watchdog.fulfill(event);
-    this.cmafDeadlinesDeferredForHidden.delete(event);
     if (event === 'cmaf_first_frame') {
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
       this.cmafFirstFrameDeadlineStartedAt = undefined;
       this.cmafFirstFrameHiddenAt = undefined;
     }
@@ -6543,10 +6539,8 @@ export class MoqtPlayer {
     if (!doc) return;
     this.visibilityListener = () => {
       if (this.documentHidden()) {
-        for (const event of ['cmaf_init', 'cmaf_first_frame']) {
-          if (this.watchdog.activeExpectations.includes(event)) {
-            this.deferCmafBootstrapDeadline(event, this.config.cmafBootstrapTimeoutMs!);
-          }
+        if (this.watchdog.activeExpectations.includes('cmaf_first_frame')) {
+          this.deferCmafFirstFrameDeadline(this.config.cmafBootstrapTimeoutMs!);
         }
         return;
       }
@@ -6555,11 +6549,11 @@ export class MoqtPlayer {
         this.cmafFirstFrameDeadlineStartedAt += Date.now() - this.cmafFirstFrameHiddenAt;
         this.cmafFirstFrameHiddenAt = undefined;
       }
-      const deferred = [...this.cmafDeadlinesDeferredForHidden];
-      this.cmafDeadlinesDeferredForHidden.clear();
-      for (const [event, timeoutMs] of deferred) {
-        this.log.info('Document visible — re-arming CMAF bootstrap deadline %s (%dms)', event, timeoutMs);
-        this.watchdog.expect(event, timeoutMs);
+      const timeoutMs = this.cmafFirstFrameDeferredTimeoutMs;
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
+      if (timeoutMs !== undefined) {
+        this.log.info('Document visible — re-arming CMAF bootstrap deadline cmaf_first_frame (%dms)', timeoutMs);
+        this.watchdog.expect('cmaf_first_frame', timeoutMs);
       }
       this.removeVisibilityListenerIfIdle();
     };
@@ -6568,8 +6562,7 @@ export class MoqtPlayer {
 
   private removeVisibilityListenerIfIdle(): void {
     const active = this.watchdog.activeExpectations;
-    if (this.cmafDeadlinesDeferredForHidden.size === 0
-        && !active.includes('cmaf_init')
+    if (this.cmafFirstFrameDeferredTimeoutMs === undefined
         && !active.includes('cmaf_first_frame')) {
       this.removeVisibilityListener();
     }

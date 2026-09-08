@@ -404,7 +404,7 @@ describe('CMAF first-frame deadline renewal (false-positive fix)', () => {
   });
 });
 
-describe('CMAF bootstrap deadlines while the document is hidden (browser defers media load)', () => {
+describe('CMAF first-frame deadline while the document is hidden (browser defers media load)', () => {
   /**
    * Minimal `document` stand-in: browsers defer a media element's resource
    * load (for MSE, the attachment that fires `sourceopen`) while the tab is
@@ -508,7 +508,7 @@ describe('CMAF bootstrap deadlines while the document is hidden (browser defers 
     await player.destroy();
   });
 
-  it('hidden: the cmaf_init deadline is suspended too', async () => {
+  it('hidden: missing CMAF init still reaches its bounded fatal deadline', async () => {
     stubDocument('hidden');
     const { player, adapter, errors, reqIdFor } =
       await bootPlayer(cmafCatalog([VIDEO_BASE]), { cmafBootstrapTimeoutMs: 60 });
@@ -517,8 +517,8 @@ describe('CMAF bootstrap deadlines while the document is hidden (browser defers 
       objectId: varint(1), payload: boxPayload(['moof', 32]),
     } as MoqtObject);
     await sleep(200);
-    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
-    expect(player.state).not.toBe(PlayerState.ERROR);
+    expect(errors.some((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toBe(true);
+    expect(player.state).toBe(PlayerState.ERROR);
     await player.destroy();
   });
 
