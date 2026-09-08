@@ -276,7 +276,7 @@ interface MigrationTxn {
  */
 export class MoqtPlayer {
   /** Player version (set at build time). */
-  static readonly version = '0.5.8';
+  static readonly version = '0.5.9';
 
   private readonly config: MoqtPlayerConfig;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
