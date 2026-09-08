@@ -5,7 +5,7 @@ import { flush } from '../testkit/stream-sim.js';
 
 const setup = createControlCodec(18).encode({ type: 'SETUP', setupOptions: new Map() });
 
-function controlledStream(): {
+function controlledStream(options: { cancelResult?: Promise<void> } = {}): {
   stream: ReadableStream<Uint8Array>;
   push(chunk: Uint8Array): void;
   close(): void;
@@ -16,7 +16,7 @@ function controlledStream(): {
   let wasCancelled = false;
   const stream = new ReadableStream<Uint8Array>({
     start(value) { controller = value; },
-    cancel() { wasCancelled = true; },
+    cancel() { wasCancelled = true; return options.cancelResult; },
   });
   return {
     stream,
@@ -185,6 +185,26 @@ describe('IncomingUniRouter', () => {
     expect(h.violations).toEqual([expect.stringMatching(/more than one SETUP/)]);
   });
 
+  it('reports a second SETUP before its cancellation settles', async () => {
+    const input = streamSource();
+    const h = handlers();
+    const router = new IncomingUniRouter(h.callbacks);
+    const ready = router.start(input.source);
+    const control = controlledStream();
+    input.push(control.stream);
+    control.push(setup);
+    control.close();
+    await ready;
+
+    const duplicate = controlledStream({ cancelResult: new Promise<void>(() => {}) });
+    input.push(duplicate.stream);
+    duplicate.push(setup);
+    await flush();
+
+    expect(duplicate.cancelled()).toBe(true);
+    expect(h.violations).toEqual([expect.stringMatching(/more than one SETUP/)]);
+  });
+
   it('rejects unknown stream types instead of treating them as data', async () => {
     const input = streamSource();
     const h = handlers();
@@ -199,6 +219,20 @@ describe('IncomingUniRouter', () => {
     expect(h.data).toEqual([]);
     expect(input.cancelled()).toBe(false);
     input.close();
+  });
+
+  it('reports an unknown stream type before its cancellation settles', async () => {
+    const input = streamSource();
+    const h = handlers();
+    const router = new IncomingUniRouter(h.callbacks);
+    void router.start(input.source).catch(() => {});
+    const unknown = controlledStream({ cancelResult: new Promise<void>(() => {}) });
+    input.push(unknown.stream);
+    unknown.push(new Uint8Array([0x08]));
+    await flush();
+
+    expect(unknown.cancelled()).toBe(true);
+    expect(h.violations).toEqual([expect.stringMatching(/unknown draft-18/)]);
   });
 
   it('rejects a clean FIN before the required stream type', async () => {

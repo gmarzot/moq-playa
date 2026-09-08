@@ -171,12 +171,12 @@ export class IncomingUniRouter {
     try {
       const classified = await classifyIncomingStream(reader);
       if (this.terminal) {
-        await classified.reader.cancel().catch(() => {});
+        cancelAndRelease(classified.reader);
         return;
       }
       if (classified.kind === 'setup') {
         if (this.setupClaimed) {
-          await classified.reader.cancel().catch(() => {});
+          cancelAndRelease(classified.reader);
           this.violate('received more than one SETUP stream (§3.3)');
           return;
         }
@@ -195,7 +195,7 @@ export class IncomingUniRouter {
 
       if (!this.dataReleased) {
         if (this.earlyData.length >= this.maxPendingStreams) {
-          await classified.reader.cancel().catch(() => {});
+          cancelAndRelease(classified.reader);
           this.violate(`too many data streams received before SETUP (limit ${this.maxPendingStreams})`);
           return;
         }
@@ -289,10 +289,18 @@ async function classifyIncomingStream(
       }
     }
   } catch (error) {
-    try { await reader.cancel(error); } catch { /* peer or transport already ended it */ }
-    try { reader.releaseLock(); } catch { /* cancel may have released it */ }
+    cancelAndRelease(reader, error);
     throw error;
   }
+}
+
+/** Start cancellation without letting a peer-controlled sink delay terminal handling. */
+function cancelAndRelease(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reason?: unknown,
+): void {
+  try { void reader.cancel(reason).catch(() => {}); } catch { /* stream already ended */ }
+  try { reader.releaseLock(); } catch { /* a transport read may still be settling */ }
 }
 
 function replayStream(
