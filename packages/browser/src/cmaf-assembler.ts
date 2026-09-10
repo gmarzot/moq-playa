@@ -600,14 +600,18 @@ export class CmafAssembler {
       }
     } else if (lastBmd !== null && bmd < lastBmd) {
       // Same track, bmd went backward.
-      // Audio: backward jumps of at most one second in the track's media
-      // timescale are late subgroup data, not a real discontinuity. Use
-      // the historical 48 kHz window when no init segment was available.
-      // Video: any backward jump is treated as a discontinuity.
+      // Backward jumps of at most one second in the track's media
+      // timescale are late subgroup data (concurrent group streams
+      // interleave at boundaries), not a real discontinuity — MSE in
+      // 'segments' mode places them correctly by tfdt. A genuine
+      // restart jumps back far beyond a second. Fallback timescales:
+      // 48 kHz audio, 90 kHz video.
       const jumpBack = lastBmd - bmd;
-      const audioReorderWindow = BigInt(this.audioTimescale ?? 48000);
-      const isSmallAudioReorder = mediaType === 'audio' && jumpBack <= audioReorderWindow;
-      if (!isSmallAudioReorder) {
+      const reorderWindow = BigInt(
+        mediaType === 'audio' ? (this.audioTimescale ?? 48000)
+                              : (this.videoTimescale ?? 90000));
+      const isSmallReorder = jumpBack <= reorderWindow;
+      if (!isSmallReorder) {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
         this.onDiscontinuity?.(mediaType, trackName);

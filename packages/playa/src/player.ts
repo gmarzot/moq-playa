@@ -108,6 +108,14 @@ export class Player {
   private ownsCanvas = false;
   private ownsVideo = false;
 
+  /** The MSE autoplay ladder may mute the element itself; mirror it. */
+  private readonly syncMutedFromElement = (): void => {
+    const el = this.videoElement;
+    if (!el || el.muted === this._muted) return;
+    this._muted = el.muted;
+    this.emitter.emit('volumechange', { volume: this.volume, muted: this.muted });
+  };
+
   // Resolved after catalog_received — 'canvas' for LOC/WebCodecs, 'video' for CMAF/MSE.
   private _activeMediaType: 'canvas' | 'video' | null = null;
 
@@ -119,6 +127,7 @@ export class Player {
   private readonly audioClock = new AudioAlignedClock();
   private readonly deferredAudio = new DeferredAudioOutput();
   private renderer: CanvasRenderer | null = null;
+  private audioOutput: WebAudioOutput | null = null;
   private audioCtx: AudioContext | null = null;
   private _prepareAudioPromise: Promise<void> | null = null;
 
@@ -180,6 +189,7 @@ export class Player {
       this.videoElement = options.video;
       this.videoElement.volume = this._volume;
       this.videoElement.muted = this._muted;
+      this.videoElement.addEventListener('volumechange', this.syncMutedFromElement);
       this.ownsVideo = false;
     } else if (container) {
       // Classic mode: create the element and append it to the container.
@@ -191,6 +201,7 @@ export class Player {
       this.videoElement.hidden = this.strategy === 'webcodecs';
       this.videoElement.volume = this._volume;
       this.videoElement.muted = this._muted;
+      this.videoElement.addEventListener('volumechange', this.syncMutedFromElement);
       container.appendChild(this.videoElement);
       this.ownsVideo = true;
     }
@@ -273,19 +284,45 @@ export class Player {
   /** Simplified stats for UI display. */
   get stats(): PlayerStats {
     const s = this.engine.stats;
+    // MSE path: the engine counts only WebCodecs frames; the element knows.
+    const q = this._activeMediaType === 'video' && this.videoElement?.getVideoPlaybackQuality
+      ? this.videoElement.getVideoPlaybackQuality() : null;
     return {
-      framesDecoded: s.framesDecoded,
-      framesRendered: s.framesRendered,
-      framesDropped: s.framesDropped,
+      framesDecoded: q ? q.totalVideoFrames : s.framesDecoded,
+      framesRendered: q ? q.totalVideoFrames - q.droppedVideoFrames : s.framesRendered,
+      framesDropped: q ? q.droppedVideoFrames : s.framesDropped,
       bitrate: s.currentBitrate,
-      latencyMs: 0, // TODO: derive from sync controller
+      latencyMs: s.currentLatencyMs,
       stallCount: s.stallCount,
       timeToFirstFrameMs: s.timeToFirstFrameMs,
       resolution: s.currentResolution ?? null,
       videoCodec: s.currentVideoCodec ?? null,
       audioCodec: s.currentAudioCodec ?? null,
       sessionAgeMs: s.sessionAgeMs,
+      stallDurationMs: s.totalStallDurationMs,
+      gapCount: s.gapCount,
+      avSkewMs: s.avSkewEwmaMs ?? null,
+      cushionMs: this.cushionMs(),
+      audioUnderruns: this.audioOutput?.underrunCount ?? 0,
     };
+  }
+
+  /** Playable media ahead of the playhead, per active path. */
+  private cushionMs(): number | null {
+    const v = this.videoElement;
+    if (this._activeMediaType === 'video' && v) {
+      let buffered: TimeRanges;
+      try { buffered = v.buffered; } catch { return null; }
+      const t = v.currentTime;
+      for (let i = 0; i < buffered.length; i++) {
+        if (buffered.start(i) <= t + 0.05 && t < buffered.end(i)) {
+          return (buffered.end(i) - t) * 1000;
+        }
+      }
+      return buffered.length ? 0 : null;
+    }
+    if (this.audioOutput) return this.audioOutput.scheduledAheadSec * 1000;
+    return this.engine.stats.loc?.renderCushionMs ?? null;
   }
 
   // ─── Lifecycle Methods ───────────────────────────────────────────
@@ -441,6 +478,7 @@ export class Player {
         // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
         // output must not add a second, divergent delay of its own.
         const real = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+        this.audioOutput = real;
         this.deferredAudio.activate(real);
       }
     })();
@@ -492,6 +530,7 @@ export class Player {
     }
     this.audioClock.detachAudioContext();
     await this.engine.destroy();
+    this.videoElement?.removeEventListener('volumechange', this.syncMutedFromElement);
 
     // Remove owned DOM elements (never touch caller-provided elements).
     // ownsCanvas/ownsVideo are only true when container was non-null (invariant),
@@ -532,6 +571,8 @@ export class Player {
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
           this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock });
+          // play() may have run before the pipelines existed (autoplay on ready).
+          if (this._state === 'playing') this.renderer.start();
           return this.renderer;
         },
         createAudioOutput: () => {
@@ -545,13 +586,15 @@ export class Player {
           // Delay unification: the shared playout cushion arrives inside
           // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
           // output must not add a second, divergent delay of its own.
-          return new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+          this.audioOutput = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+          return this.audioOutput;
         },
       });
     }
 
     Object.assign(base, {
-      createMediaSource: () => new MseMediaSource(this.videoElement!),
+      createMediaSource: () => new MseMediaSource(this.videoElement!,
+        opts.targetLatencyMs !== undefined ? { targetAheadSec: opts.targetLatencyMs / 1000 } : {}),
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),
     });
@@ -678,6 +721,14 @@ export class Player {
   private ensureAudioContext(): void {
     if (this.audioCtx) return;
     this.audioCtx = new AudioContext();
+    // Created without a gesture the context stays suspended; resume it on
+    // the first one so autoplay gets audio without a pause/play round trip.
+    if (this.audioCtx.state === 'suspended' && typeof document !== 'undefined') {
+      const resume = () => { void this.audioCtx?.resume(); };
+      for (const ev of ['pointerdown', 'keydown']) {
+        document.addEventListener(ev, resume, { once: true, passive: true });
+      }
+    }
     this.audioClock.attachAudioContext(this.audioCtx);
     this.volumeCtrl = new VolumeController(this.audioCtx, {
       initialVolume: this._volume,

@@ -1,12 +1,18 @@
 /**
- * Playa — Simple Example
+ * Playa — MSF/CMSF Example
  *
  * The entire player wired to a full UI in ~30 lines of player code.
  * Everything else is DOM glue.
  */
 
 import { Player } from '@playa/player';
-import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { namespace, certHash, draftVersion, catalogBootstrap, warmStart } from '../shared/cert.js';
+
+/** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
+const catchUpRate: number | undefined = (() => {
+  const v = Number(new URLSearchParams(location.search).get('catchUp'));
+  return Number.isFinite(v) && v >= 1 ? v : undefined;
+})();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
@@ -21,6 +27,9 @@ const stateBadge = document.getElementById('state')!;
 const diagGrid = document.getElementById('diag-grid')!;
 const latSpark = document.getElementById('lat-spark') as HTMLCanvasElement;
 const jitSpark = document.getElementById('jit-spark') as HTMLCanvasElement;
+const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
+const cusVal = document.getElementById('cus-val')!;
+const cusTarget = document.getElementById('cus-target')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const jitVal = document.getElementById('jit-val')!;
@@ -67,8 +76,12 @@ async function main(): Promise<void> {
   const player = new Player(playerContainer, {
     url: relayUrl,
     namespace,
+    autoplay: true,
     ...(certHash ? { certHash } : {}),
-    ...(draftVersion ? { draftVersion } : {})
+    ...(draftVersion ? { draftVersion } : {}),
+    ...(catalogBootstrap ? { catalogBootstrap } : {}),
+    ...(warmStart ? { warmStartCurrentGroup: true } : {}),
+    ...(catchUpRate ? { maxCatchUpRate: catchUpRate } : {})
   });
 
   // ── Wire Events ───────────────────────────────────────────────────
@@ -105,7 +118,34 @@ async function main(): Promise<void> {
 
   player.on('durationchange', ({ duration }) => log(`Duration: ${formatTime(duration)}`));
   player.on('qualitychange', ({ level, auto }) => log(`Quality: ${level.label} (${auto ? 'ABR' : 'manual'})`));
-  player.on('stall', ({ durationMs }) => log(`Stall: ${durationMs}ms`));
+  // MSE path: buffered ranges at the moment the element stalled ('waiting')
+  // and again when the stall ends — a hole that has closed by the end is a
+  // late object landing behind the playhead.
+  const describeVideo = (video: HTMLVideoElement): string => {
+    const r: string[] = [];
+    for (let i = 0; i < video.buffered.length; i++) {
+      r.push(`[${video.buffered.start(i).toFixed(2)}–${video.buffered.end(i).toFixed(2)}]`);
+    }
+    return `t=${video.currentTime.toFixed(2)} rs=${video.readyState} rate=${video.playbackRate} `
+      + `buffered=${r.join('') || 'none'}`;
+  };
+  let watchedVideo: HTMLVideoElement | null = null;
+  let stallStartSnap = '';
+  const watchVideo = () => {
+    const video = playerContainer.querySelector('video');
+    if (!video || video === watchedVideo) return video;
+    watchedVideo = video;
+    video.addEventListener('waiting', () => { stallStartSnap = describeVideo(video); });
+    return video;
+  };
+  player.on('stall', ({ durationMs }) => {
+    const video = watchVideo();
+    const where = video
+      ? ` start: ${stallStartSnap || '?'} · end: ${describeVideo(video)}` : '';
+    log(`Stall: ${durationMs.toFixed(0)}ms${where}`);
+    stallStartSnap = '';
+    stallMarks.push(cushionSamples.length);
+  });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
   player.on('stats', (s: any) => {
@@ -120,12 +160,12 @@ async function main(): Promise<void> {
       cell('rendered', String(s.framesRendered ?? 0)),
       cell('decoded', String(s.framesDecoded ?? 0)),
       cell('dropped', String(s.framesDropped ?? 0)),
-      cell('buf v/a s', `${(s.videoBufferDepth ?? 0).toFixed(2)}/${(s.audioBufferDepth ?? 0).toFixed(2)}`),
-      cell('dec queue', String(s.videoDecoderQueueDepth ?? 0)),
-      cell('obj events', `${objEvents} (${objEventsWithTs} ts)`),
-      cell('gaps', String(s.gapsReceived ?? s.gapCount ?? 0)),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.totalStallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
-      cell('a/v skew ms', s.avSkewEwmaMs != null ? s.avSkewEwmaMs.toFixed(0) : '—'),
+      cell('cushion ms', s.cushionMs != null ? s.cushionMs.toFixed(0) : '—'),
+      cell('audio underruns', String(s.audioUnderruns ?? 0)),
+      cell('objects / ts', `${objEvents}/${objEventsWithTs}`),
+      cell('gaps', String(s.gapCount ?? 0)),
+      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
+      cell('a/v skew ms', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—'),
     ].join('');
   });
 
@@ -142,6 +182,13 @@ async function main(): Promise<void> {
 
   const latSamples: number[] = [];
   const jitSamples: number[] = [];
+  // Playout cushion: media buffered ahead of the playhead, sampled every
+  // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
+  // from the engine's buffer-depth stat. Starvation (cushion ≈ 0 at a
+  // stall marker) points at the player; a healthy cushion points wire-ward.
+  const cushionSamples: number[] = [];
+  const stallMarks: number[] = [];
+  let targetLatencyMs = 0;
   let prevArrivalMs = 0;
   let prevCaptureMs = 0;
   let jitterEwma = 0;
@@ -192,19 +239,35 @@ async function main(): Promise<void> {
   });
 
   function drawSpark(canvas: HTMLCanvasElement, data: number[],
-                     color: string): void {
+                     color: string, refLine = 0,
+                     marks?: number[]): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const w = canvas.width = canvas.clientWidth * devicePixelRatio;
     const h = canvas.height = canvas.clientHeight * devicePixelRatio;
     ctx.clearRect(0, 0, w, h);
     if (data.length < 2) return;
-    const max = Math.max(...data) * 1.15 || 1;
+    const max = Math.max(...data, refLine) * 1.15 || 1;
+    const yOf = (v: number) => h - (v / max) * (h - 6) - 3;
+    const xOf = (i: number) => (i / (data.length - 1)) * w;
+    if (refLine > 0) {
+      ctx.beginPath();
+      ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
+      ctx.moveTo(0, yOf(refLine));
+      ctx.lineTo(w, yOf(refLine));
+      ctx.strokeStyle = '#667';
+      ctx.lineWidth = devicePixelRatio;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    for (const m of marks ?? []) {
+      if (m < 0 || m >= data.length) continue;
+      ctx.fillStyle = 'rgba(204, 68, 68, 0.55)';
+      ctx.fillRect(xOf(m) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
+    }
     ctx.beginPath();
     data.forEach((v, i) => {
-      const x = (i / (data.length - 1)) * w;
-      const y = h - (v / max) * (h - 6) - 3;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      if (i === 0) ctx.moveTo(xOf(i), yOf(v)); else ctx.lineTo(xOf(i), yOf(v));
     });
     ctx.strokeStyle = color;
     ctx.lineWidth = devicePixelRatio;
@@ -212,8 +275,24 @@ async function main(): Promise<void> {
   }
 
   setInterval(() => {
+    watchVideo();
+    // Contiguous cushion only (facade-computed per path). Zero with appends
+    // still landing means the playhead is parked at a hole.
+    const cushionMs = player.stats.cushionMs;
+    if (cushionMs != null && player.state !== 'idle') {
+      cushionSamples.push(cushionMs);
+      if (cushionSamples.length > 180) {
+        cushionSamples.shift();
+        for (let i = 0; i < stallMarks.length; i++) stallMarks[i]!--;
+        while (stallMarks.length && stallMarks[0]! < 0) stallMarks.shift();
+      }
+    }
     drawSpark(latSpark, latSamples, '#4d4');
     drawSpark(jitSpark, jitSamples, '#da4');
+    drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
+    cusVal.textContent = cushionSamples.length
+      ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
+    cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
     if (latSamples.length) {
       latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
       latP95.textContent = percentile(latSamples, 0.95).toFixed(0);
@@ -234,6 +313,8 @@ async function main(): Promise<void> {
 
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
+    targetLatencyMs = Math.max(0,
+      ...tracks.map((t) => Number(t.targetLatency) || 0));
     const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
     catMeta.textContent = [
       `v${cat?.version ?? '?'}`,
@@ -250,8 +331,9 @@ async function main(): Promise<void> {
       name.textContent = t.name ?? '(unnamed)';
       const pkg = document.createElement('span');
       pkg.className = 'pk';
-      pkg.textContent = t.packaging ?? '?';
+      pkg.textContent = (t.packaging ?? '?').toUpperCase();
       const detail = document.createElement('span');
+      detail.className = 'dt';
       detail.textContent = [
         t.codec,
         t.width && t.height ? `${t.width}×${t.height}` : '',

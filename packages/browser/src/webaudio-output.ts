@@ -62,6 +62,19 @@ export class WebAudioOutput implements AudioOutputLike {
   /** Current playback rate for live catch-up. @see draft-ietf-moq-msf-00 §5.1.16 */
   private _playbackRate = 1.0;
 
+  /** Buffers that arrived after the chain had already run dry (silent gap). */
+  private _underrunCount = 0;
+  private hasScheduled = false;
+
+  /** Audio scheduled beyond the current playout point, in seconds. */
+  get scheduledAheadSec(): number {
+    return Math.max(0, this.nextScheduledTime - this.audioCtx.currentTime);
+  }
+
+  get underrunCount(): number {
+    return this._underrunCount;
+  }
+
   /**
    * Local playback delay in seconds, applied at anchor/re-anchor time.
    *
@@ -145,6 +158,12 @@ export class WebAudioOutput implements AudioOutputLike {
     if (this.nextScheduledTime >= now) {
       // Normal playback — back-to-back for seamless audio
       startTime = this.nextScheduledTime;
+    } else if (this.hasScheduled) {
+      // Chain ran dry before this buffer arrived: an audible gap.
+      this._underrunCount++;
+      startTime = renderTimeUs > 0
+        ? Math.max(this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec, now)
+        : now + this.playbackDelaySec;
     } else if (renderTimeUs > 0) {
       // After stall — jump to sync-aligned position + playback delay
       startTime = Math.max(this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec, now);
@@ -161,6 +180,7 @@ export class WebAudioOutput implements AudioOutputLike {
     source.playbackRate.value = this._playbackRate;
     source.connect(this.destination);
     source.start(startTime);
+    this.hasScheduled = true;
     // Duration at adjusted rate — faster playout means shorter wall-clock time.
     this.nextScheduledTime = startTime + buf.duration / this._playbackRate;
 
@@ -234,6 +254,7 @@ export class WebAudioOutput implements AudioOutputLike {
     this.activeSources.length = 0;
     this.scheduledRing.length = 0;
     this.nextScheduledTime = 0;
+    this.hasScheduled = false;
   }
 
   /**

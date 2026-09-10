@@ -336,12 +336,18 @@ export interface MediaSourceLike {
    * must not begin its startup positioning/play sequence until intent is true;
    * withdrawing intent pauses playback that has already started.
    *
-   * Optional for backward compatibility: an adapter that does not implement it
-   * keeps its previous behavior. The player only states an intent it has
-   * actually been given — a player whose play()/pause() was never called leaves
-   * the adapter's own default untouched.
+   * Optional: an adapter that does not implement it keeps its own behavior.
+   * The player always states its current intent on a new adapter; undeclared
+   * means not playing.
    */
   setPlaybackIntent?(intent: boolean): void;
+
+  /**
+   * Playout cushion target in seconds: where live-edge and gap-jump seeks
+   * land, and the set point of the soft rate chase. Derived from
+   * `targetLatencyMs` or the catalog's targetLatency.
+   */
+  setTargetAheadSec?(sec: number): void;
 
   /** Release all resources (MediaSource, SourceBuffers, object URLs). */
   destroy(): void;

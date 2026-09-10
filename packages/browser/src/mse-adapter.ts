@@ -368,6 +368,13 @@ export class MseMediaSource implements MediaSourceLike {
    * Declare (or withdraw) playback intent. Withdrawing cancels an in-flight
    * startup so a late seek/play cannot begin playback afterwards.
    */
+  /** Playout cushion target (seek landings, chase set point). */
+  setTargetAheadSec(sec: number): void {
+    if (!Number.isFinite(sec) || sec <= 0) return;
+    this.targetAheadSec = sec;
+    this.diag('target-ahead %ss', sec.toFixed(2));
+  }
+
   setPlaybackIntent(intent: boolean): void {
     if (this.playbackIntent === intent) return;
     this.playbackIntent = intent;
@@ -383,6 +390,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.gapStallEpisode = false;
       this.retireGapLanding();
       this.cancelStartup();
+      this.resetPlaybackRate();
       if (this.playTriggered && this.video.paused === false) this.video.pause();
       return;
     }
@@ -568,7 +576,7 @@ export class MseMediaSource implements MediaSourceLike {
 
   // ── Playhead-wedge watchdog state ──
   /** Watchdog cadence; detection threshold per escalation rung. */
-  private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
+  private static readonly WEDGE_CHECK_INTERVAL_MS = 250;
   private static readonly WEDGE_FROZEN_MS = 2_500;
   private wedgeTimer: ReturnType<typeof setInterval> | null = null;
   /** Last observed currentTime; ladder resets only on ORGANIC movement. */
@@ -579,25 +587,35 @@ export class MseMediaSource implements MediaSourceLike {
   private wedgeRung = 0;
 
   // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
-  /** Holes wider than this are never jumped (escalate instead). */
-  private static readonly GAP_JUMP_MAX_HOLE_SEC = 2.0;
   /** Minimum spacing between jumps (swiss-cheese streams keep jumping, bounded). */
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
-  /** A persistent unjumpable hole escalates to a fatal error after this long. */
-  private static readonly GAP_WIDE_HOLE_FATAL_MS = 10_000;
+  /** Wait floor and per-hole-second scaling: small holes clear fast, wide
+   *  holes get proportionally longer for infill to arrive; gapJumpMs caps. */
+  private static readonly GAP_JUMP_WAIT_FLOOR_MS = 300;
+  private static readonly GAP_JUMP_WAIT_PER_HOLE_SEC_MS = 2_000;
+  /** A jump whose landing never progresses escalates to a fatal after this. */
+  private static readonly GAP_LANDING_FATAL_MS = 10_000;
   /** Playhead must be this close to its range's end to count as "at the hole". */
   private static readonly GAP_EDGE_WINDOW_SEC = 0.5;
   /** Playhead movement below this is "stuck" (gap detection only). */
   private static readonly GAP_MOVE_TOLERANCE_SEC = 0.05;
   /** Candidate identity comparison tolerance (never float equality). */
   private static readonly GAP_IDENTITY_TOLERANCE_SEC = 0.01;
+
+  // ── Soft live-edge chase (sub-seek latency debt) ──
+  /** Playback rate while shedding cushion above target; inaudible. */
+  private static readonly CHASE_RATE = 1.05;
+  /** Engage when the cushion exceeds target by this much… */
+  private static readonly CHASE_RATE_ON_SEC = 0.5;
+  /** …and release once it is back within this of target. */
+  private static readonly CHASE_RATE_OFF_SEC = 0.1;
   /** Per-attempt wait before jumping; 0 disables. */
   private readonly gapJumpMs: number;
   /** Armed hole candidate; identity is {curEnd, nextStart} ONLY (the next
    *  range's tail grows under live append and must not restart the wait). */
   private gapCandidate: {
     curEnd: number; nextStart: number; armedAtMs: number;
-    wideWarned: boolean; spent: boolean;
+    wideWarned: boolean;
   } | null = null;
   /** Own last-observed playhead — never reads or writes wedgeLastTime. */
   private gapLastPlayheadTime: number | null = null;
@@ -625,7 +643,7 @@ export class MseMediaSource implements MediaSourceLike {
   /** Buffered-ahead cap: beyond this, jump toward the live edge (post-startup only). */
   private readonly maxAheadSec: number;
   /** Where a live-edge jump lands: rangeEnd - targetAheadSec. */
-  private readonly targetAheadSec: number;
+  private targetAheadSec: number;
   /** One evict+retry is allowed per quota error before escalating to flush. */
   private readonly quotaRetried: { video: boolean; audio: boolean } = { video: false, audio: false };
   /** A quota flush happened; the next committed append jumps playback to it. */
@@ -939,13 +957,17 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
 
-    // Stale-group drop: if this group is older than what MSE has
-    // already committed, skip it. Prevents late-arriving old-group
-    // data from causing blocky artifacts or false discontinuities.
-    if (groupId !== undefined) {
+    // Stale-group drop (video only): tolerate the immediately previous group —
+    // its tail objects legitimately race the next group's head across
+    // concurrent subgroup streams, and dropping them punches holes in the
+    // timeline. Anything older is genuine replay; the timeline containment
+    // check in doAppend already suppresses replayed bytes range-wise. Audio
+    // is one group per object, so a group floor there is a ~20ms reorder
+    // window; the assembler's reorder window and containment govern it.
+    if (mediaType === 'video' && groupId !== undefined) {
       const key = `${mediaType}:${trackName}`;
       const floor = this.committedGroupFloor.get(key);
-      if (floor !== undefined && groupId < floor) {
+      if (floor !== undefined && groupId + 1n < floor) {
         return;
       }
     }
@@ -1213,6 +1235,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.gapEpisodeTicks = 0;
     this.retireGapLanding();
     this.lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+    this.resetPlaybackRate();
   }
 
   destroy(): void {
@@ -1284,13 +1307,14 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
 
-    // Skip stale queued entries whose group is below the committed floor
+    // Skip stale queued video entries (tolerating the immediately previous
+    // group — see the floor test in appendChunk)
     while (queue.length > 0) {
       const peek = queue[0]!;
-      if (peek.groupId !== undefined) {
+      if (mediaType === 'video' && peek.groupId !== undefined) {
         const floorKey = `${mediaType}:${peek.trackName}`;
         const floor = this.committedGroupFloor.get(floorKey);
-        if (floor !== undefined && peek.groupId < floor) {
+        if (floor !== undefined && peek.groupId + 1n < floor) {
           queue.shift();
           continue;
         }
@@ -1836,11 +1860,13 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * Detect a playhead frozen at a buffered hole and, after a bounded wait,
-   * seek just past it. Holes wider than GAP_JUMP_MAX_HOLE_SEC never jump;
-   * if one persists GAP_WIDE_HOLE_FATAL_MS it escalates exactly once via
-   * onError with name 'MediaGapUnrecoverableError' (the same name-based
-   * fatal channel as the wedge ladder's final rung — the app rebuilds).
+   * Detect a playhead frozen at a buffered hole and, after a wait scaled
+   * to the hole's width, seek past it — landing near the next range's live
+   * edge so media buffered during the wait becomes liveness, not backlog.
+   * Only a jump whose landing never progresses (GAP_LANDING_FATAL_MS)
+   * escalates, exactly once, via onError with name
+   * 'MediaGapUnrecoverableError' (the same name-based fatal channel as
+   * the wedge ladder's final rung — the app rebuilds).
    *
    * Commit-before-publish discipline throughout: state is finalized before
    * any callback runs, so throwing or re-entrant listeners cannot skip the
@@ -1894,7 +1920,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.gapLanding !== null && !this.gapLanding.spent) {
       if (this.video.currentTime > this.gapLanding.to + MseMediaSource.GAP_MOVE_TOLERANCE_SEC) {
         this.gapLanding = null;                                        // landed successfully
-      } else if (nowMs - this.gapLanding.jumpedAtMs >= MseMediaSource.GAP_WIDE_HOLE_FATAL_MS) {
+      } else if (nowMs - this.gapLanding.jumpedAtMs >= MseMediaSource.GAP_LANDING_FATAL_MS) {
         this.gapLanding.spent = true;                                  // committed BEFORE publish
         const err = new Error(
           `[MSE] gap-jump landing failed: no playback progress past `
@@ -1951,11 +1977,14 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
 
-    // Stuck check (own state — never wedgeLastTime).
-    const moved = this.gapLastPlayheadTime !== null
-      && Math.abs(ct - this.gapLastPlayheadTime) > MseMediaSource.GAP_MOVE_TOLERANCE_SEC;
+    // Stuck check (own state — never wedgeLastTime). The first sighting
+    // only records the playhead: arming needs PROOF of a frozen playhead
+    // across two ticks, else a still-coasting playhead arms a candidate
+    // the next tick destroys, restarting the wait from scratch.
+    const prev = this.gapLastPlayheadTime;
     this.gapLastPlayheadTime = ct;
-    if (moved) {
+    if (prev === null) return;
+    if (Math.abs(ct - prev) > MseMediaSource.GAP_MOVE_TOLERANCE_SEC) {
       this.gapCandidate = null;
       return;
     }
@@ -1966,41 +1995,26 @@ export class MseMediaSource implements MediaSourceLike {
     if (c === null || Math.abs(c.curEnd - curEnd!) > tol || Math.abs(c.nextStart - nextStart!) > tol) {
       this.gapCandidate = {
         curEnd: curEnd!, nextStart: nextStart!, armedAtMs: nowMs,
-        wideWarned: false, spent: false,
+        wideWarned: false,
       };
       return;
     }
-    if (c.spent) return;
 
-    // Unjumpable width: warn once; escalate once if it persists.
-    // Strictly the advertised bound; 1e-9 guards float subtraction noise
-    // only — the 10ms identity tolerance must never widen the policy.
-    if (holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
-      if (!c.wideWarned) {
-        c.wideWarned = true;
-        this.logWarn(
-          `[MSE] gap-too-wide: ${holeSec.toFixed(2)}s buffered hole at t=${ct.toFixed(2)}s `
-          + `exceeds the ${MseMediaSource.GAP_JUMP_MAX_HOLE_SEC}s jump bound — not skipping`,
-        );
-      }
-      if (nowMs - c.armedAtMs >= MseMediaSource.GAP_WIDE_HOLE_FATAL_MS) {
-        c.spent = true;                                    // committed BEFORE publish
-        const err = new Error(
-          `[MSE] unrecoverable buffered hole (${holeSec.toFixed(2)}s) at `
-          + `t=${ct.toFixed(2)}s — MediaSource rebuild required`,
-        );
-        err.name = 'MediaGapUnrecoverableError';
-        try {
-          this.onError?.(err);
-        } catch {
-          // Listener bugs must not corrupt adapter state.
-        }
-      }
-      return;
+    // Every hole is jumpable — a live stream must never park behind one.
+    // The wait scales with hole width (floor for sub-second holes, longer
+    // for wide ones so late infill can still land), capped by gapJumpMs.
+    if (holeSec > 2.0 && !c.wideWarned) {
+      c.wideWarned = true;
+      this.logWarn(
+        `[MSE] wide buffered hole: ${holeSec.toFixed(2)}s at t=${ct.toFixed(2)}s — will jump`,
+      );
     }
-
-    // Jumpable: wait + rate limit.
-    if (nowMs - c.armedAtMs < this.gapJumpMs) return;
+    const waitMs = Math.min(
+      this.gapJumpMs,
+      Math.max(MseMediaSource.GAP_JUMP_WAIT_FLOOR_MS,
+               holeSec * MseMediaSource.GAP_JUMP_WAIT_PER_HOLE_SEC_MS),
+    );
+    if (nowMs - c.armedAtMs < waitMs) return;
     if (nowMs - this.lastGapJumpAtMs < MseMediaSource.GAP_JUMP_MIN_INTERVAL_MS) return;
 
     // Re-validate the landing at jump time (the tail may have grown; the
@@ -2009,7 +2023,13 @@ export class MseMediaSource implements MediaSourceLike {
       this.disarmGap();
       return;
     }
-    const to = nextStart! + Math.min(0.01, (nextEnd - nextStart!) / 2);
+    // Land near the range's live edge, not its start: media that buffered
+    // during the wait is liveness to reclaim, not backlog to replay. The
+    // whole range is buffered, so the UA decodes from the preceding RAP.
+    const to = Math.max(
+      nextStart! + Math.min(0.01, (nextEnd - nextStart!) / 2),
+      nextEnd - this.targetAheadSec,
+    );
     const info: GapJumpInfo = {
       from: ct,
       to,
@@ -2029,6 +2049,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.gapLanding = { to, jumpedAtMs: nowMs, waitingAtMs: null, spent: false };
 
     // …seek…
+    this.resetPlaybackRate();
     v.currentTime = to;
     this.noteSelfSeek();
 
@@ -2200,13 +2221,25 @@ export class MseMediaSource implements MediaSourceLike {
         const target = Math.max(start, end - this.targetAheadSec);
         if (target > ct) {
           this.logWarn('[MSE] behind live by %ss — jumping %s -> %s', ahead.toFixed(1), ct.toFixed(2), target.toFixed(2));
+          this.resetPlaybackRate();
           v.currentTime = target;
           this.noteSelfSeek();
           this.onLiveEdgeResync?.('behind-live');
         }
+      } else if (ahead > this.targetAheadSec + MseMediaSource.CHASE_RATE_ON_SEC) {
+        // Soft chase: shed sub-seek latency debt by playing slightly fast
+        // until the cushion is back at target.
+        if (v.playbackRate === 1) v.playbackRate = MseMediaSource.CHASE_RATE;
+      } else if (ahead <= this.targetAheadSec + MseMediaSource.CHASE_RATE_OFF_SEC) {
+        this.resetPlaybackRate();
       }
       return; // containing range handled (or within cap) — done either way
     }
+  }
+
+  /** End a soft chase; a seek, pause or reset must not carry the rate over. */
+  private resetPlaybackRate(): void {
+    if (this.video.playbackRate !== 1) this.video.playbackRate = 1;
   }
 
   /**

@@ -757,7 +757,7 @@ describe('CmafAssembler — HEVC CRA-with-RASL strip', () => {
     expect(onDiscontinuity).toHaveBeenCalledWith('audio', 'audio-0');
   });
 
-  it('any backward video bmd triggers discontinuity', () => {
+  it('small backward video bmd is late subgroup data, not a discontinuity', () => {
     const onSegment = vi.fn();
     const onDiscontinuity = vi.fn();
     const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
@@ -766,8 +766,25 @@ describe('CmafAssembler — HEVC CRA-with-RASL strip', () => {
     assembler.push('video', 'video-0', 0n, combinedSeg(1000));
     assembler.push('video', 'video-0', 1n, combinedSeg(2000));
 
-    // Even small backward jump on video triggers discontinuity
+    // Small backward jump: a late group-tail object from a concurrent
+    // subgroup stream — appended in place, no re-anchor.
     assembler.push('video', 'video-0', 2n, combinedSeg(1500));
+
+    expect(onDiscontinuity).not.toHaveBeenCalled();
+    expect(onSegment).toHaveBeenCalledTimes(3);
+  });
+
+  it('large backward video bmd DOES trigger discontinuity', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    // Forward video segments at high bmd (no init segment: 90 kHz window)
+    assembler.push('video', 'video-0', 0n, combinedSeg(500000));
+    assembler.push('video', 'video-0', 1n, combinedSeg(503000));
+
+    // Backward jump far beyond one second: a publisher restart
+    assembler.push('video', 'video-0', 2n, combinedSeg(1000));
 
     expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video-0');
   });
