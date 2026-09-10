@@ -309,6 +309,19 @@ export interface PlaybackTuningConfig {
    * Joining Fetch references a subscription with any other filter.
    */
   readonly warmStartCurrentGroup?: boolean;
+
+  /**
+   * Static floor of the LOC render cushion in milliseconds: the minimum
+   * playout delay video and audio schedule ahead of arrival.
+   * Default: 200, or 50 when the WebTransport handshake RTT is under 5 ms.
+   */
+  readonly renderCushionFloorMs?: number;
+
+  /**
+   * Cap of the LOC render cushion in milliseconds; bounds how far arrival
+   * jitter can raise the playout delay. Default: 750. Never below the floor.
+   */
+  readonly renderCushionMaxMs?: number;
 }
 
 /** Latency and catch-up options. */
@@ -763,12 +776,21 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     ['livenessResetProbeMs', config.livenessResetProbeMs],
     ['livenessRestartBackoffMs', config.livenessRestartBackoffMs],
     ['livenessHealthyResetMs', config.livenessHealthyResetMs],
+    ['renderCushionFloorMs', config.renderCushionFloorMs],
+    ['renderCushionMaxMs', config.renderCushionMaxMs],
   ];
 
   for (const [name, value] of msFields) {
     if (value !== undefined && value <= 0) {
       throw new RangeError(`${name} must be > 0, got ${value}`);
     }
+  }
+
+  if (config.renderCushionFloorMs !== undefined && config.renderCushionMaxMs !== undefined
+      && config.renderCushionMaxMs < config.renderCushionFloorMs) {
+    throw new RangeError(
+      `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
+    );
   }
 
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)

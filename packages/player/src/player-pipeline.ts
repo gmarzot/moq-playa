@@ -24,7 +24,7 @@ import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
-import { RenderCushionSmoother } from './render-cushion.js';
+import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 
@@ -237,9 +237,17 @@ export function createPipelines(
   // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
-  const cushionFloorUs = handshakeRttMs !== undefined && handshakeRttMs < 5
-    ? 50_000 : 200_000;
-  const renderCushion = hasLoc ? new RenderCushionSmoother({ floorUs: cushionFloorUs }, clock) : null;
+  const cushionFloorUs = config.renderCushionFloorMs !== undefined
+    ? config.renderCushionFloorMs * 1000
+    : computePlaybackDelayUs(undefined, handshakeRttMs);
+  // A floor raised above the default cap lifts the cap with it.
+  const cushionMaxUs = Math.max(
+    config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : RENDER_CUSHION_MAX_US,
+    cushionFloorUs,
+  );
+  const renderCushion = hasLoc
+    ? new RenderCushionSmoother({ floorUs: cushionFloorUs, maxUs: cushionMaxUs }, clock)
+    : null;
 
   if (videoDecoder || audioDecoder) {
     commandDispatcher = new CommandDispatcher(defined({

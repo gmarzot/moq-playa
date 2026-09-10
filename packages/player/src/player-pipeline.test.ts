@@ -466,6 +466,39 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     expect(result.videoPipeline!.effectiveGapTimeoutUs).toBe(2_000_000);
   });
 
+  it('renderCushionFloorMs overrides the RTT-derived floor', () => {
+    const low = createPipelines(minimalConfig({ renderCushionFloorMs: 50 }), mockClock, LOC_AV, mockCallbacks(), 40);
+    expect(low.getRenderCushionUs!()).toBe(50_000);
+    const high = createPipelines(minimalConfig({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks(), 2);
+    expect(high.getRenderCushionUs!()).toBe(900_000);
+  });
+
+  it('renderCushionMaxMs caps scheduled adoption; a floor above the default cap lifts it', () => {
+    const withDecoder = (overrides: Partial<MoqtPlayerConfig>) => minimalConfig({
+      ...overrides,
+      createVideoDecoder: () => ({
+        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+        state: 'unconfigured', decodeQueueSize: 0, ondequeue: null,
+      }) as any,
+    });
+    // The scheduling path advances the smoother; its first update snaps to
+    // the clamped target.
+    const schedule = (r: ReturnType<typeof createPipelines>) => {
+      Object.defineProperty(r.videoPipeline, 'effectiveGapTimeoutUs', {
+        get: () => 2_000_000, configurable: true,
+      });
+      (r.commandDispatcher as any)._getPlaybackDelayUs();
+    };
+
+    const capped = createPipelines(withDecoder({ renderCushionFloorMs: 50, renderCushionMaxMs: 120 }), mockClock, LOC_AV, mockCallbacks());
+    schedule(capped);
+    expect(capped.getRenderCushionUs!()).toBe(120_000);
+
+    const lifted = createPipelines(withDecoder({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks());
+    schedule(lifted);
+    expect(lifted.getRenderCushionUs!()).toBe(900_000);
+  });
+
   it('CMAF sessions expose no LOC render cushion', () => {
     const cmaf: TrackInfo = {
       video: { codec: 'avc1.64001e', packaging: 'cmaf' },

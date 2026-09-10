@@ -301,6 +301,22 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ targetLatencyMs: 1000 }))).not.toThrow();
   });
 
+  // ── renderCushionFloorMs / renderCushionMaxMs ──
+
+  it('rejects renderCushionFloorMs <= 0 and renderCushionMaxMs <= 0', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 0 }))).toThrow(RangeError);
+    expect(() => validateConfig(minConfig({ renderCushionMaxMs: -1 }))).toThrow(RangeError);
+  });
+
+  it('rejects renderCushionMaxMs below renderCushionFloorMs', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 300, renderCushionMaxMs: 200 }))).toThrow(RangeError);
+  });
+
+  it('accepts a render cushion floor at or below its max', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 50 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 400 }))).not.toThrow();
+  });
+
   // ── deliveryTimeoutMs ──
 
   it('rejects deliveryTimeoutMs <= 0', () => {

@@ -6,7 +6,10 @@
  */
 
 import { Player } from '@playa/player';
-import { namespace, certHash, draftVersion, catalogBootstrap, warmStart } from '../shared/cert.js';
+import {
+  namespace, certHash, draftVersion, catalogBootstrap, warmStart,
+  renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
+} from '../shared/cert.js';
 
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
@@ -73,16 +76,29 @@ async function main(): Promise<void> {
 
   // ── Create Player ─────────────────────────────────────────────────
 
+  // Engine-level options reach MoqtPlayer only via moqtPlayerConfig.
+  const engineConfig = {
+    ...(catalogBootstrap ? { catalogBootstrap } : {}),
+    ...(warmStart ? { warmStartCurrentGroup: true } : {}),
+    ...(catchUpRate ? { maxCatchUpRate: catchUpRate } : {}),
+    ...(renderCushionFloorMs ? { renderCushionFloorMs } : {}),
+    ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),
+    ...(debug ? { logLevel: 'debug' as const } : {}),
+  };
   const player = new Player(playerContainer, {
     url: relayUrl,
     namespace,
     autoplay: true,
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {}),
-    ...(catalogBootstrap ? { catalogBootstrap } : {}),
-    ...(warmStart ? { warmStartCurrentGroup: true } : {}),
-    ...(catchUpRate ? { maxCatchUpRate: catchUpRate } : {})
+    ...(targetLatencyOverrideMs ? { targetLatencyMs: targetLatencyOverrideMs } : {}),
+    moqtPlayerConfig: engineConfig,
   });
+  const optionSummary = Object.entries({ ...engineConfig, targetLatencyMs: targetLatencyOverrideMs })
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}=${String(v)}`)
+    .join(' ');
+  if (optionSummary) log(`Options: ${optionSummary}`);
 
   // ── Wire Events ───────────────────────────────────────────────────
 
@@ -136,6 +152,14 @@ async function main(): Promise<void> {
     if (!video || video === watchedVideo) return video;
     watchedVideo = video;
     video.addEventListener('waiting', () => { stallStartSnap = describeVideo(video); });
+    if (debug) {
+      // Element-side view of every playhead disturbance, timestamped like
+      // the stall lines so the two can be correlated.
+      for (const ev of ['play', 'playing', 'pause', 'waiting', 'stalled', 'suspend',
+                        'seeking', 'seeked', 'ratechange', 'ended', 'error']) {
+        video.addEventListener(ev, () => log(`[video] ${ev} ${describeVideo(video)}`));
+      }
+    }
     return video;
   };
   player.on('stall', ({ durationMs }) => {
@@ -276,6 +300,12 @@ async function main(): Promise<void> {
 
   setInterval(() => {
     watchVideo();
+    if (debug) {
+      // The MSE adapter exists only after the catalog; enable its tracing
+      // once it appears (console output).
+      const ms = (player as any).engine?.mediaSource;
+      if (ms && ms.debug === false) ms.debug = true;
+    }
     // Contiguous cushion only (facade-computed per path). Zero with appends
     // still landing means the playhead is parked at a hole.
     const cushionMs = player.stats.cushionMs;
