@@ -19,6 +19,8 @@
 export const LocExtensionId = {
     /** Wall-clock capture time in microseconds. @see §2.3.1.1 */
     CAPTURE_TIMESTAMP: 0x02,
+    /** Same field under its loc-04 registered id; wins over 0x02 on receive. */
+    TIMESTAMP: 0x10,
     /** RFC 9626 video frame marking flags. @see §2.3.2.2 */
     VIDEO_FRAME_MARKING: 0x04,
     /** RFC 6464 audio level + voice activity. @see §2.3.3.1 */
