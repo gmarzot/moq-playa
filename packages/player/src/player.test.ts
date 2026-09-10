@@ -6442,9 +6442,8 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('a player that never declared intent leaves the adapter default alone', async () => {
-      // Backward compatibility: stating `false` here would stop an embedder
-      // that relies on the adapter starting once media arrives.
+    it('a player that never declared intent tells the adapter not to play', async () => {
+      // The player owns startup: an adapter must never start on its own.
       const adapter = createMockAdapter();
       const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
       const player = new MoqtPlayer({
@@ -6458,7 +6457,7 @@ describe('MoqtPlayer', () => {
 
       await deliverCmafCatalog(adapter);
 
-      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
       await player.destroy();
     });
 
@@ -6505,7 +6504,8 @@ describe('MoqtPlayer', () => {
       await loadPromise;
       await deliverCmafCatalog(adapter);
 
-      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
+      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalledWith(true);
       await player.destroy();
     });
 

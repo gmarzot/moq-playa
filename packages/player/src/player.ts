@@ -344,6 +344,8 @@ export class MoqtPlayer {
    * catalog arrived cannot get an adapter that starts anyway.
    */
   private playbackIntent: boolean | null = null;
+  /** Catalog targetLatency of the selected video track (ms); config wins. */
+  private catalogTargetLatencyMs: number | null = null;
   /** Pending `state_changed` announcements; see announceState(). */
   private readonly stateAnnouncements: { from: PlayerStateValue; to: PlayerStateValue }[] = [];
   private announcingState = false;
@@ -1975,14 +1977,16 @@ export class MoqtPlayer {
         return;
       }
 
-      // Early stale-group drop: skip objects from groups older than what
-      // MSE has already committed. Prevents late-arriving old groups from
-      // poisoning the assembler's patchEpoch (false backward-bmd detection).
+      // Early stale-group drop (video only): skip groups older than the one
+      // before what MSE has committed. The immediately previous group's tail
+      // legitimately races the next group's head across concurrent subgroup
+      // streams; the assembler's reorder window places it. Anything older is
+      // replay. Audio is one group per object; no group floor applies.
       const groupId = BigInt(obj.groupId);
-      if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
+      if (mediaType === 'video' && this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
         const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
           .getCommittedGroupFloor(mediaType, trackName);
-        if (floor !== undefined && groupId < floor) return;
+        if (floor !== undefined && groupId + 1n < floor) return;
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
@@ -6299,13 +6303,14 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     this.mediaSource = pipelines.mediaSource;
-    // Re-state playback intent on the newly created adapter. play()/pause() can
-    // both happen before the catalog exists, so the adapter that is created
-    // afterwards must inherit the player's CURRENT intent rather than its own
-    // default. `null` means the embedder has never declared one — leave the
-    // adapter's default alone.
-    if (this.playbackIntent !== null) {
-      this.mediaSource?.setPlaybackIntent?.(this.playbackIntent);
+    // Declare playback intent on the newly created adapter. play()/pause() can
+    // both happen before the catalog exists, so the adapter created afterwards
+    // inherits the player's CURRENT intent. Undeclared means not playing: the
+    // player owns startup, the adapter must never start on its own.
+    this.mediaSource?.setPlaybackIntent?.(this.playbackIntent ?? false);
+    const targetLatencyMs = this.config.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    if (targetLatencyMs != null) {
+      this.mediaSource?.setTargetAheadSec?.(targetLatencyMs / 1000);
     }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
 
@@ -6784,6 +6789,7 @@ export class MoqtPlayer {
     );
     if (selected.video?.targetLatency !== undefined) {
       this._stats.setTargetLatency(selected.video.targetLatency);
+      this.catalogTargetLatencyMs = selected.video.targetLatency;
     }
 
     // §9.2.2: Build subscription options from config
