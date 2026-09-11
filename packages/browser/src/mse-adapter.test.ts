@@ -1572,6 +1572,33 @@ describe('playhead-wedge watchdog', () => {
         expect(video.currentTime).toBeCloseTo(38, 5); // resumes → chase works again
     });
 
+    it('the watchdog tick chases live with no further appends', () => {
+        // Field case: an occluded tab's element is paused by the UA while
+        // appends keep landing, then the publisher ends. On resume there is
+        // no append left to trigger the chase, so the tick must own it —
+        // otherwise the tab replays its whole backlog (seen: 423 s ahead).
+        vi.useFakeTimers();
+        try {
+            const video = new MockVideoElement();
+            video.buffered = makeTimeRanges([[5, 400]]);
+            video.currentTime = 40;              // 360 s behind, no appends coming
+            video.paused = true;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+            (adapter as any).playTriggered = true;
+            (adapter as any).startWedgeWatchdog();
+
+            vi.advanceTimersByTime(1_000);
+            expect(video.currentTime).toBe(40);  // paused: still untouched
+
+            video.paused = false;
+            vi.advanceTimersByTime(250);
+            expect(video.currentTime).toBeCloseTo(398, 5); // end - targetAheadSec
+            adapter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('a behind-live chase seek does not reset the ladder (the slideshow tripwire)', () => {
         // This exact interaction caused the original symptom: the chase seek
         // moved currentTime every ~15s, which would read as "organic playhead

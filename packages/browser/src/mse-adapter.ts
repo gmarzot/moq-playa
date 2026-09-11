@@ -1929,6 +1929,11 @@ export class MseMediaSource implements MediaSourceLike {
         // range), so the two never race for the same playhead state.
         this.checkGapJump(nowMs);
         this.checkPlayheadWedge(nowMs);
+        // Also on the tick, not only per append: a element the UA paused
+        // (power saving on a hidden/occluded tab) keeps buffering, and on
+        // resume nothing may ever append again — a publisher that ended
+        // leaves the playhead minutes behind with no trigger to catch it.
+        this.maybeChaseLiveEdge();
       },
       MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
     );

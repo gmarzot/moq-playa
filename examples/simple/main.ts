@@ -121,7 +121,17 @@ async function main(): Promise<void> {
     }
   });
 
-  player.on('playing', () => log('First frame rendered'));
+  // Each milestone is ms from load(), so the gaps between them say which
+  // stage a slow start spent its time in (late joiners differ from the first).
+  player.on('playing', () => {
+    const b = (player as any).engine?.stats?.ttffBreakdown;
+    if (!b) { log('First frame rendered'); return; }
+    const ms = (v: number | null) => (v == null ? '—' : v.toFixed(0));
+    log(`First frame rendered · transport ${ms(b.transportConnectedMs)}`
+      + ` · setup ${ms(b.setupCompleteMs)} · catalog ${ms(b.catalogReceivedMs)}`
+      + ` · firstObject ${ms(b.firstObjectReceivedMs)}`
+      + ` · decoder ${ms(b.decoderConfiguredMs)} · frame ${ms(b.firstFrameRenderedMs)}`);
+  });
 
   player.on('timeupdate', ({ currentTime }) => {
     timeDisplay.textContent = formatTime(currentTime);
