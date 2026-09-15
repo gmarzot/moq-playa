@@ -213,8 +213,13 @@ export class WebAudioOutput implements AudioOutputLike {
         // shed by dropping; lateness is left to the chase.
         const lead = startTime - alignedTime;
         this._leadSec = lead;
-        const landing = Math.max(alignedTime + this.targetAheadSec, now);
-        if (lead > this.maxAheadSec && landing < startTime) {
+        const landing = alignedTime + this.targetAheadSec;
+        // Only snap when the landing is still in the FUTURE. A large lead
+        // with the landing already past means audio is behind its sync
+        // reference, not ahead of it: dropping the queue there discards
+        // the only media we have and stops the buffer mid-playback.
+        // Rate chase is the only legitimate tool when behind.
+        if (lead > this.maxAheadSec && landing > now && landing < startTime) {
           this.dropScheduledFrom(landing);
           this._liveEdgeSnapCount++;
           this._chasing = false;

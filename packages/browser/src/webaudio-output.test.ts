@@ -306,6 +306,30 @@ describe('live-edge lead clamp', () => {
     expect(out.chasing).toBe(true);
   });
 
+  it('audio BEHIND its sync reference is never dropped (the strobe bug)', () => {
+    // Field symptom: under CPU load the A/V skew grew to ~2.3 s, so the
+    // audio render times sat far in the past. `lead` then reads huge while
+    // the landing is already behind `now` — the clamp fired on every
+    // buffer, stopping the audible one mid-playback and flushing the
+    // queue ~47x/s. Audible as strobing, louder, with underruns climbing.
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 10.0;
+    feed(out, 40, 0, 10_000 * MS);                // chain [10.0, 10.8)
+    const queued = ctx.sources.length;
+    ctx.currentTime = 10.1;
+
+    // Render time 2.3 s in the past (still positive, or the output reads
+    // it as "no render time" and never reaches the clamp at all).
+    out.schedule(audioData(0) as unknown as AudioData, 7_800 * MS);
+
+    expect(out.liveEdgeSnapCount).toBe(0);         // nothing dropped
+    expect(ctx.sources[queued]!.start).toBeTruthy();
+    expect(ctx.started.at(-1)!.when).toBeCloseTo(10.8, 6); // chained, not cut
+    expect(ctx.sources.slice(0, queued).every((s) => s.stop.mock.calls.length === 0))
+      .toBe(true);
+    expect(out.chasing).toBe(true);                // catch up by rate instead
+  });
+
   it('options override the bounds', () => {
     const ctx = new MockAudioContext();
     const clock = { now: () => ctx.currentTime * 1_000_000 };
