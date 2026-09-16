@@ -497,6 +497,24 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     const lifted = createPipelines(withDecoder({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks());
     schedule(lifted);
     expect(lifted.getRenderCushionUs!()).toBe(900_000);
+
+    // No explicit cap: the catalog target latency is the ceiling, and a
+    // config target latency overrides the catalog's.
+    const byCatalog = createPipelines(withDecoder({ renderCushionFloorMs: 50 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(byCatalog);
+    expect(byCatalog.getRenderCushionUs!()).toBe(100_000);
+
+    const byConfig = createPipelines(withDecoder({ renderCushionFloorMs: 50, targetLatencyMs: 300 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(byConfig);
+    expect(byConfig.getRenderCushionUs!()).toBe(300_000);
+
+    // An explicit cap still wins over the target.
+    const explicit = createPipelines(withDecoder({ renderCushionFloorMs: 50, renderCushionMaxMs: 600 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(explicit);
+    expect(explicit.getRenderCushionUs!()).toBe(600_000);
   });
 
   it('CMAF sessions expose no LOC render cushion', () => {

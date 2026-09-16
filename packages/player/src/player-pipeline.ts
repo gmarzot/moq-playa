@@ -67,6 +67,8 @@ export interface TrackInfo {
   } | undefined;
   /** Whether the stream is live. Gates bounded release + backlog shedding. */
   isLive?: boolean;
+  /** Catalog targetLatency of the selected tracks (ms); config overrides it. */
+  targetLatencyMs?: number;
 }
 
 /** Callbacks from pipeline to player. */
@@ -240,9 +242,15 @@ export function createPipelines(
   const cushionFloorUs = config.renderCushionFloorMs !== undefined
     ? config.renderCushionFloorMs * 1000
     : computePlaybackDelayUs(undefined, handshakeRttMs);
-  // A floor raised above the default cap lifts the cap with it.
+  // The cap follows the target latency when one is known (config, else
+  // catalog), so jitter cannot grow the cushion past the latency the
+  // publisher asked for; an explicit cap wins. A floor above the cap lifts it.
+  const targetLatencyMs = config.targetLatencyMs ?? trackInfo.targetLatencyMs;
+  const defaultMaxUs = targetLatencyMs !== undefined
+    ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
+    : RENDER_CUSHION_MAX_US;
   const cushionMaxUs = Math.max(
-    config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : RENDER_CUSHION_MAX_US,
+    config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : defaultMaxUs,
     cushionFloorUs,
   );
   const renderCushion = hasLoc

@@ -6820,6 +6820,7 @@ export class MoqtPlayer {
         packaging: audioPackaging,
       }) : undefined,
       isLive: selected.video?.isLive === true || selected.audio?.isLive === true,
+      ...(this.catalogTargetLatencyMs != null ? { targetLatencyMs: this.catalogTargetLatencyMs } : {}),
     });
 
     // ── Subscribe to selected tracks (parallel) ──────────────────
