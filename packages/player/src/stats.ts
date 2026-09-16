@@ -181,8 +181,10 @@ export interface LocDiagnostics {
   readonly backlogShedCount: number;
   /** Recovery actions that passed the player's recovery hook. */
   readonly recoveryActionCount: number;
-  /** A/V sync baseline resets actually performed (skip-triggered). */
+  /** A/V sync baseline resets actually performed (skip or sustained late audio). */
   readonly syncResetCount: number;
+  /** Audio frames dropped before decode as late past the playout cushion. null without a LOC audio pipeline. */
+  readonly audioLateDrops: number | null;
   /** Live adaptive gap-timeout of the video pipeline (ms). null without a LOC video pipeline. */
   readonly videoEffectiveGapTimeoutMs: number | null;
   /**
@@ -200,6 +202,7 @@ export interface LocDiagnostics {
 export interface LocTimingGauges {
   readonly videoEffectiveGapTimeoutMs: number | null;
   readonly renderCushionMs: number | null;
+  readonly audioLateDrops?: number | null;
 }
 
 // ─── StatsAccumulator ────────────────────────────────────────────────
@@ -596,6 +599,7 @@ export class StatsAccumulator {
         syncResetCount: this._locCounts.sync_reset,
         videoEffectiveGapTimeoutMs: locGauges?.videoEffectiveGapTimeoutMs ?? null,
         renderCushionMs: locGauges?.renderCushionMs ?? null,
+        audioLateDrops: locGauges?.audioLateDrops ?? null,
       },
     };
   }

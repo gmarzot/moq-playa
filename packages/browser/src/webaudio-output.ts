@@ -12,6 +12,23 @@
 import type { AudioOutputLike } from '@moqt/player';
 import type { ClockSource } from '@moqt/playback';
 
+/** Live-edge bounds on the audio lead (seconds behind the capture-aligned schedule). */
+export interface WebAudioOutputOptions {
+  /** Lead beyond which queued audio is dropped and the chain re-anchored. Default 0.75. */
+  readonly maxAheadSec?: number;
+  /** Lead the soft chase drains toward and a hard snap lands at. Default 0.15. */
+  readonly targetAheadSec?: number;
+}
+
+const LIVE_EDGE_MAX_AHEAD_SEC = 0.75;
+const LIVE_EDGE_TARGET_AHEAD_SEC = 0.15;
+/**
+ * Rate while shedding lead above target. AudioBufferSourceNode rate also
+ * shifts pitch: 1.02 is a third of a semitone, 1.05 is nearly a full one.
+ */
+const CHASE_RATE = 1.02;
+/** Chase engages above target + this, releases at target (hysteresis). */
+const CHASE_ON_SEC = 0.1;
 
 /**
  * WebAudio playout behind AudioOutputLike.
@@ -21,8 +38,11 @@ import type { ClockSource } from '@moqt/playback';
  * Maps renderTimeUs (performance.now domain) → AudioContext.currentTime
  * so audio playout is synchronized with video frame presentation.
  *
- * Falls back to seamless back-to-back chaining when render times would
- * cause overlap (contiguous samples) or when audio needs to catch up.
+ * A healthy chain plays back-to-back regardless of render times, so a
+ * late anchor or a burst leaves the chain behind its capture-aligned
+ * schedule permanently. That lead is bounded: a soft rate chase drains it
+ * toward `targetAheadSec`, and past `maxAheadSec` queued audio beyond the
+ * landing point is dropped and the chain re-anchored there.
  *
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
  */
@@ -49,18 +69,53 @@ export class WebAudioOutput implements AudioOutputLike {
    * Scheduled-buffer ring for playhead observability: which capture
    * timestamp is coming out of the speakers right now. One entry per
    * scheduled buffer; pruned lazily once playout passes a buffer's end.
-   * `captureUs` is the decoded AudioData.timestamp — WebCodecs preserves
-   * the EncodedAudioChunk timestamp, which LOC sets to CaptureTimestamp.
+   * `captureUs` is the chunk's CaptureTimestamp as passed to schedule().
+   * AudioData.timestamp is only a fallback: decoders may rebase it.
    */
   private readonly scheduledRing: Array<{
     captureUs: number;
     startSec: number;
     durSec: number;
     rate: number;
+    source: AudioBufferSourceNode;
   }> = [];
 
   /** Current playback rate for live catch-up. @see draft-ietf-moq-msf-00 §5.1.16 */
   private _playbackRate = 1.0;
+
+  /** Buffers that arrived after the chain had already run dry (silent gap). */
+  private _underrunCount = 0;
+  private hasScheduled = false;
+
+  private readonly maxAheadSec: number;
+  private readonly targetAheadSec: number;
+  private _chasing = false;
+  private _liveEdgeSnapCount = 0;
+  private _leadSec: number | null = null;
+
+  /** Audio scheduled beyond the current playout point, in seconds. */
+  get scheduledAheadSec(): number {
+    return Math.max(0, this.nextScheduledTime - this.audioCtx.currentTime);
+  }
+
+  get underrunCount(): number {
+    return this._underrunCount;
+  }
+
+  /** Last measured lead of the chain behind its capture-aligned schedule (s). */
+  get captureLeadSec(): number | null {
+    return this._leadSec;
+  }
+
+  /** Whether the soft chase is shedding lead. */
+  get chasing(): boolean {
+    return this._chasing;
+  }
+
+  /** Hard re-anchors that dropped queued audio. */
+  get liveEdgeSnapCount(): number {
+    return this._liveEdgeSnapCount;
+  }
 
   /**
    * Local playback delay in seconds, applied at anchor/re-anchor time.
@@ -79,11 +134,19 @@ export class WebAudioOutput implements AudioOutputLike {
   /** Shared clock — when audio-backed, eliminates drift in toAudioCtxTime(). */
   private readonly clock: ClockSource;
 
-  constructor(audioCtx: AudioContext, destination?: AudioNode, playbackDelayMs = 0, clock?: ClockSource) {
+  constructor(
+    audioCtx: AudioContext,
+    destination?: AudioNode,
+    playbackDelayMs = 0,
+    clock?: ClockSource,
+    options: WebAudioOutputOptions = {},
+  ) {
     this.audioCtx = audioCtx;
     this.destination = destination ?? audioCtx.destination;
     this.playbackDelaySec = playbackDelayMs / 1000;
     this.clock = clock ?? { now: () => performance.now() * 1000 };
+    this.targetAheadSec = options.targetAheadSec ?? LIVE_EDGE_TARGET_AHEAD_SEC;
+    this.maxAheadSec = Math.max(options.maxAheadSec ?? LIVE_EDGE_MAX_AHEAD_SEC, this.targetAheadSec);
   }
 
   /**
@@ -112,7 +175,7 @@ export class WebAudioOutput implements AudioOutputLike {
    *
    * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for A/V sync)
    */
-  schedule(data: unknown, renderTimeUs: number): void {
+  schedule(data: unknown, renderTimeUs: number, captureTimestampUs?: number): void {
     const audioData = data as AudioData;
 
     // Copy decoded PCM into an AudioBuffer.
@@ -128,10 +191,13 @@ export class WebAudioOutput implements AudioOutputLike {
       audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
     }
     // Capture timeline position of this buffer — read BEFORE close().
-    const captureUs = audioData.timestamp;
+    const captureUs = captureTimestampUs ?? audioData.timestamp;
     audioData.close();
 
     const now = this.audioCtx.currentTime;
+    // Where this buffer belongs on the capture-aligned timeline.
+    const alignedTime = renderTimeUs > 0
+      ? this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec : null;
 
     // Audio scheduling strategy:
     // - Normal playback: chain back-to-back (nextScheduledTime) for
@@ -145,9 +211,36 @@ export class WebAudioOutput implements AudioOutputLike {
     if (this.nextScheduledTime >= now) {
       // Normal playback — back-to-back for seamless audio
       startTime = this.nextScheduledTime;
-    } else if (renderTimeUs > 0) {
+      if (alignedTime !== null) {
+        // Lead = queued backlog + arrival lateness. Only the backlog can be
+        // shed by dropping; lateness is left to the chase.
+        const lead = startTime - alignedTime;
+        this._leadSec = lead;
+        const landing = alignedTime + this.targetAheadSec;
+        // Only snap when the landing is still in the FUTURE. A large lead
+        // with the landing already past means audio is behind its sync
+        // reference, not ahead of it: dropping the queue there discards
+        // the only media we have and stops the buffer mid-playback.
+        // Rate chase is the only legitimate tool when behind.
+        if (lead > this.maxAheadSec && landing > now && landing < startTime) {
+          this.dropScheduledFrom(landing);
+          this._liveEdgeSnapCount++;
+          this._chasing = false;
+          startTime = landing;
+        } else if (lead > this.targetAheadSec + CHASE_ON_SEC) {
+          this._chasing = true;
+        } else if (lead <= this.targetAheadSec) {
+          this._chasing = false;
+        }
+      }
+    } else if (this.hasScheduled) {
+      // Chain ran dry before this buffer arrived: an audible gap.
+      this._underrunCount++;
+      this._chasing = false;
+      startTime = alignedTime !== null ? Math.max(alignedTime, now) : now + this.playbackDelaySec;
+    } else if (alignedTime !== null) {
       // After stall — jump to sync-aligned position + playback delay
-      startTime = Math.max(this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec, now);
+      startTime = Math.max(alignedTime, now);
     } else {
       // No render time (sync not established) — start from now + delay
       startTime = now + this.playbackDelaySec;
@@ -156,23 +249,22 @@ export class WebAudioOutput implements AudioOutputLike {
     // Schedule for playout.
     const source = this.audioCtx.createBufferSource();
     source.buffer = buf;
-    // Apply catch-up playback rate (>1.0 = faster playout).
-    // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-    source.playbackRate.value = this._playbackRate;
+    // Catch-up playback rate (>1.0 = faster playout). The live-edge chase
+    // takes the larger of the two rather than multiplying them, which would
+    // stack pitch shifts. @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
+    const rate = this._chasing ? Math.max(this._playbackRate, CHASE_RATE) : this._playbackRate;
+    source.playbackRate.value = rate;
     source.connect(this.destination);
     source.start(startTime);
+    this.hasScheduled = true;
     // Duration at adjusted rate — faster playout means shorter wall-clock time.
-    this.nextScheduledTime = startTime + buf.duration / this._playbackRate;
+    const durSec = buf.duration / rate;
+    this.nextScheduledTime = startTime + durSec;
 
-    // Playhead observability (no scheduling effect): record what was
-    // scheduled where, so playheadCaptureUs() can answer "what capture
-    // timestamp is being heard right now."
-    this.scheduledRing.push({
-      captureUs,
-      startSec: startTime,
-      durSec: buf.duration / this._playbackRate,
-      rate: this._playbackRate,
-    });
+    // Playhead observability: record what was scheduled where, so
+    // playheadCaptureUs() can answer "what capture timestamp is being heard
+    // right now." Also the drop set for a live-edge snap.
+    this.scheduledRing.push({ captureUs, startSec: startTime, durSec, rate, source });
 
     // Track for flush/destroy cleanup
     this.activeSources.push(source);
@@ -180,6 +272,32 @@ export class WebAudioOutput implements AudioOutputLike {
       const idx = this.activeSources.indexOf(source);
       if (idx !== -1) this.activeSources.splice(idx, 1);
     };
+  }
+
+  /** Cancel audio scheduled at or after `t`, truncate the buffer spanning it, and re-anchor the chain there. */
+  private dropScheduledFrom(t: number): void {
+    const kept: typeof this.scheduledRing = [];
+    for (const entry of this.scheduledRing) {
+      if (entry.startSec >= t) {
+        try {
+          entry.source.stop();
+          entry.source.disconnect();
+        } catch {
+          // Already ended
+        }
+        const idx = this.activeSources.indexOf(entry.source);
+        if (idx !== -1) this.activeSources.splice(idx, 1);
+        continue;
+      }
+      if (entry.startSec + entry.durSec > t) {
+        try { entry.source.stop(t); } catch { /* already ended */ }
+        entry.durSec = t - entry.startSec;
+      }
+      kept.push(entry);
+    }
+    this.scheduledRing.length = 0;
+    this.scheduledRing.push(...kept);
+    this.nextScheduledTime = t;
   }
 
   /**
@@ -234,6 +352,9 @@ export class WebAudioOutput implements AudioOutputLike {
     this.activeSources.length = 0;
     this.scheduledRing.length = 0;
     this.nextScheduledTime = 0;
+    this.hasScheduled = false;
+    this._chasing = false;
+    this._leadSec = null;
   }
 
   /**

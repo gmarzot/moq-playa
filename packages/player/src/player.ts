@@ -276,7 +276,7 @@ interface MigrationTxn {
  */
 export class MoqtPlayer {
   /** Player version (set at build time). */
-  static readonly version = '0.5.7';
+  static readonly version = '0.5.9';
 
   private readonly config: MoqtPlayerConfig;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
@@ -344,6 +344,8 @@ export class MoqtPlayer {
    * catalog arrived cannot get an adapter that starts anyway.
    */
   private playbackIntent: boolean | null = null;
+  /** Catalog targetLatency of the selected video track (ms); config wins. */
+  private catalogTargetLatencyMs: number | null = null;
   /** Pending `state_changed` announcements; see announceState(). */
   private readonly stateAnnouncements: { from: PlayerStateValue; to: PlayerStateValue }[] = [];
   private announcingState = false;
@@ -374,6 +376,30 @@ export class MoqtPlayer {
 
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
+
+  /**
+   * Wall-clock time `cmaf_init` fulfilled, i.e. when the `cmaf_first_frame`
+   * watchdog expectation was first armed. Used to bound how long video
+   * segment arrivals may keep renewing that deadline — see
+   * `cmafFirstFrameMaxWaitMs`.
+   */
+  private cmafFirstFrameDeadlineStartedAt: number | undefined;
+
+  /** Start of the current hidden interval while the first-frame deadline is pending. */
+  private cmafFirstFrameHiddenAt: number | undefined;
+
+  /**
+   * CMAF media is being held because the MediaSource is not attached yet
+   * (`mediaSource.attached === false`, e.g. hidden tab). See the attach gate
+   * in the CMAF object path and {@link handleCmafMediaSourceAttached}.
+   */
+  private cmafHoldingForAttach = false;
+
+  /** First-frame timeout to re-arm when a hidden document becomes visible. */
+  private cmafFirstFrameDeferredTimeoutMs: number | undefined;
+
+  /** `visibilitychange` listener installed while the first-frame deadline is pending. */
+  private visibilityListener: (() => void) | null = null;
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
@@ -897,6 +923,22 @@ export class MoqtPlayer {
         // CMAF bootstrap deadlines ESCALATE (fatal); all other
         // expectations keep the historical diagnostic-only behavior.
         if (e.event === 'cmaf_init' || e.event === 'cmaf_first_frame') {
+          // Browsers (Chrome in particular) defer a media element's resource
+          // load — for MSE, the MediaSource attachment that fires
+          // `sourceopen` — while the document is hidden (background tab), and
+          // resume it when the tab becomes visible. Until then no SourceBuffer
+          // exists and nothing can render, no matter how healthy delivery is.
+          // That is not a codec/init mismatch: suspend the deadline instead of
+          // escalating, and re-arm it fresh once the document is visible.
+          if (e.event === 'cmaf_first_frame' && this.documentHidden()) {
+            this.deferCmafFirstFrameDeadline(e.timeoutMs);
+            return;
+          }
+          if (e.event === 'cmaf_first_frame') {
+            this.cmafFirstFrameDeadlineStartedAt = undefined;
+            this.cmafFirstFrameHiddenAt = undefined;
+          }
+          this.removeVisibilityListenerIfIdle();
           const detail = e.event === 'cmaf_init'
             ? 'CMAF media arriving but no init segment materialized (initData / initTrack / in-band ftyp+moov)'
             : 'CMAF MediaSource initialized but no frame rendered (init/codec mismatch?)';
@@ -1001,6 +1043,7 @@ export class MoqtPlayer {
     const locGauges = gapUs !== undefined ? {
       videoEffectiveGapTimeoutMs: gapUs / 1000, // raw adaptive fuse
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
+      audioLateDrops: this.audioPipeline?.lateAudioDrops ?? null,
     } : undefined;
     return Object.freeze(this._stats.snapshot(locGauges));
   }
@@ -1545,6 +1588,10 @@ export class MoqtPlayer {
   private flushCmafStagedBuffer(
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
   ): void {
+    // The replacement is now authoritative. Pin it before replaying staged
+    // bytes so a late object from the retired stream cannot switch the
+    // assembler back after this commit.
+    this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
     const cmafStaged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
     for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload } of cmafStaged) {
@@ -1822,7 +1869,7 @@ export class MoqtPlayer {
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
-    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj) => {
+    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, headers) => {
       // Liveness: stamp before every early return (gates, staging, drops).
       this.stampMediaArrival(BigInt(obj.trackAlias));
 
@@ -1841,8 +1888,9 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
-      // Emit media_object for CMAF too — sparkline jitter chart needs
-      // inter-arrival timing from all video objects regardless of packaging.
+      // Emit media_object for CMAF too — arrival timing and capture
+      // timestamps are packaging-independent, so latency and jitter are
+      // measured the same way on both paths.
       this.emitter.emit('media_object', {
         type: 'media_object',
         mediaType,
@@ -1852,6 +1900,8 @@ export class MoqtPlayer {
         kind: obj.kind,
         ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
         ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+        ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
+        ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
       });
 
       if (obj.kind !== 'data' || !obj.payload) return;
@@ -1863,6 +1913,21 @@ export class MoqtPlayer {
       // deadline (no more silent pre-init drops).
       if (!this.cmafInitialized) {
         this.handlePreInitCmafObject(mediaType, trackName, obj.payload);
+        return;
+      }
+
+      // Gate: the MediaSource must be attached (MSE `sourceopen`) before
+      // anything can reach a SourceBuffer. Browsers defer that attachment
+      // while the document is hidden (background tab). Hold media here rather
+      // than feeding the assembler, so (a) the shared epoch anchors on the
+      // first segment actually appended and (b) on attach we re-sync to the
+      // next group start — playback resumes at the live edge on a keyframe
+      // instead of on a stale timeline built from dropped segments.
+      if (this.mediaSource?.attached === false) {
+        if (!this.cmafHoldingForAttach) {
+          this.cmafHoldingForAttach = true;
+          this.log.info('[CMAF] MediaSource not attached yet (sourceopen pending — hidden tab?); holding media until attached');
+        }
         return;
       }
 
@@ -1913,14 +1978,16 @@ export class MoqtPlayer {
         return;
       }
 
-      // Early stale-group drop: skip objects from groups older than what
-      // MSE has already committed. Prevents late-arriving old groups from
-      // poisoning the assembler's patchEpoch (false backward-bmd detection).
+      // Early stale-group drop (video only): skip groups older than the one
+      // before what MSE has committed. The immediately previous group's tail
+      // legitimately races the next group's head across concurrent subgroup
+      // streams; the assembler's reorder window places it. Anything older is
+      // replay. Audio is one group per object; no group floor applies.
       const groupId = BigInt(obj.groupId);
-      if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
+      if (mediaType === 'video' && this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
         const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
           .getCommittedGroupFloor(mediaType, trackName);
-        if (floor !== undefined && groupId < floor) return;
+        if (floor !== undefined && groupId + 1n < floor) return;
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
@@ -4555,6 +4622,10 @@ export class MoqtPlayer {
     this.cmafPendingInit = null;
     this.cmafPreInitDropWarned.clear();
     this.cmafInitDeadlineArmed = false;
+    this.cmafFirstFrameDeadlineStartedAt = undefined;
+    this.cmafFirstFrameHiddenAt = undefined;
+    this.cmafFirstFrameDeferredTimeoutMs = undefined;
+    this.removeVisibilityListener();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -6016,9 +6087,10 @@ export class MoqtPlayer {
     if (this.pipelinesCreated) return;
 
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
+      onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
         this._stats.recordFirstFrameRendered();
-        this.watchdog.fulfill('cmaf_first_frame'); // bootstrap deadline met
+        this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
         this.log.info('First frame rendered');
         this.emitter.emit('first_frame', { type: 'first_frame' });
       },
@@ -6232,13 +6304,14 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     this.mediaSource = pipelines.mediaSource;
-    // Re-state playback intent on the newly created adapter. play()/pause() can
-    // both happen before the catalog exists, so the adapter that is created
-    // afterwards must inherit the player's CURRENT intent rather than its own
-    // default. `null` means the embedder has never declared one — leave the
-    // adapter's default alone.
-    if (this.playbackIntent !== null) {
-      this.mediaSource?.setPlaybackIntent?.(this.playbackIntent);
+    // Declare playback intent on the newly created adapter. play()/pause() can
+    // both happen before the catalog exists, so the adapter created afterwards
+    // inherits the player's CURRENT intent. Undeclared means not playing: the
+    // player owns startup, the adapter must never start on its own.
+    this.mediaSource?.setPlaybackIntent?.(this.playbackIntent ?? false);
+    const targetLatencyMs = this.config.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    if (targetLatencyMs != null) {
+      this.mediaSource?.setTargetAheadSec?.(targetLatencyMs / 1000);
     }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
 
@@ -6387,14 +6460,128 @@ export class MoqtPlayer {
     for (const [mt, e] of entries) this.cmafAssembler?.setInitSegment?.(mt, e.bytes!);
 
     this._stats.recordDecoderConfigured();
-    this.watchdog.fulfill('cmaf_init');
+    this.fulfillCmafBootstrapDeadline('cmaf_init');
     if (this.config.cmafBootstrapTimeoutMs! > 0) {
       // Second bootstrap deadline: initialized but never rendered a frame
       // (codec/init mismatch class) must not be a silent black player.
-      this.watchdog.expect('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs!);
+      // Renewed on each video segment arrival in buildCmafAssembler's
+      // onSegment (bounded by cmafFirstFrameMaxWaitMs) so a fixed 10s
+      // deadline from here doesn't misfire while delivery is healthy but
+      // startup buffering legitimately takes longer (e.g. long-haul RTT).
+      this.cmafFirstFrameDeadlineStartedAt = Date.now();
+      this.expectCmafBootstrapDeadline('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs!);
     }
     this.log.info('CMAF MediaSource initialized (%s)',
       entries.map(([mt, e]) => `${mt}=${e.bytes!.byteLength}B`).join(' '));
+  }
+
+  /**
+   * The CMAF MediaSource just attached (MSE `sourceopen` → SourceBuffers).
+   * If media was held while unattached, everything the assembler had seen
+   * was dropped before MSE: start its timeline over on what will actually be
+   * appended (re-seeding the init segments it needs for timescales/trex) and
+   * wait for the next group start so the first appended video sample is a
+   * keyframe — i.e. resume at the live edge.
+   */
+  private handleCmafMediaSourceAttached(): void {
+    if (!this.cmafHoldingForAttach) return;
+    this.cmafHoldingForAttach = false;
+    this.cmafAssembler?.reset();
+    if (this.cmafPendingInit) {
+      for (const mt of ['video', 'audio'] as const) {
+        const bytes = this.cmafPendingInit[mt]?.bytes;
+        if (bytes) this.cmafAssembler?.setInitSegment?.(mt, bytes);
+      }
+    }
+    this.cmafVideoSynced = false;
+    this.log.info('[CMAF] MediaSource attached — resuming at the next group start (live edge)');
+  }
+
+  /** Whether a DOM document exists and is currently hidden (background tab). */
+  private documentHidden(): boolean {
+    const doc = (globalThis as { document?: { visibilityState?: string } }).document;
+    return doc?.visibilityState === 'hidden';
+  }
+
+  /** Suspend a CMAF bootstrap deadline while the document is hidden. */
+  private deferCmafFirstFrameDeadline(timeoutMs: number): void {
+    if (this.cmafFirstFrameDeferredTimeoutMs === undefined) {
+      this.log.warn(
+        'CMAF bootstrap deferred: document is hidden (background tab) — the browser '
+        + 'defers media loading until the tab is visible; waiting for cmaf_first_frame');
+    }
+    this.watchdog.fulfill('cmaf_first_frame');
+    this.cmafFirstFrameDeferredTimeoutMs = timeoutMs;
+    if (this.cmafFirstFrameDeadlineStartedAt !== undefined
+        && this.cmafFirstFrameHiddenAt === undefined) {
+      this.cmafFirstFrameHiddenAt = Date.now();
+    }
+    this.installVisibilityListener();
+  }
+
+  /** Arm a CMAF deadline, or park it immediately when the document is hidden. */
+  private expectCmafBootstrapDeadline(event: string, timeoutMs: number): void {
+    if (event === 'cmaf_first_frame') {
+      this.installVisibilityListener();
+      if (this.documentHidden()) {
+        this.deferCmafFirstFrameDeadline(timeoutMs);
+        return;
+      }
+    }
+    this.watchdog.expect(event, timeoutMs);
+  }
+
+  /** Fulfill a CMAF deadline and release its visibility bookkeeping. */
+  private fulfillCmafBootstrapDeadline(event: string): void {
+    this.watchdog.fulfill(event);
+    if (event === 'cmaf_first_frame') {
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
+      this.cmafFirstFrameDeadlineStartedAt = undefined;
+      this.cmafFirstFrameHiddenAt = undefined;
+    }
+    this.removeVisibilityListenerIfIdle();
+  }
+
+  private installVisibilityListener(): void {
+    if (this.visibilityListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    if (!doc) return;
+    this.visibilityListener = () => {
+      if (this.documentHidden()) {
+        if (this.watchdog.activeExpectations.includes('cmaf_first_frame')) {
+          this.deferCmafFirstFrameDeadline(this.config.cmafBootstrapTimeoutMs!);
+        }
+        return;
+      }
+      if (this.cmafFirstFrameHiddenAt !== undefined
+          && this.cmafFirstFrameDeadlineStartedAt !== undefined) {
+        this.cmafFirstFrameDeadlineStartedAt += Date.now() - this.cmafFirstFrameHiddenAt;
+        this.cmafFirstFrameHiddenAt = undefined;
+      }
+      const timeoutMs = this.cmafFirstFrameDeferredTimeoutMs;
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
+      if (timeoutMs !== undefined) {
+        this.log.info('Document visible — re-arming CMAF bootstrap deadline cmaf_first_frame (%dms)', timeoutMs);
+        this.watchdog.expect('cmaf_first_frame', timeoutMs);
+      }
+      this.removeVisibilityListenerIfIdle();
+    };
+    doc.addEventListener('visibilitychange', this.visibilityListener);
+  }
+
+  private removeVisibilityListenerIfIdle(): void {
+    const active = this.watchdog.activeExpectations;
+    if (this.cmafFirstFrameDeferredTimeoutMs === undefined
+        && !active.includes('cmaf_first_frame')) {
+      this.removeVisibilityListener();
+    }
+  }
+
+  private removeVisibilityListener(): void {
+    if (!this.visibilityListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    doc?.removeEventListener('visibilitychange', this.visibilityListener);
+    this.visibilityListener = null;
   }
 
   /** Create the moof+mdat assembler wired to the MediaSource (single site). */
@@ -6413,6 +6600,7 @@ export class MoqtPlayer {
           }
         }
         ms.appendChunk(mediaType, segment, segTrackName, groupId);
+        this.renewCmafFirstFrameDeadline(mediaType);
       },
       onDiscontinuity: (mediaType, trackName) => {
         if ('clearTimeline' in ms) {
@@ -6420,6 +6608,35 @@ export class MoqtPlayer {
         }
       },
     });
+  }
+
+  /**
+   * Renew the `cmaf_first_frame` watchdog deadline on a video segment
+   * arrival, as long as media is still flowing.
+   *
+   * A fixed 10s deadline measured only from `cmaf_init` treats "delivery is
+   * healthy but startup buffering needs more time" (observed on long-haul
+   * RTT paths) the same as "nothing is arriving at all" — firing a fatal
+   * `CMAF_INIT_TIMEOUT` and tearing the player down to `ERROR` even though
+   * the underlying transport is fine and a frame would render moments later.
+   *
+   * Only renews while the expectation is still pending (a no-op after
+   * `onFirstFrame` has already fulfilled it) and only within
+   * `cmafFirstFrameMaxWaitMs` of the original `cmaf_init` — past that
+   * ceiling, renewal stops so a genuinely broken decode path (segments
+   * arriving, appendBuffer succeeding, but the browser never painting a
+   * frame) still surfaces as fatal rather than buffering forever.
+   */
+  private renewCmafFirstFrameDeadline(mediaType: 'video' | 'audio'): void {
+    if (mediaType !== 'video') return;
+    if (!this.config.cmafBootstrapTimeoutMs || this.config.cmafBootstrapTimeoutMs <= 0) return;
+    if (!this.watchdog.activeExpectations.includes('cmaf_first_frame')) return;
+
+    const maxWaitMs = this.config.cmafFirstFrameMaxWaitMs!;
+    const elapsed = Date.now() - (this.cmafFirstFrameDeadlineStartedAt ?? Date.now());
+    if (elapsed >= maxWaitMs) return;
+
+    this.expectCmafBootstrapDeadline('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs);
   }
 
   /**
@@ -6484,7 +6701,7 @@ export class MoqtPlayer {
     }
     if (!this.cmafInitDeadlineArmed && this.config.cmafBootstrapTimeoutMs! > 0) {
       this.cmafInitDeadlineArmed = true;
-      this.watchdog.expect('cmaf_init', this.config.cmafBootstrapTimeoutMs!);
+      this.expectCmafBootstrapDeadline('cmaf_init', this.config.cmafBootstrapTimeoutMs!);
     }
   }
 
@@ -6573,6 +6790,7 @@ export class MoqtPlayer {
     );
     if (selected.video?.targetLatency !== undefined) {
       this._stats.setTargetLatency(selected.video.targetLatency);
+      this.catalogTargetLatencyMs = selected.video.targetLatency;
     }
 
     // §9.2.2: Build subscription options from config
@@ -6603,6 +6821,7 @@ export class MoqtPlayer {
         packaging: audioPackaging,
       }) : undefined,
       isLive: selected.video?.isLive === true || selected.audio?.isLive === true,
+      ...(this.catalogTargetLatencyMs != null ? { targetLatencyMs: this.catalogTargetLatencyMs } : {}),
     });
 
     // ── Subscribe to selected tracks (parallel) ──────────────────

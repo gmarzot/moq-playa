@@ -16,6 +16,7 @@ class MockAudioContext {
   currentTime = 0;
   readonly destination = { kind: 'destination' };
   readonly started: Array<{ when: number; duration: number; rate: number }> = [];
+  readonly sources: any[] = [];
 
   createBuffer(channels: number, frames: number, sampleRate: number) {
     return {
@@ -38,6 +39,7 @@ class MockAudioContext {
         ctx.started.push({ when, duration: source.buffer.duration, rate: source.playbackRate.value });
       },
     };
+    this.sources.push(source);
     return source;
   }
 }
@@ -130,6 +132,15 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
     expect(out.playheadCaptureUs()).toBeCloseTo(5_000_000 + 199 * 20_000 + 10_000, 0);
   });
 
+  it('uses the passed capture timestamp over the decoded one (decoder rebasing)', () => {
+    const { ctx, out } = makeOutput();
+    ctx.currentTime = 1.0;
+    // Decoder rebased this buffer to 5.000 s; its real capture time is 9.000 s.
+    out.schedule(audioData(5_000_000), 1_000_000, 9_000_000);
+    ctx.currentTime = 1.010;
+    expect(out.playheadCaptureUs()).toBe(9_010_000);
+  });
+
   it('flush() clears the ring — playhead goes null', () => {
     const { ctx, out } = makeOutput();
     ctx.currentTime = 1.0;
@@ -214,5 +225,134 @@ describe('unified playout cushion (delay unification)', () => {
     ctx.currentTime = 2.0; // chain long dry — underrun
     out.schedule(audioData(20_000) as unknown as AudioData, 2_300_000);
     expect(ctx.started[1]!.when).toBeCloseTo(2.3, 5); // no hidden +200ms
+  });
+});
+
+describe('live-edge lead clamp', () => {
+  const MS = 1_000; // µs per ms
+  /** Chain `n` contiguous 20ms buffers whose render times start at `renderStartUs`. */
+  const feed = (out: WebAudioOutput, n: number, captureStartUs: number, renderStartUs: number) => {
+    for (let i = 0; i < n; i++) {
+      out.schedule(audioData(captureStartUs + i * 20 * MS) as unknown as AudioData, renderStartUs + i * 20 * MS);
+    }
+  };
+
+  it('a healthy chain on schedule has zero lead: no chase, no snap', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    feed(out, 100, 0, 1_000 * MS);
+    expect(out.captureLeadSec).toBeCloseTo(0, 6);
+    expect(out.chasing).toBe(false);
+    expect(out.liveEdgeSnapCount).toBe(0);
+    expect(ctx.started.every((s) => s.rate === 1)).toBe(true);
+  });
+
+  it('a grown cushion (chain earlier than policy) is neither chased nor snapped', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_200 * MS);
+    out.schedule(audioData(20 * MS) as unknown as AudioData, 1_420 * MS);
+    expect(out.captureLeadSec).toBeLessThan(0);
+    expect(out.chasing).toBe(false);
+    expect(out.liveEdgeSnapCount).toBe(0);
+    expect(ctx.started[1]!.rate).toBe(1);
+  });
+
+  it('a late anchor leaves a persistent lead that the soft chase drains at CHASE_RATE', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    // Render time 0.5 s is already in the past: anchor at now, lead 0.5 s.
+    feed(out, 2, 0, 500 * MS);
+    expect(out.captureLeadSec).toBeCloseTo(0.5, 6);
+    expect(out.chasing).toBe(true);
+    expect(ctx.started[1]!.rate).toBeCloseTo(1.02, 6);
+
+    // Each chased buffer sheds 20ms − 20ms/1.02 ≈ 0.39ms; ~900 buffers reach target.
+    feed(out, 1000, 40 * MS, 540 * MS);
+    expect(out.chasing).toBe(false);
+    expect(out.captureLeadSec).toBeLessThanOrEqual(0.15 + 1e-9);
+    expect(ctx.started.at(-1)!.rate).toBe(1);
+    expect(out.liveEdgeSnapCount).toBe(0);
+  });
+
+  it('chase does not stack on the catch-up rate (pitch shifts would compound)', () => {
+    const { ctx, out } = makeOutput(0);
+    out.setPlaybackRate(1.1);
+    ctx.currentTime = 1.0;
+    feed(out, 2, 0, 500 * MS);
+    expect(out.chasing).toBe(true);
+    expect(ctx.started[1]!.rate).toBeCloseTo(1.1, 6);   // not 1.1 × 1.02
+
+    out.setPlaybackRate(1.0);
+    feed(out, 1, 40 * MS, 540 * MS);
+    expect(ctx.started.at(-1)!.rate).toBeCloseTo(1.02, 6);
+  });
+
+  it('a backlog beyond maxAheadSec is dropped past the landing and the chain re-anchored', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    feed(out, 60, 0, 1_000 * MS);                       // chain [1.0, 2.2)
+    // This buffer belongs at 1.3 s: lead 0.9 s > 0.75 → land at 1.3 + 0.15.
+    out.schedule(audioData(1_200 * MS) as unknown as AudioData, 1_300 * MS);
+
+    expect(out.liveEdgeSnapCount).toBe(1);
+    expect(ctx.started.at(-1)!.when).toBeCloseTo(1.45, 6);
+    expect(out.scheduledAheadSec).toBeCloseTo(0.47, 6);  // 1.47 − 1.0
+    // Buffers starting at/after 1.45 were stopped: i ≥ 23 of 60 (37 nodes);
+    // the buffer spanning 1.45 was truncated with stop(1.45).
+    const stops = ctx.sources.map((s) => s.stop.mock.calls);
+    expect(stops.filter((c) => c.length === 1 && c[0]!.length === 0)).toHaveLength(37);
+    expect(stops.filter((c) => c.length === 1 && c[0]![0] === 1.45)).toHaveLength(1);
+    // Playhead follows the re-anchored chain.
+    ctx.currentTime = 1.455;
+    expect(out.playheadCaptureUs()).toBeCloseTo(1_200 * MS + 5 * MS, 0);
+    expect(out.chasing).toBe(false);
+  });
+
+  it('pure arrival lateness with nothing queued past the landing drops nothing', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_000 * MS); // chain ends 1.02
+    ctx.currentTime = 1.02;
+    out.schedule(audioData(20 * MS) as unknown as AudioData, 100 * MS); // 0.92 s late
+    expect(out.liveEdgeSnapCount).toBe(0);
+    expect(ctx.started[1]!.when).toBeCloseTo(1.02, 6);
+    expect(out.chasing).toBe(true);
+  });
+
+  it('audio BEHIND its sync reference is never dropped (the strobe bug)', () => {
+    // Field symptom: under CPU load the A/V skew grew to ~2.3 s, so the
+    // audio render times sat far in the past. `lead` then reads huge while
+    // the landing is already behind `now` — the clamp fired on every
+    // buffer, stopping the audible one mid-playback and flushing the
+    // queue ~47x/s. Audible as strobing, louder, with underruns climbing.
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 10.0;
+    feed(out, 40, 0, 10_000 * MS);                // chain [10.0, 10.8)
+    const queued = ctx.sources.length;
+    ctx.currentTime = 10.1;
+
+    // Render time 2.3 s in the past (still positive, or the output reads
+    // it as "no render time" and never reaches the clamp at all).
+    out.schedule(audioData(0) as unknown as AudioData, 7_800 * MS);
+
+    expect(out.liveEdgeSnapCount).toBe(0);         // nothing dropped
+    expect(ctx.sources[queued]!.start).toBeTruthy();
+    expect(ctx.started.at(-1)!.when).toBeCloseTo(10.8, 6); // chained, not cut
+    expect(ctx.sources.slice(0, queued).every((s) => s.stop.mock.calls.length === 0))
+      .toBe(true);
+    expect(out.chasing).toBe(true);                // catch up by rate instead
+  });
+
+  it('options override the bounds', () => {
+    const ctx = new MockAudioContext();
+    const clock = { now: () => ctx.currentTime * 1_000_000 };
+    const out = new WebAudioOutput(ctx as unknown as AudioContext, undefined, 0, clock,
+      { maxAheadSec: 0.3, targetAheadSec: 0.05 });
+    ctx.currentTime = 1.0;
+    feed(out, 30, 0, 1_000 * MS);                        // chain [1.0, 1.6)
+    out.schedule(audioData(600 * MS) as unknown as AudioData, 1_200 * MS); // lead 0.4 > 0.3
+    expect(out.liveEdgeSnapCount).toBe(1);
+    expect(ctx.started.at(-1)!.when).toBeCloseTo(1.25, 6);
   });
 });

@@ -3,12 +3,25 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Playa — Simple Example</title>
+  <title>Playa — MSF/CMSF Example</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
 
-    .wrapper { max-width: 960px; margin: 0 auto; padding: 24px; }
+    .wrapper { max-width: 1440px; margin: 0 auto; padding: 24px; }
+
+    /* Two-column layout: video+controls+metrics left, catalog right.
+       The catalog column is absolutely positioned inside .cat-col so the
+       row height is set by the left column alone; the catalog scrolls
+       within it. Stacks to one column on narrow viewports. */
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(500px, 44%);
+      gap: 20px;
+      align-items: stretch;
+    }
+    .main-col { min-width: 0; }
+    .cat-col { position: relative; min-width: 0; }
     h1 { font-size: 1.4rem; margin-bottom: 8px; }
     .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
     .subtitle code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
@@ -90,15 +103,88 @@
       padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
     }
 
-    /* Stats overlay */
-    .stats {
-      font-size: 0.8rem;
-      color: #888;
-      padding: 12px 0;
+    /* Diagnostics strip — always visible beneath the playback window */
+    .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
+    /* One row, always: cells share the width and never wrap */
+    .diag-grid {
+      display: flex; flex-wrap: nowrap; gap: 6px 14px; overflow: hidden;
       font-variant-numeric: tabular-nums;
-      line-height: 1.6;
     }
-    .stats span { color: #bbb; }
+    .diag-grid .cell { flex: 1 1 0; min-width: 0; }
+    .diag-grid .cell, .diag-grid .cell b {
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .diag-grid .cell {
+      color: #778; text-transform: uppercase; letter-spacing: .04em;
+      font-size: .78rem;
+    }
+    .diag-grid .cell b {
+      display: block; color: #ddd; font-weight: 600; font-size: 1.05rem;
+      text-transform: none; letter-spacing: 0;
+    }
+    .diag-charts {
+      display: grid; gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    }
+    .chart-label {
+      font-size: .8rem; color: #778; text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .chart-label b { color: #4d4; font-variant-numeric: tabular-nums; }
+    .chart canvas {
+      width: 100%; height: 56px; background: #161622;
+      border-radius: 6px; display: block; margin-top: 4px;
+    }
+
+    /* Catalog panel — the MSF/CMSF catalog as delivered, redrawn on deltas.
+       Fills the right column at the left column's height; JSON scrolls. */
+    .catalog-panel {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column;
+      background: #1a1a2e;
+      border-radius: 8px; padding: 10px 14px;
+    }
+    .cat-head {
+      display: flex; align-items: baseline;
+      justify-content: space-between; gap: 12px;
+    }
+    .cat-head .chart-label { font-size: .95rem; color: #aab; font-weight: 600; white-space: nowrap; }
+    .cat-head .chart-label b { font-size: 1rem; }
+    .cat-head button {
+      background: #333; color: #bbb; border: 1px solid #555;
+      border-radius: 6px; padding: 2px 10px;
+      font-size: .7rem; cursor: pointer;
+    }
+    .cat-tracks {
+      display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
+      font-size: 1rem; font-variant-numeric: tabular-nums;
+    }
+    .cat-track {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      align-items: baseline; color: #aab;
+    }
+    .cat-track .dt { flex-basis: 100%; color: #9fb0c4; }
+    .cat-track .nm { color: #eee; font-weight: 700; min-width: 72px; }
+    .cat-track .pk {
+      color: #4d4; text-transform: uppercase; font-weight: 700;
+      font-size: .78rem; letter-spacing: .05em;
+    }
+    .cat-json {
+      margin: 10px 0 0; padding: 10px 12px; background: #12121f;
+      border-radius: 6px; font-family: monospace; font-size: 1rem;
+      line-height: 1.5; flex: 1; min-height: 0; overflow: auto;
+      white-space: pre; color: #9fb0c4;
+    }
+
+    /* Narrow viewports: stack back to a single column */
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      .cat-col { position: static; }
+      .catalog-panel { position: static; margin-top: 12px; }
+      .cat-json { flex: none; max-height: 220px; }
+    }
+    .catalog-panel.collapsed .cat-tracks,
+    .catalog-panel.collapsed .cat-json { display: none; }
 
     /* State badge */
     .state-badge {
@@ -129,15 +215,13 @@
 </head>
 <body>
   <div class="wrapper">
-    <h1>Playa — Simple Example</h1>
+    <h1>Playa — MSF/CMSF Example</h1>
     <p class="subtitle">
-      The entire player in <code>~30 lines</code> of TypeScript.
-      Pass <code>?url=</code> (the complete relay endpoint), <code>&ns=</code>, and optionally
-      <code>&hash=</code> / <code>&v=14</code>. Without <code>?url=</code> the page discovers the
-      endpoint by probing <code>https://&lt;page-host&gt;:4433</code> at <code>/moq</code>,
-      <code>/moq-relay</code>, then <code>/</code>.
+      A customized build of the openmoq/moq-playa simple example player.
     </p>
 
+    <div class="layout">
+    <div class="main-col">
     <div id="player-container"></div>
 
     <div class="controls">
@@ -151,8 +235,40 @@
       <select id="quality" disabled><option>Auto</option></select>
       <span class="state-badge" id="state">idle</span>
     </div>
+    </div>
 
-    <div class="stats" id="stats"></div>
+    <div class="cat-col">
+    <div class="catalog-panel" id="catalog-panel">
+      <div class="cat-head">
+        <span class="chart-label">MSF / CMSF catalog <b id="cat-meta">waiting…</b></span>
+        <button id="cat-toggle" type="button">hide</button>
+      </div>
+      <div class="cat-tracks" id="cat-tracks"></div>
+      <pre class="cat-json" id="cat-json"></pre>
+    </div>
+    </div>
+    </div>
+
+    <div class="diag">
+      <div class="diag-grid" id="diag-grid"></div>
+      <div class="diag-charts">
+        <div class="chart">
+          <span class="chart-label">e2e latency ms (capture→arrival, needs synced clocks)
+            p50 <b id="lat-val">—</b> p95 <b id="lat-p95">—</b></span>
+          <canvas id="lat-spark"></canvas>
+        </div>
+        <div class="chart">
+          <span class="chart-label">interarrival jitter ms (RFC 3550) <b id="jit-val">—</b></span>
+          <canvas id="jit-spark"></canvas>
+        </div>
+        <div class="chart">
+          <span class="chart-label"><span id="cus-label">queued ahead ms</span>
+            <b id="cus-val">—</b> target <b id="cus-target">—</b></span>
+          <canvas id="cus-spark"></canvas>
+        </div>
+      </div>
+    </div>
+
     <pre id="log"></pre>
   </div>
 

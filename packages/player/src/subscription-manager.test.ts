@@ -357,7 +357,7 @@ describe('SubscriptionManager', () => {
 
   // ─── CMAF packaging routing (draft-ietf-moq-cmsf-00 §3.3) ────────
 
-  it('routes CMAF objects to onCmafObject, skipping LOC header parsing (§3.3)', async () => {
+  it('routes CMAF objects to onCmafObject, not the decode pipeline (§3.3)', async () => {
     const mgr = new SubscriptionManager();
     const onObject = vi.fn();
     const onCmafObject = vi.fn();
@@ -373,8 +373,25 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.objectContaining({ kind: 'data' }),
+      expect.anything(),
     );
     expect(onObject).not.toHaveBeenCalled();
+  });
+
+  it('CMAF objects carry parsed object properties (capture timestamp)', async () => {
+    const mgr = new SubscriptionManager();
+    const onCmafObject = vi.fn();
+    mgr.registerTrack(1n, 'video', 'video', 'cmaf');
+    mgr.onCmafObject = onCmafObject;
+
+    const extensions = encodeLocHeaders({ captureTimestamp: 1000n });
+    await mgr.routeObject(0n, createMockObject({
+      trackAlias: varint(1),
+      extensions,
+    }));
+
+    const headers: LocHeaders = onCmafObject.mock.calls[0]![3];
+    expect(headers.captureTimestamp).toBe(1000n);
   });
 
   it('LOC tracks still route to onObject when CMAF tracks exist (backward compat)', async () => {
@@ -419,7 +436,7 @@ describe('SubscriptionManager', () => {
     expect(onObject).toHaveBeenCalledTimes(1);
     expect(onObject).toHaveBeenCalledWith('video', 'video-loc', expect.anything(), expect.anything());
     expect(onCmafObject).toHaveBeenCalledTimes(1);
-    expect(onCmafObject).toHaveBeenCalledWith('audio', 'audio-cmaf', expect.anything());
+    expect(onCmafObject).toHaveBeenCalledWith('audio', 'audio-cmaf', expect.anything(), expect.anything());
   });
 
   it('objectTransform applies to CMAF objects before routing', async () => {
@@ -439,6 +456,7 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.objectContaining({ payload: new Uint8Array([0xCA, 0xFE]) }),
+      expect.anything(),
     );
   });
 

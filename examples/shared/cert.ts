@@ -59,6 +59,24 @@ export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe'
   return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' ? v : undefined;
 })();
 
+/** A positive millisecond parameter, or undefined when absent or invalid. */
+function positiveMs(name: string): number | undefined {
+  const v = Number(params.get(name));
+  return Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+/** `?cushion=MS` / `?cushionMax=MS`: LOC render-cushion floor and cap. */
+export const renderCushionFloorMs: number | undefined = positiveMs('cushion');
+export const renderCushionMaxMs: number | undefined = positiveMs('cushionMax');
+
+/** `?targetLatency=MS`: catch-up set point; on CMAF also where live-edge
+ *  and gap-jump seeks land. Overrides the catalog's targetLatency. */
+export const targetLatencyMs: number | undefined = positiveMs('targetLatency');
+
+/** `?debug=1`: engine debug logging, MSE adapter tracing, and media-element
+ *  events mirrored into the on-page log. */
+export const debug: boolean = params.get('debug') === '1';
+
 /** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18). */
 export const draftVersion: 14 | 16 | 18 | undefined = (() => {
   const v = params.get('v');

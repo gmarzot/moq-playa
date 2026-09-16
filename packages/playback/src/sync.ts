@@ -142,6 +142,11 @@ export class SyncController {
         return this.localBaselineUs !== undefined;
     }
 
+    /** Lateness beyond which a frame is considered late (µs). */
+    get lateThresholdUs(): number {
+        return this.dropThresholdUs;
+    }
+
     /** Current drift magnitude in microseconds. */
     get currentDriftUs(): number {
         return this._currentDriftUs;

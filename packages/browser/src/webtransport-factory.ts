@@ -121,15 +121,17 @@ export function createWebTransport(
       if (!firstOpts.protocols) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
+      // Draft-16+ negotiate the version only via WT-Protocol. A session
+      // without it leaves the server with no draft, and a draft-18 uni
+      // control stream on such a session is a protocol violation (moqx
+      // segfaults on it). So an explicit 16/18 pin never retries bare.
+      if (options?.draftVersion && options.draftVersion >= 15) {
+        throw new Error(`WebTransport connection failed: ${detail}`);
+      }
       // Strict UAs (Safari 26) fail the session when WT-Available-Protocols
-      // negotiation does not complete. MOQT does not require it — the
-      // CLIENT_SETUP version list (§9.3) negotiates in-band — so retry
-      // once without offering before giving up.
-      //
-      // In auto mode, the fallback has no transport.protocol, so the adapter
-      // uses its default draft unless the caller passed draftVersion
-      // explicitly. Callers that need deterministic draft selection should
-      // pass draftVersion.
+      // negotiation does not complete. In auto mode retry once without
+      // offering; the fallback has no transport.protocol, so the adapter
+      // uses its default draft.
       try {
         connected = await attempt(false);
       } catch (retryErr) {

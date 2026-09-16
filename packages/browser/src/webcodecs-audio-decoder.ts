@@ -49,15 +49,21 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   /** Whether the codec is AAC (needs ADTS wrapping). */
   private isAAC = false;
 
-  /** FIFO queue: renderTimeUs values awaiting output data. */
-  private readonly renderTimeQueue: number[] = [];
+  /**
+   * FIFO of submitted chunks awaiting output: render time and the chunk's
+   * capture timestamp. The capture timestamp is carried here because the
+   * output's own is not it — Chrome's AAC decoder rebases outputs to
+   * first-chunk time plus decoded samples, so any chunk that never reaches
+   * the decoder leaves every later output timestamp behind.
+   */
+  private readonly renderTimeQueue: Array<{ renderTimeUs: number; captureUs: number }> = [];
 
   /** Error count — limit logging. */
   private errorCount = 0;
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
-  onData: ((data: unknown, renderTimeUs: number) => void) | null = null;
+  onData: ((data: unknown, renderTimeUs: number, captureUs?: number) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
 
   // ─── AudioDecoderLike ───────────────────────────────────────────
@@ -121,7 +127,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
       data = wrapInADTS(data, this.lastSampleRate, this.lastChannels);
     }
 
-    this.renderTimeQueue.push(renderTimeUs);
+    this.renderTimeQueue.push({ renderTimeUs, captureUs: chunk.timestamp });
 
     const chunkInit: EncodedAudioChunkInit = {
       type: chunk.type,
@@ -175,8 +181,8 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
           audioData.close();
           return;
         }
-        const renderTimeUs = this.renderTimeQueue.shift() ?? 0;
-        this.onData(audioData, renderTimeUs);
+        const queued = this.renderTimeQueue.shift();
+        this.onData(audioData, queued?.renderTimeUs ?? 0, queued?.captureUs);
       },
       error: (err: DOMException) => {
         this.errorCount++;
