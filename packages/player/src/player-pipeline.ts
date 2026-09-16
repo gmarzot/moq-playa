@@ -335,6 +335,8 @@ export function createPipelines(
       onCommand: (cmd) => callbacks.onCommand(cmd),
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
+      // The cushion the dispatcher adds to audio render times (peek only).
+      getPlaybackDelayUs: () => renderCushion?.currentUs ?? cushionFloorUs,
     });
   }
 

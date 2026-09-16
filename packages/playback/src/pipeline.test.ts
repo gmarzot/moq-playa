@@ -98,6 +98,7 @@ function createPipeline(opts: {
     config?: PlaybackConfig;
     sync?: SyncController;
     recovery?: import('./recovery.js').RecoveryController;
+    getPlaybackDelayUs?: () => number;
 }) {
     const commands: DecoderCommand[] = [];
     const events: PlaybackEvent[] = [];
@@ -115,6 +116,7 @@ function createPipeline(opts: {
         onCommand: (cmd) => commands.push(cmd),
         onEvent: (evt) => events.push(evt),
         recovery: opts.recovery,
+        ...(opts.getPlaybackDelayUs ? { getPlaybackDelayUs: opts.getPlaybackDelayUs } : {}),
     });
 
     return { pipeline, commands, events, sync };
@@ -2011,14 +2013,17 @@ describe('PlaybackPipeline', () => {
         const FRAME_US = 21_333;
         const C0 = 1_000_000_000n;
 
-        function setup() {
+        function setup(cushionUs?: number) {
             const clock = new MockClock();
             clock.set(5_000_000);
             // Production passes lateFrameThresholdMs (100 ms); the standalone default is 500.
             const sync = new SyncController({
                 driftThresholdUs: DEFAULT_CONFIG.driftThresholdUs, dropThresholdUs: 100_000, clock,
             });
-            const ctx = createPipeline({ mediaType: 'audio', clock, sync });
+            const ctx = createPipeline({
+                mediaType: 'audio', clock, sync,
+                ...(cushionUs !== undefined ? { getPlaybackDelayUs: () => cushionUs } : {}),
+            });
             ctx.pipeline.configure(new Uint8Array([0x01]));
             ctx.pipeline.pushObject(makeData(0, 0), audioHeaders(C0));
             ctx.pipeline.tick();
@@ -2055,6 +2060,20 @@ describe('PlaybackPipeline', () => {
             const s = setup();
             for (let i = 0; i < 40; i++) s.push(i % 2 === 0 ? 150_000 : 0);
             expect(s.reanchors()).toHaveLength(0);
+        });
+
+        it('audio the playout cushion still covers is decoded, not dropped', () => {
+            // 120 ms late against the uncushioned timeline is on time with a
+            // 150 ms cushion; only lateness past cushion + threshold drops.
+            const s = setup(150_000);
+            const before = s.decodes();
+            for (let i = 0; i < 20; i++) s.push(120_000);
+            expect(s.decodes()).toBe(before + 20);
+            expect(s.pipeline.lateAudioDrops).toBe(0);
+
+            for (let i = 0; i < 5; i++) s.push(300_000);     // 150 ms past the cushion
+            expect(s.decodes()).toBe(before + 20);
+            expect(s.pipeline.lateAudioDrops).toBe(5);
         });
 
         it('re-anchors at most once per 2 s', () => {

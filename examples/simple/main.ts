@@ -212,7 +212,9 @@ async function main(): Promise<void> {
       cell('render cushion ms', renderCushionMs() != null ? renderCushionMs()!.toFixed(0) : '—'),
       cell(queuedLabel(), s.cushionMs != null ? s.cushionMs.toFixed(0) : '—'),
       cell('audio underruns', String(s.audioUnderruns ?? 0)),
-      cell('objects / ts', `${objEvents}/${objEventsWithTs}`),
+      // Why audio underran: dropped late before decode / snapped by the output clamp.
+      cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
+        + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`),
       cell('gaps', String(s.gapCount ?? 0)),
       cell('sync resets', String(syncResets)),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
@@ -245,8 +247,6 @@ async function main(): Promise<void> {
   let jitterEwma = 0;
   let expectedIntervalMs = 0;
   let skewSamples = 0;
-  let objEvents = 0;
-  let objEventsWithTs = 0;
   (window as any).__player = player;
   const pushSample = (a: number[], v: number) => {
     a.push(v);
@@ -259,8 +259,6 @@ async function main(): Promise<void> {
   };
 
   (player as any).on('media_object', (e: any) => {
-    objEvents++;
-    if (e.captureTimestamp) objEventsWithTs++;
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
     const arrivalMs = performance.now();
