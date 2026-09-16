@@ -22,8 +22,11 @@ export interface WebAudioOutputOptions {
 
 const LIVE_EDGE_MAX_AHEAD_SEC = 0.75;
 const LIVE_EDGE_TARGET_AHEAD_SEC = 0.15;
-/** Rate while shedding lead above target; inaudible. */
-const CHASE_RATE = 1.05;
+/**
+ * Rate while shedding lead above target. AudioBufferSourceNode rate also
+ * shifts pitch: 1.02 is a third of a semitone, 1.05 is nearly a full one.
+ */
+const CHASE_RATE = 1.02;
 /** Chase engages above target + this, releases at target (hysteresis). */
 const CHASE_ON_SEC = 0.1;
 
@@ -246,9 +249,10 @@ export class WebAudioOutput implements AudioOutputLike {
     // Schedule for playout.
     const source = this.audioCtx.createBufferSource();
     source.buffer = buf;
-    // Catch-up playback rate (>1.0 = faster playout), compounded with the
-    // live-edge chase. @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-    const rate = this._playbackRate * (this._chasing ? CHASE_RATE : 1);
+    // Catch-up playback rate (>1.0 = faster playout). The live-edge chase
+    // takes the larger of the two rather than multiplying them, which would
+    // stack pitch shifts. @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
+    const rate = this._chasing ? Math.max(this._playbackRate, CHASE_RATE) : this._playbackRate;
     source.playbackRate.value = rate;
     source.connect(this.destination);
     source.start(startTime);

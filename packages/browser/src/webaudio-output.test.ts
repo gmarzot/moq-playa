@@ -265,22 +265,27 @@ describe('live-edge lead clamp', () => {
     feed(out, 2, 0, 500 * MS);
     expect(out.captureLeadSec).toBeCloseTo(0.5, 6);
     expect(out.chasing).toBe(true);
-    expect(ctx.started[1]!.rate).toBeCloseTo(1.05, 6);
+    expect(ctx.started[1]!.rate).toBeCloseTo(1.02, 6);
 
-    // Each chased buffer sheds 20ms − 20ms/1.05; ~370 buffers reach target.
-    feed(out, 500, 40 * MS, 540 * MS);
+    // Each chased buffer sheds 20ms − 20ms/1.02 ≈ 0.39ms; ~900 buffers reach target.
+    feed(out, 1000, 40 * MS, 540 * MS);
     expect(out.chasing).toBe(false);
     expect(out.captureLeadSec).toBeLessThanOrEqual(0.15 + 1e-9);
     expect(ctx.started.at(-1)!.rate).toBe(1);
     expect(out.liveEdgeSnapCount).toBe(0);
   });
 
-  it('chase compounds with the catch-up rate', () => {
+  it('chase does not stack on the catch-up rate (pitch shifts would compound)', () => {
     const { ctx, out } = makeOutput(0);
     out.setPlaybackRate(1.1);
     ctx.currentTime = 1.0;
     feed(out, 2, 0, 500 * MS);
-    expect(ctx.started[1]!.rate).toBeCloseTo(1.1 * 1.05, 6);
+    expect(out.chasing).toBe(true);
+    expect(ctx.started[1]!.rate).toBeCloseTo(1.1, 6);   // not 1.1 × 1.02
+
+    out.setPlaybackRate(1.0);
+    feed(out, 1, 40 * MS, 540 * MS);
+    expect(ctx.started.at(-1)!.rate).toBeCloseTo(1.02, 6);
   });
 
   it('a backlog beyond maxAheadSec is dropped past the landing and the chain re-anchored', () => {
