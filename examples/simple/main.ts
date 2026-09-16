@@ -33,6 +33,7 @@ const jitSpark = document.getElementById('jit-spark') as HTMLCanvasElement;
 const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
 const cusVal = document.getElementById('cus-val')!;
 const cusTarget = document.getElementById('cus-target')!;
+const cusLabel = document.getElementById('cus-label')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const jitVal = document.getElementById('jit-val')!;
@@ -182,6 +183,11 @@ async function main(): Promise<void> {
   });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
+  const renderCushionMs = (): number | null =>
+    (player as any).engine?.stats?.loc?.renderCushionMs ?? null;
+  const queuedLabel = (): string =>
+    player.activeMediaType === 'video' ? 'buffered ahead ms' : 'audio queued ms';
+
   player.on('stats', (s: any) => {
     const cell = (label: string, v: string) =>
       `<div class="cell">${label}<b>${v}</b></div>`;
@@ -194,7 +200,11 @@ async function main(): Promise<void> {
       cell('rendered', String(s.framesRendered ?? 0)),
       cell('decoded', String(s.framesDecoded ?? 0)),
       cell('dropped', String(s.framesDropped ?? 0)),
-      cell('cushion ms', s.cushionMs != null ? s.cushionMs.toFixed(0) : '—'),
+      // Two different quantities: the LOC render cushion is the playout delay
+      // the engine schedules against; the facade cushion is media actually
+      // queued ahead (MSE buffered range, or WebAudio audio on LOC).
+      cell('render cushion ms', renderCushionMs() != null ? renderCushionMs()!.toFixed(0) : '—'),
+      cell(queuedLabel(), s.cushionMs != null ? s.cushionMs.toFixed(0) : '—'),
       cell('audio underruns', String(s.audioUnderruns ?? 0)),
       cell('objects / ts', `${objEvents}/${objEventsWithTs}`),
       cell('gaps', String(s.gapCount ?? 0)),
@@ -333,6 +343,7 @@ async function main(): Promise<void> {
     cusVal.textContent = cushionSamples.length
       ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
+    cusLabel.textContent = queuedLabel();
     if (latSamples.length) {
       latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
       latP95.textContent = percentile(latSamples, 0.95).toFixed(0);
@@ -391,12 +402,20 @@ async function main(): Promise<void> {
     catJson.textContent = JSON.stringify(cat, null, 2);
   }
 
+  // Periodic catalog refreshes repeat an unchanged catalog; logging each one
+  // buries the stall lines. Log and redraw only on a real change.
+  let lastCatalogKey = '';
+  const catalogKey = (cat: any): string => JSON.stringify({ ...cat, generatedAt: undefined });
   player.on('catalog_received', ({ catalog }) => {
+    lastCatalogKey = catalogKey(catalog);
     log(`Catalog received: ${catalog?.tracks?.length ?? 0} track(s)`);
     renderCatalog(catalog);
   });
   player.on('catalog_updated', ({ catalog }) => {
-    log('Catalog delta applied');
+    const key = catalogKey(catalog);
+    if (key === lastCatalogKey) return;
+    lastCatalogKey = key;
+    log('Catalog changed');
     renderCatalog(catalog);
   });
 

@@ -253,7 +253,7 @@
       <div class="diag-grid" id="diag-grid"></div>
       <div class="diag-charts">
         <div class="chart">
-          <span class="chart-label">e2e latency ms (capture→arrival)
+          <span class="chart-label">e2e latency ms (capture→arrival, needs synced clocks)
             p50 <b id="lat-val">—</b> p95 <b id="lat-p95">—</b></span>
           <canvas id="lat-spark"></canvas>
         </div>
@@ -262,7 +262,7 @@
           <canvas id="jit-spark"></canvas>
         </div>
         <div class="chart">
-          <span class="chart-label">playout cushion ms (buffered−playhead)
+          <span class="chart-label"><span id="cus-label">queued ahead ms</span>
             <b id="cus-val">—</b> target <b id="cus-target">—</b></span>
           <canvas id="cus-spark"></canvas>
         </div>
