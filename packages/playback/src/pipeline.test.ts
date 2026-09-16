@@ -2002,4 +2002,72 @@ describe('PlaybackPipeline', () => {
             expect(decodes.length).toBe(1);
         });
     });
+
+    describe('audio lateness re-anchor', () => {
+        // The reference is set from the first audio frame's transit. Audio
+        // that then stays >100 ms later than that (a publisher clock step, a
+        // transit increase) used to be dropped for the rest of the session
+        // while video kept rendering.
+        const FRAME_US = 21_333;
+        const C0 = 1_000_000_000n;
+
+        function setup() {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            // Production passes lateFrameThresholdMs (100 ms); the standalone default is 500.
+            const sync = new SyncController({
+                driftThresholdUs: DEFAULT_CONFIG.driftThresholdUs, dropThresholdUs: 100_000, clock,
+            });
+            const ctx = createPipeline({ mediaType: 'audio', clock, sync });
+            ctx.pipeline.configure(new Uint8Array([0x01]));
+            ctx.pipeline.pushObject(makeData(0, 0), audioHeaders(C0));
+            ctx.pipeline.tick();
+            let group = 1;
+            // Frame `group` arrives `lateUs` after its reference-mapped time.
+            const push = (lateUs: number) => {
+                clock.set(5_000_000 + group * FRAME_US + lateUs);
+                ctx.pipeline.pushObject(makeData(group, 0), audioHeaders(C0 + BigInt(group * FRAME_US)));
+                ctx.pipeline.tick();
+                group++;
+            };
+            const decodes = () => ctx.commands.filter(c => c.type === 'decode_audio').length;
+            const reanchors = () => ctx.events.filter(e => e.type === 'audio_reanchored');
+            return { ...ctx, clock, push, decodes, reanchors };
+        }
+
+        it('drops a short late run, then re-anchors and resumes decoding', () => {
+            const s = setup();
+            expect(s.sync.hasReference).toBe(true);
+            const before = s.decodes();
+
+            for (let i = 0; i < 10; i++) s.push(150_000);     // ~200 ms of lateness
+            expect(s.decodes()).toBe(before);
+            expect(s.reanchors()).toHaveLength(0);
+
+            for (let i = 0; i < 20; i++) s.push(150_000);
+            expect(s.reanchors()).toHaveLength(1);
+            expect((s.reanchors()[0] as { lateByUs: number }).lateByUs).toBeGreaterThanOrEqual(150_000);
+            // Frames 1..12 dropped, frame 13 re-anchors, 14..30 are on time again.
+            expect(s.decodes()).toBe(before + 18);
+        });
+
+        it('an on-time frame ends the late run (one jittery frame never re-anchors)', () => {
+            const s = setup();
+            for (let i = 0; i < 40; i++) s.push(i % 2 === 0 ? 150_000 : 0);
+            expect(s.reanchors()).toHaveLength(0);
+        });
+
+        it('re-anchors at most once per 2 s', () => {
+            const s = setup();
+            for (let i = 0; i < 13; i++) s.push(150_000);     // first re-anchor
+            expect(s.reanchors()).toHaveLength(1);
+
+            // Another 150 ms step right away: a sustained run, but inside 2 s.
+            for (let i = 0; i < 40; i++) s.push(300_000);     // ~850 ms
+            expect(s.reanchors()).toHaveLength(1);
+
+            for (let i = 0; i < 80; i++) s.push(300_000);     // past 2 s since the first
+            expect(s.reanchors()).toHaveLength(2);
+        });
+    });
 });

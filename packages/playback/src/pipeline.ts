@@ -108,6 +108,18 @@ export class PlaybackPipeline {
     private _lastEmittedRate = 1.0;
 
     /**
+ * Audio lateness run: clock time of the first late-dropped audio frame in
+ * the current run (null when the last frame was on time), and when the
+ * sync reference was last re-anchored from audio.
+ */
+    private _lateAudioSinceUs: number | null = null;
+    private _lastAudioReanchorUs = Number.NEGATIVE_INFINITY;
+    /** Sustained audio lateness before re-anchoring (one jittery frame must not). */
+    private static readonly AUDIO_REANCHOR_AFTER_US = 250_000;
+    /** Minimum spacing between audio re-anchors. */
+    private static readonly AUDIO_REANCHOR_MIN_INTERVAL_US = 2_000_000;
+
+    /**
  * Throttle flag — set by decoder feedback when queue depth is high.
  * While true, tick() evaluates gaps but does NOT drain the buffer.
  * Objects still enter the jitter buffer (needed for gap detection).
@@ -395,6 +407,25 @@ export class PlaybackPipeline {
         this.emitFsmDecision(decision);
     }
 
+    /**
+ * Whether a late audio frame should re-anchor the sync reference instead of
+ * being dropped: only after lateness has persisted for
+ * AUDIO_REANCHOR_AFTER_US, and not more often than
+ * AUDIO_REANCHOR_MIN_INTERVAL_US.
+ */
+    private shouldReanchorAudio(): boolean {
+        const now = this.clock.now();
+        if (this._lateAudioSinceUs === null) {
+            this._lateAudioSinceUs = now;
+            return false;
+        }
+        if (now - this._lateAudioSinceUs < PlaybackPipeline.AUDIO_REANCHOR_AFTER_US) return false;
+        if (now - this._lastAudioReanchorUs < PlaybackPipeline.AUDIO_REANCHOR_MIN_INTERVAL_US) return false;
+        this._lateAudioSinceUs = null;
+        this._lastAudioReanchorUs = now;
+        return true;
+    }
+
     reset(targetGroupId?: bigint): void {
         this.buffer.clear();
         this.headerMap.clear();
@@ -408,6 +439,7 @@ export class PlaybackPipeline {
         this._trackEnded = false;
         this.endedGroups.clear();
         this.activeGroupWaitStartUs = null;
+        this._lateAudioSinceUs = null;
         this.gapDetector.reset();
         this.adaptiveTolerance?.reset();
         const decision = this.decoderState.notifyGap();
@@ -799,12 +831,21 @@ export class PlaybackPipeline {
                     // recomputes timing at decoder output and CanvasRenderer
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = this.clock.now();
+                } else if (this.mediaType === 'audio' && this.shouldReanchorAudio()) {
+                    // The reference was set once, from the first audio frame's
+                    // transit. Audio that stays later than that by more than
+                    // the drop threshold would otherwise be dropped for the
+                    // rest of the session while video keeps rendering.
+                    this.sync.setAudioReference(headers.captureTimestamp);
+                    this.onEvent({ type: 'audio_reanchored', lateByUs: -timing.offsetUs });
+                    renderTimeUs = this.clock.now();
                 } else {
                     return; // Genuinely late and safe to discard — skip
                 }
             } else if (timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
             } else {
+                if (this.mediaType === 'audio') this._lateAudioSinceUs = null;
                 renderTimeUs = timing.renderTimeUs;
             }
         } else {

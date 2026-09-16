@@ -188,7 +188,13 @@ async function main(): Promise<void> {
   const queuedLabel = (): string =>
     player.activeMediaType === 'video' ? 'buffered ahead ms' : 'audio queued ms';
 
+  let lastSyncResets = 0;
   player.on('stats', (s: any) => {
+    const syncResets: number = (player as any).engine?.stats?.loc?.syncResetCount ?? 0;
+    if (syncResets > lastSyncResets) {
+      log(`Sync reference re-anchored (${syncResets} total)`);
+      lastSyncResets = syncResets;
+    }
     const cell = (label: string, v: string) =>
       `<div class="cell">${label}<b>${v}</b></div>`;
     const res = s.resolution ?? s.currentResolution;
@@ -208,6 +214,7 @@ async function main(): Promise<void> {
       cell('audio underruns', String(s.audioUnderruns ?? 0)),
       cell('objects / ts', `${objEvents}/${objEventsWithTs}`),
       cell('gaps', String(s.gapCount ?? 0)),
+      cell('sync resets', String(syncResets)),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
       cell('a/v skew ms', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—'),
     ].join('');

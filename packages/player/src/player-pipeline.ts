@@ -475,6 +475,11 @@ export function handlePipelineEvent(
       }
       break;
     }
+    case 'audio_reanchored':
+      ctx.recordDiagnostic?.('sync_reset');
+      ctx.log.warn('Audio late by %dms for a sustained run — sync reference re-anchored',
+        Math.round(evt.lateByUs / 1000));
+      break;
     case 'catch_up_changed':
       ctx.log.debug('Catch-up %s rate=%.2f latency=%dms target=%dms',
         evt.state.active ? 'active' : 'inactive',
