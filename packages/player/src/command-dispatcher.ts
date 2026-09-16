@@ -192,7 +192,7 @@ export class CommandDispatcher {
     if (this.audioDecoder && this.audioOutput) {
       const audioOutput = this.audioOutput;
       const ad = this.audioDecoder;
-      this.audioDecoder.onData = (data, renderTimeUs) => {
+      this.audioDecoder.onData = (data, renderTimeUs, captureUs) => {
         // Delay unification: audio receives THE SAME playout cushion as the
         // video render-time recompute (getPlaybackDelayUs — adaptive gap
         // timeout with a static floor), applied here so the cushion arrives
@@ -204,7 +204,7 @@ export class CommandDispatcher {
         // the chain runs BEHIND renderTimeUs (rate chase, then a snap that
         // drops queued audio); pinned in webaudio-output.test.ts.
         const cushionUs = this._getPlaybackDelayUs?.() ?? 0;
-        audioOutput.schedule(data, renderTimeUs + cushionUs);
+        audioOutput.schedule(data, renderTimeUs + cushionUs, captureUs);
         this.checkQueuePressure('audio', ad);
       };
     }

@@ -132,6 +132,15 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
     expect(out.playheadCaptureUs()).toBeCloseTo(5_000_000 + 199 * 20_000 + 10_000, 0);
   });
 
+  it('uses the passed capture timestamp over the decoded one (decoder rebasing)', () => {
+    const { ctx, out } = makeOutput();
+    ctx.currentTime = 1.0;
+    // Decoder rebased this buffer to 5.000 s; its real capture time is 9.000 s.
+    out.schedule(audioData(5_000_000), 1_000_000, 9_000_000);
+    ctx.currentTime = 1.010;
+    expect(out.playheadCaptureUs()).toBe(9_010_000);
+  });
+
   it('flush() clears the ring — playhead goes null', () => {
     const { ctx, out } = makeOutput();
     ctx.currentTime = 1.0;

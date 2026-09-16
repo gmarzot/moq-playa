@@ -110,8 +110,12 @@ export interface AudioDecoderLike {
   /** Current decode queue depth. */
   readonly queueDepth: number;
 
-  /** Callback: decoded audio data ready for playout. */
-  onData: ((data: unknown, renderTimeUs: number) => void) | null;
+  /**
+   * Callback: decoded audio data ready for playout. `captureUs` is the
+   * submitted chunk's timestamp: decoders may rebase the output timestamp
+   * (Chrome's AAC decoder emits first-chunk time plus decoded samples).
+   */
+  onData: ((data: unknown, renderTimeUs: number, captureUs?: number) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -163,8 +167,11 @@ export interface VideoRendererLike {
  * Implementations: WebAudio AudioContext, MediaRecorder, NullOutput.
  */
 export interface AudioOutputLike {
-  /** Schedule an audio chunk for playout. */
-  schedule(data: unknown, renderTimeUs: number): void;
+  /**
+   * Schedule an audio chunk for playout. `captureUs`, when given, is the
+   * chunk's capture timestamp; prefer it over the decoded data's own.
+   */
+  schedule(data: unknown, renderTimeUs: number, captureUs?: number): void;
 
   /** Cancel all scheduled audio. */
   flush(): void;

@@ -66,8 +66,8 @@ export class WebAudioOutput implements AudioOutputLike {
    * Scheduled-buffer ring for playhead observability: which capture
    * timestamp is coming out of the speakers right now. One entry per
    * scheduled buffer; pruned lazily once playout passes a buffer's end.
-   * `captureUs` is the decoded AudioData.timestamp — WebCodecs preserves
-   * the EncodedAudioChunk timestamp, which LOC sets to CaptureTimestamp.
+   * `captureUs` is the chunk's CaptureTimestamp as passed to schedule().
+   * AudioData.timestamp is only a fallback: decoders may rebase it.
    */
   private readonly scheduledRing: Array<{
     captureUs: number;
@@ -172,7 +172,7 @@ export class WebAudioOutput implements AudioOutputLike {
    *
    * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for A/V sync)
    */
-  schedule(data: unknown, renderTimeUs: number): void {
+  schedule(data: unknown, renderTimeUs: number, captureTimestampUs?: number): void {
     const audioData = data as AudioData;
 
     // Copy decoded PCM into an AudioBuffer.
@@ -188,7 +188,7 @@ export class WebAudioOutput implements AudioOutputLike {
       audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
     }
     // Capture timeline position of this buffer — read BEFORE close().
-    const captureUs = audioData.timestamp;
+    const captureUs = captureTimestampUs ?? audioData.timestamp;
     audioData.close();
 
     const now = this.audioCtx.currentTime;
