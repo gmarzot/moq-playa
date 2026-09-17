@@ -131,6 +131,11 @@ function namespaceDisplay(ns: string | readonly string[]): string {
   return typeof ns === 'string' ? ns : ns.join('/');
 }
 
+/** Wire bytes as hex, for reporting what a request actually sent. */
+function hexBytes(b: Uint8Array): string {
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
 /**
  * Check if two CMAF codec strings are compatible without changeType().
  * Returns true only if the exact codec string matches — different
@@ -764,6 +769,23 @@ export class MoqtPlayer {
   private _mediaSubsExpected = 0;
   private _mediaSubsOk = 0;
   private _mediaSubsFailed = 0;
+
+  /**
+   * What each media SUBSCRIBE put on the wire, by requestId, so a refusal
+   * can report the exact namespace and track bytes sent. Bounded FIFO.
+   */
+  private readonly mediaSubWire = new Map<bigint, string>();
+  private static readonly MEDIA_SUB_WIRE_MAX = 32;
+
+  /** Remember one SUBSCRIBE's wire detail, evicting the oldest past the cap. */
+  private recordMediaSubWire(requestId: bigint, detail: string): void {
+    this.mediaSubWire.set(requestId, detail);
+    while (this.mediaSubWire.size > MoqtPlayer.MEDIA_SUB_WIRE_MAX) {
+      const oldest = this.mediaSubWire.keys().next();
+      if (oldest.done) break;
+      this.mediaSubWire.delete(oldest.value);
+    }
+  }
 
   /**
    * Active fetches: requestId → track info for routing fetch objects.
@@ -5659,17 +5681,26 @@ export class MoqtPlayer {
           reason: errorReason,
         });
       },
-      onMediaSubscribeOk: (_requestId, _trackName, _mediaType) => {
+      onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
         this._mediaSubsOk++;
+        this.mediaSubWire.delete(requestId);
       },
-      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode) => {
+      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
         this._mediaSubsFailed++;
         this.emitter.emit('track_subscribe_failed', {
           type: 'track_subscribe_failed', trackName, mediaType, requestId, errorCode, reason,
         });
+        // The wire detail travels in the message: this error reaches the
+        // application log without debug logging, and a refusal of a track
+        // another subscriber is receiving needs the exact bytes sent.
+        const wire = this.mediaSubWire.get(requestId);
+        this.mediaSubWire.delete(requestId);
         this.emitError(createPlayerError(
           'degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`,
+          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`
+          + ` reqId=${requestId.toString()}`
+          + (retryInterval !== undefined ? ` retryIn=${retryInterval.toString()}` : '')
+          + (wire !== undefined ? ` ${wire}` : ''),
         ));
         if (this._mediaSubsFailed === this._mediaSubsExpected && this._mediaSubsOk === 0 && this._mediaSubsExpected > 0) {
           this.emitError(createPlayerError(
@@ -6868,6 +6899,11 @@ export class MoqtPlayer {
       // requestId-as-alias optimistic registration) already in place. Adapters
       // that don't invoke the callback fall back to post-await registration.
       const connAtSubscribe = this.connection;
+      const wireDetail = `ns=${namespaceDisplay(this.config.namespace)}`
+        + ` nsFields=${nsBytes.length} nsHex=${nsBytes.map(hexBytes).join('/')}`
+        + ` track="${name}" trackHex=${hexBytes(nameBytes)}`
+        + ` filter=${(mediaOptions as { subscriptionFilter?: { type?: string } }).subscriptionFilter?.type ?? 'default'}`
+        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}`;
       let subRegistered = false;
       const registerMediaSub = (reqIdBigInt: bigint): void => {
         if (subRegistered) return;
@@ -6880,6 +6916,8 @@ export class MoqtPlayer {
         // different alias, the registration is updated in handleControlMessage.
         this.subscriptionManager.registerTrack(reqIdBigInt, name, mediaType, packaging);
         this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
+        this.recordMediaSubWire(reqIdBigInt, wireDetail);
+        this.log.info('SUBSCRIBE media reqId=%s %s', reqIdBigInt.toString(), wireDetail);
       };
       let registeredId: bigint | null = null;
       let reqIdBigInt: bigint;
