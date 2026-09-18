@@ -3158,6 +3158,41 @@ describe('buffered-hole gap-jump', () => {
         expect(stalls[0].durationMs).toBeGreaterThanOrEqual(1_000);
     });
 
+    it('jumps when the playhead parks well short of the range end (field case: 0.6s short, 4.17s hole)', () => {
+        // A stalled playhead stops at the last decodable frame, which can be
+        // a second or more before the range end. Distance to the end must not
+        // gate arming — only the frozen playhead and a hole ahead do.
+        const { video, jumps, check } = gapSetup({
+            ranges: [[132.68, 142.51], [146.68, 150.08]],
+            ct: 141.91,
+        });
+        check(0);
+        check(1_000);
+        expect(video.seekCount).toBe(0);
+
+        check(10_000);     // 4.17s hole → wait capped by gapJumpMs (2s)
+        expect(video.seekCount).toBe(1);
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0].from).toBeCloseTo(141.91, 5);
+        expect(jumps[0].holeSec).toBeCloseTo(4.17, 2);
+    });
+
+    it('a coasting playhead well short of the range end does not arm', () => {
+        const { video, jumps, check } = gapSetup({
+            ranges: [[132.68, 142.51], [146.68, 150.08]],
+            ct: 138.0,
+        });
+        check(0);
+        video.currentTime = 138.25;   // still playing
+        video.seekCount = 0;          // the mock counts our own writes as seeks
+        check(1_000);
+        video.currentTime = 138.5;
+        video.seekCount = 0;
+        check(10_000);
+        expect(video.seekCount).toBe(0);
+        expect(jumps).toHaveLength(0);
+    });
+
     it('commit-before-publish: a throwing onStall listener does not prevent the seek or onGapJump', () => {
         const { adapter, video, jumps, check } = gapSetup();
         adapter.onStall = () => { throw new Error('listener bug'); };

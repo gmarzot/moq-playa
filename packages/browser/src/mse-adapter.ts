@@ -656,8 +656,6 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly GAP_JUMP_WAIT_PER_HOLE_SEC_MS = 2_000;
   /** A jump whose landing never progresses escalates to a fatal after this. */
   private static readonly GAP_LANDING_FATAL_MS = 10_000;
-  /** Playhead must be this close to its range's end to count as "at the hole". */
-  private static readonly GAP_EDGE_WINDOW_SEC = 0.5;
   /** Playhead movement below this is "stuck" (gap detection only). */
   private static readonly GAP_MOVE_TOLERANCE_SEC = 0.05;
   /** Candidate identity comparison tolerance (never float equality). */
@@ -2064,14 +2062,18 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
 
-    // Only the proven shape arms: inside a range, near its end, with a hole
-    // and more buffered media ahead. (Outside-every-range states also match
+    // Only the proven shape arms: inside a range, with a hole and more
+    // buffered media ahead. (Outside-every-range states also match
     // startup/reset/eviction/user seeks — deliberately excluded.)
+    //
+    // Distance to the range end is NOT a condition: a stalled playhead parks
+    // wherever the last decodable frame left it, which can be a second or
+    // more short of the range end. The frozen-playhead proof below is what
+    // separates a real park from a coasting playhead, and candidate identity
+    // includes curEnd, so a still-growing current range restarts the wait.
     const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
     const holeSec = curEnd !== null && nextStart !== null ? nextStart - curEnd : 0;
-    const atHole = curEnd !== null && nextStart !== null
-      && curEnd - ct < MseMediaSource.GAP_EDGE_WINDOW_SEC
-      && holeSec > tol;
+    const atHole = curEnd !== null && nextStart !== null && holeSec > tol;
     if (!atHole) {
       this.disarmGap();
       return;
