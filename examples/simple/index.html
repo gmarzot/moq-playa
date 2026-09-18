@@ -133,11 +133,9 @@
     .chart-label b { color: #4d4; font-variant-numeric: tabular-nums; }
     .chart-label b.ser-v { color: #6cf; }
     .chart-label b.ser-a { color: #fb7; }
-    .legend {
-      margin: 2px 0 0; color: #7d8798; font-size: .78rem; line-height: 1.5;
-      max-width: 92ch;
-    }
-    .legend b { color: #9aa6ba; font-weight: 600; }
+    /* Each chart carries its explanation in a title tooltip. */
+    .chart { cursor: help; }
+    .chart .chart-label { border-bottom: 1px dotted #444a58; padding-bottom: 2px; }
     .chart canvas {
       width: 100%; height: 56px; background: #161622;
       border-radius: 6px; display: block; margin-top: 4px;
@@ -259,35 +257,26 @@
     <div class="diag">
       <div class="diag-grid" id="diag-grid"></div>
       <div class="diag-charts">
-        <div class="chart">
-          <span class="chart-label">e2e latency ms (capture→arrival, needs synced clocks)
+        <div class="chart" title="End-to-end latency, per video object: the publisher's capture stamp subtracted from its arrival time in this page. p50 and p95 over the last 180 objects.&#10;&#10;Exact when the publisher and the browser share a clock. Across machines (browser on Windows, publisher in WSL) any NTP offset shows up as a constant bias, and samples landing before their own capture stamp are reported as 'clock skew' instead of latency.&#10;&#10;It measures delivery only — the playout cushion, decode and paint are not in it.">
+          <span class="chart-label">e2e latency ms
             p50 <b id="lat-val">—</b> p95 <b id="lat-p95">—</b></span>
           <canvas id="lat-spark"></canvas>
         </div>
-        <div class="chart">
+        <div class="chart" title="RFC 3550 interarrival jitter: how much the spacing between arrivals differs from the spacing between their capture stamps, smoothed by 1/16.&#10;&#10;Clock offset cancels out here, so this is trustworthy across machines. It rises with network bursts — and also when this page's main thread stalls, because arrival is stamped in JavaScript.">
           <span class="chart-label">interarrival jitter ms (RFC 3550) <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
-        <div class="chart">
+        <div class="chart" title="Media ready to play at the playhead: on CMAF the buffered range ahead in MSE, on LOC the audio scheduled in WebAudio.&#10;&#10;Dashed line is the catalog's target latency. Red marks are stalls.&#10;&#10;On CMAF this is the INTERSECTION of the video and audio buffers, so a single low number does not say which track ran dry — the track buffer chart does.">
           <span class="chart-label"><span id="cus-label">queued ahead ms</span>
             <b id="cus-val">—</b> target <b id="cus-target">—</b></span>
           <canvas id="cus-spark"></canvas>
         </div>
-        <div class="chart">
+        <div class="chart" title="The same depth, split per track, on one shared scale. Blue is video, orange is audio.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: blue is decoded video waiting for its render time, orange is audio scheduled in WebAudio.&#10;&#10;The two lines should move together. When they diverge, one track is being delivered or decoded more slowly than the other: the deeper one keeps playing while the shallower one approaches empty. That is what audio/video desync looks like before it becomes a stall — the player waits for the starved track, and the gap between the lines is roughly how far apart the two tracks have drifted.">
           <span class="chart-label">track buffer ms —
             <b id="bufv-val" class="ser-v">video</b> / <b id="bufa-val" class="ser-a">audio</b></span>
           <canvas id="buf-spark"></canvas>
         </div>
       </div>
-      <p class="legend">
-        <b>e2e latency</b>: publisher capture stamp → arrival in this page. Only
-        meaningful when the two clocks agree; on one box it is exact.
-        <b>jitter</b>: variation in arrival spacing after removing capture spacing.
-        <b>queued ahead</b>: media ready to play — MSE buffered ahead of the playhead
-        on CMAF, scheduled audio on LOC.
-        <b>track buffer</b>: the same, per track — video and audio separately, so one
-        running dry is visible before it stalls.
-      </p>
     </div>
 
     <pre id="log"></pre>
