@@ -35,6 +35,7 @@ const cusVal = document.getElementById('cus-val')!;
 const cusTarget = document.getElementById('cus-target')!;
 const cusLabel = document.getElementById('cus-label')!;
 const bufSpark = document.getElementById('buf-spark') as HTMLCanvasElement;
+const bufDVal = document.getElementById('bufd-val')!;
 const bufVVal = document.getElementById('bufv-val')!;
 const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
@@ -245,8 +246,7 @@ async function main(): Promise<void> {
   // from the engine's buffer-depth stat. Starvation (cushion ≈ 0 at a
   // stall marker) points at the player; a healthy cushion points wire-ward.
   const cushionSamples: number[] = [];
-  const bufVSamples: number[] = [];
-  const bufASamples: number[] = [];
+  const bufSkewSamples: number[] = [];
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
   let prevArrivalMs = 0;
@@ -355,28 +355,34 @@ async function main(): Promise<void> {
     ctx.stroke();
   }
 
-  /** Two series on one scale — comparing depths only works on a shared axis. */
-  function drawSpark2(canvas: HTMLCanvasElement, a: number[], aColor: string,
-                      b: number[], bColor: string): void {
+  /** Signed series around a zero rule: only the divergence is the signal. */
+  function drawDelta(canvas: HTMLCanvasElement, data: number[]): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const w = canvas.width = canvas.clientWidth * devicePixelRatio;
     const h = canvas.height = canvas.clientHeight * devicePixelRatio;
     ctx.clearRect(0, 0, w, h);
-    const max = Math.max(1, ...a, ...b) * 1.15;
-    const series: Array<[number[], string]> = [[a, aColor], [b, bColor]];
-    for (const [data, color] of series) {
-      if (data.length < 2) continue;
-      ctx.beginPath();
-      data.forEach((v, i) => {
-        const x = (i / (data.length - 1)) * w;
-        const y = h - (v / max) * (h - 6) - 3;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      });
-      ctx.strokeStyle = color;
-      ctx.lineWidth = devicePixelRatio;
-      ctx.stroke();
-    }
+    const zeroY = h / 2;
+    ctx.beginPath();
+    ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
+    ctx.moveTo(0, zeroY);
+    ctx.lineTo(w, zeroY);
+    ctx.strokeStyle = '#667';
+    ctx.lineWidth = devicePixelRatio;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (data.length < 2) return;
+    // A floor on the scale keeps normal ±ms wobble from looking like drift.
+    const span = Math.max(100, ...data.map(Math.abs)) * 1.15;
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = (i / (data.length - 1)) * w;
+      const y = zeroY - (v / span) * (h / 2 - 3);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = '#8be';
+    ctx.lineWidth = devicePixelRatio;
+    ctx.stroke();
   }
 
   setInterval(() => {
@@ -407,15 +413,16 @@ async function main(): Promise<void> {
     const aMs = byKind ? byKind.audio
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
-    if (player.state !== 'idle') {
-      pushSample(bufVSamples, vMs ?? 0);
-      pushSample(bufASamples, aMs ?? 0);
+    if (player.state !== 'idle' && vMs != null && aMs != null) {
+      pushSample(bufSkewSamples, vMs - aMs);
     }
 
     drawSpark(latSpark, latSamples, '#4d4');
     drawSpark(jitSpark, jitSamples, '#da4');
     drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
-    drawSpark2(bufSpark, bufVSamples, '#6cf', bufASamples, '#fb7');
+    drawDelta(bufSpark, bufSkewSamples);
+    bufDVal.textContent = (vMs != null && aMs != null)
+      ? `${vMs - aMs >= 0 ? '+' : ''}${(vMs - aMs).toFixed(0)}` : '—';
     bufVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
     bufAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVal.textContent = cushionSamples.length

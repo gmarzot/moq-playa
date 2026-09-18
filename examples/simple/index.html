@@ -271,9 +271,9 @@
             <b id="cus-val">—</b> target <b id="cus-target">—</b></span>
           <canvas id="cus-spark"></canvas>
         </div>
-        <div class="chart" title="The same depth, split per track, on one shared scale. Blue is video, orange is audio.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: blue is decoded video waiting for its render time, orange is audio scheduled in WebAudio.&#10;&#10;The two lines should move together. When they diverge, one track is being delivered or decoded more slowly than the other: the deeper one keeps playing while the shallower one approaches empty. That is what audio/video desync looks like before it becomes a stall — the player waits for the starved track, and the gap between the lines is roughly how far apart the two tracks have drifted.">
-          <span class="chart-label">track buffer ms —
-            <b id="bufv-val" class="ser-v">video</b> / <b id="bufa-val" class="ser-a">audio</b></span>
+        <div class="chart" title="How far apart the two tracks' buffers are: video depth minus audio depth. The line sits on the dashed zero rule while both tracks keep up — that is why it looks flat even though the depths themselves move.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: decoded video waiting for its render time, against audio scheduled in WebAudio.&#10;&#10;Above zero means video is deeper, i.e. audio is the track running short; below zero is the reverse. The size of the excursion is roughly how far the two tracks have drifted apart. Sustained divergence is audio/video desync before it becomes a stall, because the player ends up waiting for the starved track.&#10;&#10;'buffered ahead' cannot show this: on CMAF it is the intersection of both buffers.">
+          <span class="chart-label">track skew ms (video − audio) <b id="bufd-val">—</b>
+            · v <b id="bufv-val" class="ser-v">—</b> / a <b id="bufa-val" class="ser-a">—</b></span>
           <canvas id="buf-spark"></canvas>
         </div>
       </div>
