@@ -215,7 +215,9 @@ async function main(): Promise<void> {
       // Why audio underran: dropped late before decode / snapped by the output clamp.
       cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
         + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`),
-      cell('gaps', String(s.gapCount ?? 0)),
+      // Breaks in the (group, object) sequence per track — the only view of a
+      // frame missing inside a buffered range.
+      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`),
       cell('sync resets', String(syncResets)),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
       cell('a/v skew ms', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—'),
@@ -258,7 +260,32 @@ async function main(): Promise<void> {
     return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0;
   };
 
+  // Per-track object continuity: a stall with data still ahead of the playhead
+  // means a frame is missing inside the buffered range, which only shows up as
+  // a break in the (group, object) sequence.
+  const objSeq: Record<string, { group: bigint; object: bigint }> = {};
+  const objBreaks: Record<string, number> = { video: 0, audio: 0 };
+  const noteObject = (e: any): void => {
+    const t = e.mediaType;
+    if ((t !== 'video' && t !== 'audio') || e.kind !== 'data') return;
+    if (e.group === undefined || e.object === undefined) return;
+    const group = BigInt(e.group), object = BigInt(e.object);
+    const prev = objSeq[t];
+    if (prev) {
+      const sameGroup = group === prev.group;
+      const contiguous = sameGroup
+        ? object === prev.object + 1n
+        : group === prev.group + 1n && object === 0n;
+      if (!contiguous) {
+        objBreaks[t] = (objBreaks[t] ?? 0) + 1;
+        log(`obj break [${t}]: ${prev.group}.${prev.object} -> ${group}.${object}`);
+      }
+    }
+    objSeq[t] = { group, object };
+  };
+
   (player as any).on('media_object', (e: any) => {
+    noteObject(e);
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
     const arrivalMs = performance.now();
