@@ -1246,6 +1246,27 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
+   * Media buffered ahead of the playhead per track, in ms. `video.buffered`
+   * is the INTERSECTION of the SourceBuffers, so one track running dry is
+   * invisible there; these are the individual depths.
+   */
+  getBufferAheadMsByKind(): { video: number | null; audio: number | null } {
+    const ct = this.video.currentTime;
+    const ahead = (sb: SourceBuffer | null): number | null => {
+      if (!sb) return null;
+      let ranges: TimeRanges;
+      try { ranges = sb.buffered; } catch { return null; }
+      for (let i = 0; i < ranges.length; i++) {
+        if (ct >= ranges.start(i) && ct <= ranges.end(i)) {
+          return Math.max(0, ranges.end(i) - ct) * 1000;
+        }
+      }
+      return ranges.length ? 0 : null;
+    };
+    return { video: ahead(this.videoBuffer), audio: ahead(this.audioBuffer) };
+  }
+
+  /**
    * Get the committed group floor for a (mediaType, trackName) pair.
    * Returns undefined if no group has been committed yet.
    */

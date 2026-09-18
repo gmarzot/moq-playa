@@ -105,22 +105,22 @@
 
     /* Diagnostics strip — always visible beneath the playback window */
     .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
-    /* One row, always: cells share the width and never wrap */
+    /* Wraps into as many rows as it needs: a truncated label or value is
+       worse than a taller strip. */
     .diag-grid {
-      display: flex; flex-wrap: nowrap; gap: 6px 14px; overflow: hidden;
+      display: grid; gap: 10px 16px;
+      grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
       font-variant-numeric: tabular-nums;
     }
-    .diag-grid .cell { flex: 1 1 0; min-width: 0; }
-    .diag-grid .cell, .diag-grid .cell b {
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
     .diag-grid .cell {
-      color: #778; text-transform: uppercase; letter-spacing: .04em;
-      font-size: .78rem;
+      min-width: 0;
+      color: #8a94a6; text-transform: uppercase; letter-spacing: .04em;
+      font-size: .72rem; line-height: 1.25;
     }
     .diag-grid .cell b {
-      display: block; color: #ddd; font-weight: 600; font-size: 1.05rem;
-      text-transform: none; letter-spacing: 0;
+      display: block; color: #e8e8f0; font-weight: 600; font-size: 1.05rem;
+      text-transform: none; letter-spacing: 0; white-space: nowrap;
+      margin-top: 3px;
     }
     .diag-charts {
       display: grid; gap: 16px;
@@ -131,6 +131,13 @@
       letter-spacing: .04em;
     }
     .chart-label b { color: #4d4; font-variant-numeric: tabular-nums; }
+    .chart-label b.ser-v { color: #6cf; }
+    .chart-label b.ser-a { color: #fb7; }
+    .legend {
+      margin: 2px 0 0; color: #7d8798; font-size: .78rem; line-height: 1.5;
+      max-width: 92ch;
+    }
+    .legend b { color: #9aa6ba; font-weight: 600; }
     .chart canvas {
       width: 100%; height: 56px; background: #161622;
       border-radius: 6px; display: block; margin-top: 4px;
@@ -266,7 +273,21 @@
             <b id="cus-val">—</b> target <b id="cus-target">—</b></span>
           <canvas id="cus-spark"></canvas>
         </div>
+        <div class="chart">
+          <span class="chart-label">track buffer ms —
+            <b id="bufv-val" class="ser-v">video</b> / <b id="bufa-val" class="ser-a">audio</b></span>
+          <canvas id="buf-spark"></canvas>
+        </div>
       </div>
+      <p class="legend">
+        <b>e2e latency</b>: publisher capture stamp → arrival in this page. Only
+        meaningful when the two clocks agree; on one box it is exact.
+        <b>jitter</b>: variation in arrival spacing after removing capture spacing.
+        <b>queued ahead</b>: media ready to play — MSE buffered ahead of the playhead
+        on CMAF, scheduled audio on LOC.
+        <b>track buffer</b>: the same, per track — video and audio separately, so one
+        running dry is visible before it stalls.
+      </p>
     </div>
 
     <pre id="log"></pre>

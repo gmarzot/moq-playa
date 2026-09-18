@@ -34,6 +34,9 @@ const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
 const cusVal = document.getElementById('cus-val')!;
 const cusTarget = document.getElementById('cus-target')!;
 const cusLabel = document.getElementById('cus-label')!;
+const bufSpark = document.getElementById('buf-spark') as HTMLCanvasElement;
+const bufVVal = document.getElementById('bufv-val')!;
+const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const jitVal = document.getElementById('jit-val')!;
@@ -242,6 +245,8 @@ async function main(): Promise<void> {
   // from the engine's buffer-depth stat. Starvation (cushion ≈ 0 at a
   // stall marker) points at the player; a healthy cushion points wire-ward.
   const cushionSamples: number[] = [];
+  const bufVSamples: number[] = [];
+  const bufASamples: number[] = [];
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
   let prevArrivalMs = 0;
@@ -350,6 +355,30 @@ async function main(): Promise<void> {
     ctx.stroke();
   }
 
+  /** Two series on one scale — comparing depths only works on a shared axis. */
+  function drawSpark2(canvas: HTMLCanvasElement, a: number[], aColor: string,
+                      b: number[], bColor: string): void {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+    const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+    ctx.clearRect(0, 0, w, h);
+    const max = Math.max(1, ...a, ...b) * 1.15;
+    const series: Array<[number[], string]> = [[a, aColor], [b, bColor]];
+    for (const [data, color] of series) {
+      if (data.length < 2) continue;
+      ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = (i / (data.length - 1)) * w;
+        const y = h - (v / max) * (h - 6) - 3;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = devicePixelRatio;
+      ctx.stroke();
+    }
+  }
+
   setInterval(() => {
     watchVideo();
     if (debug) {
@@ -369,9 +398,26 @@ async function main(): Promise<void> {
         while (stallMarks.length && stallMarks[0]! < 0) stallMarks.shift();
       }
     }
+    // Per-track buffer: MSE SourceBuffers on CMAF; on LOC the renderer's
+    // queued video against the audio output's scheduled audio.
+    const eng = (player as any).engine;
+    const byKind = eng?.mediaSource?.getBufferAheadMsByKind?.();
+    const vMs = byKind ? byKind.video
+      : ((player as any).renderer?.queuedAheadMs ?? null);
+    const aMs = byKind ? byKind.audio
+      : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
+        ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
+    if (player.state !== 'idle') {
+      pushSample(bufVSamples, vMs ?? 0);
+      pushSample(bufASamples, aMs ?? 0);
+    }
+
     drawSpark(latSpark, latSamples, '#4d4');
     drawSpark(jitSpark, jitSamples, '#da4');
     drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
+    drawSpark2(bufSpark, bufVSamples, '#6cf', bufASamples, '#fb7');
+    bufVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
+    bufAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVal.textContent = cushionSamples.length
       ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';

@@ -132,6 +132,19 @@ export class CanvasRenderer implements VideoRendererLike {
     this.queue.push({ frame: frame as VideoFrame, renderTimeUs });
   }
 
+  /** Decoded video held for presentation: newest queued render time ahead of now, in ms. */
+  get queuedAheadMs(): number | null {
+    if (this.queue.length === 0) return null;
+    let newest = this.queue[0]!.renderTimeUs;
+    for (const e of this.queue) if (e.renderTimeUs > newest) newest = e.renderTimeUs;
+    return Math.max(0, (newest - this.clock.now()) / 1000);
+  }
+
+  /** Decoded frames waiting for their render time. */
+  get queueLength(): number {
+    return this.queue.length;
+  }
+
   /**
    * Render tick — call from the render loop or manually.
    *
