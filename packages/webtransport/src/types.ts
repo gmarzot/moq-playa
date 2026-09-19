@@ -64,6 +64,14 @@ export interface WebTransportLike {
    */
   readonly setupOptions?: MoqtSetupRouting;
 
+  /**
+   * Connection statistics, where the implementation has them: RTT, packet
+   * loss, send rate, stream and datagram counts. Optional — native QUIC
+   * adapters and test doubles may not implement it.
+   * @see W3C WebTransport §5.4 (WebTransportConnectionStats)
+   */
+  getStats?(): Promise<Record<string, unknown>>;
+
   /** Open a new client-initiated bidirectional stream. */
   createBidirectionalStream(): Promise<WebTransportBidirectionalStream>;
 

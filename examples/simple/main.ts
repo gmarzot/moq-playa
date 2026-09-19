@@ -28,6 +28,8 @@ const muteBtn = document.getElementById('mute-btn') as HTMLButtonElement;
 const qualitySelect = document.getElementById('quality') as HTMLSelectElement;
 const stateBadge = document.getElementById('state')!;
 const diagGrid = document.getElementById('diag-grid')!;
+const advGrid = document.getElementById('adv-grid')!;
+const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
 const latSpark = document.getElementById('lat-spark') as HTMLCanvasElement;
 const jitSpark = document.getElementById('jit-spark') as HTMLCanvasElement;
 const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
@@ -211,11 +213,9 @@ async function main(): Promise<void> {
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
     diagGrid.innerHTML = [
-      cell('state', player.state),
       cell('ttff ms', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—'),
-      // Codec is in the catalog panel; the decoded resolution is not, and it
-      // is what the stream actually delivered rather than what it claimed.
       cell('resolution', res ? `${res.width}x${res.height}` : '—'),
+      cell('codec', s.videoCodec ?? s.currentVideoCodec ?? '—'),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
       cell('rendered / decoded',
@@ -430,8 +430,61 @@ async function main(): Promise<void> {
     ctx.stroke();
   }
 
+  // ── Transport panel (QUIC/WebTransport) ───────────────────────────
+  // Polled only while the panel is open. Chrome reports these on the
+  // WebTransport object; native QUIC adapters and other browsers may not,
+  // in which case the panel says so rather than showing zeros.
+  let prevWtBytes = 0;
+  let prevWtAtMs = 0;
+  const advCell = (label: string, v: string) =>
+    `<div class="cell">${label}:<b>${v}</b></div>`;
+  const renderTransport = async (): Promise<void> => {
+    if (!advPanel.open) return;
+    const conn = (player as any).engine?.connection;
+    const st = await conn?.getTransportStats?.();
+    if (!st) {
+      advGrid.innerHTML = advCell('transport stats',
+        conn ? 'not reported by this transport' : 'not connected');
+      return;
+    }
+    const num = (k: string): number | undefined => st[k];
+    const ms = (k: string) => (num(k) != null ? `${num(k)!.toFixed(1)} ms` : '—');
+    const lost = num('packetsLost') ?? 0;
+    const rcvd = num('packetsReceived') ?? 0;
+    const lossPct = rcvd + lost > 0 ? (lost / (rcvd + lost)) * 100 : 0;
+    const bytes = num('bytesReceived') ?? 0;
+    const nowMs = performance.now();
+    // Wire goodput, which includes every stream and MOQT overhead — not the
+    // media bitrate the catalog advertises.
+    const goodputMbps = prevWtAtMs && bytes > prevWtBytes
+      ? ((bytes - prevWtBytes) * 8) / ((nowMs - prevWtAtMs) * 1000)
+      : 0;
+    prevWtBytes = bytes; prevWtAtMs = nowMs;
+    const cells = [
+      advCell('rtt smoothed', ms('smoothedRtt')),
+      advCell('rtt min', ms('minRtt')),
+      advCell('rtt variation', ms('rttVariation')),
+      advCell('packets lost', `${lost} (${lossPct.toFixed(2)}%)`),
+      advCell('packets rx / tx', `${rcvd} / ${num('packetsSent') ?? 0}`),
+      advCell('bytes rx', `${(bytes / 1e6).toFixed(1)} MB`),
+      advCell('goodput', `${goodputMbps.toFixed(2)} Mbps`),
+      advCell('est send rate', num('estimatedSendRate') != null
+        ? `${(num('estimatedSendRate')! / 1e6).toFixed(2)} Mbps` : '—'),
+      advCell('streams in / out',
+        `${num('numIncomingStreamsCreated') ?? 0} / ${num('numOutgoingStreamsCreated') ?? 0}`),
+    ];
+    // Datagram counters only exist once a datagram has moved.
+    for (const k of Object.keys(st)) {
+      if (k.startsWith('datagrams.')) cells.push(advCell(k.slice(10), String(st[k])));
+    }
+    advGrid.innerHTML = cells.join('');
+  };
+  advPanel.addEventListener('toggle', () => { void renderTransport(); });
+
+  let advTick = 0;
   setInterval(() => {
     watchVideo();
+    if (++advTick % 4 === 0) void renderTransport();
     if (debug) {
       // The MSE adapter exists only after the catalog; enable its tracing
       // once it appears (console output).

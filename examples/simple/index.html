@@ -144,6 +144,14 @@
     /* Per-track depths pinned right so a changing skew value never shifts them. */
     .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
     .chart-label .right { white-space: nowrap; }
+    .adv { margin-top: 4px; }
+    .adv > summary {
+      cursor: pointer; color: #8a94a6; font-size: .72rem;
+      text-transform: uppercase; letter-spacing: .04em; padding: 4px 0;
+    }
+    .adv > summary:hover { color: #b8c2d0; }
+    .adv[open] > summary { color: #b8c2d0; }
+    .adv .diag-grid { padding: 6px 0 2px; }
     /* Each chart carries its explanation in a title tooltip. */
     .chart { cursor: help; }
     .chart .chart-label { border-bottom: 1px dotted #444a58; padding-bottom: 2px; }
@@ -288,6 +296,10 @@
           <canvas id="cus-spark"></canvas>
         </div>
       </div>
+      <details class="adv" id="adv-panel">
+        <summary>transport (QUIC / WebTransport)</summary>
+        <div class="diag-grid" id="adv-grid"></div>
+      </details>
     </div>
 
     <pre id="log"></pre>

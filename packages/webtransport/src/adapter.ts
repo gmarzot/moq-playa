@@ -313,6 +313,37 @@ export class MoqtConnection {
     return this.session.draftVersion;
   }
 
+  /**
+   * Transport statistics as the implementation reports them — RTT, loss,
+   * send rate, stream and datagram counts — flattened to numbers one level
+   * deep (`datagrams.expiredOutgoing` becomes `datagrams.expiredOutgoing`).
+   * Null when the transport has no getStats() or the call fails, which is
+   * the normal case for native QUIC adapters and test doubles.
+   */
+  async getTransportStats(): Promise<Record<string, number> | null> {
+    const t = this.transport;
+    if (!t?.getStats) return null;
+    let raw: Record<string, unknown>;
+    try {
+      raw = await t.getStats();
+    } catch {
+      return null;
+    }
+    const out: Record<string, number> = {};
+    const take = (k: string, v: unknown): void => {
+      if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+      else if (typeof v === 'bigint') out[k] = Number(v);
+    };
+    for (const [k, v] of Object.entries(raw ?? {})) {
+      if (v && typeof v === 'object') {
+        for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) take(`${k}.${k2}`, v2);
+      } else {
+        take(k, v);
+      }
+    }
+    return out;
+  }
+
   /** Wire format codec for the active negotiated draft version. Set by {@link configureForVersion}. */
   private codec!: ControlCodec;
 
