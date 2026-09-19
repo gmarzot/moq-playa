@@ -260,7 +260,11 @@ async function main(): Promise<void> {
   // separates network jitter from the publisher's own pacing. Without
   // capture timestamps it degrades to arrival-interval deviation.
 
-  const latSamples: number[] = [];
+  // Raw per-object latency with arrival times, trimmed to a window. The chart
+  // series below are filled on the 250 ms tick instead of per object, so all
+  // four charts share one time axis (180 samples = 45 s) and features line up.
+  const latWindow: Array<[number, number]> = [];
+  const LAT_WINDOW_MS = 4_000;
   const latP50Samples: number[] = [];
   const latP95Samples: number[] = [];
   const jitSamples: number[] = [];
@@ -349,10 +353,9 @@ async function main(): Promise<void> {
       // D = (Rj - Ri) - (Sj - Si);  J += (|D| - J) / 16
       const d = (arrivalMs - prevArrivalMs) - (captureMs - prevCaptureMs);
       jitterEwma += (Math.abs(d) - jitterEwma) / 16;
-      pushSample(jitSamples, jitterEwma);
     } else if (prevArrivalMs) {
       const interval = arrivalMs - prevArrivalMs;
-      if (expectedIntervalMs) pushSample(jitSamples, Math.abs(interval - expectedIntervalMs));
+      if (expectedIntervalMs) jitterEwma = Math.abs(interval - expectedIntervalMs);
       expectedIntervalMs = expectedIntervalMs
         ? expectedIntervalMs * 0.9 + interval * 0.1 : interval;
     }
@@ -363,12 +366,9 @@ async function main(): Promise<void> {
       const latencyMs = Date.now() - captureMs;
       if (latencyMs < -250) skewSamples++;
       else if (latencyMs < 30_000) {
-        pushSample(latSamples, latencyMs);
-        // Rolling percentiles over a short trailing window: the raw per-object
-        // series is mostly noise, while p50 against p95 shows the tail moving.
-        const win = latSamples.slice(-40);
-        pushSample(latP50Samples, percentile(win, 0.5));
-        pushSample(latP95Samples, percentile(win, 0.95));
+        const now = performance.now();
+        latWindow.push([now, latencyMs]);
+        while (latWindow.length && now - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
       }
     }
   });
@@ -547,6 +547,14 @@ async function main(): Promise<void> {
       pushSample(bufSkewSamples, vMs - aMs);
     }
 
+    // Sample the measurements onto the shared time axis before drawing.
+    const latVals = latWindow.map(([, v]) => v);
+    if (latVals.length) {
+      pushSample(latP50Samples, percentile(latVals, 0.5));
+      pushSample(latP95Samples, percentile(latVals, 0.95));
+    }
+    if (prevCaptureMs || expectedIntervalMs) pushSample(jitSamples, jitterEwma);
+
     drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
     drawSpark(jitSpark, jitSamples, '#d9922e');
     drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
@@ -569,9 +577,9 @@ async function main(): Promise<void> {
       cushionDiffers ? `cushion: ${cushionNow!.toFixed(0)}` : '',
       rateNow !== 1 ? `rate: ${rateNow.toFixed(2)}×` : '',
     ].filter(Boolean).join('  ');
-    if (latSamples.length) {
-      latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
-      latP95.textContent = percentile(latSamples, 0.95).toFixed(0);
+    if (latVals.length) {
+      latVal.textContent = percentile(latVals, 0.5).toFixed(0);
+      latP95.textContent = percentile(latVals, 0.95).toFixed(0);
     } else if (skewSamples) {
       // Every sample landed before its own capture stamp: the clocks
       // disagree, so the difference is offset, not latency.
