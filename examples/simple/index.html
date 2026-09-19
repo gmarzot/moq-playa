@@ -107,13 +107,14 @@
     .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
     /* Wraps into as many rows as it needs: a truncated label or value is
        worse than a taller strip. */
+    /* Flex, not grid: a wrapped row grows to fill the width, so a second row
+       is evenly distributed instead of leaving an orphan cell. */
     .diag-grid {
-      display: grid; gap: 14px 20px;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      display: flex; flex-wrap: wrap; gap: 14px 20px;
       font-variant-numeric: tabular-nums;
     }
     .diag-grid .cell {
-      min-width: 0;
+      flex: 1 1 150px; min-width: 150px;
       color: #8a94a6; text-transform: uppercase; letter-spacing: .04em;
       font-size: .72rem; line-height: 1.25;
     }
@@ -261,21 +262,21 @@
       <div class="diag-grid" id="diag-grid"></div>
       <div class="diag-charts">
         <div class="chart" title="End-to-end latency, per video object: the publisher's capture stamp subtracted from its arrival time in this page. p50 and p95 over the last 180 objects.&#10;&#10;Exact when the publisher and the browser share a clock. Across machines (browser on Windows, publisher in WSL) any NTP offset shows up as a constant bias, and samples landing before their own capture stamp are reported as 'clock skew' instead of latency.&#10;&#10;It measures delivery only — the playout cushion, decode and paint are not in it.">
-          <span class="chart-label">e2e latency ms
-            p50 <b id="lat-val">—</b> p95 <b id="lat-p95">—</b></span>
+          <span class="chart-label">e2e latency ms —
+            p50: <b id="lat-val">—</b> p95: <b id="lat-p95">—</b></span>
           <canvas id="lat-spark"></canvas>
         </div>
         <div class="chart" title="RFC 3550 interarrival jitter: how much the spacing between arrivals differs from the spacing between their capture stamps, smoothed by 1/16.&#10;&#10;Clock offset cancels out here, so this is trustworthy across machines. It rises with network bursts — and also when this page's main thread stalls, because arrival is stamped in JavaScript.">
-          <span class="chart-label">interarrival jitter ms (RFC 3550) <b id="jit-val">—</b></span>
+          <span class="chart-label">interarrival jitter ms (RFC 3550): <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
         <div class="chart" title="Media ready to play at the playhead: on CMAF the buffered range ahead in MSE, on LOC the audio scheduled in WebAudio.&#10;&#10;Dashed line is the catalog's target latency. Red marks are stalls.&#10;&#10;On CMAF this is the INTERSECTION of the video and audio buffers, so a single low number does not say which track ran dry — the track buffer chart does.">
-          <span class="chart-label"><span id="cus-label">queued ahead ms</span>
-            <b id="cus-val">—</b> target <b id="cus-target">—</b></span>
+          <span class="chart-label"><span id="cus-label">queued ahead ms</span>:
+            <b id="cus-val">—</b> target: <b id="cus-target">—</b></span>
           <canvas id="cus-spark"></canvas>
         </div>
         <div class="chart" title="How far apart the two tracks' buffers are: video depth minus audio depth. The line sits on the dashed zero rule while both tracks keep up — that is why it looks flat even though the depths themselves move.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: decoded video waiting for its render time, against audio scheduled in WebAudio.&#10;&#10;Above zero means video is deeper, i.e. audio is the track running short; below zero is the reverse. The size of the excursion is roughly how far the two tracks have drifted apart. Sustained divergence is audio/video desync before it becomes a stall, because the player ends up waiting for the starved track.&#10;&#10;'buffered ahead' cannot show this: on CMAF it is the intersection of both buffers.">
-          <span class="chart-label split">skew ms <b id="bufd-val">—</b>
+          <span class="chart-label split"><span>skew ms: <b id="bufd-val">—</b></span>
             <span class="right">A: <b id="bufa-val" class="ser-a">—</b> / V: <b id="bufv-val" class="ser-v">—</b></span></span>
           <canvas id="buf-spark"></canvas>
         </div>

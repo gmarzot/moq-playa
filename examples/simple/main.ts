@@ -200,7 +200,11 @@ async function main(): Promise<void> {
       lastSyncResets = syncResets;
     }
     const cell = (label: string, v: string) =>
-      `<div class="cell">${label}<b>${v}</b></div>`;
+      `<div class="cell">${label}:<b>${v}</b></div>`;
+    const playbackRate = (): string => {
+      const v = playerContainer.querySelector('video');
+      return v ? v.playbackRate.toFixed(2) : '—';
+    };
     const res = s.resolution ?? s.currentResolution;
     // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
     // exist on the MSE path, and a column of em-dashes is worse than no column.
@@ -209,8 +213,9 @@ async function main(): Promise<void> {
     diagGrid.innerHTML = [
       cell('state', player.state),
       cell('ttff ms', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—'),
+      // Codec is in the catalog panel; the decoded resolution is not, and it
+      // is what the stream actually delivered rather than what it claimed.
       cell('resolution', res ? `${res.width}x${res.height}` : '—'),
-      cell('codec', s.videoCodec ?? s.currentVideoCodec ?? '—'),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
       cell('rendered / decoded',
@@ -220,8 +225,10 @@ async function main(): Promise<void> {
       // Breaks in the (group, object) sequence per track — the only view of a
       // frame missing inside a buffered range.
       cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`),
-      cell('sync resets', String(syncResets)),
+      // MSE only: 1.05 means the soft chase is shedding latency right now.
+      ...(locPath ? [] : [cell('rate', playbackRate())]),
       ...(locPath ? [
+        cell('sync resets', String(syncResets)),
         // The playout delay the engine schedules against — a policy value, not
         // the media queued (that is the buffered-ahead chart).
         cell('render cushion ms', cushion != null ? cushion.toFixed(0) : '—'),
