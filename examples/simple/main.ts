@@ -210,10 +210,6 @@ async function main(): Promise<void> {
     // Role, not severity: blue names what the stream is, green measures it,
     // amber marks the counters that should stay at zero.
     const STR = 'str', NUM = 'num', FAULT = 'fault';
-    const playbackRate = (): string => {
-      const v = playerContainer.querySelector('video');
-      return v ? v.playbackRate.toFixed(2) : '—';
-    };
     const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
     const videoCodec = s.videoCodec ?? s.currentVideoCodec ?? '—';
     const codecs = audioCodec
@@ -230,25 +226,23 @@ async function main(): Promise<void> {
       cell('codec', codecs, '', STR),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
-      cell('bitrate v/a', `${fmtKbps(trackKbps('video'))} / ${fmtKbps(trackKbps('audio'))}`, 'kbps', NUM),
-      cell('rendered / decoded',
-        `${s.framesRendered ?? 0} / ${s.framesDecoded ?? 0}`, '', NUM),
+      cell('bitrate v/a', `${fmtKbps(trackKbps('video'))}/${fmtKbps(trackKbps('audio'))}`, 'kbps', NUM),
+      cell('rend/dec', `${s.framesRendered ?? 0}/${s.framesDecoded ?? 0}`, '', NUM),
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // MSE only: 1.05 means the soft chase is shedding latency right now.
-      ...(locPath ? [] : [cell('rate', playbackRate(), '×', NUM)]),
       // Render cushion rides the queued-ahead chart label and A/V skew has a
       // chart of its own: this row is for facts and fault counts, not gauges.
       ...(locPath ? [
         cell('sync resets', String(syncResets), '', FAULT),
-        cell('audio underruns', String(s.audioUnderruns ?? 0), '', FAULT),
+        cell('aud underrun', String(s.audioUnderruns ?? 0), '', FAULT),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
-        cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
-          + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '', FAULT),
+        cell('aud late/snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
+          + `/${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '', FAULT),
       ] : []),
       cell('dropped', String(s.framesDropped ?? 0), '', FAULT),
       // Breaks in the (group, object) sequence per track — the only view of a
       // frame missing inside a buffered range.
-      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`, '', FAULT),
+      cell('obj brk v/a', `${objBreaks.video ?? 0}/${objBreaks.audio ?? 0}`, '', FAULT),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '', FAULT),
     ].join('');
   });
@@ -559,7 +553,11 @@ async function main(): Promise<void> {
       ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
     const cushionNow = renderCushionMs();
-    cusCushion.textContent = cushionNow != null ? `cushion: ${cushionNow.toFixed(0)}` : '';
+    const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
+    cusCushion.textContent = [
+      cushionNow != null ? `cushion: ${cushionNow.toFixed(0)}` : '',
+      rateNow !== 1 ? `rate: ${rateNow.toFixed(2)}×` : '',
+    ].filter(Boolean).join('  ');
     cusLabel.textContent = queuedLabel();
     if (latSamples.length) {
       latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
