@@ -266,12 +266,11 @@ async function main(): Promise<void> {
   // four charts share one time axis (180 samples = 45 s) and features line up.
   const latWindow: Array<[number, number]> = [];
   const LAT_WINDOW_MS = 4_000;
+  // Both curves are the printed p50 and p95 over the same window, so the lines
+  // and the numbers cannot disagree. Max stays a readout: as a curve it is one
+  // sample wide and reads as noise.
   const latP50Samples: number[] = [];
-  // Worst sample seen since the previous tick. Percentiles over a window can
-  // average a short spike away (a 150 ms ProbeRTT stall touches ~5 of 120
-  // objects — right at the p95 boundary), so the tail gets its own series.
-  const latMaxSamples: number[] = [];
-  let latTickMax = 0;
+  const latP95Samples: number[] = [];
   const jitSamples: number[] = [];
   // Playout cushion: media buffered ahead of the playhead, sampled every
   // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
@@ -373,7 +372,6 @@ async function main(): Promise<void> {
       else if (latencyMs < 30_000) {
         const now = performance.now();
         latWindow.push([now, latencyMs]);
-        if (latencyMs > latTickMax) latTickMax = latencyMs;
         while (latWindow.length && now - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
       }
     }
@@ -557,12 +555,11 @@ async function main(): Promise<void> {
     const latVals = latWindow.map(([, v]) => v);
     if (latVals.length) {
       pushSample(latP50Samples, percentile(latVals, 0.5));
-      pushSample(latMaxSamples, latTickMax || percentile(latVals, 0.95));
-      latTickMax = 0;
+      pushSample(latP95Samples, percentile(latVals, 0.95));
     }
     if (prevCaptureMs || expectedIntervalMs) pushSample(jitSamples, jitterEwma);
 
-    drawSpark2(latSpark, latP50Samples, '#d9c25c', latMaxSamples, '#e07a7a');
+    drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
     drawSpark(jitSpark, jitSamples, '#d9922e');
     drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
