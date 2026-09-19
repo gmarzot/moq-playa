@@ -35,7 +35,6 @@ const jitSpark = document.getElementById('jit-spark') as HTMLCanvasElement;
 const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
 const cusVal = document.getElementById('cus-val')!;
 const cusTarget = document.getElementById('cus-target')!;
-const cusLabel = document.getElementById('cus-label')!;
 const cusCushion = document.getElementById('cus-cushion')!;
 const bufSpark = document.getElementById('buf-spark') as HTMLCanvasElement;
 const bufDVal = document.getElementById('bufd-val')!;
@@ -192,9 +191,6 @@ async function main(): Promise<void> {
 
   const renderCushionMs = (): number | null =>
     (player as any).engine?.stats?.loc?.renderCushionMs ?? null;
-  const queuedLabel = (): string =>
-    player.activeMediaType === 'video' ? 'buffered ahead ms' : 'audio queued ms';
-
   let lastSyncResets = 0;
   player.on('stats', (s: any) => {
     const syncResets: number = (player as any).engine?.stats?.loc?.syncResetCount ?? 0;
@@ -558,7 +554,6 @@ async function main(): Promise<void> {
       cushionNow != null ? `cushion: ${cushionNow.toFixed(0)}` : '',
       rateNow !== 1 ? `rate: ${rateNow.toFixed(2)}×` : '',
     ].filter(Boolean).join('  ');
-    cusLabel.textContent = queuedLabel();
     if (latSamples.length) {
       latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
       latP95.textContent = percentile(latSamples, 0.95).toFixed(0);
