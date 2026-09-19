@@ -562,7 +562,7 @@ async function main(): Promise<void> {
     }
     if (prevCaptureMs || expectedIntervalMs) pushSample(jitSamples, jitterEwma);
 
-    drawSpark2(latSpark, latP50Samples, '#d9c25c', latMaxSamples, '#d9922e');
+    drawSpark2(latSpark, latP50Samples, '#d9c25c', latMaxSamples, '#e07a7a');
     drawSpark(jitSpark, jitSamples, '#d9922e');
     drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
