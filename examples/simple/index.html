@@ -123,6 +123,20 @@
       text-transform: none; letter-spacing: 0; white-space: nowrap;
       margin-top: 4px;
     }
+    /* Units ride small and muted next to the number they belong to. */
+    .diag-grid .cell b .u {
+      font-size: .68rem; font-weight: 500; color: #8a94a6;
+      margin-left: 3px; letter-spacing: .03em;
+    }
+    /* A second fact under the first, same column (audio codec under video). */
+    .diag-grid .cell b .sub {
+      display: block; font-size: .8rem; font-weight: 500; color: #9aa6ba;
+      margin-top: 1px;
+    }
+    /* Fault counters colour themselves: zero is quiet, anything else is not. */
+    .diag-grid .cell b.ok { color: #7f8b9c; }
+    .diag-grid .cell b.warn { color: #d9c25c; }
+    .diag-grid .cell b.bad { color: #e07a7a; }
     .diag-charts {
       display: grid; gap: 16px;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));

@@ -201,39 +201,49 @@ async function main(): Promise<void> {
       log(`Sync reference re-anchored (${syncResets} total)`);
       lastSyncResets = syncResets;
     }
-    const cell = (label: string, v: string) =>
-      `<div class="cell">${label}:<b>${v}</b></div>`;
+    // `unit` renders small and muted after the value; `tone` colours the value
+    // by health, so a non-zero fault counter is visible without reading labels.
+    const cell = (label: string, v: string, unit = '', tone = '') =>
+      `<div class="cell">${label}:<b${tone ? ` class="${tone}"` : ''}>${v}`
+      + `${unit ? `<span class="u">${unit}</span>` : ''}</b></div>`;
+    const faultTone = (n: number) => (n === 0 ? 'ok' : n < 5 ? 'warn' : 'bad');
     const playbackRate = (): string => {
       const v = playerContainer.querySelector('video');
       return v ? v.playbackRate.toFixed(2) : '—';
     };
+    const codecs = (s.videoCodec ?? s.currentVideoCodec ?? '—')
+      + (audioCodec ? `<span class="sub">${audioCodec}</span>` : '');
     const res = s.resolution ?? s.currentResolution;
     // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
     diagGrid.innerHTML = [
-      cell('ttff ms', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—'),
       cell('resolution', res ? `${res.width}x${res.height}` : '—'),
-      cell('codec', s.videoCodec ?? s.currentVideoCodec ?? '—'),
+      // Video codec with the catalog's audio codec beneath it: two facts, one column.
+      cell('codec', codecs),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
       cell('rendered / decoded',
         `${s.framesRendered ?? 0} / ${s.framesDecoded ?? 0}`),
-      cell('dropped', String(s.framesDropped ?? 0)),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
+      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms'),
+      // MSE only: 1.05 means the soft chase is shedding latency right now.
+      ...(locPath ? [] : [cell('rate', playbackRate(), '×')]),
+      cell('dropped', String(s.framesDropped ?? 0), '', faultTone(s.framesDropped ?? 0)),
       // Breaks in the (group, object) sequence per track — the only view of a
       // frame missing inside a buffered range.
-      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`),
-      // MSE only: 1.05 means the soft chase is shedding latency right now.
-      ...(locPath ? [] : [cell('rate', playbackRate())]),
+      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`, '',
+        faultTone((objBreaks.video ?? 0) + (objBreaks.audio ?? 0))),
+      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
+        faultTone(s.stallCount ?? 0)),
       ...(locPath ? [
-        cell('sync resets', String(syncResets)),
         // The playout delay the engine schedules against — a policy value, not
         // the media queued (that is the buffered-ahead chart).
-        cell('render cushion ms', cushion != null ? cushion.toFixed(0) : '—'),
-        cell('a/v skew ms', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—'),
-        cell('audio underruns', String(s.audioUnderruns ?? 0)),
+        cell('render cushion', cushion != null ? cushion.toFixed(0) : '—', 'ms'),
+        cell('a/v skew', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—', 'ms'),
+        cell('sync resets', String(syncResets), '', faultTone(syncResets)),
+        cell('audio underruns', String(s.audioUnderruns ?? 0), '',
+          faultTone(s.audioUnderruns ?? 0)),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
         cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
           + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`),
@@ -264,6 +274,7 @@ async function main(): Promise<void> {
   const bufSkewSamples: number[] = [];
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
+  let audioCodec: string | null = null;
   let prevArrivalMs = 0;
   let prevCaptureMs = 0;
   let jitterEwma = 0;
@@ -547,6 +558,7 @@ async function main(): Promise<void> {
 
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
+    audioCodec = tracks.find((t) => (t.role ?? t.name) === 'audio')?.codec ?? null;
     targetLatencyMs = Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
     const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
