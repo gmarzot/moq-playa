@@ -42,6 +42,7 @@ const bufVVal = document.getElementById('bufv-val')!;
 const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
+const latMax = document.getElementById('lat-max')!;
 const jitVal = document.getElementById('jit-val')!;
 const catalogPanel = document.getElementById('catalog-panel')!;
 const catMeta = document.getElementById('cat-meta')!;
@@ -266,7 +267,11 @@ async function main(): Promise<void> {
   const latWindow: Array<[number, number]> = [];
   const LAT_WINDOW_MS = 4_000;
   const latP50Samples: number[] = [];
-  const latP95Samples: number[] = [];
+  // Worst sample seen since the previous tick. Percentiles over a window can
+  // average a short spike away (a 150 ms ProbeRTT stall touches ~5 of 120
+  // objects — right at the p95 boundary), so the tail gets its own series.
+  const latMaxSamples: number[] = [];
+  let latTickMax = 0;
   const jitSamples: number[] = [];
   // Playout cushion: media buffered ahead of the playhead, sampled every
   // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
@@ -368,6 +373,7 @@ async function main(): Promise<void> {
       else if (latencyMs < 30_000) {
         const now = performance.now();
         latWindow.push([now, latencyMs]);
+        if (latencyMs > latTickMax) latTickMax = latencyMs;
         while (latWindow.length && now - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
       }
     }
@@ -551,11 +557,12 @@ async function main(): Promise<void> {
     const latVals = latWindow.map(([, v]) => v);
     if (latVals.length) {
       pushSample(latP50Samples, percentile(latVals, 0.5));
-      pushSample(latP95Samples, percentile(latVals, 0.95));
+      pushSample(latMaxSamples, latTickMax || percentile(latVals, 0.95));
+      latTickMax = 0;
     }
     if (prevCaptureMs || expectedIntervalMs) pushSample(jitSamples, jitterEwma);
 
-    drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
+    drawSpark2(latSpark, latP50Samples, '#d9c25c', latMaxSamples, '#d9922e');
     drawSpark(jitSpark, jitSamples, '#d9922e');
     drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
@@ -580,6 +587,7 @@ async function main(): Promise<void> {
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
+      latMax.textContent = Math.max(...latVals).toFixed(0);
     } else if (skewSamples) {
       // Every sample landed before its own capture stamp: the clocks
       // disagree, so the difference is offset, not latency.
