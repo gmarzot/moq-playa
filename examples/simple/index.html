@@ -194,15 +194,20 @@
       display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
       font-size: 1rem; font-variant-numeric: tabular-nums;
     }
+    /* One line per track: name, packaging badge, then the declared detail. */
     .cat-track {
-      display: flex; flex-wrap: wrap; gap: 10px;
+      display: flex; flex-wrap: wrap; gap: 8px;
       align-items: baseline; color: #aab;
+      padding: 5px 0; border-bottom: 1px solid #23233a;
     }
-    .cat-track .dt { flex-basis: 100%; color: #9fb0c4; }
-    .cat-track .nm { color: #eee; font-weight: 700; min-width: 72px; }
+    .cat-track:last-child { border-bottom: 0; }
+    .cat-track .dt { color: #c3d0de; }
+    .cat-track .nm { color: #eee; font-weight: 700; min-width: 52px; }
     .cat-track .pk {
-      color: #4d4; text-transform: uppercase; font-weight: 700;
-      font-size: .78rem; letter-spacing: .05em;
+      color: #6cf; border: 1px solid #35506b; border-radius: 4px;
+      background: #17273a; padding: 1px 6px;
+      text-transform: uppercase; font-weight: 700;
+      font-size: .68rem; letter-spacing: .06em;
     }
     .cat-json {
       margin: 10px 0 0; padding: 10px 12px; background: #12121f;

@@ -216,7 +216,7 @@ async function main(): Promise<void> {
     const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
     const videoCodec = s.videoCodec ?? s.currentVideoCodec ?? '—';
     const codecs = audioCodec
-      ? `${audioCodec}/<span class="ln2">${videoCodec}</span>`
+      ? `${audioCodec} /<span class="ln2">${videoCodec}</span>`
       : videoCodec;
     const res = s.resolution ?? s.currentResolution;
     // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
