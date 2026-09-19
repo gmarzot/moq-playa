@@ -36,6 +36,7 @@ const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
 const cusVal = document.getElementById('cus-val')!;
 const cusTarget = document.getElementById('cus-target')!;
 const cusLabel = document.getElementById('cus-label')!;
+const cusCushion = document.getElementById('cus-cushion')!;
 const bufSpark = document.getElementById('buf-spark') as HTMLCanvasElement;
 const bufDVal = document.getElementById('bufd-val')!;
 const bufVVal = document.getElementById('bufv-val')!;
@@ -235,11 +236,9 @@ async function main(): Promise<void> {
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // MSE only: 1.05 means the soft chase is shedding latency right now.
       ...(locPath ? [] : [cell('rate', playbackRate(), '×', NUM)]),
+      // Render cushion rides the queued-ahead chart label and A/V skew has a
+      // chart of its own: this row is for facts and fault counts, not gauges.
       ...(locPath ? [
-        // The playout delay the engine schedules against — a policy value, not
-        // the media queued (that is the buffered-ahead chart).
-        cell('render cushion', cushion != null ? cushion.toFixed(0) : '—', 'ms', NUM),
-        cell('a/v skew', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—', 'ms', NUM),
         cell('sync resets', String(syncResets), '', FAULT),
         cell('audio underruns', String(s.audioUnderruns ?? 0), '', FAULT),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
@@ -559,6 +558,8 @@ async function main(): Promise<void> {
     cusVal.textContent = cushionSamples.length
       ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
+    const cushionNow = renderCushionMs();
+    cusCushion.textContent = cushionNow != null ? `cushion: ${cushionNow.toFixed(0)}` : '';
     cusLabel.textContent = queuedLabel();
     if (latSamples.length) {
       latVal.textContent = percentile(latSamples, 0.5).toFixed(0);
