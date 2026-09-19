@@ -206,49 +206,50 @@ async function main(): Promise<void> {
     const cell = (label: string, v: string, unit = '', tone = '') =>
       `<div class="cell">${label}:<b${tone ? ` class="${tone}"` : ''}>${v}`
       + `${unit ? `<span class="u">${unit}</span>` : ''}</b></div>`;
-    const faultTone = (n: number) => (n === 0 ? 'ok' : n < 5 ? 'warn' : 'bad');
+    // Role, not severity: blue names what the stream is, green measures it,
+    // amber marks the counters that should stay at zero.
+    const STR = 'str', NUM = 'num', FAULT = 'fault';
     const playbackRate = (): string => {
       const v = playerContainer.querySelector('video');
       return v ? v.playbackRate.toFixed(2) : '—';
     };
     const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
-    const codecs = (s.videoCodec ?? s.currentVideoCodec ?? '—')
-      + (audioCodec ? `<span class="sub">${audioCodec}</span>` : '');
+    const videoCodec = s.videoCodec ?? s.currentVideoCodec ?? '—';
+    const codecs = audioCodec
+      ? `${audioCodec}/<span class="ln2">${videoCodec}</span>`
+      : videoCodec;
     const res = s.resolution ?? s.currentResolution;
     // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
     diagGrid.innerHTML = [
-      cell('resolution', res ? `${res.width}x${res.height}` : '—'),
+      cell('resolution', res ? `${res.width}x${res.height}` : '—', '', STR),
       // Video codec with the catalog's audio codec beneath it: two facts, one column.
-      cell('codec', codecs),
+      cell('codec', codecs, '', STR),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
-      cell('bitrate v/a', `${fmtKbps(trackKbps('video'))} / ${fmtKbps(trackKbps('audio'))}`, 'kbps'),
+      cell('bitrate v/a', `${fmtKbps(trackKbps('video'))} / ${fmtKbps(trackKbps('audio'))}`, 'kbps', NUM),
       cell('rendered / decoded',
-        `${s.framesRendered ?? 0} / ${s.framesDecoded ?? 0}`),
-      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms'),
+        `${s.framesRendered ?? 0} / ${s.framesDecoded ?? 0}`, '', NUM),
+      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // MSE only: 1.05 means the soft chase is shedding latency right now.
-      ...(locPath ? [] : [cell('rate', playbackRate(), '×')]),
-      cell('dropped', String(s.framesDropped ?? 0), '', faultTone(s.framesDropped ?? 0)),
+      ...(locPath ? [] : [cell('rate', playbackRate(), '×', NUM)]),
+      cell('dropped', String(s.framesDropped ?? 0), '', FAULT),
       // Breaks in the (group, object) sequence per track — the only view of a
       // frame missing inside a buffered range.
-      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`, '',
-        faultTone((objBreaks.video ?? 0) + (objBreaks.audio ?? 0))),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
-        faultTone(s.stallCount ?? 0)),
+      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`, '', FAULT),
+      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '', FAULT),
       ...(locPath ? [
         // The playout delay the engine schedules against — a policy value, not
         // the media queued (that is the buffered-ahead chart).
-        cell('render cushion', cushion != null ? cushion.toFixed(0) : '—', 'ms'),
-        cell('a/v skew', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—', 'ms'),
-        cell('sync resets', String(syncResets), '', faultTone(syncResets)),
-        cell('audio underruns', String(s.audioUnderruns ?? 0), '',
-          faultTone(s.audioUnderruns ?? 0)),
+        cell('render cushion', cushion != null ? cushion.toFixed(0) : '—', 'ms', NUM),
+        cell('a/v skew', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—', 'ms', NUM),
+        cell('sync resets', String(syncResets), '', FAULT),
+        cell('audio underruns', String(s.audioUnderruns ?? 0), '', FAULT),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
         cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
-          + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`),
+          + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '', FAULT),
       ] : []),
     ].join('');
   });
