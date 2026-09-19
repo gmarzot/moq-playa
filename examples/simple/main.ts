@@ -271,6 +271,10 @@ async function main(): Promise<void> {
   // sample wide and reads as noise.
   const latP50Samples: number[] = [];
   const latP95Samples: number[] = [];
+  // Per-tick worst sample, not drawn: it lets the readout report the worst
+  // across the whole charted span. p95 over ~120 samples cannot be moved by a
+  // lone spike, so this is the only series here that sees one.
+  const latTickMaxSamples: number[] = [];
   const jitSamples: number[] = [];
   // Playout cushion: media buffered ahead of the playhead, sampled every
   // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
@@ -556,6 +560,7 @@ async function main(): Promise<void> {
     if (latVals.length) {
       pushSample(latP50Samples, percentile(latVals, 0.5));
       pushSample(latP95Samples, percentile(latVals, 0.95));
+      pushSample(latTickMaxSamples, Math.max(...latVals));
     }
     if (prevCaptureMs || expectedIntervalMs) pushSample(jitSamples, jitterEwma);
 
@@ -584,7 +589,7 @@ async function main(): Promise<void> {
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
-      latMax.textContent = Math.max(...latVals).toFixed(0);
+      latMax.textContent = Math.max(...latTickMaxSamples).toFixed(0);
     } else if (skewSamples) {
       // Every sample landed before its own capture stamp: the clocks
       // disagree, so the difference is offset, not latency.
