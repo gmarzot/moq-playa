@@ -596,7 +596,7 @@ async function main(): Promise<void> {
       row.className = 'cat-track';
       const name = document.createElement('span');
       name.className = 'nm';
-      name.textContent = t.name ?? '(unnamed)';
+      name.textContent = `${t.name ?? '(unnamed)'}:`;
       const pkg = document.createElement('span');
       pkg.className = 'pk';
       pkg.textContent = (t.packaging ?? '?').toUpperCase();
