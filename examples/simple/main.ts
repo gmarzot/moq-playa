@@ -310,14 +310,18 @@ async function main(): Promise<void> {
   const noteObject = (e: any): void => {
     const t = e.mediaType;
     if ((t !== 'video' && t !== 'audio') || e.kind !== 'data') return;
-    if (e.group === undefined || e.object === undefined) return;
-    const group = BigInt(e.group), object = BigInt(e.object);
+    // Bytes first: the sequence check below returns early when a relay omits
+    // ids, and bitrate must not depend on that.
     if (e.bytes) {
       const w = byteLog[t]!;
       const now = performance.now();
       w.push([now, e.bytes]);
       while (w.length && now - w[0]![0] > BITRATE_WINDOW_MS) w.shift();
     }
+    // The facade names these groupId/objectId.
+    const gid = e.groupId ?? e.group, oid = e.objectId ?? e.object;
+    if (gid === undefined || oid === undefined) return;
+    const group = BigInt(gid), object = BigInt(oid);
     const prev = objSeq[t];
     if (prev) {
       const sameGroup = group === prev.group;
