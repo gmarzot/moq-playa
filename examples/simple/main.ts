@@ -205,7 +205,9 @@ async function main(): Promise<void> {
       + `${unit ? `<span class="u">${unit}</span>` : ''}</b></div>`;
     // Role, not severity: blue names what the stream is, green measures it,
     // amber marks the counters that should stay at zero.
-    const STR = 'str', NUM = 'num', FAULT = 'fault';
+    const STR = 'str', NUM = 'num';
+    // Amber only once a counter has something to report; white at zero.
+    const FAULT = (n: number) => (n > 0 ? 'fault' : '');
     const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
     const videoCodec = s.videoCodec ?? s.currentVideoCodec ?? '—';
     const codecs = audioCodec
@@ -229,17 +231,21 @@ async function main(): Promise<void> {
       // Render cushion rides the queued-ahead chart label and A/V skew has a
       // chart of its own: this row is for facts and fault counts, not gauges.
       ...(locPath ? [
-        cell('sync resets', String(syncResets), '', FAULT),
-        cell('aud underrun', String(s.audioUnderruns ?? 0), '', FAULT),
+        cell('sync resets', String(syncResets), '', FAULT(syncResets)),
+        cell('aud underrun', String(s.audioUnderruns ?? 0), '', FAULT(s.audioUnderruns ?? 0)),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
         cell('aud late/snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
-          + `/${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '', FAULT),
+          + `/${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '',
+          FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
+            + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
       ] : []),
-      cell('dropped', String(s.framesDropped ?? 0), '', FAULT),
+      cell('dropped', String(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
       // Breaks in the (group, object) sequence per track — the only view of a
       // frame missing inside a buffered range.
-      cell('obj brk v/a', `${objBreaks.video ?? 0}/${objBreaks.audio ?? 0}`, '', FAULT),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '', FAULT),
+      cell('obj brk v/a', `${objBreaks.video ?? 0}/${objBreaks.audio ?? 0}`, '',
+        FAULT((objBreaks.video ?? 0) + (objBreaks.audio ?? 0))),
+      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
+        FAULT(s.stallCount ?? 0)),
     ].join('');
   });
 
