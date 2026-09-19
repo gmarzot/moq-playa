@@ -633,6 +633,8 @@ export class Player {
         groupId: e.groupId,
         objectId: e.objectId,
         kind: e.kind,
+        // Size only: the payload itself stays inside the engine.
+        bytes: e.payload?.byteLength ?? 0,
         captureTimestamp: e.captureTimestamp,
         isKeyframe: e.isKeyframe,
       });

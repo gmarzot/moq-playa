@@ -78,6 +78,8 @@ export interface MediaObjectEvent {
   readonly groupId: bigint;
   readonly objectId: bigint;
   readonly kind: string;
+  /** Payload size in bytes — the measured contribution to track bitrate. */
+  readonly bytes: number;
   /** Publisher capture time, µs since the epoch, when the object carries it. */
   readonly captureTimestamp?: bigint | undefined;
   readonly isKeyframe?: boolean | undefined;

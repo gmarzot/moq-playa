@@ -211,6 +211,7 @@ async function main(): Promise<void> {
       const v = playerContainer.querySelector('video');
       return v ? v.playbackRate.toFixed(2) : '—';
     };
+    const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
     const codecs = (s.videoCodec ?? s.currentVideoCodec ?? '—')
       + (audioCodec ? `<span class="sub">${audioCodec}</span>` : '');
     const res = s.resolution ?? s.currentResolution;
@@ -224,6 +225,7 @@ async function main(): Promise<void> {
       cell('codec', codecs),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
+      cell('bitrate v/a', `${fmtKbps(trackKbps('video'))} / ${fmtKbps(trackKbps('audio'))}`, 'kbps'),
       cell('rendered / decoded',
         `${s.framesRendered ?? 0} / ${s.framesDecoded ?? 0}`),
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms'),
@@ -295,12 +297,31 @@ async function main(): Promise<void> {
   // means a frame is missing inside the buffered range, which only shows up as
   // a break in the (group, object) sequence.
   const objSeq: Record<string, { group: bigint; object: bigint }> = {};
+  // Payload bytes with arrival times, trimmed to a 5 s window: the measured
+  // media bitrate, as distinct from the catalog's declared figure and from
+  // wire goodput in the transport panel (which counts MOQT and QUIC overhead).
+  const byteLog: Record<string, Array<[number, number]>> = { video: [], audio: [] };
+  const BITRATE_WINDOW_MS = 5_000;
+  const trackKbps = (t: string): number | null => {
+    const w = byteLog[t];
+    if (!w || w.length < 2) return null;
+    const span = w[w.length - 1]![0] - w[0]![0];
+    if (span < 500) return null;
+    const total = w.reduce((n, [, b]) => n + b, 0);
+    return (total * 8) / span;   // bytes/ms * 8 = kbit/s
+  };
   const objBreaks: Record<string, number> = { video: 0, audio: 0 };
   const noteObject = (e: any): void => {
     const t = e.mediaType;
     if ((t !== 'video' && t !== 'audio') || e.kind !== 'data') return;
     if (e.group === undefined || e.object === undefined) return;
     const group = BigInt(e.group), object = BigInt(e.object);
+    if (e.bytes) {
+      const w = byteLog[t]!;
+      const now = performance.now();
+      w.push([now, e.bytes]);
+      while (w.length && now - w[0]![0] > BITRATE_WINDOW_MS) w.shift();
+    }
     const prev = objSeq[t];
     if (prev) {
       const sameGroup = group === prev.group;
