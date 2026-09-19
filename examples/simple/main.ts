@@ -240,11 +240,18 @@ async function main(): Promise<void> {
           FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
             + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
       ] : []),
+      // Expected on per-group audio streams, so never a fault. The worst settle
+      // time is the measured distance to the gap timeout that turns a reorder
+      // into a discard.
+      cell('reorder v/a',
+        `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`
+        + `<span class="u ln2">&le;${Math.max(seqStat('video', 'settleMs'),
+          seqStat('audio', 'settleMs')).toFixed(0)}ms</span>`, '', NUM),
       cell('dropped', String(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
-      // Breaks in the (group, object) sequence per track — the only view of a
-      // frame missing inside a buffered range.
-      cell('obj brk v/a', `${objBreaks.video ?? 0}/${objBreaks.audio ?? 0}`, '',
-        FAULT((objBreaks.video ?? 0) + (objBreaks.audio ?? 0))),
+      // An id that never arrived: a frame missing inside a buffered range, which
+      // nothing else on this panel can see.
+      cell('obj lost v/a', `${seqStat('video', 'lost')}/${seqStat('audio', 'lost')}`, '',
+        FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
         FAULT(s.stallCount ?? 0)),
     ].join('');
@@ -301,10 +308,24 @@ async function main(): Promise<void> {
     return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0;
   };
 
-  // Per-track object continuity: a stall with data still ahead of the playhead
-  // means a frame is missing inside the buffered range, which only shows up as
-  // a break in the (group, object) sequence.
-  const objSeq: Record<string, { group: bigint; object: bigint }> = {};
+  // Per-track object continuity. Arrival order is not delivery order: LOC audio
+  // is one group per frame on its own QUIC stream (~47/s), and independent
+  // streams carry no ordering guarantee between them, so adjacent ids routinely
+  // race. A high-water mark plus a pending set separates the two cases — an id
+  // that lands late and fills its own hole is a reorder, one still missing after
+  // the settle window is loss. Loss inside a buffered range is what a stall with
+  // data still ahead of the playhead looks like from here.
+  const REORDER_SETTLE_MS = 1_000;
+  // Past this a jump is a restart or a join, not a hole worth enumerating.
+  const SEQ_JUMP_CAP = 200n;
+  interface ObjSeq {
+    group: bigint; object: bigint;        // high-water mark, not last seen
+    pending: Map<string, number>;
+    reorders: number; settleMs: number; lost: number;
+  }
+  const objSeq: Record<string, ObjSeq> = {};
+  const seqStat = (t: string, k: 'reorders' | 'settleMs' | 'lost'): number =>
+    objSeq[t]?.[k] ?? 0;
   // Payload bytes with arrival times, trimmed to a 5 s window: the measured
   // media bitrate, as distinct from the catalog's declared figure and from
   // wire goodput in the transport panel (which counts MOQT and QUIC overhead).
@@ -318,7 +339,6 @@ async function main(): Promise<void> {
     const total = w.reduce((n, [, b]) => n + b, 0);
     return (total * 8) / span;   // bytes/ms * 8 = kbit/s
   };
-  const objBreaks: Record<string, number> = { video: 0, audio: 0 };
   const noteObject = (e: any): void => {
     const t = e.mediaType;
     if ((t !== 'video' && t !== 'audio') || e.kind !== 'data') return;
@@ -334,18 +354,52 @@ async function main(): Promise<void> {
     const gid = e.groupId ?? e.group, oid = e.objectId ?? e.object;
     if (gid === undefined || oid === undefined) return;
     const group = BigInt(gid), object = BigInt(oid);
-    const prev = objSeq[t];
-    if (prev) {
-      const sameGroup = group === prev.group;
-      const contiguous = sameGroup
-        ? object === prev.object + 1n
-        : group === prev.group + 1n && object === 0n;
-      if (!contiguous) {
-        objBreaks[t] = (objBreaks[t] ?? 0) + 1;
-        log(`obj break [${t}]: ${prev.group}.${prev.object} -> ${group}.${object}`);
+    const now = performance.now();
+    const s = objSeq[t];
+    if (!s) {
+      objSeq[t] = { group, object, pending: new Map(),
+                    reorders: 0, settleMs: 0, lost: 0 };
+      return;
+    }
+    if (group > s.group || (group === s.group && object > s.object)) {
+      if (group - s.group > SEQ_JUMP_CAP) {
+        s.pending.clear();
+        log(`obj jump [${t}]: ${s.group}.${s.object} -> ${group}.${object}`);
+      } else if (group === s.group) {
+        for (let o = s.object + 1n; o < object; o++) s.pending.set(`${group}.${o}`, now);
+      } else {
+        // Only each skipped group's head is tracked: without END_OF_GROUP the
+        // previous group's object count is unknown, so its tail is not a hole.
+        for (let g = s.group + 1n; g < group; g++) s.pending.set(`${g}.0`, now);
+        for (let o = 0n; o < object && o < SEQ_JUMP_CAP; o++) {
+          s.pending.set(`${group}.${o}`, now);
+        }
+      }
+      s.group = group;
+      s.object = object;
+    } else {
+      const key = `${group}.${object}`;
+      const at = s.pending.get(key);
+      if (at !== undefined) {
+        s.pending.delete(key);
+        s.reorders++;
+        s.settleMs = Math.max(s.settleMs, now - at);
       }
     }
-    objSeq[t] = { group, object };
+    // An id that never fills its hole is loss. The settle window is what keeps
+    // this from counting every in-flight reorder as a missing object.
+    let lost = 0, firstKey = '';
+    for (const [key, at] of s.pending) {
+      if (now - at <= REORDER_SETTLE_MS) continue;
+      s.pending.delete(key);
+      if (!lost) firstKey = key;
+      lost++;
+    }
+    // One line per sweep: a multi-group gap expires every id it opened at once.
+    if (lost) {
+      s.lost += lost;
+      log(`obj lost [${t}]: ${lost} from ${firstKey}`);
+    }
   };
 
   (player as any).on('media_object', (e: any) => {
