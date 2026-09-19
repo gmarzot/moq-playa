@@ -235,11 +235,6 @@ async function main(): Promise<void> {
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // MSE only: 1.05 means the soft chase is shedding latency right now.
       ...(locPath ? [] : [cell('rate', playbackRate(), '×', NUM)]),
-      cell('dropped', String(s.framesDropped ?? 0), '', FAULT),
-      // Breaks in the (group, object) sequence per track — the only view of a
-      // frame missing inside a buffered range.
-      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`, '', FAULT),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '', FAULT),
       ...(locPath ? [
         // The playout delay the engine schedules against — a policy value, not
         // the media queued (that is the buffered-ahead chart).
@@ -251,6 +246,11 @@ async function main(): Promise<void> {
         cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
           + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '', FAULT),
       ] : []),
+      cell('dropped', String(s.framesDropped ?? 0), '', FAULT),
+      // Breaks in the (group, object) sequence per track — the only view of a
+      // frame missing inside a buffered range.
+      cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`, '', FAULT),
+      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '', FAULT),
     ].join('');
   });
 
