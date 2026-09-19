@@ -108,8 +108,8 @@
     /* Wraps into as many rows as it needs: a truncated label or value is
        worse than a taller strip. */
     .diag-grid {
-      display: grid; gap: 10px 16px;
-      grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+      display: grid; gap: 14px 20px;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       font-variant-numeric: tabular-nums;
     }
     .diag-grid .cell {
@@ -118,9 +118,9 @@
       font-size: .72rem; line-height: 1.25;
     }
     .diag-grid .cell b {
-      display: block; color: #e8e8f0; font-weight: 600; font-size: 1.05rem;
+      display: block; color: #e8e8f0; font-weight: 600; font-size: 1.2rem;
       text-transform: none; letter-spacing: 0; white-space: nowrap;
-      margin-top: 3px;
+      margin-top: 4px;
     }
     .diag-charts {
       display: grid; gap: 16px;
@@ -133,6 +133,9 @@
     .chart-label b { color: #4d4; font-variant-numeric: tabular-nums; }
     .chart-label b.ser-v { color: #6cf; }
     .chart-label b.ser-a { color: #fb7; }
+    /* Per-track depths pinned right so a changing skew value never shifts them. */
+    .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
+    .chart-label .right { white-space: nowrap; }
     /* Each chart carries its explanation in a title tooltip. */
     .chart { cursor: help; }
     .chart .chart-label { border-bottom: 1px dotted #444a58; padding-bottom: 2px; }
@@ -272,8 +275,8 @@
           <canvas id="cus-spark"></canvas>
         </div>
         <div class="chart" title="How far apart the two tracks' buffers are: video depth minus audio depth. The line sits on the dashed zero rule while both tracks keep up — that is why it looks flat even though the depths themselves move.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: decoded video waiting for its render time, against audio scheduled in WebAudio.&#10;&#10;Above zero means video is deeper, i.e. audio is the track running short; below zero is the reverse. The size of the excursion is roughly how far the two tracks have drifted apart. Sustained divergence is audio/video desync before it becomes a stall, because the player ends up waiting for the starved track.&#10;&#10;'buffered ahead' cannot show this: on CMAF it is the intersection of both buffers.">
-          <span class="chart-label">skew ms <b id="bufd-val">—</b>
-            a <b id="bufa-val" class="ser-a">—</b> v <b id="bufv-val" class="ser-v">—</b></span>
+          <span class="chart-label split">skew ms <b id="bufd-val">—</b>
+            <span class="right">A: <b id="bufa-val" class="ser-a">—</b> / V: <b id="bufv-val" class="ser-v">—</b></span></span>
           <canvas id="buf-spark"></canvas>
         </div>
       </div>

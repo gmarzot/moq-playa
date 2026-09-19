@@ -202,29 +202,35 @@ async function main(): Promise<void> {
     const cell = (label: string, v: string) =>
       `<div class="cell">${label}<b>${v}</b></div>`;
     const res = s.resolution ?? s.currentResolution;
+    // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
+    // exist on the MSE path, and a column of em-dashes is worse than no column.
+    const cushion = renderCushionMs();
+    const locPath = cushion != null || s.avSkewMs != null;
     diagGrid.innerHTML = [
       cell('state', player.state),
       cell('ttff ms', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—'),
       cell('resolution', res ? `${res.width}x${res.height}` : '—'),
       cell('codec', s.videoCodec ?? s.currentVideoCodec ?? '—'),
-      cell('rendered', String(s.framesRendered ?? 0)),
-      cell('decoded', String(s.framesDecoded ?? 0)),
+      // Frames that were decoded but never presented are the interesting part,
+      // so the pair stays together rather than in two separate columns.
+      cell('rendered / decoded',
+        `${s.framesRendered ?? 0} / ${s.framesDecoded ?? 0}`),
       cell('dropped', String(s.framesDropped ?? 0)),
-      // Two different quantities: the LOC render cushion is the playout delay
-      // the engine schedules against; the facade cushion is media actually
-      // queued ahead (MSE buffered range, or WebAudio audio on LOC).
-      cell('render cushion ms', renderCushionMs() != null ? renderCushionMs()!.toFixed(0) : '—'),
-      cell(queuedLabel(), s.cushionMs != null ? s.cushionMs.toFixed(0) : '—'),
-      cell('audio underruns', String(s.audioUnderruns ?? 0)),
-      // Why audio underran: dropped late before decode / snapped by the output clamp.
-      cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
-        + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`),
+      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
       // Breaks in the (group, object) sequence per track — the only view of a
       // frame missing inside a buffered range.
       cell('obj breaks v/a', `${objBreaks.video ?? 0} / ${objBreaks.audio ?? 0}`),
       cell('sync resets', String(syncResets)),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`),
-      cell('a/v skew ms', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—'),
+      ...(locPath ? [
+        // The playout delay the engine schedules against — a policy value, not
+        // the media queued (that is the buffered-ahead chart).
+        cell('render cushion ms', cushion != null ? cushion.toFixed(0) : '—'),
+        cell('a/v skew ms', s.avSkewMs != null ? s.avSkewMs.toFixed(0) : '—'),
+        cell('audio underruns', String(s.audioUnderruns ?? 0)),
+        // Why audio underran: dropped late before decode / snapped by the output clamp.
+        cell('audio late / snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
+          + ` / ${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`),
+      ] : []),
     ].join('');
   });
 
