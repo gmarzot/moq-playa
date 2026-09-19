@@ -303,7 +303,7 @@
           <canvas id="lat-spark"></canvas>
         </div>
         <div class="chart" title="RFC 3550 interarrival jitter: how much the spacing between arrivals differs from the spacing between their capture stamps, smoothed by 1/16.&#10;&#10;Clock offset cancels out here, so this is trustworthy across machines. It rises with network bursts — and also when this page's main thread stalls, because arrival is stamped in JavaScript.">
-          <span class="chart-label">interarrival jitter ms (RFC 3550): <b id="jit-val">—</b></span>
+          <span class="chart-label">jitter ms (RFC 3550): <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
         <div class="chart" title="How far apart the two tracks' buffers are: video depth minus audio depth. The line sits on the dashed zero rule while both tracks keep up — that is why it looks flat even though the depths themselves move.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: decoded video waiting for its render time, against audio scheduled in WebAudio.&#10;&#10;Above zero means video is deeper, i.e. audio is the track running short; below zero is the reverse. The size of the excursion is roughly how far the two tracks have drifted apart. Sustained divergence is audio/video desync before it becomes a stall, because the player ends up waiting for the starved track.&#10;&#10;'buffered ahead' cannot show this: on CMAF it is the intersection of both buffers.">
