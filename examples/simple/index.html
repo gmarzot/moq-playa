@@ -160,7 +160,7 @@
     .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
     .chart-label .right { white-space: nowrap; }
     .chart-label .aside { color: #8a94a6; }
-    .adv { margin-top: 4px; }
+    .adv { margin-top: 10px; }
     .adv > summary {
       cursor: pointer; color: #8a94a6; font-size: .72rem;
       text-transform: uppercase; letter-spacing: .04em; padding: 4px 0;
@@ -321,13 +321,13 @@
           <canvas id="cus-spark"></canvas>
         </div>
       </div>
-      <details class="adv" id="adv-panel">
-        <summary>transport (QUIC / WebTransport)</summary>
-        <div class="diag-grid" id="adv-grid"></div>
-      </details>
     </div>
 
     <pre id="log"></pre>
+    <details class="adv" id="adv-panel">
+      <summary>transport (QUIC / WebTransport)</summary>
+      <div class="diag-grid" id="adv-grid"></div>
+    </details>
   </div>
 
   <script type="module" src="./main.ts"></script>
