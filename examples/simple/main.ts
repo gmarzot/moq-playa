@@ -425,7 +425,7 @@ async function main(): Promise<void> {
       const y = zeroY - (v / span) * (h / 2 - 3);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
-    ctx.strokeStyle = '#48d';
+    ctx.strokeStyle = '#d9922e';
     ctx.lineWidth = devicePixelRatio;
     ctx.stroke();
   }
@@ -462,9 +462,9 @@ async function main(): Promise<void> {
       pushSample(bufSkewSamples, vMs - aMs);
     }
 
-    drawSpark2(latSpark, latP50Samples, '#3b82d6', latP95Samples, '#9fe0ff');
-    drawSpark(jitSpark, jitSamples, '#48d');
-    drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
+    drawSpark2(latSpark, latP50Samples, '#e6c84c', latP95Samples, '#c8871a');
+    drawSpark(jitSpark, jitSamples, '#d9922e');
+    drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
     bufDVal.textContent = (vMs != null && aMs != null)
       ? `${vMs - aMs >= 0 ? '+' : ''}${(vMs - aMs).toFixed(0)}` : '—';
