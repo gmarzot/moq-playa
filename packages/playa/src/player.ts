@@ -446,8 +446,8 @@ export class Player {
 
   /**
    * Prepare audio for playback. Creates AudioContext (WebCodecs path only),
-   * attaches the audio-aligned clock, creates VolumeController, and activates
-   * the deferred audio output.
+   * attaches the audio-aligned clock, creates VolumeController, and — under
+   * `audioActivation: 'gesture'` — activates the deferred audio output.
    *
    * For CMAF/MSE playback, the HTMLVideoElement owns audio — no AudioContext
    * is created. Safe to call either way.
@@ -467,12 +467,10 @@ export class Player {
       this.ensureAudioContext();
       await this.audioCtx!.resume();
 
-      // Activate deferred audio output — real WebAudioOutput starts receiving data.
-      // The deferred output may or may not have been wired into the pipeline yet
-      // (depends on whether createAudioOutput factory has fired). Either way,
-      // activating it now means any subsequent or queued schedule() calls forward
-      // to the real output.
-      if (!this.deferredAudio.isActive) {
+      // Only the deferred proxy needs a real output installed here. Eager mode
+      // wires one at pipeline creation; replacing it would orphan the output the
+      // decoder feeds, leaving every audio gauge reading a dead instance.
+      if (this.options.audioActivation === 'gesture' && !this.deferredAudio.isActive) {
         const dest = this.volumeCtrl?.destinationNode;
         // Delay unification: the shared playout cushion arrives inside
         // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
