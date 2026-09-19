@@ -548,10 +548,15 @@ async function main(): Promise<void> {
     cusVal.textContent = cushionSamples.length
       ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
+    // The cushion is adaptive, but pub_media's printed URL pins floor == cap
+    // == target, so it usually equals the target: show it only when it has
+    // actually moved, and the playback rate only when the chase is running.
     const cushionNow = renderCushionMs();
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
+    const cushionDiffers = cushionNow != null
+      && Math.abs(cushionNow - targetLatencyMs) > 1;
     cusCushion.textContent = [
-      cushionNow != null ? `cushion: ${cushionNow.toFixed(0)}` : '',
+      cushionDiffers ? `cushion: ${cushionNow!.toFixed(0)}` : '',
       rateNow !== 1 ? `rate: ${rateNow.toFixed(2)}×` : '',
     ].filter(Boolean).join('  ');
     if (latSamples.length) {
