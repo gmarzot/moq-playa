@@ -43,6 +43,7 @@ const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const latMax = document.getElementById('lat-max')!;
+const latOffsetEl = document.getElementById('lat-offset')!;
 const jitVal = document.getElementById('jit-val')!;
 const catalogPanel = document.getElementById('catalog-panel')!;
 const catMeta = document.getElementById('cat-meta')!;
@@ -282,6 +283,8 @@ async function main(): Promise<void> {
   // across the whole charted span. p95 over ~120 samples cannot be moved by a
   // lone spike, so this is the only series here that sees one.
   const latTickMaxSamples: number[] = [];
+  // Per-tick floor, for the offset estimate below.
+  const latMinSamples: number[] = [];
   const jitSamples: number[] = [];
   // Playout cushion: media buffered ahead of the playhead, sampled every
   // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
@@ -296,7 +299,6 @@ async function main(): Promise<void> {
   let prevCaptureMs = 0;
   let jitterEwma = 0;
   let expectedIntervalMs = 0;
-  let skewSamples = 0;
   (window as any).__player = player;
   const pushSample = (a: number[], v: number) => {
     a.push(v);
@@ -426,8 +428,10 @@ async function main(): Promise<void> {
     if (captureMs) {
       prevCaptureMs = captureMs;
       const latencyMs = Date.now() - captureMs;
-      if (latencyMs < -250) skewSamples++;
-      else if (latencyMs < 30_000) {
+      // Kept whatever the sign: a publisher stamping ahead of its own clock,
+      // or an unsynchronised pair of machines, is an offset the tick removes.
+      // Only a stamp too far out to be a clock difference is dropped.
+      if (Math.abs(latencyMs) < 120_000) {
         const now = performance.now();
         latWindow.push([now, latencyMs]);
         while (latWindow.length && now - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
@@ -610,7 +614,19 @@ async function main(): Promise<void> {
     }
 
     // Sample the measurements onto the shared time axis before drawing.
-    const latVals = latWindow.map(([, v]) => v);
+    const latRaw = latWindow.map(([, v]) => v);
+    if (latRaw.length) pushSample(latMinSamples, Math.min(...latRaw));
+    // Clocks that disagree — or a publisher whose capture stamps run ahead of
+    // its own clock — put every sample below zero by a constant. The floor of
+    // the charted window is that constant: subtracting it leaves the spikes,
+    // the jitter and the shape, which is what the chart is for. Zero offset
+    // when the samples are already positive, so a synced pair reads absolute.
+    // A low percentile rather than the outright floor: one bad stamp must not
+    // re-base the whole chart for the length of the window.
+    const latOffset = latMinSamples.length
+      ? Math.min(0, percentile(latMinSamples, 0.05)) : 0;
+    const latVals = latOffset
+      ? latRaw.map((v) => Math.max(0, v - latOffset)) : latRaw;
     if (latVals.length) {
       pushSample(latP50Samples, percentile(latVals, 0.5));
       pushSample(latP95Samples, percentile(latVals, 0.95));
@@ -644,12 +660,10 @@ async function main(): Promise<void> {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
       latMax.textContent = Math.max(...latTickMaxSamples).toFixed(0);
-    } else if (skewSamples) {
-      // Every sample landed before its own capture stamp: the clocks
-      // disagree, so the difference is offset, not latency.
-      latVal.textContent = 'clock skew';
-      latP95.textContent = '—';
     }
+    // Present only when an offset was removed, so absolute readings stay bare.
+    latOffsetEl.textContent = latOffset
+      ? ` (${(latOffset / 1000).toFixed(1)}s)` : '';
     jitVal.textContent = jitSamples.length
       ? jitSamples[jitSamples.length - 1]!.toFixed(1)
       : '—';
