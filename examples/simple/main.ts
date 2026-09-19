@@ -244,9 +244,9 @@ async function main(): Promise<void> {
       // time is the measured distance to the gap timeout that turns a reorder
       // into a discard.
       cell('reorder v/a',
-        `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`
-        + `<span class="u ln2">&le;${Math.max(seqStat('video', 'settleMs'),
-          seqStat('audio', 'settleMs')).toFixed(0)}ms</span>`, '', NUM),
+        `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`,
+        `&le;${Math.max(seqStat('video', 'settleMs'),
+          seqStat('audio', 'settleMs')).toFixed(0)}ms`, NUM),
       cell('dropped', String(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.
