@@ -138,7 +138,10 @@
       display: grid; gap: 16px;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     }
+    /* Block so the underline spans the graph rather than the text; nowrap
+       keeps every label one line, so all four canvases sit at the same y. */
     .chart-label {
+      display: block; white-space: nowrap;
       font-size: .8rem; color: #778; text-transform: uppercase;
       letter-spacing: .04em;
     }
