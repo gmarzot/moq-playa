@@ -462,7 +462,7 @@ async function main(): Promise<void> {
       pushSample(bufSkewSamples, vMs - aMs);
     }
 
-    drawSpark2(latSpark, latP50Samples, '#4d4', latP95Samples, '#d96');
+    drawSpark2(latSpark, latP50Samples, '#3b82d6', latP95Samples, '#9fe0ff');
     drawSpark(jitSpark, jitSamples, '#48d');
     drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
