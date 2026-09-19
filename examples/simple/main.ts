@@ -425,7 +425,7 @@ async function main(): Promise<void> {
       const y = zeroY - (v / span) * (h / 2 - 3);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
-    ctx.strokeStyle = '#8be';
+    ctx.strokeStyle = '#48d';
     ctx.lineWidth = devicePixelRatio;
     ctx.stroke();
   }
@@ -463,7 +463,7 @@ async function main(): Promise<void> {
     }
 
     drawSpark2(latSpark, latP50Samples, '#4d4', latP95Samples, '#d96');
-    drawSpark(jitSpark, jitSamples, '#da4');
+    drawSpark(jitSpark, jitSamples, '#48d');
     drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
     bufDVal.textContent = (vMs != null && aMs != null)

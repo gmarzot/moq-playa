@@ -135,6 +135,9 @@
     .chart-label b.ser-v { color: #6cf; }
     .chart-label b.ser-a { color: #fb7; }
     .chart-label b.ser-p95 { color: #d96; }
+    .diag-charts .chart-label b { color: #6cf; }
+    .diag-charts .chart-label b.ser-p50 { color: #4d4; }
+    .diag-charts .chart-label b#cus-target { color: #8a94a6; }
     /* Per-track depths pinned right so a changing skew value never shifts them. */
     .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
     .chart-label .right { white-space: nowrap; }
@@ -264,7 +267,7 @@
       <div class="diag-charts">
         <div class="chart" title="End-to-end latency: the publisher's capture stamp subtracted from its arrival time in this page, per video object.&#10;&#10;The curves are rolling percentiles over a 40-sample window — green p50, orange p95 — so the tail is visible separately from the median instead of buried in per-object noise. The label reports p50 and p95 over the last 180 objects.&#10;&#10;Exact when the publisher and the browser share a clock. Across machines (browser on Windows, publisher in WSL) any NTP offset shows up as a constant bias, and samples landing before their own capture stamp are reported as 'clock skew' instead of latency.&#10;&#10;It measures delivery only — the playout cushion, decode and paint are not in it.">
           <span class="chart-label">e2e latency ms —
-            p50: <b id="lat-val">—</b> p95: <b id="lat-p95" class="ser-p95">—</b></span>
+            p50: <b id="lat-val" class="ser-p50">—</b> p95: <b id="lat-p95" class="ser-p95">—</b></span>
           <canvas id="lat-spark"></canvas>
         </div>
         <div class="chart" title="RFC 3550 interarrival jitter: how much the spacing between arrivals differs from the spacing between their capture stamps, smoothed by 1/16.&#10;&#10;Clock offset cancels out here, so this is trustworthy across machines. It rises with network bursts — and also when this page's main thread stalls, because arrival is stamped in JavaScript.">
