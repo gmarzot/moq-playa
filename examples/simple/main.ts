@@ -253,6 +253,8 @@ async function main(): Promise<void> {
   // capture timestamps it degrades to arrival-interval deviation.
 
   const latSamples: number[] = [];
+  const latP50Samples: number[] = [];
+  const latP95Samples: number[] = [];
   const jitSamples: number[] = [];
   // Playout cushion: media buffered ahead of the playhead, sampled every
   // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
@@ -328,7 +330,14 @@ async function main(): Promise<void> {
       prevCaptureMs = captureMs;
       const latencyMs = Date.now() - captureMs;
       if (latencyMs < -250) skewSamples++;
-      else if (latencyMs < 30_000) pushSample(latSamples, latencyMs);
+      else if (latencyMs < 30_000) {
+        pushSample(latSamples, latencyMs);
+        // Rolling percentiles over a short trailing window: the raw per-object
+        // series is mostly noise, while p50 against p95 shows the tail moving.
+        const win = latSamples.slice(-40);
+        pushSample(latP50Samples, percentile(win, 0.5));
+        pushSample(latP95Samples, percentile(win, 0.95));
+      }
     }
   });
 
@@ -366,6 +375,29 @@ async function main(): Promise<void> {
     ctx.strokeStyle = color;
     ctx.lineWidth = devicePixelRatio;
     ctx.stroke();
+  }
+
+  /** Two series on one scale — only comparable on a shared axis. */
+  function drawSpark2(canvas: HTMLCanvasElement, a: number[], aColor: string,
+                      b: number[], bColor: string): void {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+    const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+    ctx.clearRect(0, 0, w, h);
+    const max = Math.max(1, ...a, ...b) * 1.15;
+    for (const [data, color] of [[a, aColor], [b, bColor]] as Array<[number[], string]>) {
+      if (data.length < 2) continue;
+      ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = (i / (data.length - 1)) * w;
+        const y = h - (v / max) * (h - 6) - 3;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = devicePixelRatio;
+      ctx.stroke();
+    }
   }
 
   /** Signed series around a zero rule: only the divergence is the signal. */
@@ -430,7 +462,7 @@ async function main(): Promise<void> {
       pushSample(bufSkewSamples, vMs - aMs);
     }
 
-    drawSpark(latSpark, latSamples, '#4d4');
+    drawSpark2(latSpark, latP50Samples, '#4d4', latP95Samples, '#d96');
     drawSpark(jitSpark, jitSamples, '#da4');
     drawSpark(cusSpark, cushionSamples, '#48d', targetLatencyMs, stallMarks);
     drawDelta(bufSpark, bufSkewSamples);
