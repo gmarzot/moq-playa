@@ -465,8 +465,9 @@ async function main(): Promise<void> {
     const w = canvas.width = canvas.clientWidth * devicePixelRatio;
     const h = canvas.height = canvas.clientHeight * devicePixelRatio;
     ctx.clearRect(0, 0, w, h);
-    if (data.length < 2) return;
-    const max = Math.max(...data, refLine) * 1.15 || 1;
+    const live = data.filter(Number.isFinite);
+    if (live.length < 2) return;
+    const max = Math.max(...live, refLine) * 1.15 || 1;
     const yOf = (v: number) => h - (v / max) * (h - 6) - 3;
     const xOf = (i: number) => (i / (data.length - 1)) * w;
     if (refLine > 0) {
@@ -485,8 +486,11 @@ async function main(): Promise<void> {
       ctx.fillRect(xOf(m) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
     }
     ctx.beginPath();
+    // A gap in the data lifts the pen rather than drawing through it.
+    let pen = false;
     data.forEach((v, i) => {
-      if (i === 0) ctx.moveTo(xOf(i), yOf(v)); else ctx.lineTo(xOf(i), yOf(v));
+      if (!Number.isFinite(v)) { pen = false; return; }
+      if (pen) ctx.lineTo(xOf(i), yOf(v)); else { ctx.moveTo(xOf(i), yOf(v)); pen = true; }
     });
     ctx.strokeStyle = color;
     ctx.lineWidth = devicePixelRatio;
@@ -501,14 +505,16 @@ async function main(): Promise<void> {
     const w = canvas.width = canvas.clientWidth * devicePixelRatio;
     const h = canvas.height = canvas.clientHeight * devicePixelRatio;
     ctx.clearRect(0, 0, w, h);
-    const max = Math.max(1, ...a, ...b) * 1.15;
+    const max = Math.max(1, ...a.filter(Number.isFinite), ...b.filter(Number.isFinite)) * 1.15;
     for (const [data, color] of [[a, aColor], [b, bColor]] as Array<[number[], string]>) {
-      if (data.length < 2) continue;
+      if (data.filter(Number.isFinite).length < 2) continue;
       ctx.beginPath();
+      let pen = false;
       data.forEach((v, i) => {
+        if (!Number.isFinite(v)) { pen = false; return; }
         const x = (i / (data.length - 1)) * w;
         const y = h - (v / max) * (h - 6) - 3;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
       });
       ctx.strokeStyle = color;
       ctx.lineWidth = devicePixelRatio;
@@ -532,14 +538,17 @@ async function main(): Promise<void> {
     ctx.lineWidth = devicePixelRatio;
     ctx.stroke();
     ctx.setLineDash([]);
-    if (data.length < 2) return;
+    const live = data.filter(Number.isFinite);
+    if (live.length < 2) return;
     // A floor on the scale keeps normal ±ms wobble from looking like drift.
-    const span = Math.max(100, ...data.map(Math.abs)) * 1.15;
+    const span = Math.max(100, ...live.map(Math.abs)) * 1.15;
     ctx.beginPath();
+    let pen = false;
     data.forEach((v, i) => {
+      if (!Number.isFinite(v)) { pen = false; return; }
       const x = (i / (data.length - 1)) * w;
       const y = zeroY - (v / span) * (h / 2 - 3);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
     });
     ctx.strokeStyle = '#d9922e';
     ctx.lineWidth = devicePixelRatio;
@@ -610,8 +619,8 @@ async function main(): Promise<void> {
     // Contiguous cushion only (facade-computed per path). Zero with appends
     // still landing means the playhead is parked at a hole.
     const cushionMs = player.stats.cushionMs;
-    if (cushionMs != null && player.state !== 'idle') {
-      cushionSamples.push(cushionMs);
+    if (player.state !== 'idle') {
+      cushionSamples.push(cushionMs ?? NaN);
       if (cushionSamples.length > 180) {
         cushionSamples.shift();
         for (let i = 0; i < stallMarks.length; i++) stallMarks[i]!--;
@@ -627,8 +636,8 @@ async function main(): Promise<void> {
     const aMs = byKind ? byKind.audio
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
-    if (player.state !== 'idle' && vMs != null && aMs != null) {
-      pushSample(bufDeltaSamples, vMs - aMs);
+    if (player.state !== 'idle') {
+      pushSample(bufDeltaSamples, vMs != null && aMs != null ? vMs - aMs : NaN);
     }
 
     // Sample the measurements onto the shared time axis before drawing.
@@ -645,12 +654,15 @@ async function main(): Promise<void> {
       ? Math.min(0, percentile(latMinSamples, 0.05)) : 0;
     const latVals = latOffset
       ? latRaw.map((v) => Math.max(0, v - latOffset)) : latRaw;
-    if (latVals.length) {
-      pushSample(latP50Samples, percentile(latVals, 0.5));
-      pushSample(latP95Samples, percentile(latVals, 0.95));
-      pushSample(latTickMaxSamples, Math.max(...latVals));
-    }
-    if (prevCaptureMs || expectedIntervalMs) pushSample(jitSamples, jitterEwma);
+    // Every series takes exactly one slot per tick, NaN where there is nothing
+    // to report, so all four charts share one time axis and a feature at the
+    // same x is the same instant. Skipping a slot silently stretches that
+    // chart's window past the others'.
+    const have = latVals.length > 0;
+    pushSample(latP50Samples, have ? percentile(latVals, 0.5) : NaN);
+    pushSample(latP95Samples, have ? percentile(latVals, 0.95) : NaN);
+    pushSample(latTickMaxSamples, have ? Math.max(...latVals) : NaN);
+    pushSample(jitSamples, prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
 
     drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
     drawSpark(jitSpark, jitSamples, '#d9922e');
@@ -668,6 +680,7 @@ async function main(): Promise<void> {
     // actually moved, and the playback rate only when the chase is running.
     const cushionNow = renderCushionMs();
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
+    const audioOut = (player as any).audioOutput;
     const cushionDiffers = cushionNow != null
       && Math.abs(cushionNow - targetLatencyMs) > 1;
     // Own strings only — no remote input reaches this, so markup is safe here.
@@ -675,7 +688,10 @@ async function main(): Promise<void> {
       cushionDiffers ? `cushion: <b>${cushionNow!.toFixed(0)}</b>` : '',
       rateNow !== 1 ? `rate: <b>${rateNow.toFixed(2)}×</b>` : '',
       // LOC: the WebAudio soft chase has no visible playbackRate of its own.
-      (player as any).audioOutput?.chasing ? 'chasing: <b>1.02×</b>' : '',
+      // Always present once there is an audio output, so a chase starting or
+      // stopping changes one value instead of shifting the label in and out.
+      audioOut ? `chasing: <b${audioOut.chasing ? '' : ' class="idle"'}>`
+        + `${audioOut.chasing ? '1.02' : '1.00'}×</b>` : '',
     ].filter(Boolean).join('  ');
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
