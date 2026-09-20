@@ -43,7 +43,7 @@ const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const latMax = document.getElementById('lat-max')!;
-const latOffsetEl = document.getElementById('lat-offset')!;
+const latLabel = document.getElementById('lat-label')!;
 const jitVal = document.getElementById('jit-val')!;
 const catalogPanel = document.getElementById('catalog-panel')!;
 const catMeta = document.getElementById('cat-meta')!;
@@ -661,9 +661,15 @@ async function main(): Promise<void> {
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
       latMax.textContent = Math.max(...latTickMaxSamples).toFixed(0);
     }
-    // Present only when an offset was removed, so absolute readings stay bare.
-    latOffsetEl.textContent = latOffset
-      ? ` (${(latOffset / 1000).toFixed(1)}s)` : '';
+    // The offset is a publisher stamping artifact, not a playback figure, so it
+    // stays off the label and rides a hover instead. Empty title falls through
+    // to the chart's own explanation.
+    latLabel.title = latOffset
+      ? `Capture stamps run ${(-latOffset / 1000).toFixed(1)}s ahead of this `
+        + 'browser\'s clock, so these are delay above the best sample in the '
+        + 'window, not one-way delay. The publisher reports the same offset as '
+        + 'its own send lag; it is a stamping artifact, not latency.'
+      : '';
     jitVal.textContent = jitSamples.length
       ? jitSamples[jitSamples.length - 1]!.toFixed(1)
       : '—';
