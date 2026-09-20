@@ -107,13 +107,16 @@
     .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
     /* Equal columns on a tight gap: every cell is the same width, and a
        second row lines up under the first instead of stretching. */
+    /* Content-sized, not equal columns: a static ttff and a counter climbing
+       into six digits do not deserve the same width. Free space goes to the
+       gaps, so the row still spans the strip. */
     .diag-grid {
-      display: grid; gap: 12px 12px;
-      grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+      display: flex; flex-wrap: wrap; justify-content: space-between;
+      gap: 12px 18px;
       font-variant-numeric: tabular-nums;
     }
     .diag-grid .cell {
-      min-width: 0;
+      flex: 0 1 auto; white-space: nowrap;
       color: #8a94a6; text-transform: uppercase; letter-spacing: .04em;
       font-size: .72rem; line-height: 1.25;
     }
