@@ -37,6 +37,9 @@ class MockAudioContext {
     connect: vi.fn(),
   }));
   getOutputTimestamp = vi.fn(() => ({ contextTime: 0, performanceTime: 0 }));
+  // WebAudioOutput subscribes to statechange to re-anchor on resume.
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
 }
 
 // Capture constructor count so we can assert NO AudioContext is created before user gesture
