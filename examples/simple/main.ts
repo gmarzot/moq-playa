@@ -202,9 +202,9 @@ async function main(): Promise<void> {
     }
     // `unit` renders small and muted after the value; `tone` colours the value
     // by health, so a non-zero fault counter is visible without reading labels.
-    const cell = (label: string, v: string, unit = '', tone = '') =>
+    const cell = (label: string, v: string, unit = '', tone = '', unitTone = '') =>
       `<div class="cell">${label}:<b${tone ? ` class="${tone}"` : ''}>${v}`
-      + `${unit ? `<span class="u">${unit}</span>` : ''}</b></div>`;
+      + `${unit ? `<span class="u${unitTone ? ` ${unitTone}` : ''}">${unit}</span>` : ''}</b></div>`;
     // Role, not severity: blue names what the stream is, green measures it,
     // amber marks the counters that should stay at zero.
     const STR = 'str', NUM = 'num';
@@ -220,6 +220,13 @@ async function main(): Promise<void> {
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
+    // Half the live gap timeout: warn while a reorder still has headroom, not
+    // once it is already being discarded. Video's timeout stands in because it
+    // is the one exposed; audio runs its own instance on the same policy.
+    const settleMs = Math.max(seqStat('video', 'settleMs'), seqStat('audio', 'settleMs'));
+    const gapMs: number | null =
+      (player as any).engine?.stats?.loc?.videoEffectiveGapTimeoutMs ?? null;
+    const settleTone = gapMs != null && settleMs > gapMs / 2 ? 'fault' : '';
     diagGrid.innerHTML = [
       cell('resolution', res ? `${res.width}x${res.height}` : '—', '', STR),
       // Video codec with the catalog's audio codec beneath it: two facts, one column.
@@ -227,9 +234,16 @@ async function main(): Promise<void> {
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
       cell('bitrate v/a', `${fmtKbps(trackKbps('video'))}/${fmtKbps(trackKbps('audio'))}`, 'kbps', NUM),
-      cell('rend/dec', `${s.framesRendered ?? 0}/${s.framesDecoded ?? 0}`, '', NUM),
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
-      // MSE only: 1.05 means the soft chase is shedding latency right now.
+      cell('rend/dec', `${s.framesRendered ?? 0}/${s.framesDecoded ?? 0}`, '', NUM),
+      // Cross-stream arrival order, not a fault: LOC audio is one group per frame
+      // on its own QUIC stream and independent streams carry no ordering between
+      // them. The settle time is the one with a cliff in front of it — past the
+      // adaptive gap timeout the object is discarded and costs a sync reset — so
+      // it, not the count, is what goes amber.
+      cell('reorder v/a',
+        `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`,
+        `&le;${settleMs.toFixed(0)}ms`, NUM, settleTone),
       // Render cushion rides the queued-ahead chart label and A/V skew has a
       // chart of its own: this row is for facts and fault counts, not gauges.
       ...(locPath ? [
@@ -241,13 +255,6 @@ async function main(): Promise<void> {
           FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
             + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
       ] : []),
-      // Expected on per-group audio streams, so never a fault. The worst settle
-      // time is the measured distance to the gap timeout that turns a reorder
-      // into a discard.
-      cell('reorder v/a',
-        `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`,
-        `&le;${Math.max(seqStat('video', 'settleMs'),
-          seqStat('audio', 'settleMs')).toFixed(0)}ms`, NUM),
       cell('dropped', String(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.

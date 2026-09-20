@@ -134,6 +134,8 @@
     .diag-grid .cell b.str { color: #6cf; }
     .diag-grid .cell b.num { color: #4d4; }
     .diag-grid .cell b.fault { color: #d9922e; }
+    /* A unit can warn while its value stays neutral. */
+    .diag-grid .cell b .u.fault { color: #d9922e; }
     .diag-charts {
       display: grid; gap: 16px;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
