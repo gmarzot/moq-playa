@@ -670,11 +670,12 @@ async function main(): Promise<void> {
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
     const cushionDiffers = cushionNow != null
       && Math.abs(cushionNow - targetLatencyMs) > 1;
-    cusCushion.textContent = [
-      cushionDiffers ? `cushion: ${cushionNow!.toFixed(0)}` : '',
-      rateNow !== 1 ? `rate: ${rateNow.toFixed(2)}×` : '',
+    // Own strings only — no remote input reaches this, so markup is safe here.
+    cusCushion.innerHTML = [
+      cushionDiffers ? `cushion: <b>${cushionNow!.toFixed(0)}</b>` : '',
+      rateNow !== 1 ? `rate: <b>${rateNow.toFixed(2)}×</b>` : '',
       // LOC: the WebAudio soft chase has no visible playbackRate of its own.
-      (player as any).audioOutput?.chasing ? 'chasing 1.02×' : '',
+      (player as any).audioOutput?.chasing ? 'chasing: <b>1.02×</b>' : '',
     ].filter(Boolean).join('  ');
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
