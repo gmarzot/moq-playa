@@ -229,9 +229,12 @@ async function main(): Promise<void> {
     const lagWorst = Math.max(0, ...lagSamples.map(([, d]) => d));
     const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
-      cell('resolution', res ? `${res.width}x${res.height}` : '—', '', STR),
       // Video codec with the catalog's audio codec beneath it: two facts, one column.
       cell('codec', codecs, '', STR),
+      // Framerate rides as the unit rather than a column of its own — it
+      // describes the same picture and is two characters wide.
+      cell('resolution', res ? `${res.width}x${res.height}` : '—',
+        videoFps ? `${videoFps}fps` : '', STR),
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
@@ -327,6 +330,7 @@ async function main(): Promise<void> {
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
   let audioCodec: string | null = null;
+  let videoFps: number | null = null;
   let prevArrivalMs = 0;
   let prevCaptureMs = 0;
   let jitterEwma = 0;
@@ -770,7 +774,10 @@ async function main(): Promise<void> {
 
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
+    const videoTrack = tracks.find((t) => (t.role ?? t.name) === 'video');
     audioCodec = tracks.find((t) => (t.role ?? t.name) === 'audio')?.codec ?? null;
+    // Absent on the --ts path: the live demuxer has no framerate to declare.
+    videoFps = Number(videoTrack?.framerate) || null;
     targetLatencyMs = Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
     const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
