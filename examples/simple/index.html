@@ -160,6 +160,7 @@
     .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
     .chart-label .right { white-space: nowrap; }
     .chart-label .aside { color: #8a94a6; }
+    .chart-label .aside.warn { color: #e07a7a; }
     .adv { margin-top: 10px; }
     .adv > summary {
       cursor: pointer; color: #8a94a6; font-size: .72rem;
@@ -310,8 +311,9 @@
           <span class="chart-label">jitter ms (RFC 3550): <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
-        <div class="chart" title="How far apart the two tracks' buffers are: video depth minus audio depth. The line sits on the dashed zero rule while both tracks keep up — that is why it looks flat even though the depths themselves move.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: decoded video waiting for its render time, against audio scheduled in WebAudio.&#10;&#10;Above zero means video is deeper, i.e. audio is the track running short; below zero is the reverse. The size of the excursion is roughly how far the two tracks have drifted apart. Sustained divergence is audio/video desync before it becomes a stall, because the player ends up waiting for the starved track.&#10;&#10;'buffered ahead' cannot show this: on CMAF it is the intersection of both buffers.">
-          <span class="chart-label split"><span>skew ms: <b id="bufd-val">—</b></span>
+        <div class="chart" title="Audio/video sync, measured at every painted frame: the capture instant of the frame just drawn minus the capture instant of the audio leaving the speakers at that moment.&#10;&#10;Positive means the picture is ahead of the sound, so audio is late; negative means audio is early. Under about 100 ms either way is below the usual detectability threshold and reads &#39;in sync&#39;; past that the note turns red.&#10;&#10;This is a real lip-sync measurement, not a difference of buffer depths. A and V on the right ARE buffer depths — audio scheduled ahead and video queued ahead — and they are measured from different origins (video excludes frames still inside the decoder), so their difference is not a sync figure and is shown only as context.&#10;&#10;LOC only: it needs the audio output&#39;s playhead, which the CMAF/MSE path does not expose.">
+          <span class="chart-label split"><span>a/v skew ms: <b id="bufd-val">—</b><span
+              id="bufd-note" class="aside"></span></span>
             <span class="right">A: <b id="bufa-val" class="ser-a">—</b> / V: <b id="bufv-val" class="ser-v">—</b></span></span>
           <canvas id="buf-spark"></canvas>
         </div>

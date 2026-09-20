@@ -38,6 +38,7 @@ const cusTarget = document.getElementById('cus-target')!;
 const cusCushion = document.getElementById('cus-cushion')!;
 const bufSpark = document.getElementById('buf-spark') as HTMLCanvasElement;
 const bufDVal = document.getElementById('bufd-val')!;
+const bufDNote = document.getElementById('bufd-note')!;
 const bufVVal = document.getElementById('bufv-val')!;
 const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
@@ -291,7 +292,10 @@ async function main(): Promise<void> {
   // from the engine's buffer-depth stat. Starvation (cushion ≈ 0 at a
   // stall marker) points at the player; a healthy cushion points wire-ward.
   const cushionSamples: number[] = [];
-  const bufSkewSamples: number[] = [];
+  const avSkewSamples: number[] = [];
+  // ITU-R BT.1359 puts detectability near audio 45 ms early / 125 ms late;
+  // one symmetric band is enough to say "stop reading this number".
+  const AV_SKEW_OK_MS = 100;
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
   let audioCodec: string | null = null;
@@ -609,9 +613,13 @@ async function main(): Promise<void> {
     const aMs = byKind ? byKind.audio
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
-    if (player.state !== 'idle' && vMs != null && aMs != null) {
-      pushSample(bufSkewSamples, vMs - aMs);
-    }
+    // True A/V skew: the capture instant of the frame just drawn minus the
+    // capture instant of the audio in the speakers right now. Positive means
+    // the picture is ahead of the sound. The two depths above cannot stand in
+    // for it — they are measured from different origins and video's excludes
+    // frames still inside the decoder.
+    const avSkew: number | null = eng?.stats?.avSkewEwmaMs ?? null;
+    if (player.state !== 'idle' && avSkew != null) pushSample(avSkewSamples, avSkew);
 
     // Sample the measurements onto the shared time axis before drawing.
     const latRaw = latWindow.map(([, v]) => v);
@@ -637,9 +645,17 @@ async function main(): Promise<void> {
     drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
     drawSpark(jitSpark, jitSamples, '#d9922e');
     drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
-    drawDelta(bufSpark, bufSkewSamples);
-    bufDVal.textContent = (vMs != null && aMs != null)
-      ? `${vMs - aMs >= 0 ? '+' : ''}${(vMs - aMs).toFixed(0)}` : '—';
+    drawDelta(bufSpark, avSkewSamples);
+    // Signed with the direction spelled out: a bare +178 does not say which
+    // track is late, and lip-sync tolerance is asymmetric either way.
+    bufDVal.textContent = avSkew == null ? '—'
+      : `${avSkew >= 0 ? '+' : ''}${avSkew.toFixed(0)}`;
+    const avOut = avSkew != null && Math.abs(avSkew) > AV_SKEW_OK_MS;
+    bufDNote.textContent = avSkew == null ? ''
+      : !avOut ? 'in sync'
+        : avSkew > 0 ? 'audio late' : 'audio early';
+    // The value keeps the line's colour; the note carries the verdict.
+    bufDNote.className = avOut ? 'aside warn' : 'aside';
     bufVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
     bufAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVal.textContent = cushionSamples.length
