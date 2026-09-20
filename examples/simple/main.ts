@@ -220,13 +220,13 @@ async function main(): Promise<void> {
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
-    // Half the live gap timeout: warn while a reorder still has headroom, not
-    // once it is already being discarded. Video's timeout stands in because it
-    // is the one exposed; audio runs its own instance on the same policy.
-    const settleMs = Math.max(seqStat('video', 'settleMs'), seqStat('audio', 'settleMs'));
-    const gapMs: number | null =
-      (player as any).engine?.stats?.loc?.videoEffectiveGapTimeoutMs ?? null;
-    const settleTone = gapMs != null && settleMs > gapMs / 2 ? 'fault' : '';
+    // Compared against the playout cushion, which is on screen and static: a
+    // reorder settling inside it is absorbed invisibly, one settling beyond it
+    // arrived later than the buffer was sized to cope with. The adaptive gap
+    // timeout is the true discard threshold but it moves, which made a frozen
+    // value change colour on its own.
+    const settleMs = settleMaxMs();
+    const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
       cell('resolution', res ? `${res.width}x${res.height}` : '—', '', STR),
       // Video codec with the catalog's audio codec beneath it: two facts, one column.
@@ -327,14 +327,24 @@ async function main(): Promise<void> {
   const REORDER_SETTLE_MS = 1_000;
   // Past this a jump is a restart or a join, not a hole worth enumerating.
   const SEQ_JUMP_CAP = 200n;
+  // Settle times age out: a lifetime maximum reports one bad moment forever and
+  // stops describing current conditions.
+  const SETTLE_WINDOW_MS = 45_000;
   interface ObjSeq {
     group: bigint; object: bigint;        // high-water mark, not last seen
     pending: Map<string, number>;
-    reorders: number; settleMs: number; lost: number;
+    reorders: number; lost: number;
+    settles: Array<[number, number]>;     // [arrival, settle ms]
   }
   const objSeq: Record<string, ObjSeq> = {};
-  const seqStat = (t: string, k: 'reorders' | 'settleMs' | 'lost'): number =>
-    objSeq[t]?.[k] ?? 0;
+  const seqStat = (t: string, k: 'reorders' | 'lost'): number => objSeq[t]?.[k] ?? 0;
+  const settleMaxMs = (): number => {
+    let worst = 0;
+    for (const s of Object.values(objSeq)) {
+      for (const [, ms] of s.settles) if (ms > worst) worst = ms;
+    }
+    return worst;
+  };
   // Payload bytes with arrival times, trimmed to a 5 s window: the measured
   // media bitrate, as distinct from the catalog's declared figure and from
   // wire goodput in the transport panel (which counts MOQT and QUIC overhead).
@@ -367,7 +377,7 @@ async function main(): Promise<void> {
     const s = objSeq[t];
     if (!s) {
       objSeq[t] = { group, object, pending: new Map(),
-                    reorders: 0, settleMs: 0, lost: 0 };
+                    reorders: 0, lost: 0, settles: [] };
       return;
     }
     if (group > s.group || (group === s.group && object > s.object)) {
@@ -392,11 +402,12 @@ async function main(): Promise<void> {
       if (at !== undefined) {
         s.pending.delete(key);
         s.reorders++;
-        s.settleMs = Math.max(s.settleMs, now - at);
+        s.settles.push([now, now - at]);
       }
     }
     // An id that never fills its hole is loss. The settle window is what keeps
     // this from counting every in-flight reorder as a missing object.
+    while (s.settles.length && now - s.settles[0]![0] > SETTLE_WINDOW_MS) s.settles.shift();
     let lost = 0, firstKey = '';
     for (const [key, at] of s.pending) {
       if (now - at <= REORDER_SETTLE_MS) continue;
@@ -662,6 +673,8 @@ async function main(): Promise<void> {
     cusCushion.textContent = [
       cushionDiffers ? `cushion: ${cushionNow!.toFixed(0)}` : '',
       rateNow !== 1 ? `rate: ${rateNow.toFixed(2)}×` : '',
+      // LOC: the WebAudio soft chase has no visible playbackRate of its own.
+      (player as any).audioOutput?.chasing ? 'chasing 1.02×' : '',
     ].filter(Boolean).join('  ');
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
