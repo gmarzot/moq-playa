@@ -165,6 +165,13 @@
     .chart-label b.ser-v { color: #6cf; }                     /* video depth */
     /* Per-track depths pinned right so a changing skew value never shifts them. */
     .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
+    /* Equal outer tracks pin the middle item dead centre, so a growing
+       value on the left cannot shove the target reading sideways. */
+    .chart-label.split3 {
+      display: grid; grid-template-columns: 1fr auto 1fr;
+      gap: 12px; align-items: baseline;
+    }
+    .chart-label.split3 > :last-child { text-align: right; }
     .chart-label .right { white-space: nowrap; }
     .chart-label .aside { color: #8a94a6; }
         .adv { margin-top: 10px; }
@@ -322,9 +329,10 @@
           <canvas id="buf-spark"></canvas>
         </div>
         <div class="chart" title="Media ready to play at the playhead: on CMAF the buffered range ahead in MSE, on LOC the audio scheduled in WebAudio.&#10;&#10;Dashed line is the catalog's target latency. Red marks are stalls.&#10;&#10;On CMAF this is the INTERSECTION of the video and audio buffers, so a single low number does not say which track ran dry — the track buffer chart does.">
-          <span class="chart-label split"><span><span id="cus-label">queued ms</span>:
-            <b id="cus-val">—</b> target: <b id="cus-target">—</b></span>
-            <span id="cus-cushion" class="right aside"></span></span>
+          <span class="chart-label split3"><span><span id="cus-label">queued ms</span>:
+            <b id="cus-val">—</b></span>
+            <span>target: <b id="cus-target">—</b></span>
+            <span id="cus-cushion" class="aside"></span></span>
           <canvas id="cus-spark"></canvas>
         </div>
       </div>

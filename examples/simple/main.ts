@@ -312,6 +312,17 @@ async function main(): Promise<void> {
     if (a.length > 180) a.shift();
   };
 
+  // Series carry NaN for "nothing to report" so the charts stay on one axis;
+  // readouts must skip those rather than print them.
+  const lastFinite = (a: number[]): number | null => {
+    for (let i = a.length - 1; i >= 0; i--) if (Number.isFinite(a[i]!)) return a[i]!;
+    return null;
+  };
+  const maxFinite = (a: number[]): number | null => {
+    const f = a.filter(Number.isFinite);
+    return f.length ? Math.max(...f) : null;
+  };
+
   const percentile = (a: number[], p: number): number => {
     const s = [...a].sort((x, y) => x - y);
     return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0;
@@ -672,8 +683,7 @@ async function main(): Promise<void> {
       ? `${vMs - aMs >= 0 ? '+' : ''}${(vMs - aMs).toFixed(0)}` : '—';
     bufVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
     bufAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
-    cusVal.textContent = cushionSamples.length
-      ? cushionSamples[cushionSamples.length - 1]!.toFixed(0) : '—';
+    cusVal.textContent = lastFinite(cushionSamples)?.toFixed(0) ?? '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
     // The cushion is adaptive, but pub_media's printed URL pins floor == cap
     // == target, so it usually equals the target: show it only when it has
@@ -696,7 +706,7 @@ async function main(): Promise<void> {
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
-      latMax.textContent = Math.max(...latTickMaxSamples).toFixed(0);
+      latMax.textContent = maxFinite(latTickMaxSamples)?.toFixed(0) ?? '—';
     }
     // The offset is a publisher stamping artifact, not a playback figure, so it
     // stays off the label and rides a hover instead. Empty title falls through
@@ -707,9 +717,7 @@ async function main(): Promise<void> {
         + 'window, not one-way delay. The publisher reports the same offset as '
         + 'its own send lag; it is a stamping artifact, not latency.'
       : '';
-    jitVal.textContent = jitSamples.length
-      ? jitSamples[jitSamples.length - 1]!.toFixed(1)
-      : '—';
+    jitVal.textContent = lastFinite(jitSamples)?.toFixed(1) ?? '—';
   }, 250);
 
   // ── CMSF / MSF catalog panel ──────────────────────────────────────
