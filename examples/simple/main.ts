@@ -252,10 +252,10 @@ async function main(): Promise<void> {
       // Render cushion rides the queued-ahead chart label and A/V skew has a
       // chart of its own: this row is for facts and fault counts, not gauges.
       ...(locPath ? [
-        cell('sync resets', String(syncResets), '', FAULT(syncResets)),
-        cell('aud underrun', String(s.audioUnderruns ?? 0), '', FAULT(s.audioUnderruns ?? 0)),
+        cell('resyncs', String(syncResets), '', FAULT(syncResets)),
+        cell('underruns', String(s.audioUnderruns ?? 0), '', FAULT(s.audioUnderruns ?? 0)),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
-        cell('aud late/snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
+        cell('late/snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
           + `/${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '',
           FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
             + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
