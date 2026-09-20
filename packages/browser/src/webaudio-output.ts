@@ -92,6 +92,7 @@ export class WebAudioOutput implements AudioOutputLike {
   private _chasing = false;
   private _liveEdgeSnapCount = 0;
   private _leadSec: number | null = null;
+  private suspendedDrops = 0;
 
   /** Audio scheduled beyond the current playout point, in seconds. */
   get scheduledAheadSec(): number {
@@ -110,6 +111,16 @@ export class WebAudioOutput implements AudioOutputLike {
   /** Whether the soft chase is shedding lead. */
   get chasing(): boolean {
     return this._chasing;
+  }
+
+  /** Buffers dropped because the context was not running. */
+  get suspendedDropCount(): number {
+    return this.suspendedDrops;
+  }
+
+  /** AudioContext state, so a stopped clock is never invisible. */
+  get contextState(): string {
+    return this.audioCtx.state;
   }
 
   /** Hard re-anchors that dropped queued audio. */
@@ -147,7 +158,16 @@ export class WebAudioOutput implements AudioOutputLike {
     this.clock = clock ?? { now: () => performance.now() * 1000 };
     this.targetAheadSec = options.targetAheadSec ?? LIVE_EDGE_TARGET_AHEAD_SEC;
     this.maxAheadSec = Math.max(options.maxAheadSec ?? LIVE_EDGE_MAX_AHEAD_SEC, this.targetAheadSec);
+    // A suspended context stops currentTime. Everything derived from it —
+    // scheduledAheadSec, lead, the playhead — is then measured against a clock
+    // that is not moving, so the chain must be dropped and re-anchored rather
+    // than resumed against a backlog that was never real.
+    this.audioCtx.addEventListener('statechange', this.onStateChange);
   }
+
+  private readonly onStateChange = (): void => {
+    if (this.audioCtx.state === 'running' && this.suspendedDrops > 0) this.flush();
+  };
 
   /**
    * Convert renderTimeUs (pipeline clock domain) to AudioContext.currentTime seconds.
@@ -177,6 +197,15 @@ export class WebAudioOutput implements AudioOutputLike {
    */
   schedule(data: unknown, renderTimeUs: number, captureTimestampUs?: number): void {
     const audioData = data as AudioData;
+
+    // Nothing scheduled into a suspended context is audible, and currentTime
+    // does not advance, so scheduling anyway builds a queue that exists only in
+    // the arithmetic. Drop it and free the native memory.
+    if (this.audioCtx.state !== 'running') {
+      this.suspendedDrops++;
+      audioData.close();
+      return;
+    }
 
     // Copy decoded PCM into an AudioBuffer.
     // AudioData holds native memory — close() is required.
@@ -367,6 +396,7 @@ export class WebAudioOutput implements AudioOutputLike {
 
   /** Release resources. */
   destroy(): void {
+    this.audioCtx.removeEventListener('statechange', this.onStateChange);
     this.flush();
   }
 }

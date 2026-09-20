@@ -14,6 +14,19 @@ import { WebAudioOutput } from './webaudio-output.js';
 
 class MockAudioContext {
   currentTime = 0;
+  // Real contexts start suspended and stop currentTime while they are; the
+  // output now refuses to schedule into one, so the mock must say it is live.
+  state: AudioContextState = 'running';
+  private listeners: Array<() => void> = [];
+  addEventListener(_type: string, fn: () => void): void { this.listeners.push(fn); }
+  removeEventListener(_type: string, fn: () => void): void {
+    this.listeners = this.listeners.filter((l) => l !== fn);
+  }
+  /** Drive a suspend/resume transition the way the browser would. */
+  setState(next: AudioContextState): void {
+    this.state = next;
+    for (const l of [...this.listeners]) l();
+  }
   readonly destination = { kind: 'destination' };
   readonly started: Array<{ when: number; duration: number; rate: number }> = [];
   readonly sources: any[] = [];
@@ -354,5 +367,36 @@ describe('live-edge lead clamp', () => {
     out.schedule(audioData(600 * MS) as unknown as AudioData, 1_200 * MS); // lead 0.4 > 0.3
     expect(out.liveEdgeSnapCount).toBe(1);
     expect(ctx.started.at(-1)!.when).toBeCloseTo(1.25, 6);
+  });
+});
+
+describe('suspended AudioContext', () => {
+  it('schedules nothing and reports no queue while suspended', () => {
+    const { out, ctx } = makeOutput();
+    ctx.setState('suspended');
+    for (let i = 0; i < 50; i++) out.schedule(audioData(i * 20_000), (i * 20_000) + 1, i * 20_000);
+    expect(out.suspendedDropCount).toBe(50);
+    // The bug this guards: nextScheduledTime advanced per buffer while
+    // currentTime stayed frozen, so the queue reading grew without bound.
+    expect(out.scheduledAheadSec).toBe(0);
+    expect(out.playheadCaptureUs()).toBeNull();
+  });
+
+  it('re-anchors instead of unwinding a phantom backlog on resume', () => {
+    const { out, ctx } = makeOutput();
+    ctx.setState('suspended');
+    for (let i = 0; i < 50; i++) out.schedule(audioData(i * 20_000), (i * 20_000) + 1, i * 20_000);
+    ctx.setState('running');
+    expect(out.scheduledAheadSec).toBe(0);
+    expect(out.chasing).toBe(false);
+    expect(out.captureLeadSec).toBeNull();
+  });
+
+  it('frees native memory for every dropped buffer', () => {
+    const { out, ctx } = makeOutput();
+    ctx.setState('suspended');
+    const d = audioData(0);
+    out.schedule(d, 1, 0);
+    expect(d.close).toHaveBeenCalledOnce();
   });
 });
