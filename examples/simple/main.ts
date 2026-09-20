@@ -232,10 +232,10 @@ async function main(): Promise<void> {
       cell('resolution', res ? `${res.width}x${res.height}` : '—', '', STR),
       // Video codec with the catalog's audio codec beneath it: two facts, one column.
       cell('codec', codecs, '', STR),
+      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
       cell('bitrate v/a', `${fmtKbps(trackKbps('video'))}/${fmtKbps(trackKbps('audio'))}`, 'kbps', NUM),
-      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       cell('rend/dec', `${s.framesRendered ?? 0}/${s.framesDecoded ?? 0}`, '', NUM),
       // Cross-stream arrival order, not a fault: LOC audio is one group per frame
       // on its own QUIC stream and independent streams carry no ordering between
@@ -313,6 +313,7 @@ async function main(): Promise<void> {
   const LAG_PERIOD_MS = 50;
   const lagSamples: Array<[number, number]> = [];
   let lagDueAt = 0;
+  let lastChaseNoteMs = 0;
   const lagProbe = (): void => {
     const now = performance.now();
     if (lagDueAt) lagSamples.push([now, Math.max(0, now - lagDueAt)]);
@@ -653,6 +654,7 @@ async function main(): Promise<void> {
     }
     // Contiguous cushion only (facade-computed per path). Zero with appends
     // still landing means the playhead is parked at a hole.
+    const tickNowMs = performance.now();
     const cushionMs = player.stats.cushionMs;
     if (player.state !== 'idle') {
       cushionSamples.push(cushionMs ?? NaN);
@@ -727,6 +729,24 @@ async function main(): Promise<void> {
       audioOut ? `chasing: <b${audioOut.chasing ? '' : ' class="idle"'}>`
         + `${audioOut.chasing ? '1.02' : '1.00'}×</b>` : '',
     ].filter(Boolean).join('  ');
+
+    // A large queue with an idle chase is a contradiction: the controller acts on
+    // its own `lead`, which the panel cannot see. Log both together when they
+    // disagree — lead null means alignedTime was null, so no chase or snap could
+    // have run at all.
+    if (audioOut && targetLatencyMs > 0) {
+      const qMs = audioOut.scheduledAheadSec * 1000;
+      if (qMs > targetLatencyMs * 2 && !audioOut.chasing
+          && tickNowMs - lastChaseNoteMs > 5_000) {
+        lastChaseNoteMs = tickNowMs;
+        const leadSec = audioOut.captureLeadSec;
+        const lagNow = Math.max(0, ...lagSamples.map(([, d]) => d));
+        log(`chase idle: queued=${qMs.toFixed(0)}ms target=${targetLatencyMs}ms `
+          + `lead=${leadSec == null ? 'null' : (leadSec * 1000).toFixed(0) + 'ms'} `
+          + `lag=${lagNow.toFixed(0)}ms snaps=${audioOut.liveEdgeSnapCount ?? 0}`);
+      }
+    }
+
     if (latVals.length) {
       latVal.textContent = percentile(latVals, 0.5).toFixed(0);
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
