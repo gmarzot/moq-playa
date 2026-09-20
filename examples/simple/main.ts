@@ -226,7 +226,7 @@ async function main(): Promise<void> {
     // timeout is the true discard threshold but it moves, which made a frozen
     // value change colour on its own.
     const settleMs = settleMaxMs();
-    const tickWorst = Math.max(0, ...tickSamples.map(([, d]) => d));
+    const lagWorst = Math.max(0, ...lagSamples.map(([, d]) => d));
     const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
       cell('resolution', res ? `${res.width}x${res.height}` : '—', '', STR),
@@ -245,10 +245,10 @@ async function main(): Promise<void> {
       cell('reorder v/a',
         `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`,
         `&le;${settleMs.toFixed(0)}ms`, NUM, settleTone),
-      // Worst tick interval against a 250 ms nominal: a throttled or blocked
-      // main thread starves every stage downstream of it.
-      cell('tick ms', tickWorst ? tickWorst.toFixed(0) : '—', '',
-        tickWorst > TICK_NOMINAL_MS * 1.6 ? 'fault' : NUM),
+      // Worst event-loop lag in the window. Tens of ms is ordinary scheduling;
+      // hundreds means the thread is blocked or the tab is being throttled.
+      cell('lag ms', lagSamples.length ? lagWorst.toFixed(0) : '—', '',
+        lagWorst > 100 ? 'fault' : NUM),
       // Render cushion rides the queued-ahead chart label and A/V skew has a
       // chart of its own: this row is for facts and fault counts, not gauges.
       ...(locPath ? [
@@ -304,13 +304,25 @@ async function main(): Promise<void> {
   // stall marker) points at the player; a healthy cushion points wire-ward.
   const cushionSamples: number[] = [];
   const bufDeltaSamples: number[] = [];
-  // Interval actually achieved by the 250 ms tick below. Chrome clamps timers
-  // toward 1 Hz for a tab that is hidden or inaudible, and a throttled tick
-  // releases media in bursts — which reads downstream as queue oscillation
-  // rather than as the main thread being starved.
-  const TICK_NOMINAL_MS = 250;
-  let lastTickMs = 0;
-  const tickSamples: Array<[number, number]> = [];
+  // Event-loop lag: how late a timer that does nothing actually runs. The 250 ms
+  // tick below cannot measure this — setInterval waits for its own callback, so
+  // its period carries this page's draw cost. A bare probe carries only
+  // contention: other work blocking the thread, or Chrome clamping timers toward
+  // 1 Hz for a tab that is hidden or inaudible. Either starves every stage of the
+  // pipeline and surfaces downstream as queue oscillation.
+  const LAG_PERIOD_MS = 50;
+  const lagSamples: Array<[number, number]> = [];
+  let lagDueAt = 0;
+  const lagProbe = (): void => {
+    const now = performance.now();
+    if (lagDueAt) lagSamples.push([now, Math.max(0, now - lagDueAt)]);
+    while (lagSamples.length && now - lagSamples[0]![0] > SETTLE_WINDOW_MS) {
+      lagSamples.shift();
+    }
+    lagDueAt = now + LAG_PERIOD_MS;
+    setTimeout(lagProbe, LAG_PERIOD_MS);
+  };
+  setTimeout(lagProbe, LAG_PERIOD_MS);
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
   let audioCodec: string | null = null;
@@ -641,12 +653,6 @@ async function main(): Promise<void> {
     }
     // Contiguous cushion only (facade-computed per path). Zero with appends
     // still landing means the playhead is parked at a hole.
-    const tickNow = performance.now();
-    if (lastTickMs) tickSamples.push([tickNow, tickNow - lastTickMs]);
-    lastTickMs = tickNow;
-    while (tickSamples.length && tickNow - tickSamples[0]![0] > SETTLE_WINDOW_MS) {
-      tickSamples.shift();
-    }
     const cushionMs = player.stats.cushionMs;
     if (player.state !== 'idle') {
       cushionSamples.push(cushionMs ?? NaN);
