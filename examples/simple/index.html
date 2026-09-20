@@ -160,8 +160,7 @@
     .chart-label.split { display: flex; justify-content: space-between; gap: 12px; }
     .chart-label .right { white-space: nowrap; }
     .chart-label .aside { color: #8a94a6; }
-    .chart-label .aside.warn { color: #e07a7a; }
-    .adv { margin-top: 10px; }
+        .adv { margin-top: 10px; }
     .adv > summary {
       cursor: pointer; color: #8a94a6; font-size: .72rem;
       text-transform: uppercase; letter-spacing: .04em; padding: 4px 0;
@@ -173,7 +172,7 @@
     .chart { cursor: help; }
     .chart .chart-label { border-bottom: 1px dotted #444a58; padding-bottom: 2px; }
     .chart canvas {
-      width: 100%; height: 56px; background: #161622;
+      width: 100%; height: 63px; background: #161622;
       border-radius: 6px; display: block; margin-top: 4px;
     }
 
@@ -311,9 +310,8 @@
           <span class="chart-label">jitter ms (RFC 3550): <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
-        <div class="chart" title="Audio/video sync, measured at every painted frame: the capture instant of the frame just drawn minus the capture instant of the audio leaving the speakers at that moment.&#10;&#10;Positive means the picture is ahead of the sound, so audio is late; negative means audio is early. Under about 100 ms either way is below the usual detectability threshold and reads &#39;in sync&#39;; past that the note turns red.&#10;&#10;This is a real lip-sync measurement, not a difference of buffer depths. A and V on the right ARE buffer depths — audio scheduled ahead and video queued ahead — and they are measured from different origins (video excludes frames still inside the decoder), so their difference is not a sync figure and is shown only as context.&#10;&#10;LOC only: it needs the audio output&#39;s playhead, which the CMAF/MSE path does not expose.">
-          <span class="chart-label split"><span>a/v skew ms: <b id="bufd-val">—</b><span
-              id="bufd-note" class="aside"></span></span>
+        <div class="chart" title="Buffer depth difference: video queued ahead minus audio scheduled ahead. It shows the two tracks drifting apart before either starves, and a sustained excursion is what precedes a stall.&#10;&#10;This is NOT an A/V sync figure. The two depths are measured from different origins and video&#39;s excludes frames still inside the decoder, so their difference does not convert to lip-sync milliseconds. A true skew stat exists in the engine but currently reads back as elapsed session time, so it is not shown.&#10;&#10;CMAF: the two MSE SourceBuffers. LOC: decoded video waiting for its render time, against audio scheduled in WebAudio.&#10;&#10;Above zero means video is deeper, i.e. audio is the track running short; below zero is the reverse.">
+          <span class="chart-label split"><span>buffer Δ ms: <b id="bufd-val">—</b></span>
             <span class="right">A: <b id="bufa-val" class="ser-a">—</b> / V: <b id="bufv-val" class="ser-v">—</b></span></span>
           <canvas id="buf-spark"></canvas>
         </div>
