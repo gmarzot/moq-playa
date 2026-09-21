@@ -247,7 +247,7 @@
       font-size: .68rem; letter-spacing: .06em;
     }
     .cat-json {
-      margin: 10px 0 0; padding: 10px 12px; background: #12121f;
+      margin: 0; padding: 10px 12px; background: #12121f;
       border-radius: 6px; font-family: monospace; font-size: 1rem;
       line-height: 1.5; flex: 1; min-width: 0; min-height: 0; overflow-y: auto;
       /* Wrap rather than scroll sideways, indentation preserved. break-all
@@ -291,7 +291,10 @@
       background: #23233a; border-color: #3a3a52;
     }
     .copy:hover, .copy:focus-visible { opacity: 1; }
-    .json-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+    .json-wrap {
+      position: relative; flex: 1; min-height: 0; display: flex;
+      margin-top: 10px;
+    }
 
     #log {
       background: #1a1a2e;
