@@ -32,6 +32,12 @@ import {
 // ─── URL params ──────────────────────────────────────────────────────
 
 const params = new URLSearchParams(window.location.search);
+/**
+ * Our relay. Discovery probes the page's own host, which never finds this one,
+ * so it is the default rather than a fallback. `?url=` and the settings dialog
+ * still override, and discovery still runs when either names something else.
+ */
+const DEFAULT_RELAY = 'https://moqx-main.ci.openmoq.org:4433/moq-relay';
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
@@ -63,7 +69,7 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
   }
 
   function populateFields() {
-    sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? '';
+    sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? DEFAULT_RELAY;
     if (!sUrl.value && !modalDiscovery) {
       modalDiscovery = new AbortController();
       void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
@@ -258,8 +264,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // consumer remains — it never hangs the cancellation.
       const discoveryAbort = new AbortController();
       ctx.onCancel(() => discoveryAbort.abort(new Error('broadcast stopped')));
-      log('Discovering relay endpoint...');
-      const relayUrl = await resolveRelayEndpoint({ signal: discoveryAbort.signal });
+      // The settings dialog writes its value back to ?url=, so the param covers
+      // both ways of naming a relay; absent either, use ours.
+      const relayUrl = params.get('url') ?? DEFAULT_RELAY;
+      if (!params.get('url')) log(`Relay: ${DEFAULT_RELAY} (default)`);
       ctx.throwIfCancelled();
       resolvedRelayUrl = relayUrl;
 
