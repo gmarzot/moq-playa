@@ -50,6 +50,8 @@ const catMeta = document.getElementById('cat-meta')!;
 const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
+const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
+const layoutEl = document.getElementById('layout')!;
 const logEl = document.getElementById('log')!;
 const playerContainer = document.getElementById('player-container')!;
 
@@ -205,17 +207,12 @@ async function main(): Promise<void> {
     const cell = (label: string, v: string, unit = '', tone = '', unitTone = '') =>
       `<div class="cell">${label}:<b${tone ? ` class="${tone}"` : ''}>${v}`
       + `${unit ? `<span class="u${unitTone ? ` ${unitTone}` : ''}">${unit}</span>` : ''}</b></div>`;
-    // Role, not severity: blue names what the stream is, green measures it,
-    // amber marks the counters that should stay at zero.
-    const STR = 'str', NUM = 'num';
+    // Role, not severity: green measures, amber marks the counters that
+    // should stay at zero. Stream identity lives in the catalog panel.
+    const NUM = 'num';
     // Amber only once a counter has something to report; white at zero.
     const FAULT = (n: number) => (n > 0 ? 'fault' : '');
     const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
-    const videoCodec = s.videoCodec ?? s.currentVideoCodec ?? '—';
-    const codecs = audioCodec
-      ? `${audioCodec} /<span class="ln2">${videoCodec}</span>`
-      : videoCodec;
-    const res = s.resolution ?? s.currentResolution;
     // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
@@ -229,12 +226,6 @@ async function main(): Promise<void> {
     const lagWorst = Math.max(0, ...lagSamples.map(([, d]) => d));
     const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
-      // Video codec with the catalog's audio codec beneath it: two facts, one column.
-      cell('codec', codecs, '', STR),
-      // Framerate rides as the unit rather than a column of its own — it
-      // describes the same picture and is two characters wide.
-      cell('resolution', res ? `${res.width}x${res.height}` : '—',
-        videoFps ? `${videoFps}fps` : '', STR),
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
       // Frames that were decoded but never presented are the interesting part,
       // so the pair stays together rather than in two separate columns.
@@ -797,18 +788,33 @@ async function main(): Promise<void> {
       const pkg = document.createElement('span');
       pkg.className = 'pk';
       pkg.textContent = (t.packaging ?? '?').toUpperCase();
+      // Remote input: every value is a text node, never markup.
       const detail = document.createElement('span');
       detail.className = 'dt';
-      detail.textContent = [
-        t.codec,
-        t.width && t.height ? `${t.width}×${t.height}` : '',
-        t.framerate ? `${t.framerate}fps` : '',
-        t.samplerate ? `${t.samplerate}Hz` : '',
-        t.channelConfig ? `${t.channelConfig}ch` : '',
-        t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',
-        t.initRef ? `init=${t.initRef}` : '',
-        t.targetLatency ? `target=${t.targetLatency}ms` : '',
-      ].filter(Boolean).join(' · ');
+      const parts: Array<[string, boolean]> = [
+        [t.codec ?? '', true],
+        [t.width && t.height ? `${t.width}×${t.height}` : '', true],
+        [t.framerate ? `${t.framerate}fps` : '', true],
+        [t.samplerate ? `${t.samplerate}Hz` : '', true],
+        [t.channelConfig ? `${t.channelConfig}ch` : '', false],
+        [t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '', false],
+        [t.initRef ? `init=${t.initRef}` : '', false],
+        [t.targetLatency ? `target=${t.targetLatency}ms` : '', false],
+      ];
+      let first = true;
+      for (const [text, strong] of parts) {
+        if (!text) continue;
+        if (!first) detail.append(document.createTextNode(' · '));
+        first = false;
+        if (strong) {
+          const em = document.createElement('span');
+          em.className = 'hi';
+          em.textContent = text;
+          detail.append(em);
+        } else {
+          detail.append(document.createTextNode(text));
+        }
+      }
       row.append(name, pkg, detail);
       return row;
     }));
@@ -833,9 +839,13 @@ async function main(): Promise<void> {
     renderCatalog(catalog);
   });
 
+  const setCatalogHidden = (hidden: boolean): void => {
+    layoutEl.classList.toggle('cat-hidden', hidden);
+    catRestore.hidden = !hidden;
+  };
+  catRestore.addEventListener('click', () => setCatalogHidden(false));
   catToggle.addEventListener('click', () => {
-    const collapsed = catalogPanel.classList.toggle('collapsed');
-    catToggle.textContent = collapsed ? 'show' : 'hide';
+    setCatalogHidden(true);
   });
 
   // ── Controls ──────────────────────────────────────────────────────
