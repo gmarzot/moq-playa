@@ -52,6 +52,8 @@ const catMeta = document.getElementById('cat-meta')!;
 const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
+const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
+const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
 const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
 const layoutEl = document.getElementById('layout')!;
 const logEl = document.getElementById('log')!;
@@ -61,6 +63,21 @@ function log(msg: string): void {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
   logEl.textContent += `[${ts}] ${msg}\n`;
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+/** Copy to the clipboard, confirming in the button itself. */
+function wireCopy(btn: HTMLButtonElement, text: () => string): void {
+  btn.addEventListener('click', async () => {
+    const restore = btn.textContent;
+    try {
+      await navigator.clipboard.writeText(text());
+      btn.textContent = 'copied';
+    } catch {
+      // Denied permission, or no clipboard outside a secure context.
+      btn.textContent = 'blocked';
+    }
+    setTimeout(() => { btn.textContent = restore; }, 1200);
+  });
 }
 
 function formatTime(ms: number): string {
@@ -714,14 +731,13 @@ async function main(): Promise<void> {
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
     const audioOut = (player as any).audioOutput;
     // Own strings only — no remote input reaches this, so markup is safe here.
-    cusCushion.innerHTML = [
-      rateNow !== 1 ? `rate: <b>${rateNow.toFixed(2)}×</b>` : '',
-      // LOC: the WebAudio soft chase has no visible playbackRate of its own.
-      // Always present once there is an audio output, so a chase starting or
-      // stopping changes one value instead of shifting the label in and out.
-      audioOut ? `chasing: <b${audioOut.chasing ? '' : ' class="idle"'}>`
-        + `${audioOut.chasing ? '1.02' : '1.00'}×</b>` : '',
-    ].filter(Boolean).join('  ');
+    // One label for one concept: playout sped up to shed latency. CMAF does it
+    // with the video element's playbackRate, LOC inside WebAudioOutput where
+    // there is none to read — the value carries the difference, not the name.
+    const chaseRate = audioOut ? (audioOut.chasing ? 1.02 : 1) : rateNow;
+    cusCushion.innerHTML = audioOut || rateNow !== 1
+      ? `rate: <b${chaseRate > 1 ? '' : ' class="idle"'}>${chaseRate.toFixed(2)}×</b>`
+      : '';
 
     // A large queue with an idle chase is a contradiction: the controller acts on
     // its own `lead`, which the panel cannot see. Log both together when they
@@ -828,6 +844,8 @@ async function main(): Promise<void> {
     catRestore.hidden = !hidden;
   };
   catRestore.addEventListener('click', () => setCatalogHidden(false));
+  wireCopy(logCopy, () => logEl.textContent ?? '');
+  wireCopy(catCopy, () => catJson.textContent ?? '');
   catToggle.addEventListener('click', () => {
     setCatalogHidden(true);
   });

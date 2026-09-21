@@ -279,6 +279,13 @@
     .state-badge.error { background: #3a1a1a; color: #c44; }
 
     /* Log */
+    /* A copy control rides the top-right of the pane it belongs to, so the
+       pane keeps its full height and the button never moves with the content. */
+    .log-wrap { position: relative; }
+    .copy { position: absolute; top: 8px; right: 10px; z-index: 1; opacity: .55; }
+    .copy:hover, .copy:focus-visible { opacity: 1; }
+    .cat-btns { display: flex; gap: 6px; }
+
     #log {
       background: #1a1a2e;
       padding: 12px 16px;
@@ -319,7 +326,10 @@
     <div class="catalog-panel" id="catalog-panel">
       <div class="cat-head">
         <span class="chart-label">MSF / CMSF catalog <b id="cat-meta">waiting…</b></span>
-        <button id="cat-toggle" type="button">hide</button>
+        <span class="cat-btns">
+          <button id="cat-copy" type="button">copy</button>
+          <button id="cat-toggle" type="button">hide</button>
+        </span>
       </div>
       <div class="cat-tracks" id="cat-tracks"></div>
       <pre class="cat-json" id="cat-json"></pre>
@@ -354,7 +364,10 @@
       </div>
     </div>
 
-    <pre id="log"></pre>
+    <div class="log-wrap">
+      <button id="log-copy" class="mini copy" type="button">copy</button>
+      <pre id="log"></pre>
+    </div>
     <details class="adv" id="adv-panel">
       <summary>transport (QUIC / WebTransport)</summary>
       <div class="diag-grid" id="adv-grid"></div>
