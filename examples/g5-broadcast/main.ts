@@ -258,12 +258,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     // behavior binds to the NEGOTIATED draft (connection.draftVersion after
     // connect), not the configured preference.
     openSession: async (ctx: AttemptResources) => {
-      // Resolve the relay endpoint (explicit ?url= as-is, discovery
-      // otherwise). The consumer aborts with the attempt: Stop during
-      // probing closes the connecting probe transport once no other
-      // consumer remains — it never hangs the cancellation.
-      const discoveryAbort = new AbortController();
-      ctx.onCancel(() => discoveryAbort.abort(new Error('broadcast stopped')));
       // The settings dialog writes its value back to ?url=, so the param covers
       // both ways of naming a relay; absent either, use ours.
       const relayUrl = params.get('url') ?? DEFAULT_RELAY;
