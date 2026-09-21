@@ -245,8 +245,10 @@
     .cat-json {
       margin: 10px 0 0; padding: 10px 12px; background: #12121f;
       border-radius: 6px; font-family: monospace; font-size: 1rem;
-      line-height: 1.5; flex: 1; min-height: 0; overflow: auto;
-      white-space: pre; color: #9fb0c4;
+      line-height: 1.5; flex: 1; min-height: 0; overflow-y: auto;
+      /* Wrap rather than scroll sideways: indentation is preserved, and a long
+         value breaks instead of widening the panel. */
+      white-space: pre-wrap; overflow-wrap: anywhere; color: #9fb0c4;
     }
 
     /* Narrow viewports: stack back to a single column */
