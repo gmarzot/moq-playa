@@ -1,5 +1,5 @@
 /**
- * G5 Player — MoQT stream introspection.
+ * G5 Player
  *
  * Plays LOC and CMAF through the relay and instruments what it sees: a metrics
  * row of health counters, four charts on one shared time axis, the catalog as

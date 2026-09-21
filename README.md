@@ -326,7 +326,7 @@ Example pages:
 | Path | Description |
 |------|-------------|
 | `/player/` | Full-featured player with stats overlay, quality selector, settings |
-| `/g5-player/` | G5 Player — MoQT stream introspection |
+| `/g5-player/` | G5 Player — playback with health counters, charts and catalog |
 | `/connect/` | Protocol explorer — raw message log |
 | `/catalog/` | Catalog browser |
 | `/broadcast/` | Publisher example |
