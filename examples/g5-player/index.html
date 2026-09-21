@@ -249,7 +249,7 @@
     .cat-json {
       margin: 10px 0 0; padding: 10px 12px; background: #12121f;
       border-radius: 6px; font-family: monospace; font-size: 1rem;
-      line-height: 1.5; flex: 1; min-height: 0; overflow-y: auto;
+      line-height: 1.5; flex: 1; min-width: 0; min-height: 0; overflow-y: auto;
       /* Wrap rather than scroll sideways, indentation preserved. break-all
          rather than overflow-wrap: a normal break opportunity would push a long
          value to its own line first, leaving `"data":` stranded above it. */
@@ -261,7 +261,8 @@
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
-      .cat-json { flex: none; max-height: 220px; }
+      .json-wrap { flex: none; max-height: 220px; }
+      .cat-json { flex: 1; max-height: 220px; }
     }
     .catalog-panel.collapsed .cat-tracks,
     .catalog-panel.collapsed .cat-json { display: none; }
@@ -284,7 +285,7 @@
     .log-wrap { position: relative; }
     .copy { position: absolute; top: 8px; right: 10px; z-index: 1; opacity: .55; }
     .copy:hover, .copy:focus-visible { opacity: 1; }
-    .cat-btns { display: flex; gap: 6px; }
+    .json-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
 
     #log {
       background: #1a1a2e;
@@ -326,13 +327,13 @@
     <div class="catalog-panel" id="catalog-panel">
       <div class="cat-head">
         <span class="chart-label">MSF / CMSF catalog <b id="cat-meta">waiting…</b></span>
-        <span class="cat-btns">
-          <button id="cat-copy" type="button">copy</button>
-          <button id="cat-toggle" type="button">hide</button>
-        </span>
+        <button id="cat-toggle" type="button">hide</button>
       </div>
       <div class="cat-tracks" id="cat-tracks"></div>
-      <pre class="cat-json" id="cat-json"></pre>
+      <div class="json-wrap">
+        <button id="cat-copy" class="mini copy" type="button">copy</button>
+        <pre class="cat-json" id="cat-json"></pre>
+      </div>
     </div>
     </div>
     </div>
