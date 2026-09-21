@@ -197,7 +197,10 @@
     /* Catalog panel — the MSF/CMSF catalog as delivered, redrawn on deltas.
        Fills the right column at the left column's height; JSON scrolls. */
     .catalog-panel {
-      position: absolute; inset: 0;
+      /* The column stretches to the main column, whose last 12px are the
+         controls' bottom padding — inset by that so the panel ends level with
+         the buttons rather than with the padding. */
+      position: absolute; inset: 0 0 12px 0;
       display: flex; flex-direction: column;
       background: #1a1a2e;
       border-radius: 8px; padding: 10px 14px;
