@@ -231,9 +231,11 @@
       padding: 5px 0; border-bottom: 1px solid #23233a;
     }
     .cat-track:last-child { border-bottom: 0; }
-    .cat-track .dt { color: #8a94a6; font-size: .9rem; white-space: nowrap; }
-    /* Codec and geometry left the metrics row; they are the headline here. */
-    .cat-track .dt .hi { color: #e8eef6; font-weight: 700; }
+    /* Stream identity left the metrics row; this line is now the only place
+       it appears, and it keeps the blue that named it there. */
+    .cat-track .dt {
+      color: #6cf; font-weight: 600; font-size: .9rem; white-space: nowrap;
+    }
     .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
     .cat-track .pk {
       color: #4d4; border: 1px solid #2f5a34; border-radius: 4px;

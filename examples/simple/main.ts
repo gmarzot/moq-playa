@@ -788,33 +788,19 @@ async function main(): Promise<void> {
       const pkg = document.createElement('span');
       pkg.className = 'pk';
       pkg.textContent = (t.packaging ?? '?').toUpperCase();
-      // Remote input: every value is a text node, never markup.
+      // Remote input: a text node, never markup.
       const detail = document.createElement('span');
       detail.className = 'dt';
-      const parts: Array<[string, boolean]> = [
-        [t.codec ?? '', true],
-        [t.width && t.height ? `${t.width}×${t.height}` : '', true],
-        [t.framerate ? `${t.framerate}fps` : '', true],
-        [t.samplerate ? `${t.samplerate}Hz` : '', true],
-        [t.channelConfig ? `${t.channelConfig}ch` : '', false],
-        [t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '', false],
-        [t.initRef ? `init=${t.initRef}` : '', false],
-        [t.targetLatency ? `target=${t.targetLatency}ms` : '', false],
-      ];
-      let first = true;
-      for (const [text, strong] of parts) {
-        if (!text) continue;
-        if (!first) detail.append(document.createTextNode(' · '));
-        first = false;
-        if (strong) {
-          const em = document.createElement('span');
-          em.className = 'hi';
-          em.textContent = text;
-          detail.append(em);
-        } else {
-          detail.append(document.createTextNode(text));
-        }
-      }
+      detail.textContent = [
+        t.codec,
+        t.width && t.height ? `${t.width}×${t.height}` : '',
+        t.framerate ? `${t.framerate}fps` : '',
+        t.samplerate ? `${t.samplerate}Hz` : '',
+        t.channelConfig ? `${t.channelConfig}ch` : '',
+        t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',
+        t.initRef ? `init=${t.initRef}` : '',
+        t.targetLatency ? `target=${t.targetLatency}ms` : '',
+      ].filter(Boolean).join(' · ');
       row.append(name, pkg, detail);
       return row;
     }));
