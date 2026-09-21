@@ -56,6 +56,7 @@ export default defineConfig({
         player: resolve(__dirname, 'player/index.html'),
         'g5-player': resolve(__dirname, 'g5-player/index.html'),
         broadcast: resolve(__dirname, 'broadcast/index.html'),
+        'g5-broadcast': resolve(__dirname, 'g5-broadcast/index.html'),
       },
     },
   },

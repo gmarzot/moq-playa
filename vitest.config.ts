@@ -30,6 +30,7 @@ export default defineConfig({
       'examples/node-relay/src/**/*.test.ts',
       'examples/node-publisher/src/**/*.test.ts',
       'examples/broadcast/**/*.test.ts',
+      'examples/g5-broadcast/**/*.test.ts',
       'examples/shared/**/*.test.ts',
     ],
     // The external-probe differential lane (`*.diff.test.ts`) requires a built
