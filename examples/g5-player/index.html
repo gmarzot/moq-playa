@@ -283,7 +283,13 @@
     /* A copy control rides the top-right of the pane it belongs to, so the
        pane keeps its full height and the button never moves with the content. */
     .log-wrap { position: relative; }
-    .copy { position: absolute; top: 8px; right: 10px; z-index: 1; opacity: .55; }
+    .copy {
+      position: absolute; top: 10px; z-index: 1; opacity: .5;
+      /* Clear of the pane's own scrollbar, and opaque so text scrolling
+         underneath is occluded cleanly rather than showing through. */
+      right: 24px;
+      background: #23233a; border-color: #3a3a52;
+    }
     .copy:hover, .copy:focus-visible { opacity: 1; }
     .json-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
 
