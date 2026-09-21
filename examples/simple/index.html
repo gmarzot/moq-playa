@@ -217,16 +217,14 @@
       border-radius: 6px; padding: 2px 10px;
       font-size: .7rem; cursor: pointer;
     }
-    /* Never wrap a track's detail: it scrolls sideways if the column is
-       too narrow, so nothing is hidden or clipped. */
     .cat-tracks {
       display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
-      overflow-x: auto;
       font-size: 1rem; font-variant-numeric: tabular-nums;
     }
-    /* One line per track: name, packaging badge, then the declared detail. */
+    /* Name and badge hold their line; the detail wraps under them rather than
+       scrolling the panel sideways. Nothing is clipped either way. */
     .cat-track {
-      display: flex; flex-wrap: nowrap; gap: 8px;
+      display: flex; flex-wrap: wrap; gap: 8px;
       align-items: baseline; color: #aab;
       padding: 5px 0; border-bottom: 1px solid #23233a;
     }
@@ -234,7 +232,8 @@
     /* Stream identity left the metrics row; this line is now the only place
        it appears, and it keeps the blue that named it there. */
     .cat-track .dt {
-      color: #6cf; font-weight: 600; font-size: .9rem; white-space: nowrap;
+      color: #6cf; font-weight: 600; font-size: .9rem;
+      min-width: 0; overflow-wrap: anywhere;
     }
     .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
     .cat-track .pk {
