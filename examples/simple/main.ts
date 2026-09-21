@@ -706,17 +706,13 @@ async function main(): Promise<void> {
     bufAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVal.textContent = lastFinite(cushionSamples)?.toFixed(0) ?? '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
-    // The cushion is adaptive, but pub_media's printed URL pins floor == cap
-    // == target, so it usually equals the target: show it only when it has
-    // actually moved, and the playback rate only when the chase is running.
-    const cushionNow = renderCushionMs();
+    // One measurement (queued) against one setting (target). The render
+    // cushion is a third name for the same region and pub_media pins it equal
+    // to the target anyway, so it is not shown; rate and chase state are.
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
     const audioOut = (player as any).audioOutput;
-    const cushionDiffers = cushionNow != null
-      && Math.abs(cushionNow - targetLatencyMs) > 1;
     // Own strings only — no remote input reaches this, so markup is safe here.
     cusCushion.innerHTML = [
-      cushionDiffers ? `cushion: <b>${cushionNow!.toFixed(0)}</b>` : '',
       rateNow !== 1 ? `rate: <b>${rateNow.toFixed(2)}×</b>` : '',
       // LOC: the WebAudio soft chase has no visible playbackRate of its own.
       // Always present once there is an audio output, so a chase starting or
