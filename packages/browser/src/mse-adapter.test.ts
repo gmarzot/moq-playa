@@ -3634,6 +3634,32 @@ describe('stale-group floor', () => {
         expect(asb.appendedPayloads.length).toBe(aBase + 1);
         adapter.destroy();
     });
+
+    it('clearTimeline drops the floor so a renumbered epoch is not stale', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        currentMs.open();
+        await flush();
+        await flush();
+        const vsb = currentMs.videoBuffer;
+        const seg = (bmd: number) => makeSegment({ bmd, defaultDur: 100, sampleCount: 1 });
+
+        adapter.appendChunk('video', seg(5000), 'v', 50n);                 // floor → 50
+        await flush(); await flush();
+        expect(adapter.getCommittedGroupFloor('video', 'v')).toBe(50n);
+
+        // Source restart renumbers groups downward; without the floor clear
+        // every chunk of the new epoch reads as stale and is dropped forever.
+        adapter.clearTimeline('video', 'v');
+        expect(adapter.getCommittedGroupFloor('video', 'v')).toBeUndefined();
+
+        const base = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', seg(100), 'v', 1n);
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.destroy();
+    });
 });
 
 describe('seam-overlap default visibility (non-silent accountability)', () => {

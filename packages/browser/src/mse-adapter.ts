@@ -1275,15 +1275,19 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * Clear a specific track's timeline index.
+   * Clear a specific track's timeline index and committed group floor.
    * Called on decode-time discontinuity so old ranges don't cause
    * overlap drops on segments from the new epoch. Scoped to the
    * affected track — other tracks (e.g., during ABR switch) keep
    * their overlap protection intact.
+   *
+   * The floor is epoch-relative: a new epoch may renumber groups downward,
+   * and a retained high-water mark would drop every later chunk as stale.
    */
   clearTimeline(mediaType: 'video' | 'audio', trackName: string): void {
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-    if (timelines.delete(trackName)) {
+    const clearedFloor = this.committedGroupFloor.delete(`${mediaType}:${trackName}`);
+    if (timelines.delete(trackName) || clearedFloor) {
       this.logWarn('[MSE] timeline cleared for %s track "%s" (discontinuity)', mediaType, trackName);
     }
   }
