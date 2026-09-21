@@ -98,6 +98,11 @@
       cursor: pointer;
     }
 
+    /* Free space is shared by the seek bar and this spacer, so the quality
+       selector sits between the transport and audio clusters rather than
+       packed against the audio ones. */
+    .controls .spring { flex: 0.55 1 0; min-width: 0; }
+
     /* Time display */
     .time { font-size: 0.85rem; color: #aaa; font-variant-numeric: tabular-nums; min-width: 50px; }
 
@@ -302,6 +307,7 @@
       <input type="range" class="seek-bar" id="seek" min="0" max="1000" value="0" disabled>
       <span class="time" id="time">0:00</span>
       <select id="quality" disabled><option>Auto</option></select>
+      <span class="spring"></span>
       <div class="volume-group">
         <button id="mute-btn" disabled>Mute</button>
         <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100">
