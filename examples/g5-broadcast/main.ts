@@ -4,7 +4,7 @@
  * Captures via getUserMedia/getDisplayMedia, encodes via WebCodecs,
  * packages with LOC headers, and publishes via MoqtConnection.
  *
- * The viewer URL points to the player example with matching relay + namespace.
+ * The viewer URL points to g5-player with matching relay + namespace.
  *
  * @see draft-ietf-moq-transport-16 §9.13 (PUBLISH)
  * @see draft-ietf-moq-transport-16 §10.4.2 (Subgroup streams)
@@ -382,7 +382,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       };
 
       // Carry the resolved endpoint and certificate hash into the viewer link.
-      const viewerBase = window.location.origin + '/player/';
+      const viewerBase = window.location.origin + '/g5-player/';
       const viewerParams = new URLSearchParams();
       viewerParams.set('url', resolvedRelayUrl);
       viewerParams.set('ns', namespace);
