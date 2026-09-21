@@ -20,7 +20,7 @@ import type { BroadcastSessionConnection } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
 import { log } from '../shared/log.js';
-import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import {
   WebCodecsVideoEncoder,
@@ -41,6 +41,12 @@ const DEFAULT_RELAY = 'https://moqx-main.ci.openmoq.org:4433/moq-relay';
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
+/**
+ * `?ns=` when given, otherwise a fresh namespace per page load. A shared
+ * default collides: two broadcasters claim the same name, and a relay still
+ * holding state from a previous session routes subscribers to the dead one.
+ */
+const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
 
 // ─── Settings modal ──────────────────────────────────────────────────
 
@@ -77,7 +83,7 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
         () => { /* aborted or failed — the field stays editable */ },
       );
     }
-    sNs.value = params.get('ns') ?? 'live';
+    sNs.value = namespace;
     sHash.value = params.get('hash') ?? '';
     sVersion.value = params.get('v') ?? '';
     sCodec.value = videoCodec;
@@ -97,7 +103,7 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
     const url = sUrl.value.trim();
     const ns = sNs.value.trim();
     if (url) np.set('url', url);
-    if (ns && ns !== 'live') np.set('ns', ns);
+    if (ns) np.set('ns', ns);
     if (sHash.value.trim()) np.set('hash', sHash.value.trim());
     if (sVersion.value) np.set('v', sVersion.value);
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
@@ -386,6 +392,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const viewerParams = new URLSearchParams();
       viewerParams.set('url', resolvedRelayUrl);
       viewerParams.set('ns', namespace);
+      // The catalog is served only from the SUBSCRIBE handler — there is no
+      // FETCH responder here, so the player's default SUBSCRIBE + Joining
+      // FETCH path has no fallback it will accept.
+      viewerParams.set('catalogBootstrap', 'subscribe');
       if (draftVersion) viewerParams.set('v', String(draftVersion));
       const hashParam = params.get('hash');
       if (hashParam) viewerParams.set('hash', hashParam);
