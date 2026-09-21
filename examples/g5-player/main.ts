@@ -1,8 +1,10 @@
 /**
- * Playa — MSF/CMSF Example
+ * G5 Player — MoQT stream introspection.
  *
- * The entire player wired to a full UI in ~30 lines of player code.
- * Everything else is DOM glue.
+ * Plays LOC and CMAF through the relay and instruments what it sees: a metrics
+ * row of health counters, four charts on one shared time axis, the catalog as
+ * delivered, and a transport panel. Built on openmoq/moq-playa; the engine is
+ * theirs, the instrument is not.
  */
 
 import { Player } from '@playa/player';

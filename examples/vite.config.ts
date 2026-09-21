@@ -54,7 +54,7 @@ export default defineConfig({
         catalog: resolve(__dirname, 'catalog/index.html'),
         connect: resolve(__dirname, 'connect/index.html'),
         player: resolve(__dirname, 'player/index.html'),
-        simple: resolve(__dirname, 'simple/index.html'),
+        'g5-player': resolve(__dirname, 'g5-player/index.html'),
         broadcast: resolve(__dirname, 'broadcast/index.html'),
       },
     },
