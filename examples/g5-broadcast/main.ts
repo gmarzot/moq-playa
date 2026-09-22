@@ -38,6 +38,12 @@ const params = new URLSearchParams(window.location.search);
  * still override, and discovery still runs when either names something else.
  */
 const DEFAULT_RELAY = 'https://moqx-main.ci.openmoq.org:4433/moq-relay';
+/**
+ * Our demos run draft 18. The shared default is moqt-16, so without this the
+ * d18 wire behaviour the demos exist to exercise never gets negotiated.
+ * `?v=` still overrides.
+ */
+const broadcastDraft: 14 | 16 | 18 = draftVersion ?? 18;
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
@@ -85,7 +91,7 @@ const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
     }
     sNs.value = namespace;
     sHash.value = params.get('hash') ?? '';
-    sVersion.value = params.get('v') ?? '';
+    sVersion.value = String(broadcastDraft);
     sCodec.value = videoCodec;
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
@@ -186,6 +192,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let audioEncoder: WebCodecsAudioEncoder | null = null;
   let connection: MoqtConnection | null = null;
   let resolvedRelayUrl = '';   // set by openSession; feeds the viewer link
+  let negotiatedDraft: 14 | 16 | 18 = broadcastDraft;  // replaced by the agreed value at connect
   let audio: { sampleRate: number; channels: number } | undefined;
   let width = 1280;
   let height = 720;
@@ -272,7 +279,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       resolvedRelayUrl = relayUrl;
 
       log(`Connecting to ${relayUrl}...`);
-      const transportFactory = createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) });
+      const transportFactory = createWebTransport({ ...(certHash ? { certHash } : {}), draftVersion: broadcastDraft });
       // Each resource is adopted the moment it exists — a cancellation or a
       // handshake failure between these awaits must not leak the transport or
       // the connection.
@@ -280,7 +287,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         try { (t as unknown as { close(): void }).close(); } catch { /* already closed */ }
       });
       ctx.throwIfCancelled();
-      const conn = ctx.adopt(new MoqtConnection(draftVersion), (c) => c.close());
+      const conn = ctx.adopt(new MoqtConnection(broadcastDraft), (c) => c.close());
       connection = conn;
 
       conn.onError = (err) => { log(`Session error: ${err.message}`); };
@@ -295,7 +302,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       });
       await conn.connect(transport, { maxRequestId: varint(100) });
       ctx.throwIfCancelled();
-      const negotiatedDraft = conn.draftVersion;
+      negotiatedDraft = conn.draftVersion;
       log(`Session established (draft-${negotiatedDraft}).`);
 
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
@@ -396,7 +403,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // FETCH responder here, so the player's default SUBSCRIBE + Joining
       // FETCH path has no fallback it will accept.
       viewerParams.set('catalogBootstrap', 'subscribe');
-      if (draftVersion) viewerParams.set('v', String(draftVersion));
+      viewerParams.set('v', String(negotiatedDraft));
       const hashParam = params.get('hash');
       if (hashParam) viewerParams.set('hash', hashParam);
       currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
