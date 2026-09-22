@@ -160,8 +160,12 @@ export function createWebTransport(
     };
 
     const protocol = (transport as any).protocol as string | undefined;
+    // Forwarded only when the implementation has it, so "no stats support"
+    // stays distinguishable from "stats reported nothing".
+    const getStats = (transport as WebTransportLike).getStats;
     return {
       ...(protocol !== undefined ? { protocol } : {}),
+      ...(getStats ? { getStats: () => getStats.call(transport) } : {}),
       ...wrappedTransport,
     } satisfies WebTransportLike;
   };

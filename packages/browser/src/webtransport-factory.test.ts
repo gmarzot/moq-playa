@@ -213,3 +213,25 @@ describe('createWebTransport protocol fallback', () => {
     }
   });
 });
+
+describe('getStats forwarding', () => {
+  it('forwards getStats when the implementation has it', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+      getStats = async (): Promise<Record<string, unknown>> => ({ rtt: 12 });
+    });
+    const transport = await createWebTransport()('https://r:4433');
+    expect(typeof transport.getStats).toBe('function');
+    await expect(transport.getStats!()).resolves.toEqual({ rtt: 12 });
+  });
+
+  it('omits getStats when the implementation has none', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+    });
+    const transport = await createWebTransport()('https://r:4433');
+    expect(transport.getStats).toBeUndefined();
+  });
+});
