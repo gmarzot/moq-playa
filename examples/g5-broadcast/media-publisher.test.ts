@@ -219,6 +219,65 @@ describe('MediaPublisher — serialized video publication', () => {
   });
 });
 
+describe('MediaPublisher — Forward State 0 pause', () => {
+  /** A connection whose sends fail with the adapter's §5.1 message until
+   *  `forwarding` is flipped on. */
+  function forwardGated(conn: ReturnType<typeof recordingConnection>) {
+    const realSend = conn.sendObject.bind(conn);
+    const gate = { forwarding: false };
+    conn.sendObject = (sid, oid, payload, ext) => (gate.forwarding
+      ? realSend(sid, oid, payload, ext)
+      : Promise.reject(new Error(
+        `sendObject: stream ${String(sid)} belongs to a subscription with `
+        + 'Forward State 0 — no Objects may be sent (§5.1)')));
+    return gate;
+  }
+
+  it('pauses instead of retiring, keeps the alias, and reports once', async () => {
+    const conn = recordingConnection();
+    forwardGated(conn);
+    const errors: string[] = [];
+    const pub = makePublisher(conn, { onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`) });
+    pub.setVideoAlias(2n);
+
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    pub.publishVideo(chunk(1), kf());   // suppressed while paused
+    pub.publishVideo(chunk(2), kf());
+    await settle();
+
+    expect(pub.pausedTracks).toEqual(['video']);
+    // Retiring would clear the alias, and no new SUBSCRIBE follows a
+    // Forward 0→1 resume — the track would never come back.
+    expect(pub.retiredTracks).toEqual([]);
+    expect(errors.filter((e) => e.includes('paused'))).toHaveLength(1);
+  });
+
+  it('resumes production when forwarding returns, with no new SUBSCRIBE', async () => {
+    const conn = recordingConnection();
+    const gate = forwardGated(conn);
+    const errors: string[] = [];
+    const pub = makePublisher(conn, {
+      pauseProbeMs: 1,
+      onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
+    });
+    pub.setVideoAlias(2n);
+
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    expect(pub.pausedTracks).toEqual(['video']);
+
+    gate.forwarding = true;
+    await new Promise((r) => setTimeout(r, 5));   // probe window elapses
+    pub.publishVideo(chunk(1), kf());
+    await settle();
+
+    expect(pub.pausedTracks).toEqual([]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1]);
+    expect(errors.filter((e) => e.includes('resumed'))).toHaveLength(1);
+  });
+});
+
 describe('MediaPublisher — audio publication', () => {
   it('a failed audio send still closes its stream (best-effort terminal cleanup) and the next chunk recovers', async () => {
     const conn = recordingConnection();

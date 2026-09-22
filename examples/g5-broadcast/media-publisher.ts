@@ -87,10 +87,16 @@ export interface MediaPublisherOptions {
    * fan-out so concurrency is still backpressure, not unlimited streams.
    */
   audioMaxInFlight?: number;
+  /** How long a Forward State 0 pause suppresses production before one chunk
+   *  is re-attempted (default 1000ms). Injectable for tests. */
+  pauseProbeMs?: number;
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
 const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+
+/** Default Forward State 0 pause before one chunk is re-attempted. */
+const PAUSE_PROBE_MS = 1_000;
 
 /** Validate a queue bound: NaN/Infinity would disable backpressure entirely
  *  and a non-positive or fractional cap has no coherent meaning. */
@@ -118,6 +124,7 @@ export class MediaPublisher {
   private readonly videoQueueMax: number;
   private readonly audioQueueMax: number;
   private readonly audioMaxInFlight: number;
+  private readonly pauseProbeMs: number;
 
   private videoAlias: bigint | null = null;
   private audioAlias: bigint | null = null;
@@ -145,6 +152,10 @@ export class MediaPublisher {
 
   private stopped = false;
   private readonly retired = new Set<string>();
+  /** Tracks the relay has stopped forwarding (Forward State 0). */
+  private readonly paused = new Set<string>();
+  /** Pause episodes already reported, so a probe failure is not re-announced. */
+  private readonly pauseReported = new Set<string>();
 
   /** Every subgroup close ever initiated — drain() waits for all of them. */
   private readonly pendingCloses = new Set<Promise<void>>();
@@ -167,6 +178,7 @@ export class MediaPublisher {
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
     this.audioQueueMax = options.audioQueueMax ?? 50;
+    this.pauseProbeMs = options.pauseProbeMs ?? PAUSE_PROBE_MS;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.videoGroupId = BigInt(Date.now());
     this.audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
@@ -178,6 +190,45 @@ export class MediaPublisher {
 
   /** Tracks retired because their subscription ended, for the UI. */
   get retiredTracks(): readonly string[] { return [...this.retired]; }
+
+  /** Tracks the relay is not currently forwarding, for the UI. */
+  get pausedTracks(): readonly string[] { return [...this.paused]; }
+
+  /**
+   * The relay set Forward State 0 — its last downstream subscriber left, so it
+   * wants no Objects for now. Distinct from retirement: the subscription is
+   * alive and the ALIAS MUST BE KEPT, because a resume flips Forward back to 1
+   * without sending a new SUBSCRIBE. Clearing the alias here would take the
+   * track dark permanently.
+   *
+   * Queued frames are dropped (stale before forwarding resumes) and production
+   * is suppressed until a probe re-attempts one chunk.
+   */
+  private pauseTrack(track: 'video' | 'audio', err: unknown): boolean {
+    if (!String((err as Error)?.message ?? '').includes('§5.1')) return false;
+    if (track === 'video') {
+      this.videoQueue.length = 0;
+      // Resume at a keyframe: dependents published across the gap are useless.
+      this.videoContinuityLost = true;
+    } else {
+      this.audioQueue.length = 0;
+    }
+    this.paused.add(track);
+    if (!this.pauseReported.has(track)) {
+      this.pauseReported.add(track);
+      this.report(`${track} paused`, new Error(
+        'relay set Forward State 0; production paused until it resumes forwarding'));
+    }
+    setTimeout(() => { this.paused.delete(track); }, this.pauseProbeMs);
+    return true;
+  }
+
+  /** A chunk got through: the pause episode, if any, is over. */
+  private noteSent(track: 'video' | 'audio'): void {
+    if (!this.pauseReported.delete(track)) return;
+    this.paused.delete(track);
+    this.report(`${track} resumed`, new Error('relay resumed forwarding'));
+  }
 
   /**
    * A subscription ended under us — the viewer paused, closed, or the relay
@@ -209,7 +260,7 @@ export class MediaPublisher {
    * or the video alias is not yet bound (never a stale-alias send).
    */
   publishVideo(data: Uint8Array, meta: VideoChunkMeta): void {
-    if (this.stopped || this.videoAlias === null) return;
+    if (this.stopped || this.videoAlias === null || this.paused.has('video')) return;
     if (this.videoQueue.length >= this.videoQueueMax) {
       // Overflow: the queued dependents can never all be delivered in time —
       // continuity is lost. Invalidate the whole backlog and recover at the
@@ -231,7 +282,7 @@ export class MediaPublisher {
 
   /** Enqueue one encoded audio chunk (same contract as {@link publishVideo}). */
   publishAudio(data: Uint8Array, meta: AudioChunkMeta): void {
-    if (this.stopped || this.audioAlias === null) return;
+    if (this.stopped || this.audioAlias === null || this.paused.has('audio')) return;
     if (this.audioQueue.length >= this.audioQueueMax) {
       // Audio chunks are independently decodable — drop the OLDEST to keep
       // the live edge. Report once per overflow episode.
@@ -324,7 +375,9 @@ export class MediaPublisher {
           const item = this.videoQueue.shift()!;
           try {
             await this.sendVideoChunk(item.data, item.meta);
+            this.noteSent('video');
           } catch (err) {
+            if (this.pauseTrack('video', err)) break;
             if (this.retireTrack('video', err)) break;
             this.report('video publish', err);
           }
@@ -347,8 +400,11 @@ export class MediaPublisher {
       const inFlight = (async () => {
         try {
           await this.sendAudioChunk(item.data, item.meta, groupId);
+          this.noteSent('audio');
         } catch (err) {
-          if (!this.retireTrack('audio', err)) this.report('audio publish', err);
+          if (!this.pauseTrack('audio', err) && !this.retireTrack('audio', err)) {
+            this.report('audio publish', err);
+          }
         }
       })();
       this.audioInFlight.add(inFlight);
