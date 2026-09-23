@@ -9,6 +9,7 @@ const PARAMS: BroadcastCatalogParams = {
   height: 720,
   fps: 30,
   videoBitrate: 2_000_000,
+  targetLatencyMs: 200,
   audio: { sampleRate: 48_000, channels: 1 },
 };
 const D16 = { draft: 16 as const };

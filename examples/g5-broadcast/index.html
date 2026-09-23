@@ -2,326 +2,320 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>G5 Broadcast</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #0a0a1a;
-      color: #e0e0e0;
-      min-height: 100vh;
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* The UA's [hidden] rule loses to any class selector that sets display. */
+    [hidden] { display: none !important; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
 
-    /* ─── Header ─────────────────────────────────── */
-    .header {
-      padding: 16px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid rgba(255,255,255,0.06);
-    }
-    .header h1 {
-      font-size: 1.1rem;
-      font-weight: 700;
-      color: #fff;
-    }
-    .header h1 .prod { margin-left: 6px; }
-    .header-actions { display: flex; gap: 8px; }
-    .header-actions button {
-      padding: 6px 16px;
-      border-radius: 6px;
-      border: 1px solid rgba(255,255,255,0.15);
-      background: transparent;
-      color: #e0e0e0;
-      font-size: 0.85rem;
-      cursor: pointer;
-    }
-    .header-actions button:hover { background: rgba(255,255,255,0.05); }
-    .header-actions button.live {
-      background: #d04c2b;
-      border-color: #d04c2b;
-      color: #fff;
-      font-weight: 600;
-    }
-    .header-actions button.live:hover { background: #a83d22; }
-    .header-actions button:disabled { opacity: 0.4; cursor: default; }
+    .wrapper { max-width: 1440px; margin: 0 auto; padding: 24px; }
 
-    /* ─── Main layout ────────────────────────────── */
-    .main {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 24px;
+    h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: #fff; }
+    h1 .attrib { color: #888; font-size: 0.9rem; font-weight: 400; }
+
+    /* Two-column layout: preview+controls+metrics left, catalog right. */
+    .layout {
       display: grid;
-      grid-template-columns: 1fr 320px;
-      gap: 24px;
+      grid-template-columns: minmax(0, 1fr) minmax(500px, 44%);
+      gap: 20px;
+      align-items: stretch;
     }
-    @media (max-width: 900px) {
-      .main { grid-template-columns: 1fr; }
-    }
+    .main-col { min-width: 0; }
+    .cat-col { position: relative; min-width: 0; }
+    .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
+    .layout.cat-hidden .cat-col { display: none; }
 
-    /* ─── Preview ─────────────────────────────────── */
+    /* Preview */
     .preview-container {
-      position: relative;
-      background: #000;
-      border-radius: 12px;
-      overflow: hidden;
-      aspect-ratio: 16/9;
+      position: relative; width: 100%; aspect-ratio: 16/9;
+      background: #000; border-radius: 8px; overflow: hidden;
     }
-    .preview-container video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-    }
+    .preview-container video { width: 100%; height: 100%; object-fit: contain; }
     .live-badge {
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      background: #d04c2b;
-      color: #fff;
-      padding: 3px 10px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 1px;
-      display: none;
-    }
-    .live-badge.visible { display: block; }
-    .preview-stats {
-      position: absolute;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      padding: 8px 14px;
-      background: linear-gradient(transparent, rgba(0,0,0,0.8));
-      font-family: 'SF Mono', 'Cascadia Code', monospace;
-      font-size: 11px;
-      color: rgba(255,255,255,0.7);
-      display: flex;
-      gap: 16px;
-    }
-    .preview-stats .stat { display: flex; gap: 4px; }
-    .preview-stats .stat-val { color: #fff; }
-
-    /* ─── Sidebar ─────────────────────────────────── */
-    .sidebar { display: flex; flex-direction: column; gap: 16px; }
-    .card {
-      background: #12122a;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.06);
-      padding: 16px;
-    }
-    .card h3 {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      color: rgba(255,255,255,0.4);
-      margin-bottom: 10px;
+      position: absolute; top: 12px; left: 12px;
+      background: #c0392b; color: #fff;
+      padding: 3px 10px; border-radius: 4px;
+      font-size: 11px; font-weight: 700; letter-spacing: 1px;
     }
 
-    .source-btns { display: flex; gap: 8px; }
-    .source-btns button {
-      flex: 1;
-      padding: 10px;
-      border-radius: 8px;
-      border: 1px solid rgba(255,255,255,0.12);
-      background: rgba(255,255,255,0.04);
-      color: #e0e0e0;
-      font-size: 0.9rem;
-      cursor: pointer;
-      transition: all 0.15s;
+    button {
+      background: #333; color: #eee; border: 1px solid #555;
+      padding: 8px 20px; border-radius: 6px; cursor: pointer;
+      font-size: 0.9rem; transition: background 0.15s;
     }
-    .source-btns button:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.2); }
-    .source-btns button:disabled { opacity: 0.3; cursor: default; }
+    button:hover { background: #444; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.mini { padding: 4px 12px; font-size: .8rem; color: #bbb; border-color: #444; }
 
-    .viewer-url {
-      font-family: 'SF Mono', monospace;
-      font-size: 0.75rem;
-      color: #5aa8c9;
-      word-break: break-all;
-      line-height: 1.5;
-      padding: 10px;
-      background: rgba(65,149,185,0.08);
-      border-radius: 6px;
-      display: none;
-    }
-    .viewer-url.visible { display: block; }
-    .viewer-url .label {
-      display: block;
-      font-size: 0.65rem;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: rgba(255,255,255,0.3);
-      margin-bottom: 4px;
+    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; }
+    .controls .spacer { flex: 1; }
+    .controls .state-badge,
+    .controls button.mini {
+      font-size: .85rem; padding: 6px 12px;
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 5px; line-height: 1; white-space: nowrap; flex-shrink: 0;
     }
 
-    /* ─── Log ──────────────────────────────────────── */
-    .log-container {
-      grid-column: 1 / -1;
+    .state-badge {
+      font-size: 0.8rem; padding: 3px 10px; border-radius: 12px;
+      background: #333; color: #888;
     }
-    pre {
-      background: #0d0d20;
-      color: rgba(255,255,255,0.5);
-      padding: 12px 16px;
-      border-radius: 8px;
-      font-size: 0.8rem;
-      max-height: 200px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      border: 1px solid rgba(255,255,255,0.04);
+    .state-badge.live { background: #1a3a1a; color: #4d4; }
+    .state-badge.starting { background: #3a3a1a; color: #cc4; }
+    .state-badge.error { background: #3a1a1a; color: #c44; }
+
+    /* Metrics strip */
+    .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
+    .diag-grid {
+      display: flex; flex-wrap: wrap; justify-content: space-between;
+      gap: 12px 18px; font-variant-numeric: tabular-nums;
+    }
+    .diag-grid .cell {
+      flex: 0 1 auto; white-space: nowrap;
+      color: #8a94a6; text-transform: uppercase; letter-spacing: .04em;
+      font-size: .72rem; line-height: 1.25;
+    }
+    .diag-grid .cell b {
+      display: block; color: #e8e8f0; font-weight: 600; font-size: 1.1rem;
+      text-transform: none; letter-spacing: 0; white-space: nowrap; margin-top: 4px;
+    }
+    .diag-grid .cell b .u {
+      font-size: .68rem; font-weight: 500; color: #8a94a6;
+      margin-left: 3px; letter-spacing: .03em;
+    }
+    /* Blue names the stream, green measures it, amber marks what should stay
+       at zero, grey is inactive. */
+    .diag-grid .cell b.str { color: #6cf; }
+    .diag-grid .cell b.num { color: #4d4; }
+    .diag-grid .cell b.fault { color: #d9922e; }
+    .diag-grid .cell b.idle { color: #8a94a6; }
+
+    .adv { margin-top: 10px; }
+    .adv > summary {
+      cursor: pointer; color: #8a94a6; font-size: .72rem;
+      text-transform: uppercase; letter-spacing: .04em; padding: 4px 0;
+    }
+    .adv > summary:hover { color: #b8c2d0; }
+    .adv[open] > summary { color: #b8c2d0; }
+    .adv .diag-grid { padding: 6px 0 2px; }
+
+    /* Catalog panel — exactly the bytes published on the catalog track. */
+    .catalog-panel {
+      position: absolute; inset: 0 0 12px 0;
+      display: flex; flex-direction: column;
+      background: #1a1a2e; border-radius: 8px; padding: 10px 14px;
+    }
+    .cat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .cat-head .chart-label {
+      font-size: .95rem; color: #aab; font-weight: 600; white-space: nowrap;
+      text-transform: uppercase; letter-spacing: .04em;
+    }
+    .cat-head .chart-label b { font-size: 1rem; color: #4d4; font-weight: 600; }
+    .cat-head button {
+      background: #333; color: #bbb; border: 1px solid #555;
+      border-radius: 6px; padding: 3px 10px; font-size: .78rem; cursor: pointer;
+    }
+    .cat-tracks {
+      display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
+      font-size: 1rem; font-variant-numeric: tabular-nums;
+    }
+    .cat-track {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+      color: #aab; padding: 5px 0; border-bottom: 1px solid #23233a;
+    }
+    .cat-track:last-child { border-bottom: 0; }
+    .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
+    .cat-track .dt { color: #6cf; font-weight: 600; font-size: .9rem; min-width: 0; overflow-wrap: anywhere; }
+    .cat-track .pk {
+      color: #4d4; border: 1px solid #2f5a34; border-radius: 4px;
+      background: #16271a; padding: 1px 6px; text-transform: uppercase;
+      font-weight: 700; font-size: .68rem; letter-spacing: .06em;
+    }
+    /* Subscription state per track: what the RELAY is pulling, not viewers. */
+    .cat-track .sub {
+      border-radius: 4px; padding: 1px 6px; text-transform: uppercase;
+      font-weight: 700; font-size: .68rem; letter-spacing: .06em;
+      border: 1px solid #3a3a52; background: #23233a; color: #8a94a6;
+    }
+    .cat-track .sub.on { color: #4d4; border-color: #2f5a34; background: #16271a; }
+    .cat-track .sub.paused { color: #d9922e; border-color: #5a4a2f; background: #271f16; }
+    .cat-track .sub.retired { color: #c44; border-color: #5a2f2f; background: #271616; }
+    .json-wrap { position: relative; display: flex; flex: 1; min-height: 0; margin-top: 10px; }
+    .cat-json {
+      margin: 0; padding: 10px 12px; background: #12121f;
+      border-radius: 6px; font-family: monospace; font-size: 1rem;
+      line-height: 1.5; flex: 1; min-width: 0; min-height: 0; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all; color: #9fb0c4;
     }
 
-    /* ─── Settings modal ─────────────────────────── */
+    /* A copy control rides the top-right of the pane it belongs to. */
+    .log-wrap { position: relative; margin-top: 12px; }
+    .copy {
+      position: absolute; top: 10px; right: 24px; z-index: 1; opacity: .5;
+      background: #23233a; border-color: #3a3a52;
+    }
+    .copy:hover, .copy:focus-visible { opacity: 1; }
+    pre#log {
+      background: #0d0d20; color: rgba(255,255,255,0.55);
+      padding: 12px 16px; border-radius: 8px;
+      font-family: monospace; font-size: 0.85rem; line-height: 1.5;
+      max-height: 220px; overflow-y: auto; white-space: pre-wrap;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      .cat-col { position: static; }
+      .catalog-panel { position: static; margin-top: 12px; }
+      .cat-json { max-height: 220px; }
+    }
+
+    /* Settings / share modals */
     .modal-backdrop {
-      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-      z-index: 100; backdrop-filter: blur(6px);
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+      z-index: 100; backdrop-filter: blur(4px);
     }
     .modal-backdrop.visible { display: flex; align-items: center; justify-content: center; }
     .modal {
-      background: #1a1a2e; color: #e0e0e0; border-radius: 12px; padding: 24px;
-      width: min(480px, 90vw); max-height: 80vh; overflow-y: auto;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.6); border: 1px solid rgba(255,255,255,0.08);
+      background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      padding: 20px; width: min(500px, 92vw); max-height: 86vh; overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7);
     }
-    .modal h2 { margin: 0 0 16px; font-size: 1rem; color: #fff; }
+    .modal h2 { font-size: 1rem; margin-bottom: 4px; }
+    .modal .lede { color: #888; font-size: .8rem; margin-bottom: 8px; }
     .modal label {
-      display: block; font-size: 0.75rem; color: rgba(255,255,255,0.4);
-      margin-bottom: 4px; margin-top: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+      display: block; font-size: .7rem; color: #888; margin: 12px 0 4px;
+      text-transform: uppercase; letter-spacing: .5px;
     }
-    .modal input, .modal select {
-      width: 100%; padding: 8px 10px; border-radius: 6px;
-      border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.3);
-      color: #fff; font-family: 'SF Mono', monospace; font-size: 0.85rem; box-sizing: border-box;
+    .modal input[type=text], .modal input[type=number], .modal select {
+      width: 100%; padding: 7px 9px; border-radius: 6px;
+      border: 1px solid #444; background: #222; color: #eee;
+      font-family: monospace; font-size: .85rem;
     }
-    .modal input:focus, .modal select:focus { outline: none; border-color: #5aa8c9; }
-    .modal .hint { font-size: 0.7rem; color: rgba(255,255,255,0.25); margin-top: 2px; }
+    .modal input:focus, .modal select:focus { outline: none; border-color: #2a6; }
+    .modal .hint { font-size: .68rem; color: #666; margin-top: 3px; }
     .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
-    .modal .btn-row button { font-size: 0.85rem; padding: 8px 20px; border-radius: 6px; cursor: pointer; border: none; }
-    .modal #settings-apply { background: #4195b9; color: #fff; }
-    .modal #settings-cancel { background: rgba(255,255,255,0.08); color: #e0e0e0; }
+    .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
+    .modal #settings-apply, .modal #share-open { background: #2a6; border-color: #2a6; color: #fff; }
+    .modal #settings-apply:hover, .modal #share-open:hover { background: #2b7; }
   </style>
 </head>
 <body>
+  <div class="wrapper">
+    <h1>G5 Broadcast <span class="attrib">(camera or screen → MoQT)</span></h1>
 
-<div class="header">
-  <h1>G5<span class="prod">Broadcast</span></h1>
-  <div class="header-actions">
-    <button id="stop" disabled>Stop</button>
-    <button id="settings-btn">Settings</button>
+    <div class="layout" id="layout">
+      <div class="main-col">
+        <div class="preview-container">
+          <video id="preview" autoplay muted playsinline></video>
+          <div class="live-badge" id="live-badge" hidden>LIVE</div>
+        </div>
+
+        <div class="controls">
+          <button id="start-camera">Camera</button>
+          <button id="start-screen">Screen</button>
+          <button id="stop" disabled>Stop</button>
+          <span class="spacer"></span>
+          <span class="state-badge" id="state">idle</span>
+          <button id="share-btn" class="mini" type="button" hidden>⧉ viewer link</button>
+          <button id="settings-btn" class="mini" type="button" title="Broadcast settings">⚙ settings</button>
+          <button id="cat-restore" class="mini" hidden>catalog</button>
+        </div>
+
+        <div class="diag">
+          <div class="diag-grid" id="diag-grid"></div>
+          <details class="adv" id="adv-panel">
+            <summary>transport (QUIC / WebTransport)</summary>
+            <div class="diag-grid" id="adv-grid"></div>
+          </details>
+        </div>
+      </div>
+
+      <div class="cat-col">
+        <div class="catalog-panel" id="catalog-panel">
+          <div class="cat-head">
+            <span class="chart-label">published catalog <b id="cat-meta">not yet</b></span>
+            <button id="cat-toggle" type="button">hide</button>
+          </div>
+          <div class="cat-tracks" id="cat-tracks"></div>
+          <div class="json-wrap">
+            <button id="cat-copy" class="mini copy" type="button">copy</button>
+            <pre class="cat-json" id="cat-json"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="log-wrap">
+      <button id="log-copy" class="mini copy" type="button">copy</button>
+      <pre id="log"></pre>
+    </div>
   </div>
-</div>
 
-<div class="main">
-  <div>
-    <div class="preview-container">
-      <video id="preview" autoplay muted playsinline></video>
-      <div class="live-badge" id="live-badge">LIVE</div>
-      <div class="preview-stats" id="preview-stats">
-        <div class="stat">Frames: <span class="stat-val" id="stat-frames">0</span></div>
-        <div class="stat">Audio: <span class="stat-val" id="stat-audio">0</span></div>
-        <div class="stat" id="stat-res-container" style="display:none">Res: <span class="stat-val" id="stat-res">—</span></div>
+  <!-- Share modal -->
+  <div id="share-backdrop" class="modal-backdrop">
+    <div class="modal">
+      <h2>Viewer link</h2>
+      <div class="lede">Opens g5-player against this relay and namespace.</div>
+      <input id="share-url" type="text" readonly>
+      <div id="share-copied" class="hint" style="color:#4d4" hidden>Copied to clipboard.</div>
+      <div class="btn-row">
+        <button id="share-close" type="button">Close</button>
+        <button id="share-copy" type="button">Copy</button>
+        <button id="share-open" type="button">Open in new tab</button>
       </div>
     </div>
   </div>
 
-  <div class="sidebar">
-    <div class="card">
-      <h3>Source</h3>
-      <div class="source-btns">
-        <button id="start-camera">Camera</button>
-        <button id="start-screen">Screen</button>
+  <!-- Settings modal -->
+  <div id="settings-backdrop" class="modal-backdrop">
+    <div class="modal">
+      <h2>Broadcast settings</h2>
+      <div class="lede">Applying reloads the page with these as URL parameters.</div>
+
+      <label for="s-url">Relay URL</label>
+      <input id="s-url" type="text" placeholder="default: moqx-main">
+      <div class="hint">Full WebTransport endpoint, scheme through path.</div>
+
+      <label for="s-ns">Namespace</label>
+      <input id="s-ns" type="text" placeholder="minted per load">
+
+      <label for="s-version">Draft version</label>
+      <select id="s-version">
+        <option value="18">Draft 18 (default)</option>
+        <option value="16">Draft 16</option>
+        <option value="14">Draft 14</option>
+      </select>
+
+      <label for="s-codec">Video codec</label>
+      <select id="s-codec">
+        <option value="avc1.42001f">H.264 Baseline</option>
+        <option value="avc1.640028">H.264 High</option>
+        <option value="av01.0.04M.08">AV1 Main</option>
+      </select>
+
+      <label for="s-bitrate">Video bitrate (kbps)</label>
+      <input id="s-bitrate" type="number" min="1" value="2000">
+
+      <label for="s-keyframe">Keyframe interval (frames)</label>
+      <input id="s-keyframe" type="number" min="1" value="60">
+
+      <label for="s-target">Target latency (ms)</label>
+      <input id="s-target" type="number" min="1" placeholder="200">
+      <div class="hint">Published in the catalog; the player's chase set point.</div>
+
+      <label for="s-hash">Certificate hash</label>
+      <input id="s-hash" type="text" placeholder="(none)">
+
+      <div class="btn-row">
+        <button id="settings-cancel" type="button">Cancel</button>
+        <button id="settings-apply" type="button">Apply &amp; reload</button>
       </div>
     </div>
-
-    <div class="card">
-      <h3>Status</h3>
-      <div id="status" style="font-size:0.9rem;">Ready</div>
-    </div>
-
-    <div class="card" id="viewer-card" style="display:none">
-      <h3>Viewer Link</h3>
-      <button id="share-btn" style="
-        width:100%; padding:10px; border-radius:8px; border:1px solid rgba(65,149,185,0.3);
-        background:rgba(65,149,185,0.1); color:#5aa8c9; font-size:0.9rem; cursor:pointer;
-      ">Share Viewer Link</button>
-    </div>
   </div>
 
-  <div class="log-container">
-    <pre id="log"></pre>
-  </div>
-</div>
-
-<!-- Share modal -->
-<div id="share-backdrop" class="modal-backdrop">
-  <div class="modal" style="width:min(440px,90vw)">
-    <h2>Share Viewer Link</h2>
-    <p style="font-size:0.85rem;color:rgba(255,255,255,0.5);margin-bottom:12px">
-      Anyone with this link can watch your broadcast with sub-second latency.
-    </p>
-    <div style="display:flex;gap:8px">
-      <input id="share-url" type="text" readonly style="flex:1;font-size:0.8rem">
-      <button id="share-copy" style="
-        padding:8px 16px; border-radius:6px; border:none; background:#4195b9;
-        color:#fff; font-size:0.85rem; cursor:pointer; white-space:nowrap;
-      ">Copy</button>
-    </div>
-    <div id="share-copied" style="
-      font-size:0.8rem; color:#4ade80; margin-top:8px; display:none;
-    ">Copied to clipboard!</div>
-    <div class="btn-row" style="margin-top:16px">
-      <button id="share-open" style="
-        padding:8px 16px; border-radius:6px; border:1px solid rgba(255,255,255,0.15);
-        background:transparent; color:#e0e0e0; font-size:0.85rem; cursor:pointer;
-      ">Open in New Tab</button>
-      <button id="share-close" style="
-        padding:8px 16px; border-radius:6px; border:none;
-        background:rgba(255,255,255,0.08); color:#e0e0e0; font-size:0.85rem; cursor:pointer;
-      ">Close</button>
-    </div>
-  </div>
-</div>
-
-<!-- Settings modal -->
-<div id="settings-backdrop" class="modal-backdrop">
-  <div class="modal">
-    <h2>Broadcast Settings</h2>
-    <label for="s-url">Relay URL</label>
-    <input id="s-url" type="text" placeholder="auto-discovered (/moq, /moq-relay, /)">
-    <div class="hint">WebTransport relay endpoint</div>
-
-    <label for="s-ns">Namespace</label>
-    <input id="s-ns" type="text" placeholder="minted per load">
-
-    <label for="s-hash">Certificate Hash</label>
-    <input id="s-hash" type="text" placeholder="(none)">
-
-    <label for="s-version">Draft Version</label>
-    <select id="s-version">
-      <option value="18">Draft 18 (default)</option>
-      <option value="16">Draft 16</option>
-      <option value="14">Draft 14</option>
-    </select>
-
-    <label for="s-codec">Video Codec</label>
-    <select id="s-codec">
-      <option value="avc1.42001f">H.264 Baseline</option>
-      <option value="avc1.640028">H.264 High</option>
-      <option value="av01.0.04M.08">AV1 Main</option>
-    </select>
-
-    <label for="s-bitrate">Video Bitrate (kbps)</label>
-    <input id="s-bitrate" type="number" value="2000">
-
-    <label for="s-keyframe">Keyframe Interval (frames)</label>
-    <input id="s-keyframe" type="number" value="60">
-
-    <div class="btn-row">
-      <button id="settings-cancel">Cancel</button>
-      <button id="settings-apply">Apply &amp; Reload</button>
-    </div>
-  </div>
-</div>
-
-<script type="module" src="main.ts"></script>
+  <script type="module" src="./main.ts"></script>
 </body>
 </html>

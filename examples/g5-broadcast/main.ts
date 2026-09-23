@@ -19,6 +19,9 @@ import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
+import { buildCatalogPayload } from './catalog-publisher.js';
+import type { BroadcastCatalogParams } from './catalog-publisher.js';
+import type { MediaPublisher } from './media-publisher.js';
 import { log } from '../shared/log.js';
 import { certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
@@ -47,6 +50,9 @@ const broadcastDraft: 14 | 16 | 18 = draftVersion ?? 18;
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
+/** Published in the catalog as the viewer's playout set point. Without it the
+ *  player has no target and runs with no cushion policy or chase at all. */
+const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
 /**
  * `?ns=` when given, otherwise a fresh namespace per page load. A shared
  * default collides: two broadcasters claim the same name, and a relay still
@@ -66,6 +72,7 @@ const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
   const sCodec = document.getElementById('s-codec') as HTMLSelectElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
+  const sTarget = document.getElementById('s-target') as HTMLInputElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
 
@@ -95,6 +102,7 @@ const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
     sCodec.value = videoCodec;
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
+    sTarget.value = String(targetLatencyMs);
   }
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
@@ -115,6 +123,7 @@ const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
+    if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     const qs = np.toString();
     window.location.href = window.location.pathname + (qs ? '?' + qs : '');
   });
@@ -123,9 +132,8 @@ const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
 // ─── DOM ─────────────────────────────────────────────────────────────
 
 const preview = document.getElementById('preview') as HTMLVideoElement;
-const statusEl = document.getElementById('status')!;
-const viewerCard = document.getElementById('viewer-card')!;
-const shareBtn = document.getElementById('share-btn')!;
+const stateBadge = document.getElementById('state')!;
+const shareBtn = document.getElementById('share-btn') as HTMLButtonElement;
 const shareBackdrop = document.getElementById('share-backdrop')!;
 const shareUrlInput = document.getElementById('share-url') as HTMLInputElement;
 const shareCopyBtn = document.getElementById('share-copy')!;
@@ -134,10 +142,17 @@ const shareOpenBtn = document.getElementById('share-open')!;
 const shareCloseBtn = document.getElementById('share-close')!;
 let currentViewerLink = '';
 const liveBadge = document.getElementById('live-badge')!;
-const statFrames = document.getElementById('stat-frames')!;
-const statAudio = document.getElementById('stat-audio')!;
-const statRes = document.getElementById('stat-res')!;
-const statResContainer = document.getElementById('stat-res-container')!;
+const diagGrid = document.getElementById('diag-grid')!;
+const advGrid = document.getElementById('adv-grid')!;
+const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
+const catMeta = document.getElementById('cat-meta')!;
+const catTracks = document.getElementById('cat-tracks')!;
+const catJson = document.getElementById('cat-json')!;
+const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
+const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
+const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
+const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
+const layoutEl = document.getElementById('layout')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
 const startScreenBtn = document.getElementById('start-screen') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop') as HTMLButtonElement;
@@ -152,19 +167,179 @@ const stopBtn = document.getElementById('stop') as HTMLButtonElement;
 // or mutate a replacement.
 let currentAttempt: BroadcastAttempt | null = null;
 
+type BroadcastState = 'idle' | 'starting' | 'live' | 'error';
+function setState(label: string, cls: BroadcastState): void {
+  stateBadge.textContent = label;
+  stateBadge.className = cls === 'idle' ? 'state-badge' : `state-badge ${cls}`;
+}
+
+// Publication state the 1 Hz strip reads. The publisher REFERENCE is held
+// here, never its counters: a superseded attempt must not write into its
+// replacement's UI, so resetBroadcastUi clears it.
+let currentPublisher: MediaPublisher | null = null;
+let currentConnection: MoqtConnection | null = null;
+let currentDraft: number | null = null;
+let captureRes = '—';
+let liveSinceMs: number | null = null;
+let catalogJsonText = '';
+
+/** Copy to the clipboard, confirming in the button itself. */
+function wireCopy(btn: HTMLButtonElement, text: () => string): void {
+  btn.addEventListener('click', async () => {
+    const was = btn.textContent;
+    try {
+      await navigator.clipboard.writeText(text());
+      btn.textContent = 'copied';
+    } catch {
+      btn.textContent = 'failed';
+    }
+    setTimeout(() => { btn.textContent = was; }, 1200);
+  });
+}
+
+// ─── Published catalog ───────────────────────────────────────────────
+
+/** Render the catalog from the SAME builder the catalog track publishes, so
+ *  the panel cannot drift from the bytes on the wire. */
+function renderCatalogPanel(params: BroadcastCatalogParams): void {
+  const bytes = buildCatalogPayload(params);
+  const text = new TextDecoder().decode(bytes);
+  catalogJsonText = text;
+  let tracks: Array<Record<string, unknown>> = [];
+  try {
+    const doc = JSON.parse(text) as { tracks?: Array<Record<string, unknown>> };
+    tracks = doc.tracks ?? [];
+    catJson.textContent = JSON.stringify(doc, null, 2);
+  } catch {
+    catJson.textContent = text;
+  }
+  catMeta.textContent = `${tracks.length} track(s) · ${bytes.byteLength}B`;
+  catTracks.replaceChildren(...tracks.map((t) => {
+    const row = document.createElement('div');
+    row.className = 'cat-track';
+    const detail = t['name'] === 'audio'
+      ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch`
+      : `${t['codec']} · ${t['width']}x${t['height']} · ${t['framerate']}fps`;
+    row.innerHTML = `<span class="nm">${String(t['name'])}</span>`
+      + `<span class="pk">${String(t['packaging'])}</span>`
+      + `<span class="sub" data-track="${String(t['name'])}">pending</span>`
+      + `<span class="dt">${detail}</span>`;
+    return row;
+  }));
+}
+
+/** Per-track relay subscription state. NOT a viewer count — the relay
+ *  subscribes once per track and fans out downstream on its own. */
+function renderTrackStates(): void {
+  const paused = new Set(currentPublisher?.pausedTracks ?? []);
+  const retired = new Set(currentPublisher?.retiredTracks ?? []);
+  for (const el of catTracks.querySelectorAll<HTMLElement>('.sub')) {
+    const track = el.dataset['track'] ?? '';
+    const live = liveSinceMs !== null;
+    let cls = '', label = 'pending';
+    if (retired.has(track)) { cls = 'retired'; label = 'retired'; }
+    else if (paused.has(track)) { cls = 'paused'; label = 'paused'; }
+    else if (live) { cls = 'on'; label = 'forwarding'; }
+    el.className = `sub ${cls}`.trim();
+    el.textContent = label;
+  }
+}
+
+// ─── Metrics strip ───────────────────────────────────────────────────
+
+function cell(label: string, value: string, cls = ''): string {
+  return `<div class="cell">${label}<b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
+}
+const u = (s: string): string => `<span class="u">${s}</span>`;
+
+let lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
+let fpsEnc = 0, vKbps = 0, aKbps = 0;
+
+function renderMetrics(): void {
+  const p = currentPublisher;
+  const now = performance.now();
+  if (p) {
+    const dt = (now - lastSample.t) / 1000;
+    if (lastSample.t > 0 && dt >= 0.5) {
+      fpsEnc = (p.frameCount - lastSample.frames) / dt;
+      vKbps = ((p.videoByteCount - lastSample.vBytes) * 8) / dt / 1000;
+      aKbps = ((p.audioByteCount - lastSample.aBytes) * 8) / dt / 1000;
+    }
+    if (lastSample.t === 0 || dt >= 0.5) {
+      lastSample = {
+        t: now, frames: p.frameCount, chunks: p.audioChunkCount,
+        vBytes: p.videoByteCount, aBytes: p.audioByteCount,
+      };
+    }
+  }
+  const upS = liveSinceMs === null ? 0 : Math.floor((Date.now() - liveSinceMs) / 1000);
+  const up = `${Math.floor(upS / 60)}:${String(upS % 60).padStart(2, '0')}`;
+  const q = p?.queueLimits ?? { video: 0, audio: 0 };
+  const qv = p?.videoQueueDepth ?? 0, qa = p?.audioQueueDepth ?? 0;
+  const backlog = qv > q.video / 2 || qa > q.audio / 2;
+
+  diagGrid.innerHTML = [
+    cell('uptime', up, liveSinceMs === null ? 'idle' : ''),
+    cell('fps enc', p ? fpsEnc.toFixed(0) : '—', p ? 'num' : 'idle'),
+    cell('bitrate v/a', p ? `${vKbps.toFixed(0)}/${aKbps.toFixed(0)}${u('kbps')}` : '—', p ? 'num' : 'idle'),
+    cell('objects v/a', p ? `${p.frameCount}/${p.audioChunkCount}` : '—', p ? '' : 'idle'),
+    cell('keyframes', p ? String(p.keyframeCount) : '—', p ? '' : 'idle'),
+    cell('queue v/a', p ? `${qv}/${qa}${u(`of ${q.video}/${q.audio}`)}` : '—', backlog ? 'fault' : p ? '' : 'idle'),
+    cell('capture', captureRes, captureRes === '—' ? 'idle' : 'str'),
+    cell('namespace', namespace, 'str'),
+    cell('draft', currentDraft ? String(currentDraft) : '—', currentDraft ? 'str' : 'idle'),
+  ].join('');
+  renderTrackStates();
+}
+
+/** Transport counters, when the implementation reports them. */
+async function renderTransport(): Promise<void> {
+  if (!advPanel.open) return;
+  const stats = currentConnection ? await currentConnection.getTransportStats() : null;
+  if (!stats || Object.keys(stats).length === 0) {
+    advGrid.innerHTML = cell('transport', 'not reported by this transport', 'idle');
+    return;
+  }
+  const pick = (k: string): string => (stats[k] !== undefined ? String(Math.round(stats[k]!)) : '—');
+  advGrid.innerHTML = [
+    cell('rtt', `${pick('smoothedRtt')}${u('ms')}`, 'num'),
+    cell('min rtt', `${pick('minRtt')}${u('ms')}`),
+    cell('bytes sent', pick('bytesSent')),
+    cell('est send rate', `${pick('estimatedSendRate')}${u('bps')}`),
+    cell('packets lost', pick('packetsLost'), Number(stats['packetsLost'] ?? 0) > 0 ? 'fault' : ''),
+  ].join('');
+}
+
+setInterval(() => {
+  renderMetrics();
+  void renderTransport();
+}, 1000);
+renderMetrics();
+
+// ─── Catalog panel controls ──────────────────────────────────────────
+
+const setCatalogHidden = (hidden: boolean): void => {
+  layoutEl.classList.toggle('cat-hidden', hidden);
+  catRestore.hidden = !hidden;
+};
+catToggle.addEventListener('click', () => setCatalogHidden(true));
+catRestore.addEventListener('click', () => setCatalogHidden(false));
+wireCopy(catCopy, () => catalogJsonText);
+wireCopy(logCopy, () => document.getElementById('log')?.textContent ?? '');
+
 // ─── Share modal ─────────────────────────────────────────────────────
 
 shareBtn.addEventListener('click', () => {
   shareUrlInput.value = currentViewerLink;
-  shareCopied.style.display = 'none';
+  shareCopied.hidden = true;
   shareBackdrop.classList.add('visible');
   shareUrlInput.select();
 });
 
 shareCopyBtn.addEventListener('click', () => {
   navigator.clipboard.writeText(currentViewerLink).then(() => {
-    shareCopied.style.display = 'block';
-    setTimeout(() => { shareCopied.style.display = 'none'; }, 2000);
+    shareCopied.hidden = false;
+    setTimeout(() => { shareCopied.hidden = true; }, 2000);
   });
 });
 
@@ -184,7 +359,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
   stopBtn.disabled = false;
-  statusEl.textContent = 'Connecting...';
+  setState('connecting', 'starting');
 
   // Attempt-local state threaded between steps (never module globals).
   let capture: MediaCapture | null = null;
@@ -303,6 +478,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       await conn.connect(transport, { maxRequestId: varint(100) });
       ctx.throwIfCancelled();
       negotiatedDraft = conn.draftVersion;
+      currentDraft = negotiatedDraft;
+      currentConnection = conn;
       log(`Session established (draft-${negotiatedDraft}).`);
 
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
@@ -312,23 +489,19 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           height,
           fps,
           videoBitrate,
+          targetLatencyMs,
           ...(audio ? { audio } : {}),
         },
         publisher: {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
-          onCounts: (videoFrames, audioChunks) => {
-            if (videoFrames % 30 === 0) {
-              statFrames.textContent = String(videoFrames);
-              statAudio.textContent = String(audioChunks);
-            }
-          },
         },
         log,
         onCatalogPublished: () => {
-          statusEl.textContent = 'Broadcasting';
-          liveBadge.classList.add('visible');
+          setState('live', 'live');
+          liveBadge.hidden = false;
+          liveSinceMs ??= Date.now();
         },
         // Only the CURRENT attempt's session may drive the global stop.
         onSessionClosed: () => { if (currentAttempt === attempt) void stopBroadcast(); },
@@ -365,6 +538,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     // under the negotiated draft's wire profile.
     wirePublication: (session) => {
       const mediaPublisher = session.publisher;
+      currentPublisher = mediaPublisher;
       const ve = videoEncoder!;
       ve.onChunk = (data, isKeyframe, timestamp, _duration, description) => {
         const videoConfig = description ?? ve.description;
@@ -407,10 +581,13 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const hashParam = params.get('hash');
       if (hashParam) viewerParams.set('hash', hashParam);
       currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
-      viewerCard.style.display = 'block';
-      statRes.textContent = `${width}x${height}`;
-      statResContainer.style.display = '';
-      statusEl.textContent = 'Waiting for relay to subscribe...';
+      shareBtn.hidden = false;
+      captureRes = `${width}x${height}`;
+      renderCatalogPanel({
+        videoCodec, width, height, fps, videoBitrate, targetLatencyMs,
+        ...(audio ? { audio } : {}),
+      });
+      setState('awaiting subscribe', 'starting');
     },
   });
 
@@ -446,12 +623,15 @@ async function stopBroadcast(): Promise<void> {
 
 function resetBroadcastUi(): void {
   preview.srcObject = null;
-  statusEl.textContent = 'Ready';
-  liveBadge.classList.remove('visible');
-  viewerCard.style.display = 'none';
-  statFrames.textContent = '0';
-  statAudio.textContent = '0';
-  statResContainer.style.display = 'none';
+  setState('idle', 'idle');
+  liveBadge.hidden = true;
+  shareBtn.hidden = true;
+  currentPublisher = null;
+  currentConnection = null;
+  currentDraft = null;
+  captureRes = '—';
+  liveSinceMs = null;
+  lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
   startCameraBtn.disabled = false;
   startScreenBtn.disabled = false;
   stopBtn.disabled = true;

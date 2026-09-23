@@ -136,6 +136,10 @@ export class MediaPublisher {
 
   private videoFrames = 0;
   private audioChunks = 0;
+  /** Payload bytes accepted for send, per track. Rates are a caller-side delta. */
+  private videoBytes = 0;
+  private audioBytes = 0;
+  private videoKeyframes = 0;
 
   /** Explicit bounded queues + single-flight pumps (the serialization). */
   private readonly videoQueue: QueuedVideo[] = [];
@@ -253,6 +257,15 @@ export class MediaPublisher {
 
   get frameCount(): number { return this.videoFrames; }
   get audioChunkCount(): number { return this.audioChunks; }
+  get videoByteCount(): number { return this.videoBytes; }
+  get audioByteCount(): number { return this.audioBytes; }
+  get keyframeCount(): number { return this.videoKeyframes; }
+  /** Enqueued but not yet sent, against videoQueueMax / audioQueueMax. */
+  get videoQueueDepth(): number { return this.videoQueue.length; }
+  get audioQueueDepth(): number { return this.audioQueue.length; }
+  get queueLimits(): { video: number; audio: number } {
+    return { video: this.videoQueueMax, audio: this.audioQueueMax };
+  }
 
   /**
    * Enqueue one encoded video chunk. Synchronous and void — safe to call
@@ -488,6 +501,8 @@ export class MediaPublisher {
     }
     this.videoObjectId++;
     this.videoFrames++;
+    this.videoBytes += data.byteLength;
+    if (meta.isKeyframe) this.videoKeyframes++;
     this.onCounts?.(this.videoFrames, this.audioChunks);
   }
 
@@ -509,6 +524,7 @@ export class MediaPublisher {
     }
     await this.trackClose(streamId);
     this.audioChunks++;
+    this.audioBytes += data.byteLength;
     this.onCounts?.(this.videoFrames, this.audioChunks);
     if (this.audioQueue.length < this.audioQueueMax) this.audioOverflowing = false;
   }

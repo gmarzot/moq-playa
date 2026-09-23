@@ -95,6 +95,9 @@ export interface BroadcastCatalogParams {
   height: number;
   fps: number;
   videoBitrate: number;
+  /** Playout set point published to viewers (MSF-01 §5.1.16). Identical on
+   *  every track of a renderGroup, which the spec requires. */
+  targetLatencyMs: number;
   /** Present only when the capture HAS audio — a catalog must not advertise
    *  a track that can never publish. */
   audio?: {
@@ -204,7 +207,7 @@ async function terminateFailedCatalog(
 
 /** Assemble the catalog payload. Pure: no wire effects, so a failure here is
  *  safely recoverable by answering the request with a rejection. */
-function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
+export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
   return buildCatalog({
     tracks: [
       {
@@ -217,6 +220,7 @@ function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
         height: params.height,
         framerate: params.fps,
         bitrate: params.videoBitrate,
+        targetLatency: params.targetLatencyMs,
         renderGroup: 1,
       },
       ...(params.audio ? [{
@@ -228,6 +232,7 @@ function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
         samplerate: params.audio.sampleRate,
         channelConfig: String(params.audio.channels),
         bitrate: 128_000,
+        targetLatency: params.targetLatencyMs,
         renderGroup: 1,
       }] : []),
     ],
