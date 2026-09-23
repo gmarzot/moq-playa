@@ -217,9 +217,14 @@
       color: #bbb; border-color: #444;
     }
     /* Control-bar chips read at the resolution picker's size. Scoped so the
-       in-panel copy buttons keep the smaller treatment. */
+       in-panel copy buttons keep the smaller treatment. Centred by flex rather
+       than baseline: the gear glyph's metrics differ from the text beside it. */
     .controls .state-badge,
-    .controls button.mini { font-size: .85rem; padding: 5px 12px; }
+    .controls button.mini {
+      font-size: .85rem; padding: 6px 12px;
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 5px; line-height: 1;
+    }
     .cat-head button {
       background: #333; color: #bbb; border: 1px solid #555;
       border-radius: 6px; padding: 2px 10px;
