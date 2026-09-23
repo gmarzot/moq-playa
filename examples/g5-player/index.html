@@ -224,6 +224,8 @@
       font-size: .85rem; padding: 6px 12px;
       display: inline-flex; align-items: center; justify-content: center;
       gap: 5px; line-height: 1;
+      /* The seek bar takes all slack; these must not be squeezed into wrapping. */
+      white-space: nowrap; flex-shrink: 0;
     }
     .cat-head button {
       background: #333; color: #bbb; border: 1px solid #555;
