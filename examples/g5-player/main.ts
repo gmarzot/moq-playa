@@ -65,6 +65,81 @@ function log(msg: string): void {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// ─── Settings modal ──────────────────────────────────────────────────
+
+{
+  /** Rewritten on apply. Every other param in the URL is carried over, so
+   *  multi-valued and unlisted ones (nsField) survive a round trip. */
+  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'cushion', 'cushionMax',
+    'catchUp', 'catalogBootstrap', 'authority', 'hash', 'warmStart', 'debug'];
+
+  const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
+  const backdrop = byId('settings-backdrop');
+  const fUrl = byId<HTMLInputElement>('s-url');
+  const fNs = byId<HTMLInputElement>('s-ns');
+  const fV = byId<HTMLSelectElement>('s-v');
+  const fTarget = byId<HTMLInputElement>('s-target');
+  const fCushion = byId<HTMLInputElement>('s-cushion');
+  const fCushionMax = byId<HTMLInputElement>('s-cushion-max');
+  const fCatchUp = byId<HTMLInputElement>('s-catchup');
+  const fBootstrap = byId<HTMLSelectElement>('s-bootstrap');
+  const fAuthority = byId<HTMLInputElement>('s-authority');
+  const fHash = byId<HTMLInputElement>('s-hash');
+  const fWarm = byId<HTMLInputElement>('s-warm');
+  const fDebug = byId<HTMLInputElement>('s-debug');
+  const advSec = byId<HTMLDetailsElement>('s-adv');
+
+  const close = (): void => backdrop.classList.remove('visible');
+
+  function populate(): void {
+    const p = new URLSearchParams(location.search);
+    fUrl.value = p.get('url') ?? '';
+    fNs.value = p.get('ns') ?? '';
+    fV.value = p.get('v') ?? '';
+    fTarget.value = p.get('targetLatency') ?? '';
+    fCushion.value = p.get('cushion') ?? '';
+    fCushionMax.value = p.get('cushionMax') ?? '';
+    fCatchUp.value = p.get('catchUp') ?? '';
+    fBootstrap.value = p.get('catalogBootstrap') ?? '';
+    fAuthority.value = p.get('authority') ?? '';
+    fHash.value = p.get('hash') ?? '';
+    fWarm.checked = p.get('warmStart') === '1';
+    fDebug.checked = p.get('debug') === '1';
+    // Open Advanced when anything in it is set, so a non-default is never hidden.
+    advSec.open = MANAGED.slice(3).some((k) => p.has(k));
+  }
+
+  byId('settings-btn').addEventListener('click', () => { populate(); backdrop.classList.add('visible'); });
+  byId('set-cancel').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && backdrop.classList.contains('visible')) close();
+  });
+
+  byId('set-apply').addEventListener('click', () => {
+    const next = new URLSearchParams(location.search);
+    for (const k of MANAGED) next.delete(k);
+    // A blank field means "use the default", and a default is never written —
+    // the URL stays short enough to paste.
+    const set = (k: string, v: string): void => { if (v) next.set(k, v); };
+    set('url', fUrl.value.trim());
+    const ns = fNs.value.trim();
+    if (ns && ns !== 'live') next.set('ns', ns);
+    set('v', fV.value);
+    set('targetLatency', fTarget.value.trim());
+    set('cushion', fCushion.value.trim());
+    set('cushionMax', fCushionMax.value.trim());
+    set('catchUp', fCatchUp.value.trim());
+    set('catalogBootstrap', fBootstrap.value);
+    set('authority', fAuthority.value.trim());
+    set('hash', fHash.value.trim());
+    if (fWarm.checked) next.set('warmStart', '1');
+    if (fDebug.checked) next.set('debug', '1');
+    const qs = next.toString();
+    location.href = location.pathname + (qs ? `?${qs}` : '');
+  });
+}
+
 /** Copy to the clipboard, confirming in the button itself. */
 function wireCopy(btn: HTMLButtonElement, text: () => string): void {
   btn.addEventListener('click', async () => {

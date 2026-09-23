@@ -26,7 +26,8 @@
        reclaims its width. A restore button rides the controls bar. */
     .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
     .layout.cat-hidden .cat-col { display: none; }
-    h1 { font-size: 1.4rem; margin-bottom: 8px; }
+    h1 { font-size: 1.4rem; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+    h1 #settings-btn { margin-left: auto; }
     .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
     h1 .attrib { color: #888; font-size: 0.9rem; font-weight: 400; }
     .subtitle code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
@@ -308,11 +309,47 @@
       line-height: 1.5;
       margin-top: 12px;
     }
+
+    /* ─── Settings modal ─────────────────────────── */
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+      z-index: 100; backdrop-filter: blur(4px);
+    }
+    .modal-backdrop.visible { display: flex; align-items: center; justify-content: center; }
+    .modal {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      padding: 20px; width: min(500px, 92vw); max-height: 86vh; overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    }
+    .modal h2 { font-size: 1rem; margin-bottom: 4px; }
+    .modal .lede { color: #888; font-size: .8rem; margin-bottom: 8px; }
+    .modal label {
+      display: block; font-size: .7rem; color: #888; margin: 12px 0 4px;
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .modal input[type=text], .modal input[type=number], .modal select {
+      width: 100%; padding: 7px 9px; border-radius: 6px;
+      border: 1px solid #444; background: #222; color: #eee;
+      font-family: monospace; font-size: .85rem;
+    }
+    .modal input:focus, .modal select:focus { outline: none; border-color: #2a6; }
+    .modal .hint { font-size: .68rem; color: #666; margin-top: 3px; }
+    .modal .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+    .modal .check input { width: auto; }
+    .modal .check label { margin: 0; text-transform: none; letter-spacing: 0; font-size: .8rem; color: #bbb; }
+    .modal .adv-sec { margin-top: 16px; border-top: 1px solid #2a2a2a; padding-top: 4px; }
+    .modal .adv-sec summary { cursor: pointer; font-size: .8rem; color: #bbb; padding: 8px 0; }
+    .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+    .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
+    .modal #set-apply { background: #2a6; border-color: #2a6; color: #fff; }
+    .modal #set-apply:hover { background: #2b7; }
   </style>
 </head>
 <body>
   <div class="wrapper">
-    <h1>G5 Player <span class="attrib">(built on openmoq/moq-playa)</span></h1>
+    <h1>G5 Player <span class="attrib">(built on openmoq/moq-playa)</span>
+      <button id="settings-btn" class="mini" type="button" title="Connection settings">⚙ settings</button>
+    </h1>
 
     <div class="layout" id="layout">
     <div class="main-col">
@@ -382,6 +419,73 @@
       <summary>transport (QUIC / WebTransport)</summary>
       <div class="diag-grid" id="adv-grid"></div>
     </details>
+  </div>
+
+  <div id="settings-backdrop" class="modal-backdrop">
+    <div class="modal">
+      <h2>Connection settings</h2>
+      <div class="lede">Applying reloads the page with these as URL parameters.</div>
+
+      <label for="s-url">Relay URL</label>
+      <input id="s-url" type="text" placeholder="blank = discover on this host">
+      <div class="hint">Full WebTransport endpoint, e.g. https://host:4433/moq-relay</div>
+
+      <label for="s-ns">Namespace</label>
+      <input id="s-ns" type="text" placeholder="live">
+
+      <label for="s-v">Draft version</label>
+      <select id="s-v">
+        <option value="">Auto (offers moqt-16)</option>
+        <option value="18">Draft 18</option>
+        <option value="16">Draft 16</option>
+        <option value="14">Draft 14</option>
+      </select>
+
+      <details class="adv-sec" id="s-adv">
+        <summary>Advanced</summary>
+
+        <label for="s-target">Target latency (ms)</label>
+        <input id="s-target" type="number" min="1" placeholder="from catalog">
+        <div class="hint">Overrides the catalog's targetLatency.</div>
+
+        <label for="s-cushion">Render cushion floor / max (ms)</label>
+        <input id="s-cushion" type="number" min="1" placeholder="engine default">
+        <input id="s-cushion-max" type="number" min="1" placeholder="cap" style="margin-top:6px">
+
+        <label for="s-catchup">Catch-up rate</label>
+        <input id="s-catchup" type="number" min="1" step="0.01" placeholder="1 (off)">
+        <div class="hint">Max playback rate while chasing the target.</div>
+
+        <label for="s-bootstrap">Catalog bootstrap</label>
+        <select id="s-bootstrap">
+          <option value="">Player default</option>
+          <option value="subscribe">subscribe (publishers without FETCH)</option>
+          <option value="auto">auto</option>
+          <option value="joining-fetch">joining-fetch</option>
+          <option value="strict">strict</option>
+        </select>
+
+        <label for="s-authority">Authority</label>
+        <input id="s-authority" type="text" placeholder="(none)">
+
+        <label for="s-hash">Certificate hash</label>
+        <input id="s-hash" type="text" placeholder="(none)">
+
+        <div class="check">
+          <input id="s-warm" type="checkbox">
+          <label for="s-warm">Warm start</label>
+        </div>
+        <div class="check">
+          <input id="s-debug" type="checkbox">
+          <label for="s-debug">Debug logging (engine, MSE, raw catalog)</label>
+        </div>
+      </details>
+
+      <div class="btn-row">
+        <button id="set-cancel" type="button">Cancel</button>
+        <button id="set-apply" type="button">Apply &amp; reload</button>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="./main.ts"></script>
