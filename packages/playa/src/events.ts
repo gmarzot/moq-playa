@@ -60,6 +60,8 @@ export interface PlayerEventMap {
   'catalog_received': CatalogEvent;
   /** Delta catalog update applied. */
   'catalog_updated': CatalogEvent;
+  /** Raw catalog bytes as delivered, before parsing. Diagnostics only. */
+  'catalog_raw': CatalogRawEvent;
 
   /**
    * One media object arrived. Fires per object — measurement and
@@ -70,6 +72,12 @@ export interface PlayerEventMap {
 
 export interface CatalogEvent {
   readonly catalog: CatalogState;
+}
+
+export interface CatalogRawEvent {
+  readonly bytes: number;
+  /** UTF-8 decoding of the payload, or null when it is not valid UTF-8. */
+  readonly text: string | null;
 }
 
 export interface MediaObjectEvent {

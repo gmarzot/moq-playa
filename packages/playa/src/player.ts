@@ -624,6 +624,13 @@ export class Player {
     this.engine.on('catalog_updated', (e) => {
       this.emitter.emit('catalog_updated', { catalog: e.catalog });
     });
+    // Size and text only: the payload itself stays inside the engine.
+    this.engine.on('catalog_raw', (e) => {
+      this.emitter.emit('catalog_raw', {
+        bytes: e.payload?.byteLength ?? 0,
+        text: e.text ?? null,
+      });
+    });
     this.engine.on('media_object', (e) => {
       this.emitter.emit('media_object', {
         mediaType: e.mediaType,

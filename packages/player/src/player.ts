@@ -600,6 +600,17 @@ export class MoqtPlayer {
     replaying: boolean;
   } | null = null;
   /** Fail-closed recovery-parking bounds (objects / bytes / lifecycle). */
+  /** Cooldown after a failed recovery REQUEST_UPDATE. Request IDs are a bounded
+   *  resource (peer MAX_REQUEST_ID); retrying per object exhausts them and
+   *  makes every later recovery fail permanently. */
+  private static readonly RECOVERY_UPDATE_COOLDOWN_US = 5_000_000;
+  /** Catalog objects dropped for an empty payload, and parse failures. */
+  private emptyCatalogObjects = 0;
+  private catalogParseFailures = 0;
+  /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
+  private recoveryUpdateBlockedUntilUs = 0;
+  private recoveryUpdateFailures = 0;
+
   private static readonly MAX_RECOVERY_PARKED_OBJECTS = 256;
   private static readonly MAX_RECOVERY_PARKED_BYTES = 4 * 1024 * 1024;
   private static readonly MAX_RECOVERY_PARKED_EVENTS = 64;
@@ -6018,6 +6029,20 @@ export class MoqtPlayer {
     // be re-sent as a new independent object on the next group.
     if (obj.kind === 'gap') return;
 
+    // A zero-length payload carries no catalog. Parsing it throws once per
+    // object and each failure drives recovery, so drop and count instead.
+    if (obj.payload.byteLength === 0) {
+      this.emptyCatalogObjects++;
+      if (this.emptyCatalogObjects === 1) {
+        this.log.warn(
+          'Catalog object with empty payload (group=%s object=%s) — dropped; '
+          + 'further occurrences counted only',
+          String(obj.groupId), String(obj.objectId),
+        );
+      }
+      return;
+    }
+
     // Emit raw payload before parsing — for debugging catalog format issues
     if (obj.payload && obj.payload.byteLength > 0) {
       let text: string | null = null;
@@ -6091,7 +6116,19 @@ export class MoqtPlayer {
         ? PlayerErrorCode.CATALOG_DELTA_ERROR
         : PlayerErrorCode.CATALOG_PARSE_ERROR;
       const cause = err instanceof Error ? err : new Error(String(err));
-      this.emitError(createPlayerError(severity, 'catalog', code, cause.message, { cause }));
+      // A malformed producer repeats per object. Name the payload once — its
+      // size and head are what identify truncation versus a format mismatch —
+      // then stop emitting, so recovery is not driven by every repeat.
+      this.catalogParseFailures++;
+      if (this.catalogParseFailures === 1) {
+        this.log.warn(
+          'Catalog parse failed (%d bytes, head=%s): %s',
+          obj.payload.byteLength,
+          JSON.stringify(new TextDecoder().decode(obj.payload.subarray(0, 64))),
+          cause.message,
+        );
+        this.emitError(createPlayerError(severity, 'catalog', code, cause.message, { cause }));
+      }
     }
   }
 
@@ -7242,6 +7279,9 @@ export class MoqtPlayer {
     startGroup?: bigint,
   ): void {
     if (!this.connection) return;
+    // Request IDs are bounded by the peer's MAX_REQUEST_ID. Re-issuing on every
+    // failure exhausts the space, after which no recovery can ever succeed.
+    if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
     const matching = [...this.activeSubscriptions.entries()]
       .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId);
@@ -7256,6 +7296,7 @@ export class MoqtPlayer {
           }
           : { type: 'NextGroupStart' },
       }).then(() => {
+        this.recoveryUpdateFailures = 0;
         this.log.info(
           'Recovery REQUEST_UPDATE %s "%s" reqId=%s filter=%s',
           mediaType,
@@ -7265,8 +7306,13 @@ export class MoqtPlayer {
         );
       }).catch((err: unknown) => {
         const cause = err instanceof Error ? err : new Error(String(err));
+        this.recoveryUpdateBlockedUntilUs =
+          this.clock.now() + MoqtPlayer.RECOVERY_UPDATE_COOLDOWN_US;
+        this.recoveryUpdateFailures++;
+        if (this.recoveryUpdateFailures > 1) return;
         this.log.warn(
-          'Recovery REQUEST_UPDATE failed for %s reqId=%s: %s',
+          'Recovery REQUEST_UPDATE failed for %s reqId=%s: %s — backing off; '
+          + 'further failures counted only',
           mediaType,
           requestId,
           cause.message,
