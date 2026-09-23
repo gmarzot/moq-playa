@@ -26,8 +26,7 @@
        reclaims its width. A restore button rides the controls bar. */
     .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
     .layout.cat-hidden .cat-col { display: none; }
-    h1 { font-size: 1.4rem; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-    h1 #settings-btn { margin-left: auto; }
+    h1 { font-size: 1.4rem; margin-bottom: 8px; }
     .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
     h1 .attrib { color: #888; font-size: 0.9rem; font-weight: 400; }
     .subtitle code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
@@ -66,6 +65,7 @@
     /* Seek bar */
     .seek-bar {
       flex: 1;
+      max-width: 280px;
       height: 4px;
       -webkit-appearance: none;
       appearance: none;
@@ -82,7 +82,8 @@
     }
 
     /* Volume */
-    .volume-group { display: flex; align-items: center; gap: 6px; }
+    /* The capped seek bar no longer fills the row; the rest rides the edge. */
+    .volume-group { display: flex; align-items: center; gap: 6px; margin-left: auto; }
     .volume-bar {
       width: 80px;
       height: 4px;
@@ -347,9 +348,7 @@
 </head>
 <body>
   <div class="wrapper">
-    <h1>G5 Player <span class="attrib">(built on openmoq/moq-playa)</span>
-      <button id="settings-btn" class="mini" type="button" title="Connection settings">⚙ settings</button>
-    </h1>
+    <h1>G5 Player <span class="attrib">(built on openmoq/moq-playa)</span></h1>
 
     <div class="layout" id="layout">
     <div class="main-col">
@@ -365,6 +364,7 @@
       </div>
       <select id="quality" disabled><option>Auto</option></select>
       <span class="state-badge" id="state">idle</span>
+      <button id="settings-btn" class="mini" type="button" title="Connection settings">⚙</button>
       <button id="cat-restore" class="mini" hidden>catalog</button>
     </div>
     </div>
