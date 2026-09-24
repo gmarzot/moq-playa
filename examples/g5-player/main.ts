@@ -883,7 +883,9 @@ async function main(): Promise<void> {
       detail.textContent = [
         t.codec,
         t.width && t.height ? `${t.width}×${t.height}` : '',
-        t.framerate ? `${t.framerate}fps` : '',
+        // 24000/1001 arrives as 23.976043701171875; three places is the most
+        // that distinguishes real rates.
+        t.framerate ? `${Number(Number(t.framerate).toFixed(3))}fps` : '',
         t.samplerate ? `${t.samplerate}Hz` : '',
         t.channelConfig ? `${t.channelConfig}ch` : '',
         t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',

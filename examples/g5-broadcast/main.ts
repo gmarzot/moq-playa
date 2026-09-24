@@ -217,9 +217,12 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
   catTracks.replaceChildren(...tracks.map((t) => {
     const row = document.createElement('div');
     row.className = 'cat-track';
+    // 24000/1001 arrives as 23.976043701171875; three places is the most that
+    // distinguishes real rates.
+    const fps = Number(Number(t['framerate']).toFixed(3));
     const detail = t['name'] === 'audio'
-      ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch`
-      : `${t['codec']} · ${t['width']}x${t['height']} · ${t['framerate']}fps`;
+      ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
+      : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`;
     row.innerHTML = `<span class="nm">${String(t['name'])}</span>`
       + `<span class="pk">${String(t['packaging'])}</span>`
       + `<span class="sub" data-track="${String(t['name'])}">pending</span>`

@@ -128,13 +128,19 @@
       display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
       font-size: 1rem; font-variant-numeric: tabular-nums;
     }
+    /* One line per track: the summary ellipsises rather than wrapping under
+       the name, so every track row is the same height. */
     .cat-track {
-      display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+      display: flex; flex-wrap: nowrap; gap: 8px; align-items: baseline;
       color: #aab; padding: 5px 0; border-bottom: 1px solid #23233a;
     }
     .cat-track:last-child { border-bottom: 0; }
     .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
-    .cat-track .dt { color: #6cf; font-weight: 600; font-size: .9rem; min-width: 0; overflow-wrap: anywhere; }
+    .cat-track .dt {
+      color: #6cf; font-weight: 600; font-size: .9rem;
+      min-width: 0; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
     .cat-track .pk {
       color: #4d4; border: 1px solid #2f5a34; border-radius: 4px;
       background: #16271a; padding: 1px 6px; text-transform: uppercase;

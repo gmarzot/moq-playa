@@ -273,8 +273,10 @@
     }
     /* Name and badge hold their line; the detail wraps under them rather than
        scrolling the panel sideways. Nothing is clipped either way. */
+    /* One line per track: the summary ellipsises rather than wrapping under
+       the name, so every track row is the same height. */
     .cat-track {
-      display: flex; flex-wrap: wrap; gap: 8px;
+      display: flex; flex-wrap: nowrap; gap: 8px;
       align-items: baseline; color: #aab;
       padding: 5px 0; border-bottom: 1px solid #23233a;
     }
@@ -283,7 +285,8 @@
        it appears, and it keeps the blue that named it there. */
     .cat-track .dt {
       color: #6cf; font-weight: 600; font-size: .9rem;
-      min-width: 0; overflow-wrap: anywhere;
+      min-width: 0; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
     }
     .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
     .cat-track .pk {
