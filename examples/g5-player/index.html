@@ -18,7 +18,7 @@
        within it. Stacks to one column on narrow viewports. */
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(500px, 44%);
+      grid-template-columns: minmax(0, 1fr) minmax(400px, 44%);
       gap: 20px;
       align-items: stretch;
     }
@@ -70,9 +70,11 @@
 
     /* Seek bar */
     .seek-bar {
-      flex: 1;
-      /* A range input's intrinsic width would otherwise floor the whole row;
-         let it absorb the shrink down to a still-usable track. */
+      /* A real basis (not 0) so the two sliders shed width in proportion —
+         seek gives up 2px for every 1px volume gives up — rather than the
+         seek bar absorbing all of it. A range input's intrinsic width would
+         otherwise floor the whole row, so both carry explicit minimums. */
+      flex: 1 1 160px;
       min-width: 60px;
       height: 4px;
       -webkit-appearance: none;
@@ -154,9 +156,17 @@
     .diag-grid .cell b.fault { color: #d9922e; }
     /* A unit can warn while its value stays neutral. */
     .diag-grid .cell b .u.fault { color: #d9922e; }
+    /* Fixed counts, not auto-fit: the four charts share one time axis, so they
+       go 4 across then 2x2. An odd row (3 + 1) breaks the comparison. */
     .diag-charts {
       display: grid; gap: 16px;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    @media (max-width: 900px) {
+      .diag-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 520px) {
+      .diag-charts { grid-template-columns: 1fr; }
     }
     /* Block so the underline spans the graph rather than the text; nowrap
        keeps every label one line, so all four canvases sit at the same y. */
@@ -278,7 +288,7 @@
     }
 
     /* Narrow viewports: stack back to a single column */
-    @media (max-width: 1320px) {
+    @media (max-width: 1120px) {
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
