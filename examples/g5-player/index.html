@@ -54,6 +54,9 @@
       flex-wrap: nowrap;
       min-width: 0;
     }
+    /* Tighten the spacing before the sliders bottom out, so the row keeps
+       breathing room between items rather than running them together. */
+    @media (max-width: 1280px) { .controls { gap: 8px; } }
     button {
       background: #333;
       color: #eee;
@@ -75,7 +78,7 @@
          seek bar absorbing all of it. A range input's intrinsic width would
          otherwise floor the whole row, so both carry explicit minimums. */
       flex: 1 1 160px;
-      min-width: 60px;
+      min-width: 40px;
       height: 4px;
       -webkit-appearance: none;
       appearance: none;
@@ -92,7 +95,10 @@
     }
 
     /* Volume */
-    .volume-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    /* No min-width:0 here — the group must stay at least as wide as the mute
+       button plus the slider's minimum, or its children overflow the box and
+       run under the next control. The slider's own flex does the shrinking. */
+    .volume-group { display: flex; align-items: center; gap: 6px; }
     .volume-bar {
       flex: 0 1 80px;
       min-width: 44px;
@@ -112,7 +118,10 @@
     }
 
     /* Time display */
-    .time { font-size: 0.85rem; color: #aaa; font-variant-numeric: tabular-nums; min-width: 50px; }
+    .time {
+      font-size: 0.85rem; color: #aaa; font-variant-numeric: tabular-nums;
+      min-width: 44px; text-align: center; flex-shrink: 0;
+    }
 
     /* Quality selector */
     select {
