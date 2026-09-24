@@ -13,7 +13,10 @@
     .wrapper { max-width: 1440px; margin: 0 auto; padding: 24px; }
 
     h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: #fff; }
-    h1 .attrib { color: #888; font-size: 0.9rem; font-weight: 400; }
+    .attrib-note {
+      color: #666; font-size: .75rem; margin-top: 18px;
+      padding-top: 10px; border-top: 1px solid #222;
+    }
 
     /* Two-column layout: preview+controls+metrics left, catalog right. */
     .layout {
@@ -209,7 +212,7 @@
 </head>
 <body>
   <div class="wrapper">
-    <h1>G5 Broadcast <span class="attrib">(camera or screen → MoQT)</span></h1>
+    <h1>G5 Broadcast</h1>
 
     <div class="layout" id="layout">
       <div class="main-col">
@@ -258,6 +261,8 @@
       <button id="log-copy" class="mini copy" type="button">copy</button>
       <pre id="log"></pre>
     </div>
+
+    <footer class="attrib-note">Built on openmoq/moq-playa.</footer>
   </div>
 
   <!-- Share modal -->
