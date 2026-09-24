@@ -165,11 +165,13 @@
     }
     .copy:hover, .copy:focus-visible { opacity: 1; }
     pre#log {
-      background: #0d0d20; color: rgba(255,255,255,0.55);
+      background: #1a1a2e; color: rgba(255,255,255,0.6);
       padding: 12px 16px; border-radius: 8px;
-      font-family: monospace; font-size: 0.85rem; line-height: 1.5;
-      max-height: 220px; overflow-y: auto; white-space: pre-wrap;
-      border: 1px solid rgba(255,255,255,0.05);
+      font-family: monospace; font-size: 0.8rem; line-height: 1.5;
+      /* A floating copy button over a one-line box reads as broken; the panel
+         keeps a consistent height from the first line. */
+      min-height: 140px; max-height: 220px;
+      overflow-y: auto; white-space: pre-wrap;
     }
 
     @media (max-width: 1120px) {

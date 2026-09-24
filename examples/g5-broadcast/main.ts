@@ -316,6 +316,13 @@ setInterval(() => {
 }, 1000);
 renderMetrics();
 
+// The namespace is minted per load, so the log is the only durable record of
+// which one a soak ran on. Echo the whole configuration before anything starts.
+log(`Namespace: ${namespace}`);
+log(`Relay: ${params.get('url') ?? `${DEFAULT_RELAY} (default)`}`);
+log(`Draft: ${broadcastDraft} · codec ${videoCodec} · ${videoBitrate / 1000}kbps · `
+  + `keyframe every ${keyframeInterval} · target ${targetLatencyMs}ms`);
+
 // ─── Catalog panel controls ──────────────────────────────────────────
 
 const setCatalogHidden = (hidden: boolean): void => {
@@ -449,7 +456,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // The settings dialog writes its value back to ?url=, so the param covers
       // both ways of naming a relay; absent either, use ours.
       const relayUrl = params.get('url') ?? DEFAULT_RELAY;
-      if (!params.get('url')) log(`Relay: ${DEFAULT_RELAY} (default)`);
       ctx.throwIfCancelled();
       resolvedRelayUrl = relayUrl;
 
