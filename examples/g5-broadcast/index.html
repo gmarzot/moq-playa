@@ -49,9 +49,9 @@
     button:disabled { opacity: 0.4; cursor: default; }
     button.mini { padding: 4px 12px; font-size: .8rem; color: #bbb; border-color: #444; }
 
-    /* The column can be narrower than this row's content. Wrapping keeps the
-       chips on-screen; without it the row overflows under the catalog. */
-    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: wrap; }
+    /* One line always. The spacer absorbs the shrink; past that the layout
+       stacks, rather than the row overflowing under the catalog. */
+    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: nowrap; }
     .controls .spacer { flex: 1; min-width: 0; }
     .controls .state-badge,
     .controls button.mini {
@@ -167,7 +167,7 @@
       border: 1px solid rgba(255,255,255,0.05);
     }
 
-    @media (max-width: 1100px) {
+    @media (max-width: 1320px) {
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
@@ -229,13 +229,6 @@
           <button id="cat-restore" class="mini" hidden>catalog</button>
         </div>
 
-        <div class="diag">
-          <div class="diag-grid" id="diag-grid"></div>
-          <details class="adv" id="adv-panel">
-            <summary>transport (QUIC / WebTransport)</summary>
-            <div class="diag-grid" id="adv-grid"></div>
-          </details>
-        </div>
       </div>
 
       <div class="cat-col">
@@ -251,6 +244,14 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <div class="diag">
+      <div class="diag-grid" id="diag-grid"></div>
+      <details class="adv" id="adv-panel">
+        <summary>transport (QUIC / WebTransport)</summary>
+        <div class="diag-grid" id="adv-grid"></div>
+      </details>
     </div>
 
     <div class="log-wrap">
