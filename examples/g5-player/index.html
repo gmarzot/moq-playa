@@ -34,6 +34,8 @@
       color: #666; font-size: .75rem; margin-top: 18px;
       padding-top: 10px; border-top: 1px solid #222;
     }
+    .attrib-note a { color: #8a94a6; text-decoration: none; border-bottom: 1px solid #333; }
+    .attrib-note a:hover { color: #b8c2d0; border-bottom-color: #555; }
     .subtitle code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
 
     /* Player container */
@@ -76,12 +78,13 @@
 
     /* Seek bar */
     .seek-bar {
-      /* A real basis (not 0) so the two sliders shed width in proportion —
-         seek gives up 2px for every 1px volume gives up — rather than the
-         seek bar absorbing all of it. A range input's intrinsic width would
-         otherwise floor the whole row, so both carry explicit minimums. */
-      flex: 1 1 160px;
-      min-width: 40px;
+      /* Shrink is distributed by (shrink factor x basis), so volume's higher
+         factor makes it give up width faster. The seek floor sits above the
+         volume basis, which keeps the timeline the longer of the two at every
+         width. A range input's intrinsic width would otherwise floor the row,
+         so both carry explicit minimums. */
+      flex: 1 1 240px;
+      min-width: 80px;
       height: 4px;
       -webkit-appearance: none;
       appearance: none;
@@ -103,8 +106,8 @@
        run under the next control. The slider's own flex does the shrinking. */
     .volume-group { display: flex; align-items: center; gap: 6px; }
     .volume-bar {
-      flex: 0 1 80px;
-      min-width: 44px;
+      flex: 0 4 64px;
+      min-width: 30px;
       height: 4px;
       -webkit-appearance: none;
       appearance: none;
@@ -300,7 +303,7 @@
     }
 
     /* Narrow viewports: stack back to a single column */
-    @media (max-width: 1120px) {
+    @media (max-width: 1150px) {
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
@@ -463,7 +466,7 @@
       <div class="diag-grid" id="adv-grid"></div>
     </details>
 
-    <footer class="attrib-note">Built on openmoq/moq-playa.</footer>
+    <footer class="attrib-note">Built on <a href="https://github.com/openmoq/moq-playa" target="_blank" rel="noopener noreferrer">openmoq/moq-playa</a>.</footer>
   </div>
 
   <div id="settings-backdrop" class="modal-backdrop">
