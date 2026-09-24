@@ -49,8 +49,10 @@
     button:disabled { opacity: 0.4; cursor: default; }
     button.mini { padding: 4px 12px; font-size: .8rem; color: #bbb; border-color: #444; }
 
-    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; }
-    .controls .spacer { flex: 1; }
+    /* The column can be narrower than this row's content. Wrapping keeps the
+       chips on-screen; without it the row overflows under the catalog. */
+    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: wrap; }
+    .controls .spacer { flex: 1; min-width: 0; }
     .controls .state-badge,
     .controls button.mini {
       font-size: .85rem; padding: 6px 12px;
@@ -169,7 +171,10 @@
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
-      .cat-json { max-height: 220px; }
+      /* Stacked, the panel has no column height to fill — the JSON pane needs
+         an explicit one or it collapses to the header. */
+      .json-wrap { flex: none; }
+      .cat-json { flex: none; min-height: 220px; max-height: 45vh; }
     }
 
     /* Settings / share modals */

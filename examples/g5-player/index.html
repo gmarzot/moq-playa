@@ -49,6 +49,9 @@
       align-items: center;
       gap: 12px;
       padding: 12px 0;
+      /* The column can be narrower than this row's content. Wrapping keeps the
+         chips on-screen; without it the row overflows under the catalog. */
+      flex-wrap: wrap;
     }
     button {
       background: #333;
@@ -67,6 +70,9 @@
     /* Seek bar */
     .seek-bar {
       flex: 1;
+      /* A range input's intrinsic width would otherwise floor the whole row;
+         let it absorb the shrink before anything wraps. */
+      min-width: 60px;
       height: 4px;
       -webkit-appearance: none;
       appearance: none;
@@ -274,8 +280,10 @@
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
-      .json-wrap { flex: none; max-height: 220px; }
-      .cat-json { flex: 1; max-height: 220px; }
+      /* Stacked, the panel has no column height to fill — the JSON pane needs
+         an explicit one or it collapses to the header. */
+      .json-wrap { flex: none; }
+      .cat-json { flex: none; min-height: 220px; max-height: 45vh; }
     }
     .catalog-panel.collapsed .cat-tracks,
     .catalog-panel.collapsed .cat-json { display: none; }
