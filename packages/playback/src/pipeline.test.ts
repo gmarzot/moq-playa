@@ -2090,3 +2090,57 @@ describe('PlaybackPipeline', () => {
         });
     });
 });
+
+describe('sync reference fallback (advertised audio that never delivers)', () => {
+    it('video anchors the reference itself once the bound elapses, and says so', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        // videoOnly is NOT set: the catalog advertised an audio track, so only
+        // the audio pipeline may normally anchor the shared reference.
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+
+        pipeline.pushObject(
+            makeData(0, 0),
+            videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])),
+        );
+        pipeline.tick();
+        // No audio has arrived, so nothing may anchor yet.
+        expect(sync.hasReference).toBe(false);
+
+        // Still inside the bound.
+        clock.set(5_000_000 + 1_900_000);
+        pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_333n, false));
+        pipeline.tick();
+        expect(sync.hasReference).toBe(false);
+        expect(events.some((e) => e.type === 'sync_reference_fallback')).toBe(false);
+
+        // Past it: video anchors, and the reason is reported exactly once.
+        clock.set(5_000_000 + 2_100_000);
+        pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_666n, false));
+        pipeline.tick();
+        expect(sync.hasReference).toBe(true);
+        expect(events.filter((e) => e.type === 'sync_reference_fallback')).toHaveLength(1);
+
+        clock.set(5_000_000 + 3_000_000);
+        pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_099_999n, false));
+        pipeline.tick();
+        expect(events.filter((e) => e.type === 'sync_reference_fallback')).toHaveLength(1);
+    });
+
+    it('audio arriving inside the bound keeps priority — no fallback fires', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true));
+        pipeline.tick();
+
+        sync.setAudioReference(1_000_000_000n);   // audio lands first
+
+        clock.set(5_000_000 + 5_000_000);
+        pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_333n, false));
+        pipeline.tick();
+
+        expect(events.some((e) => e.type === 'sync_reference_fallback')).toBe(false);
+    });
+});

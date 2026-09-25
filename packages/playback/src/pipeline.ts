@@ -123,6 +123,9 @@ export class PlaybackPipeline {
     private _lateAudioDrops = 0;
     private readonly getPlaybackDelayUs: (() => number) | undefined;
     /** Sustained audio lateness before re-anchoring (one jittery frame must not). */
+    /** How long video waits on an advertised audio track to anchor the shared
+     *  reference before anchoring itself. */
+    private static readonly SYNC_REFERENCE_FALLBACK_US = 2_000_000;
     private static readonly AUDIO_REANCHOR_AFTER_US = 250_000;
     /** Minimum spacing between audio re-anchors. */
     private static readonly AUDIO_REANCHOR_MIN_INTERVAL_US = 2_000_000;
@@ -145,6 +148,8 @@ export class PlaybackPipeline {
     /** Video codec string from catalog (e.g., 'avc1.42c01f'). Used for keyframe validation. */
     private _videoCodec: string | undefined;
     private _videoOnly: boolean;
+    /** When video first held a frame waiting on audio to anchor the reference. */
+    private videoRefWaitStartUs: number | null = null;
 
     constructor(opts: PipelineOptions) {
         this.mediaType = opts.mediaType;
@@ -819,6 +824,18 @@ export class PlaybackPipeline {
                 this.sync.setAudioReference(headers.captureTimestamp);
             } else if (this._videoOnly) {
                 this.sync.setVideoReference(headers.captureTimestamp);
+            } else {
+                // Audio-master, but a catalog can advertise audio that never
+                // delivers a referenceable frame. Video is held and dropped
+                // with no timeout, so the picture never starts and nothing
+                // says why. Anchor on video once the wait exceeds the bound;
+                // setVideoReference defers if audio lands first.
+                this.videoRefWaitStartUs ??= this.clock.now();
+                const waitedUs = this.clock.now() - this.videoRefWaitStartUs;
+                if (waitedUs >= PlaybackPipeline.SYNC_REFERENCE_FALLBACK_US) {
+                    this.sync.setVideoReference(headers.captureTimestamp);
+                    this.onEvent({ type: 'sync_reference_fallback', waitedUs });
+                }
             }
         }
 

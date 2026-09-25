@@ -482,6 +482,13 @@ export function handlePipelineEvent(
       ctx.log.warn('Audio late by %dms for a sustained run — sync reference re-anchored',
         Math.round(evt.lateByUs / 1000));
       break;
+    case 'sync_reference_fallback':
+      // warn, not debug: the catalog advertised audio that never arrived, and
+      // without this the picture would have stayed black indefinitely.
+      ctx.log.warn('No audio frame in %dms — video anchored the sync reference itself; '
+        + 'the advertised audio track has delivered nothing',
+        Math.round(evt.waitedUs / 1000));
+      break;
     case 'catch_up_changed':
       ctx.log.debug('Catch-up %s rate=%.2f latency=%dms target=%dms',
         evt.state.active ? 'active' : 'inactive',
