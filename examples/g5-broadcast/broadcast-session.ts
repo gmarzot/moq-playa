@@ -79,6 +79,17 @@ export class BroadcastSession {
    * and void (the connection does not await its onSubscribe callback); every
    * async operation contains its own failure. Inert once retired.
    */
+  /**
+   * A track carries ONE alias, so a second concurrent subscription to it is
+   * silently served only the newest. Name it: the publisher cannot fan out,
+   * and this is the only place the condition is visible.
+   */
+  private warnOnAliasReplace(track: string, armed: bigint | null, next: bigint): void {
+    if (armed === null || armed === next) return;
+    this.safeLog(`WARNING: ${track} alias ${armed} replaced by ${next} — this publisher `
+      + `serves ONE subscription per track; the earlier one now receives nothing`);
+  }
+
   handleSubscribe(requestId: bigint, trackName: string): void {
     if (this.retired) {
       this.safeLog(`Ignoring SUBSCRIBE for "${trackName}" on a retired broadcast session`);
@@ -106,6 +117,7 @@ export class BroadcastSession {
       this.connection.acceptSubscribe(this.wrapInt(requestId), this.wrapInt(alias))
         .then(() => {
           if (this.retired) return; // never arm a retired generation's publisher
+          this.warnOnAliasReplace('video', this.publisher.videoAliasArmed, alias);
           this.publisher.setVideoAlias(alias);
           this.safeLog(`Accepted video subscription`);
         })
@@ -121,6 +133,7 @@ export class BroadcastSession {
       this.connection.acceptSubscribe(this.wrapInt(requestId), this.wrapInt(alias))
         .then(() => {
           if (this.retired) return;
+          this.warnOnAliasReplace('audio', this.publisher.audioAliasArmed, alias);
           this.publisher.setAudioAlias(alias);
           this.safeLog(`Accepted audio subscription`);
         })

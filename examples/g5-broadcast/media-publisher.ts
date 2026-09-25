@@ -192,6 +192,10 @@ export class MediaPublisher {
   setVideoAlias(alias: bigint): void { this.videoAlias = alias; this.retired.delete('video'); }
   setAudioAlias(alias: bigint): void { this.audioAlias = alias; this.retired.delete('audio'); }
 
+  /** The alias each track currently publishes to, or null when unarmed. */
+  get videoAliasArmed(): bigint | null { return this.videoAlias; }
+  get audioAliasArmed(): bigint | null { return this.audioAlias; }
+
   /** Tracks retired because their subscription ended, for the UI. */
   get retiredTracks(): readonly string[] { return [...this.retired]; }
 
