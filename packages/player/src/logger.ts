@@ -61,20 +61,23 @@ export class ConsoleLogger implements LoggerLike {
     this.level = LOG_LEVELS[level];
   }
 
+  // The prefix rides INSIDE the format string: a console only applies %s/%d
+  // substitution to its first argument, so passing the prefix separately
+  // printed every specifier literally with the values appended.
   error(msg: string, ...args: unknown[]): void {
-    if (this.level >= 1) console.error(`[${this.prefix}]`, msg, ...args);
+    if (this.level >= 1) console.error(`[${this.prefix}] ${msg}`, ...args);
   }
 
   warn(msg: string, ...args: unknown[]): void {
-    if (this.level >= 2) console.warn(`[${this.prefix}]`, msg, ...args);
+    if (this.level >= 2) console.warn(`[${this.prefix}] ${msg}`, ...args);
   }
 
   info(msg: string, ...args: unknown[]): void {
-    if (this.level >= 3) console.info(`[${this.prefix}]`, msg, ...args);
+    if (this.level >= 3) console.info(`[${this.prefix}] ${msg}`, ...args);
   }
 
   debug(msg: string, ...args: unknown[]): void {
-    if (this.level >= 4) console.debug(`[${this.prefix}]`, msg, ...args);
+    if (this.level >= 4) console.debug(`[${this.prefix}] ${msg}`, ...args);
   }
 }
 

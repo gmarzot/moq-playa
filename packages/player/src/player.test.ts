@@ -4623,9 +4623,9 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       // Should have logged "Connecting to ..." and "Session established"
-      const calls = spyInfo.mock.calls.map(c => c[1]);
-      expect(calls).toContain('Connecting to %s');
-      expect(calls.some((c: string) => c.startsWith('Session established'))).toBe(true);
+      const calls = spyInfo.mock.calls.map(c => c[0]);
+      expect(calls).toContain('[moqt] Connecting to %s');
+      expect(calls.some((c: string) => c.startsWith('[moqt] Session established'))).toBe(true);
 
       vi.restoreAllMocks();
     });
@@ -4661,8 +4661,8 @@ describe('MoqtPlayer', () => {
 
       // Wait for async subscription wiring
       await vi.waitFor(() => {
-        const calls = spyInfo.mock.calls.map(c => c[1]);
-        expect(calls).toContain('Catalog received: %d tracks');
+        const calls = spyInfo.mock.calls.map(c => c[0]);
+        expect(calls).toContain('[moqt] Catalog received: %d tracks');
       });
 
       vi.restoreAllMocks();
@@ -4742,7 +4742,7 @@ describe('MoqtPlayer', () => {
 
       // Wait for subscription wiring
       await vi.waitFor(() => {
-        expect(spyInfo.mock.calls.some(c => c[1] === 'Catalog received: %d tracks')).toBe(true);
+        expect(spyInfo.mock.calls.some(c => c[0] === '[moqt] Catalog received: %d tracks')).toBe(true);
       });
 
       spyDebug.mockClear();
@@ -4760,7 +4760,7 @@ describe('MoqtPlayer', () => {
       });
 
       // Video objects log at info level with [OBJ] prefix for debugging
-      const infoCalls = spyInfo.mock.calls.map(c => c[1]);
+      const infoCalls = spyInfo.mock.calls.map(c => c[0]);
       expect(infoCalls.some((c: string) => typeof c === 'string' && c.includes('[OBJ]'))).toBe(true);
 
       vi.restoreAllMocks();
@@ -4783,7 +4783,7 @@ describe('MoqtPlayer', () => {
       adapter._triggerError(new Error('control stream closed'));
 
       expect(spyError).toHaveBeenCalled();
-      const errorCalls = spyError.mock.calls.map(c => c[1]);
+      const errorCalls = spyError.mock.calls.map(c => c[0]);
       expect(errorCalls.some(c => typeof c === 'string' && c.includes('Error'))).toBe(true);
       // Info-level messages should be suppressed
       expect(spyInfo).not.toHaveBeenCalled();

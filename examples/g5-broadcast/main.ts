@@ -54,11 +54,30 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
  *  player has no target and runs with no cushion policy or chase at all. */
 const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
 /**
- * `?ns=` when given, otherwise a fresh namespace per page load. A shared
- * default collides: two broadcasters claim the same name, and a relay still
- * holding state from a previous session routes subscribers to the dead one.
+ * `?ns=` when given, otherwise one minted per TAB and held in sessionStorage.
+ *
+ * Per-tab rather than per-load: a reload (including a dev-server hot reload)
+ * keeps the namespace, so viewer links already handed out stay valid, while a
+ * new tab still mints a fresh one — which is what stops two broadcasters
+ * claiming the same name and stops a relay holding state from a dead session
+ * routing subscribers to it.
  */
-const namespace = params.get('ns') ?? `g5-${crypto.randomUUID().slice(0, 8)}`;
+const NAMESPACE_KEY = 'g5-broadcast.namespace';
+function mintNamespace(): string {
+  const fresh = (): string => `g5-${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    const held = sessionStorage.getItem(NAMESPACE_KEY);
+    if (held) return held;
+    const minted = fresh();
+    sessionStorage.setItem(NAMESPACE_KEY, minted);
+    return minted;
+  } catch {
+    // Private mode or blocked site data: a per-load namespace still works,
+    // it just will not survive a reload.
+    return fresh();
+  }
+}
+const namespace = params.get('ns') ?? mintNamespace();
 
 // ─── Settings modal ──────────────────────────────────────────────────
 
