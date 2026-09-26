@@ -62,14 +62,12 @@ export function createWebTransport(
   options?: WebTransportFactoryOptions,
 ): (url: string) => Promise<WebTransportLike> {
   return async (url: string): Promise<WebTransportLike> => {
-    // A page has no raw-QUIC API, so moqt:// cannot be dialled here however
-    // valid it is elsewhere — @moqt/quic serves that under Node. Say so,
-    // rather than letting the WebTransport constructor throw something opaque.
+    // Browsers expose no raw QUIC.
     if (!/^https:\/\//i.test(url)) {
       const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1];
       throw new Error(
         `Relay URL must be https:// for WebTransport, got ${scheme ? `${scheme}://` : `"${url}"`}`
-        + ' — a browser exposes no raw QUIC, so moqt:// is reachable only from Node (@moqt/quic)',
+        + ' — browsers expose no raw QUIC',
       );
     }
     // Build options as a plain object — WebTransportOptions varies by environment.
@@ -170,8 +168,7 @@ export function createWebTransport(
     };
 
     const protocol = (transport as any).protocol as string | undefined;
-    // Forwarded only when the implementation has it, so "no stats support"
-    // stays distinguishable from "stats reported nothing".
+    // Absent when unsupported, so callers can tell that from empty stats.
     const getStats = (transport as WebTransportLike).getStats;
     return {
       ...(protocol !== undefined ? { protocol } : {}),

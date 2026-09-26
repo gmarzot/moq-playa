@@ -107,11 +107,8 @@ export type PlaybackEvent =
     | SyncReferenceFallbackEvent
     | AudioReanchoredEvent;
 
-/**
- * An audio track was advertised but produced no referenceable frame within the
- * bound, so video anchored the shared reference itself. Until that happens
- * every video frame is decoded and held, so the picture never starts.
- */
+/** Advertised audio produced no referenceable frame within the bound, so
+ *  video anchored the shared reference itself. */
 export interface SyncReferenceFallbackEvent {
     readonly type: 'sync_reference_fallback';
     /** How long video waited on audio before anchoring (µs). */

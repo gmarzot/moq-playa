@@ -81,11 +81,8 @@ export class BroadcastSession {
     this.publisher = new MediaPublisher(connection, opts.publisher);
   }
 
-  /**
-   * A track carries ONE alias, so a second concurrent subscription to it is
-   * silently served only the newest. Name it: the publisher cannot fan out,
-   * and this is the only place the condition is visible.
-   */
+  /** A track carries one alias, so a second concurrent subscription would be
+   *  served only the newest. */
   private warnOnAliasReplace(track: string, armed: bigint | null, next: bigint): void {
     if (armed === null || armed === next) return;
     this.safeLog(`WARNING: ${track} alias ${armed} replaced by ${next} — this publisher `
@@ -95,12 +92,10 @@ export class BroadcastSession {
   /**
    * Re-publish the catalog on an interval.
    *
-   * MSF-01 §5 has a late joiner acquire the catalog by SUBSCRIBE plus a
-   * joining FETCH, which needs no re-emission — but this publisher answers no
-   * FETCH, and a relay subscribes upstream once and fans out, so without this
-   * the catalog's single group is closed before any later viewer arrives and
-   * they never acquire one. Best-effort: a failed re-emission is reported and
-   * the interval continues, since the live subscription is still healthy.
+   * A relay subscribes upstream once and fans out, so the catalog's single
+   * group is closed before any later viewer arrives. MSF-01 §5 would cover
+   * that with a joining FETCH; this publisher answers none. Best-effort: a
+   * failed re-emission is reported once and the interval continues.
    */
   private startCatalogReemission(alias: bigint): void {
     if (this.catalogTimer !== null) return;
@@ -128,7 +123,7 @@ export class BroadcastSession {
     }, periodMs);
   }
 
-  /** A timer outliving the session would publish into a dead connection. */
+  /** Stop before the connection goes away. */
   private stopCatalogReemission(): void {
     if (this.catalogTimer === null) return;
     clearInterval(this.catalogTimer);

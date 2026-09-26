@@ -600,9 +600,8 @@ export class MoqtPlayer {
     replaying: boolean;
   } | null = null;
   /** Fail-closed recovery-parking bounds (objects / bytes / lifecycle). */
-  /** Cooldown after a failed recovery REQUEST_UPDATE. Request IDs are a bounded
-   *  resource (peer MAX_REQUEST_ID); retrying per object exhausts them and
-   *  makes every later recovery fail permanently. */
+  /** Cooldown after a failed recovery REQUEST_UPDATE: request IDs are bounded
+   *  by the peer's MAX_REQUEST_ID, and retrying per object exhausts them. */
   private static readonly RECOVERY_UPDATE_COOLDOWN_US = 5_000_000;
   /** Catalog objects dropped for an empty payload, and parse failures. */
   private emptyCatalogObjects = 0;
@@ -6029,8 +6028,8 @@ export class MoqtPlayer {
     // be re-sent as a new independent object on the next group.
     if (obj.kind === 'gap') return;
 
-    // A zero-length payload carries no catalog. Parsing it throws once per
-    // object and each failure drives recovery, so drop and count instead.
+    // A zero-length payload carries no catalog; parsing it throws and drives
+    // recovery.
     if (obj.payload.byteLength === 0) {
       this.emptyCatalogObjects++;
       if (this.emptyCatalogObjects === 1) {
@@ -6116,9 +6115,9 @@ export class MoqtPlayer {
         ? PlayerErrorCode.CATALOG_DELTA_ERROR
         : PlayerErrorCode.CATALOG_PARSE_ERROR;
       const cause = err instanceof Error ? err : new Error(String(err));
-      // A malformed producer repeats per object. Name the payload once — its
-      // size and head are what identify truncation versus a format mismatch —
-      // then stop emitting, so recovery is not driven by every repeat.
+      // Once only: a malformed producer repeats per object, and every emit
+      // drives recovery. Size and head separate truncation from a format
+      // mismatch.
       this.catalogParseFailures++;
       if (this.catalogParseFailures === 1) {
         this.log.warn(
@@ -7279,8 +7278,7 @@ export class MoqtPlayer {
     startGroup?: bigint,
   ): void {
     if (!this.connection) return;
-    // Request IDs are bounded by the peer's MAX_REQUEST_ID. Re-issuing on every
-    // failure exhausts the space, after which no recovery can ever succeed.
+    // Re-issuing on every failure exhausts the request-ID space.
     if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
     const matching = [...this.activeSubscriptions.entries()]

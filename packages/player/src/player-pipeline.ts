@@ -147,10 +147,8 @@ export interface RecoveryCallbacks {
  * effective gap timeout (arrival-jitter EMA); the static floor is 200 ms,
  * or 50 ms when the WebTransport handshake RTT is under 5 ms (LAN/loopback).
  *
- * A declared target latency then CAPS the result. The static floor is a
- * guess about jitter; the target is what the publisher asked for, and a guess
- * must not silently overrule it — a target the network cannot sustain should
- * surface as stalls, not as a cushion quietly four times larger than asked.
+ * A declared target latency caps the result: the floor is a jitter estimate
+ * and must not exceed the latency the publisher asked for.
  */
 export function computePlaybackDelayUs(
   effectiveGapTimeoutUs: number | undefined,
@@ -248,10 +246,7 @@ export function createPipelines(
   // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
-  // The target is resolved BEFORE the floor so it can cap it: an unset
-  // cushion must not inherit a 200ms static guess when the publisher asked
-  // for less. An explicit renderCushionFloorMs still wins — that is the
-  // operator overriding both.
+  // Resolved before the floor so it can cap it; an explicit floor still wins.
   const targetLatencyMs = config.targetLatencyMs ?? trackInfo.targetLatencyMs;
   const cushionFloorUs = config.renderCushionFloorMs !== undefined
     ? config.renderCushionFloorMs * 1000

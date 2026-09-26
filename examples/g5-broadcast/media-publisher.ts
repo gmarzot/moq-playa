@@ -45,8 +45,7 @@ export interface MediaPublishConnection {
   ): Promise<bigint>;
   sendObject(streamId: bigint, objectId: unknown, payload: Uint8Array, extensions?: Uint8Array): Promise<void>;
   closeSubgroup(streamId: bigint): Promise<void>;
-  /** draft-18 OBJECT_DATAGRAM. Optional: absent on test doubles and on any
-   *  transport without datagram support, which the caller falls back from. */
+  /** draft-18 OBJECT_DATAGRAM. Absent without datagram support. */
   sendDatagram?(
     trackAlias: bigint,
     groupId: bigint,
@@ -99,13 +98,8 @@ export interface MediaPublisherOptions {
   /** How long a Forward State 0 pause suppresses production before one chunk
    *  is re-attempted (default 1000ms). Injectable for tests. */
   pauseProbeMs?: number;
-  /**
-   * Publish audio as OBJECT_DATAGRAMs instead of one subgroup stream per
-   * chunk. An Opus frame fits a datagram with room to spare, and this trades
-   * retransmission — which cannot help a frame that misses its render time
-   * anyway — for the stream churn of ~50 opens and closes per second.
-   * draft-18 only; ignored on 14/16 and when the transport has no datagrams.
-   */
+  /** Publish audio as OBJECT_DATAGRAMs rather than a subgroup stream per
+   *  chunk: no retransmission, no per-chunk stream churn. draft-18 only. */
   audioDatagrams?: boolean;
 }
 
@@ -223,14 +217,10 @@ export class MediaPublisher {
   get pausedTracks(): readonly string[] { return [...this.paused]; }
 
   /**
-   * The relay set Forward State 0 — its last downstream subscriber left, so it
-   * wants no Objects for now. Distinct from retirement: the subscription is
-   * alive and the ALIAS MUST BE KEPT, because a resume flips Forward back to 1
-   * without sending a new SUBSCRIBE. Clearing the alias here would take the
-   * track dark permanently.
-   *
-   * Queued frames are dropped (stale before forwarding resumes) and production
-   * is suppressed until a probe re-attempts one chunk.
+   * Forward State 0: the relay wants no Objects for now. Distinct from
+   * retirement — the alias MUST be kept, because a resume flips Forward back
+   * to 1 without a new SUBSCRIBE. Queued frames are dropped and production is
+   * suppressed until a probe re-attempts one chunk.
    */
   private pauseTrack(track: 'video' | 'audio', err: unknown): boolean {
     if (!String((err as Error)?.message ?? '').includes('§5.1')) return false;

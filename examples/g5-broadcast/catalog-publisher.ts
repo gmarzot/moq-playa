@@ -162,12 +162,11 @@ export async function acceptCatalogSubscribe(
  * Publish ONE catalog group on an established subscription.
  *
  * A relay subscribes upstream once and fans out, so a catalog sent only at
- * subscribe time reaches the first viewer and no one after: every later
- * viewer attaches to a subscription whose single group is already closed.
- * Re-emitting on an interval is what lets a late joiner acquire a catalog.
+ * subscribe time never reaches a later viewer; re-emitting on an interval is
+ * what lets one acquire it.
  *
- * `onStreamOpen` reports the stream id as soon as it exists, so a caller whose
- * terminal path must close it still can when a later step throws.
+ * `onStreamOpen` reports the stream id so a caller's terminal path can close
+ * it when a later step throws.
  */
 export async function publishCatalogGroup(
   connection: CatalogPublishConnection,

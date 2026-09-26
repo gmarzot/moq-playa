@@ -825,11 +825,10 @@ export class PlaybackPipeline {
             } else if (this._videoOnly) {
                 this.sync.setVideoReference(headers.captureTimestamp);
             } else {
-                // Audio-master, but a catalog can advertise audio that never
-                // delivers a referenceable frame. Video is held and dropped
-                // with no timeout, so the picture never starts and nothing
-                // says why. Anchor on video once the wait exceeds the bound;
-                // setVideoReference defers if audio lands first.
+                // Audio-master, but advertised audio may never deliver a
+                // referenceable frame, and video is held until one does.
+                // Anchor on video past the bound; setVideoReference defers
+                // if audio lands first.
                 this.videoRefWaitStartUs ??= this.clock.now();
                 const waitedUs = this.clock.now() - this.videoRefWaitStartUs;
                 if (waitedUs >= PlaybackPipeline.SYNC_REFERENCE_FALLBACK_US) {

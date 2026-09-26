@@ -27,11 +27,9 @@ const LIVE_EDGE_TARGET_AHEAD_SEC = 0.15;
  * shifts pitch: 1.02 is a third of a semitone, 1.05 is nearly a full one.
  */
 const CHASE_RATE = 1.02;
-/** Hysteresis above target before the chase engages, as a fraction of the
- *  target. Fixed milliseconds cannot serve both a 50ms and a 500ms target:
- *  at 50ms a flat 100ms band is twice the whole latency budget. */
+/** Chase engages above target * (1 + this), releases at target. */
 const CHASE_ON_RATIO = 0.66;
-/** Floor for that band, so a very small target does not chatter. */
+/** Lower bound on that band. */
 const CHASE_ON_MIN_SEC = 0.02;
 
 /**
@@ -174,14 +172,8 @@ export class WebAudioOutput implements AudioOutputLike {
     return Math.max(CHASE_ON_MIN_SEC, this.targetAheadSec * CHASE_ON_RATIO);
   }
 
-  /**
-   * Re-aim the live edge once the catalog's target latency is known.
-   *
-   * The lead this class allows is part of the end-to-end latency, so a fixed
-   * default cannot serve every target — at a 50ms target the 150ms default is
-   * three times the whole budget and the chase never engages. Clamped to the
-   * construction default: this narrows the edge, never widens it.
-   */
+  /** Aim the live edge at a known target latency. Clamped to the construction
+   *  default, so it only ever narrows the edge. */
   setTargetAheadSec(sec: number): void {
     if (!Number.isFinite(sec) || sec <= 0) return;
     this.targetAheadSec = Math.min(sec, LIVE_EDGE_TARGET_AHEAD_SEC);

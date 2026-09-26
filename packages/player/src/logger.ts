@@ -61,9 +61,8 @@ export class ConsoleLogger implements LoggerLike {
     this.level = LOG_LEVELS[level];
   }
 
-  // The prefix rides INSIDE the format string: a console only applies %s/%d
-  // substitution to its first argument, so passing the prefix separately
-  // printed every specifier literally with the values appended.
+  // Prefix inside the format string: a console substitutes %s/%d only in its
+  // first argument.
   error(msg: string, ...args: unknown[]): void {
     if (this.level >= 1) console.error(`[${this.prefix}] ${msg}`, ...args);
   }

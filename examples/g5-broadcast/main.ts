@@ -56,15 +56,12 @@ const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
 /** How often the catalog is re-published so late joiners can acquire one.
  *  0 publishes it only at subscribe time. */
 const catalogIntervalMs = parseInt(params.get('catalogInterval') ?? '1000', 10);
-/** `?debug=1`: per-second ingest snapshots and catalog re-emissions in the log,
- *  so a soak leaves a copyable time series. */
+/** `?debug=1`: per-second ingest snapshots and catalog re-emissions. */
 const debug = params.get('debug') === '1';
-/** Capture frame rate. One frame period is pure latency before encode even
- *  starts — 42ms at 24fps, 17ms at 60. `ideal` lets the camera negotiate
- *  down rather than fail outright. */
+/** Capture frame rate. One frame period is latency before encode starts:
+ *  42ms at 24fps, 17ms at 60. */
 const captureFps = parseInt(params.get('fps') ?? '60', 10);
-/** `?audioDatagram=1`: publish audio as OBJECT_DATAGRAMs rather than one
- *  subgroup stream per 20ms chunk. draft-18 only. */
+/** `?audioDatagram=1`: audio as OBJECT_DATAGRAMs. draft-18 only. */
 const audioDatagrams = params.get('audioDatagram') === '1';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
@@ -661,8 +658,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // FETCH responder here, so the player's default SUBSCRIBE + Joining
       // FETCH path has no fallback it will accept.
       viewerParams.set('catalogBootstrap', 'subscribe');
-      // A verbose broadcaster is being debugged; the viewer it hands out
-      // should be too, or half the exchange is silent.
+      // A verbose broadcaster hands out a verbose viewer.
       if (debug) viewerParams.set('debug', '1');
       viewerParams.set('v', String(negotiatedDraft));
       const hashParam = params.get('hash');

@@ -551,12 +551,8 @@ export class MoqtConnection {
    * or transport close). Guards {@link terminate} so shutdown is exactly-once.
    */
   private _terminated = false;
-  /**
-   * One long-lived writer for the datagram stream. A WritableStream admits a
-   * single writer, so acquiring one per datagram fails as soon as two sends
-   * overlap — which audio does routinely. write() queues internally, so
-   * sharing the writer is what makes concurrent sends legal.
-   */
+  /** Shared writer: a WritableStream admits one, and write() queues, so
+   *  concurrent sends need this rather than a writer each. */
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   /** The close report to emit; upgraded from preliminary→authoritative before it fires. */
   private _terminalReport: { code: number; reason: string; authoritative: boolean } | null = null;
@@ -4768,8 +4764,7 @@ export class MoqtConnection {
     state.isFirstObject = false;
   }
 
-  /** Drop the shared datagram writer so its lock does not outlive the
-   *  connection. Contained: a writer on an already-errored stream throws. */
+  /** Release the datagram writer's lock on teardown. */
   private releaseDatagramWriter(): void {
     const writer = this.datagramWriter;
     this.datagramWriter = null;
@@ -4780,8 +4775,7 @@ export class MoqtConnection {
   /**
    * Send a draft-18 OBJECT_DATAGRAM for an accepted subscription (§11.3.1).
    * Uses the assigned Track Alias and vi64 encoding. No status or
-   * end-of-group; Properties ride when `extensions` is given, which is what
-   * carries LOC headers (a capture timestamp among them) on datagram media.
+   * end-of-group; Properties ride when `extensions` is given.
    *
    * @param trackAlias Track alias (from acceptSubscribe)
    * @param groupId Group ID
@@ -4808,8 +4802,7 @@ export class MoqtConnection {
     const assoc = this.beginPublishOp(trackAlias, 'sendDatagram');
     try {
       const bytes = encodeObjectDatagram18({
-        // Priority present; PROPERTIES only when there are some to carry —
-        // the encoder rejects the flag and the field disagreeing.
+        // PROPERTIES only with properties: the encoder rejects a mismatch.
         typeByte: opts?.extensions ? DatagramFlags18.PROPERTIES : 0x00,
         trackAlias,
         groupId,

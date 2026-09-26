@@ -1281,8 +1281,7 @@ export class MseMediaSource implements MediaSourceLike {
    * affected track — other tracks (e.g., during ABR switch) keep
    * their overlap protection intact.
    *
-   * The floor is epoch-relative: a new epoch may renumber groups downward,
-   * and a retained high-water mark would drop every later chunk as stale.
+   * The floor is epoch-relative: a new epoch may renumber groups downward.
    */
   clearTimeline(mediaType: 'video' | 'audio', trackName: string): void {
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
