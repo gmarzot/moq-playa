@@ -62,6 +62,16 @@ export function createWebTransport(
   options?: WebTransportFactoryOptions,
 ): (url: string) => Promise<WebTransportLike> {
   return async (url: string): Promise<WebTransportLike> => {
+    // A page has no raw-QUIC API, so moqt:// cannot be dialled here however
+    // valid it is elsewhere — @moqt/quic serves that under Node. Say so,
+    // rather than letting the WebTransport constructor throw something opaque.
+    if (!/^https:\/\//i.test(url)) {
+      const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1];
+      throw new Error(
+        `Relay URL must be https:// for WebTransport, got ${scheme ? `${scheme}://` : `"${url}"`}`
+        + ' — a browser exposes no raw QUIC, so moqt:// is reachable only from Node (@moqt/quic)',
+      );
+    }
     // Build options as a plain object — WebTransportOptions varies by environment.
     // §3.1: WT-Available-Protocols for MOQT version negotiation.
     // Default: offer ['moqt-16']. Draft-14 does not send protocols —

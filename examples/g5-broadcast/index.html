@@ -299,7 +299,8 @@
 
       <label for="s-url">Relay URL</label>
       <input id="s-url" type="text" placeholder="default: moqx-main">
-      <div class="hint">Full WebTransport endpoint, scheme through path.</div>
+      <div class="hint">Full https:// WebTransport endpoint, scheme through path.
+        A browser exposes no raw QUIC, so moqt:// is Node-only.</div>
 
       <label for="s-ns">Namespace</label>
       <input id="s-ns" type="text" placeholder="minted per load">
@@ -318,6 +319,13 @@
         <option value="av01.0.04M.08">AV1 Main</option>
       </select>
 
+      <label for="s-bitrate-mode">Bitrate mode</label>
+      <select id="s-bitrate-mode">
+        <option value="">Encoder default (variable)</option>
+        <option value="constant">Constant — smoother output, less burst</option>
+        <option value="variable">Variable</option>
+      </select>
+
       <label for="s-bitrate">Video bitrate (kbps)</label>
       <input id="s-bitrate" type="number" min="1" value="2000">
 
@@ -325,13 +333,6 @@
       <input id="s-fps" type="number" min="1" placeholder="60">
       <div class="hint">One frame period is latency before encode starts:
         42ms at 24fps, 17ms at 60. The camera may negotiate lower.</div>
-
-      <label for="s-bitrate-mode">Bitrate mode</label>
-      <select id="s-bitrate-mode">
-        <option value="">Encoder default (variable)</option>
-        <option value="constant">Constant — smoother output, less burst</option>
-        <option value="variable">Variable</option>
-      </select>
 
       <label for="s-keyframe">Keyframe interval (frames)</label>
       <input id="s-keyframe" type="number" min="1" value="60">
