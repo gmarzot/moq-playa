@@ -1394,6 +1394,24 @@ describe('MoqtConnection(18) publisher data send for accepted inbound SUBSCRIBE 
     expect(datagram.extensions).toEqual(props);
     expect(datagram.payload).toEqual(new Uint8Array([0xaa]));
   });
+
+  // A WritableStream admits ONE writer, so acquiring one per datagram throws
+  // "Cannot create writer when WritableStream is locked" the moment two sends
+  // overlap — which audio does routinely at 8 in flight.
+  it('concurrent sendDatagram calls share one writer', async () => {
+    const { conn, transport } = await subscribed(7n);
+
+    await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        conn.sendDatagram(7n, 1n, BigInt(i), new Uint8Array([i]))),
+    );
+
+    expect(transport.sentDatagrams.length).toBe(8);
+    const ids = transport.sentDatagrams
+      .map((b) => decodeObjectDatagram18(b, 0).datagram.objectId)
+      .sort((a, b) => Number(a - b));
+    expect(ids).toEqual([0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n]);
+  });
 });
 
 describe('MoqtConnection(18) publisher data send — wide values + PUBLISH_DONE', () => {

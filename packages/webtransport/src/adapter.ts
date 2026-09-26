@@ -551,6 +551,13 @@ export class MoqtConnection {
    * or transport close). Guards {@link terminate} so shutdown is exactly-once.
    */
   private _terminated = false;
+  /**
+   * One long-lived writer for the datagram stream. A WritableStream admits a
+   * single writer, so acquiring one per datagram fails as soon as two sends
+   * overlap — which audio does routinely. write() queues internally, so
+   * sharing the writer is what makes concurrent sends legal.
+   */
+  private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   /** The close report to emit; upgraded from preliminary→authoritative before it fires. */
   private _terminalReport: { code: number; reason: string; authoritative: boolean } | null = null;
   /** True once onClose has actually fired (emission is deferred one microtask). */
@@ -613,6 +620,7 @@ export class MoqtConnection {
       return;
     }
     this._terminated = true;
+    this.releaseDatagramWriter();
     if (this.session.state !== SessionState.CLOSED) {
       if (opts.closeSession) {
         void this.executeActions(this.session.close(
@@ -3179,6 +3187,7 @@ export class MoqtConnection {
     // (a quiet local close fires no onClose, and cannot be upgraded into one).
     this._terminated = true;
     this._closeEmitted = true;
+    this.releaseDatagramWriter();
     const actions = this.session.close(error, reason);
     this.failPendingRawSubscriptions(reason ?? 'Session closed');
     // Start transport shutdown before retiring local I/O, while still making
@@ -4759,6 +4768,15 @@ export class MoqtConnection {
     state.isFirstObject = false;
   }
 
+  /** Drop the shared datagram writer so its lock does not outlive the
+   *  connection. Contained: a writer on an already-errored stream throws. */
+  private releaseDatagramWriter(): void {
+    const writer = this.datagramWriter;
+    this.datagramWriter = null;
+    if (!writer) return;
+    try { writer.releaseLock(); } catch { /* stream already errored or closed */ }
+  }
+
   /**
    * Send a draft-18 OBJECT_DATAGRAM for an accepted subscription (§11.3.1).
    * Uses the assigned Track Alias and vi64 encoding. No status or
@@ -4802,15 +4820,14 @@ export class MoqtConnection {
         payload,
         status: undefined,
       });
-      const writer = this.transport.datagrams.writable?.getWriter();
-      if (!writer) {
-        throw new MoqtConnectionError('Transport datagrams are not writable', { errorSource: 'transport' });
+      if (!this.datagramWriter) {
+        const writable = this.transport.datagrams.writable;
+        if (!writable) {
+          throw new MoqtConnectionError('Transport datagrams are not writable', { errorSource: 'transport' });
+        }
+        this.datagramWriter = writable.getWriter();
       }
-      try {
-        await writer.write(bytes);
-      } finally {
-        writer.releaseLock();
-      }
+      await this.datagramWriter.write(bytes);
     } finally {
       this.endPublishOp(assoc?.requestId);
     }
