@@ -321,8 +321,8 @@
 
       <label for="s-bitrate-mode">Bitrate mode</label>
       <select id="s-bitrate-mode">
-        <option value="">Encoder default (variable)</option>
-        <option value="constant">Constant — smoother output, less burst</option>
+        <option value="">Encoder default</option>
+        <option value="constant">Constant</option>
         <option value="variable">Variable</option>
       </select>
 
@@ -331,7 +331,7 @@
 
       <label for="s-fps">Capture frame rate</label>
       <input id="s-fps" type="number" min="1" placeholder="60">
-      <div class="hint">One frame period is latency: 42ms at 24, 17ms at 60.</div>
+      <div class="hint">42ms of latency at 24fps, 17ms at 60.</div>
 
       <label for="s-keyframe">Keyframe interval (frames)</label>
       <input id="s-keyframe" type="number" min="1" value="60">
