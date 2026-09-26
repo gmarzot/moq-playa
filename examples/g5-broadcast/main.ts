@@ -53,6 +53,12 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
 /** Published in the catalog as the viewer's playout set point. Without it the
  *  player has no target and runs with no cushion policy or chase at all. */
 const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
+/** How often the catalog is re-published so late joiners can acquire one.
+ *  0 publishes it only at subscribe time. */
+const catalogIntervalMs = parseInt(params.get('catalogInterval') ?? '1000', 10);
+/** `?debug=1`: per-second ingest snapshots and catalog re-emissions in the log,
+ *  so a soak leaves a copyable time series. */
+const debug = params.get('debug') === '1';
 /**
  * `?ns=` when given, otherwise one minted per TAB and held in sessionStorage.
  *
@@ -92,6 +98,8 @@ const namespace = params.get('ns') ?? mintNamespace();
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
   const sTarget = document.getElementById('s-target') as HTMLInputElement;
+  const sCatalogInterval = document.getElementById('s-catalog-interval') as HTMLInputElement;
+  const sDebug = document.getElementById('s-debug') as HTMLInputElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
 
@@ -122,6 +130,8 @@ const namespace = params.get('ns') ?? mintNamespace();
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
     sTarget.value = String(targetLatencyMs);
+    sCatalogInterval.value = String(catalogIntervalMs);
+    sDebug.checked = debug;
   }
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
@@ -143,6 +153,8 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
+    if (sCatalogInterval.value && sCatalogInterval.value !== '1000') np.set('catalogInterval', sCatalogInterval.value);
+    if (sDebug.checked) np.set('debug', '1');
     const qs = np.toString();
     window.location.href = window.location.pathname + (qs ? '?' + qs : '');
   });
@@ -335,8 +347,23 @@ async function renderTransport(): Promise<void> {
 setInterval(() => {
   renderMetrics();
   void renderTransport();
+  logSnapshot();
 }, 1000);
 renderMetrics();
+
+/** `?debug=1`: one line per second while publishing, so an overnight soak
+ *  leaves a copyable time series rather than only a final reading. */
+function logSnapshot(): void {
+  if (!debug) return;
+  const p = currentPublisher;
+  if (!p || liveSinceMs === null) return;
+  const q = p.queueLimits;
+  log(`[ingest] fps=${fpsEnc.toFixed(0)} v=${vKbps.toFixed(0)}kbps a=${aKbps.toFixed(0)}kbps `
+    + `obj=${p.frameCount}/${p.audioChunkCount} kf=${p.keyframeCount} `
+    + `queue=${p.videoQueueDepth}/${p.audioQueueDepth} of ${q.video}/${q.audio}`
+    + (p.pausedTracks.length ? ` paused=[${p.pausedTracks.join(',')}]` : '')
+    + (p.retiredTracks.length ? ` retired=[${p.retiredTracks.join(',')}]` : ''));
+}
 
 // The namespace is minted per load, so the log is the only durable record of
 // which one a soak ran on. Echo the whole configuration before anything starts.
@@ -526,6 +553,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
         },
         log,
+        catalogIntervalMs,
+        ...(debug ? { onCatalogReemitted: (bytes: number) => log(`Catalog re-emitted (${bytes} bytes)`) } : {}),
         onCatalogPublished: () => {
           setState('live', 'live');
           liveBadge.hidden = false;

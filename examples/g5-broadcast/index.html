@@ -328,8 +328,19 @@
       <input id="s-target" type="number" min="1" placeholder="200">
       <div class="hint">Published in the catalog; the player's chase set point.</div>
 
+      <label for="s-catalog-interval">Catalog re-emit (ms)</label>
+      <input id="s-catalog-interval" type="number" min="0" placeholder="1000">
+      <div class="hint">How often the catalog is republished so a viewer joining
+        later can acquire one. 0 publishes it only at subscribe time.</div>
+
       <label for="s-hash">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)">
+
+      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+        <input id="s-debug" type="checkbox" style="width:auto">
+        <label for="s-debug" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
+          Debug logging (per-second ingest snapshots, catalog re-emits)</label>
+      </div>
 
       <div class="btn-row">
         <button id="settings-cancel" type="button">Cancel</button>

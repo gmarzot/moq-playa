@@ -36,6 +36,9 @@ export interface BroadcastSessionOptions {
   onCatalogPublished?: (bytes: number) => void;
   /** Catalog re-emission period (default 1000ms). 0 disables it. */
   catalogIntervalMs?: number;
+  /** Each successful re-emission, for a verbose UI. Not called for the first
+   *  catalog, which reports through onCatalogPublished. */
+  onCatalogReemitted?: (bytes: number) => void;
   /** THIS generation's session closed while it was still current (UI hook).
    *  Never invoked for a retired generation — a superseded session must not
    *  stop its replacement. */
@@ -114,7 +117,9 @@ export class BroadcastSession {
       }
       void publishCatalogGroup(
         this.connection as never, alias, payload, { draft: this.opts.publisher.draft },
-      ).catch((err: unknown) => {
+      ).then(() => {
+        if (!this.retired) this.opts.onCatalogReemitted?.(payload.byteLength);
+      }).catch((err: unknown) => {
         if (reportedFailure) return;
         reportedFailure = true;
         this.safeLog(`Catalog re-emission failed: ${(err as Error)?.message ?? err}`
