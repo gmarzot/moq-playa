@@ -145,25 +145,10 @@ export async function acceptCatalogSubscribe(
   // catalog nor a terminal would strand the subscriber forever.
   await connection.acceptSubscribe(varint(requestId), varint(alias));
 
-  const catalogGroupId = varint(BigInt(Date.now()));
   let streamId: bigint | null = null;
   try {
-    streamId = await connection.openSubgroup(
-      varint(alias), catalogGroupId, varint(0),
-      {
-        hasExtensions: false,
-        endOfGroup: true,
-        defaultPriority: true,
-        subgroupIdMode: SubgroupIdMode.ZERO,
-        ...(wire.draft === 18 ? { firstObject: true } : {}),
-      },
-    );
-    await connection.sendObject(streamId, varint(0), catalogPayload);
-    // The clean FIN is part of SUCCESS, not cleanup: without it the receiver
-    // cannot tell the catalog group ended, so a FIN failure is a failure — and
-    // it is BOUNDED, because a FIN that never settles would otherwise hang
-    // startup forever and never reach the terminal path below.
-    await awaitWithin(connection.closeSubgroup(streamId), deadlineMs, 'catalog FIN');
+    await publishCatalogGroup(connection, alias, catalogPayload, wire, deadlineMs,
+      (id) => { streamId = id; });
     streamId = null;
   } catch (err) {
     await terminateFailedCatalog(connection, requestId, streamId, err, deadlineMs);
@@ -171,6 +156,44 @@ export async function acceptCatalogSubscribe(
   }
 
   return catalogPayload.byteLength;
+}
+
+/**
+ * Publish ONE catalog group on an established subscription.
+ *
+ * A relay subscribes upstream once and fans out, so a catalog sent only at
+ * subscribe time reaches the first viewer and no one after: every later
+ * viewer attaches to a subscription whose single group is already closed.
+ * Re-emitting on an interval is what lets a late joiner acquire a catalog.
+ *
+ * `onStreamOpen` reports the stream id as soon as it exists, so a caller whose
+ * terminal path must close it still can when a later step throws.
+ */
+export async function publishCatalogGroup(
+  connection: CatalogPublishConnection,
+  alias: bigint,
+  payload: Uint8Array,
+  wire: { draft: DraftVersion },
+  deadlineMs: number = DEFAULT_TERMINAL_CLOSE_DEADLINE_MS,
+  onStreamOpen?: (streamId: bigint) => void,
+): Promise<void> {
+  const streamId = await connection.openSubgroup(
+    varint(alias), varint(BigInt(Date.now())), varint(0),
+    {
+      hasExtensions: false,
+      endOfGroup: true,
+      defaultPriority: true,
+      subgroupIdMode: SubgroupIdMode.ZERO,
+      ...(wire.draft === 18 ? { firstObject: true } : {}),
+    },
+  );
+  onStreamOpen?.(streamId);
+  await connection.sendObject(streamId, varint(0), payload);
+  // The clean FIN is part of SUCCESS, not cleanup: without it the receiver
+  // cannot tell the catalog group ended, so a FIN failure is a failure — and
+  // it is BOUNDED, because a FIN that never settles would otherwise hang
+  // startup forever and never reach the caller's terminal path.
+  await awaitWithin(connection.closeSubgroup(streamId), deadlineMs, 'catalog FIN');
 }
 
 /**

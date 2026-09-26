@@ -9,7 +9,7 @@
  * subscriptions or consume aliases, and a delayed `onClose` can no longer
  * stop or mutate the replacement generation.
  */
-import { acceptCatalogSubscribe } from './catalog-publisher.js';
+import { acceptCatalogSubscribe, buildCatalogPayload, publishCatalogGroup } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
@@ -34,6 +34,8 @@ export interface BroadcastSessionOptions {
   shutdownGraceMs?: number;
   /** The catalog went out — the broadcast is live (UI hook). */
   onCatalogPublished?: (bytes: number) => void;
+  /** Catalog re-emission period (default 1000ms). 0 disables it. */
+  catalogIntervalMs?: number;
   /** THIS generation's session closed while it was still current (UI hook).
    *  Never invoked for a retired generation — a superseded session must not
    *  stop its replacement. */
@@ -57,6 +59,8 @@ export class BroadcastSession {
   /** Per-generation alias space — a restart starts a fresh allocator. */
   private nextAlias = 1n;
   private retired = false;
+  /** Re-emission timer for the catalog track, and the alias it publishes on. */
+  private catalogTimer: ReturnType<typeof setInterval> | null = null;
   /** Session-owned in-flight work (catalog publication) that shutdown()
    *  must account for. */
   private readonly pendingWork = new Set<Promise<void>>();
@@ -75,11 +79,6 @@ export class BroadcastSession {
   }
 
   /**
-   * Serve an incoming SUBSCRIBE on THIS generation's connection. Synchronous
-   * and void (the connection does not await its onSubscribe callback); every
-   * async operation contains its own failure. Inert once retired.
-   */
-  /**
    * A track carries ONE alias, so a second concurrent subscription to it is
    * silently served only the newest. Name it: the publisher cannot fan out,
    * and this is the only place the condition is visible.
@@ -90,6 +89,52 @@ export class BroadcastSession {
       + `serves ONE subscription per track; the earlier one now receives nothing`);
   }
 
+  /**
+   * Re-publish the catalog on an interval.
+   *
+   * MSF-01 §5 has a late joiner acquire the catalog by SUBSCRIBE plus a
+   * joining FETCH, which needs no re-emission — but this publisher answers no
+   * FETCH, and a relay subscribes upstream once and fans out, so without this
+   * the catalog's single group is closed before any later viewer arrives and
+   * they never acquire one. Best-effort: a failed re-emission is reported and
+   * the interval continues, since the live subscription is still healthy.
+   */
+  private startCatalogReemission(alias: bigint): void {
+    if (this.catalogTimer !== null) return;
+    const periodMs = this.opts.catalogIntervalMs ?? 1_000;
+    if (periodMs <= 0) return;
+    let reportedFailure = false;
+    this.catalogTimer = setInterval(() => {
+      if (this.retired) return;
+      let payload: Uint8Array;
+      try {
+        payload = buildCatalogPayload(this.opts.catalog);
+      } catch {
+        return; // the first publish already proved the params build
+      }
+      void publishCatalogGroup(
+        this.connection as never, alias, payload, { draft: this.opts.publisher.draft },
+      ).catch((err: unknown) => {
+        if (reportedFailure) return;
+        reportedFailure = true;
+        this.safeLog(`Catalog re-emission failed: ${(err as Error)?.message ?? err}`
+          + ' — later viewers may not acquire a catalog');
+      });
+    }, periodMs);
+  }
+
+  /** A timer outliving the session would publish into a dead connection. */
+  private stopCatalogReemission(): void {
+    if (this.catalogTimer === null) return;
+    clearInterval(this.catalogTimer);
+    this.catalogTimer = null;
+  }
+
+  /**
+   * Serve an incoming SUBSCRIBE on THIS generation's connection. Synchronous
+   * and void (the connection does not await its onSubscribe callback); every
+   * async operation contains its own failure. Inert once retired.
+   */
   handleSubscribe(requestId: bigint, trackName: string): void {
     if (this.retired) {
       this.safeLog(`Ignoring SUBSCRIBE for "${trackName}" on a retired broadcast session`);
@@ -109,7 +154,10 @@ export class BroadcastSession {
         this.connection as never, requestId, alias, this.opts.catalog, { draft: this.opts.publisher.draft })
         .then((bytes) => {
           this.safeLog(`Catalog published (${bytes} bytes)`);
-          if (!this.retired) this.opts.onCatalogPublished?.(bytes);
+          if (!this.retired) {
+            this.opts.onCatalogPublished?.(bytes);
+            this.startCatalogReemission(alias);
+          }
         })
         .catch(report);
       this.trackWork(work);
@@ -151,6 +199,7 @@ export class BroadcastSession {
   handleClose(error?: number, reason?: string): void {
     if (this.retired) return;
     this.retired = true;
+    this.stopCatalogReemission();
     this.publisher.retire();
     this.opts.onSessionClosed?.(error, reason);
   }
@@ -199,6 +248,7 @@ export class BroadcastSession {
 
   private async runShutdown(): Promise<void> {
     this.retired = true;
+    this.stopCatalogReemission();
     this.publisher.retire();
 
     // Every stage below is CONTAINED and BOUNDED: shutdown resolves even if

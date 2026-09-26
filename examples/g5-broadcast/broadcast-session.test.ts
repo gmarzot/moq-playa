@@ -38,12 +38,15 @@ function makeSession(conn: BroadcastSessionConnection, hooks: {
   onSessionClosed?: (error?: number, reason?: string) => void;
   catalog?: BroadcastCatalogParams;
   shutdownGraceMs?: number;
+  catalogIntervalMs?: number;
 } = {}) {
-  const { catalog, shutdownGraceMs, ...rest } = hooks;
+  const { catalog, shutdownGraceMs, catalogIntervalMs, ...rest } = hooks;
   return new BroadcastSession(conn, {
     catalog: catalog ?? CATALOG,
     publisher: { wrapInt, draft: 16 },
     log: () => {},
+    // Off unless a test asks: an interval would outlive every other case.
+    catalogIntervalMs: catalogIntervalMs ?? 0,
     ...(shutdownGraceMs !== undefined ? { shutdownGraceMs } : {}),
     ...rest,
   });
@@ -357,5 +360,49 @@ describe('BroadcastSession — option validation', () => {
       publisher: { wrapInt, draft: 15 as never },
       log: () => {},
     })).toThrow(/draft/i);
+  });
+});
+
+describe('BroadcastSession — catalog re-emission (late joiners)', () => {
+  it('keeps publishing catalog groups so a viewer arriving later can acquire one', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const session = makeSession(conn, { catalogIntervalMs: 50 });
+
+      session.handleSubscribe(1n, 'catalog');
+      await vi.advanceTimersByTimeAsync(0);
+      const afterFirst = conn.sends.length;
+      expect(afterFirst).toBe(1);   // the subscribe-time catalog
+
+      // A relay subscribes upstream ONCE, so without re-emission nothing more
+      // is ever sent and every later viewer waits forever.
+      await vi.advanceTimersByTimeAsync(160);
+      expect(conn.sends.length).toBeGreaterThan(afterFirst);
+
+      // The timer must not outlive the session.
+      const atShutdown = conn.sends.length;
+      session.handleClose(0, 'test');
+      await vi.advanceTimersByTimeAsync(300);
+      expect(conn.sends.length).toBe(atShutdown);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('catalogIntervalMs 0 publishes once and starts no timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const session = makeSession(conn, { catalogIntervalMs: 0 });
+      session.handleSubscribe(1n, 'catalog');
+      await vi.advanceTimersByTimeAsync(0);
+      const once = conn.sends.length;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(conn.sends.length).toBe(once);
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
