@@ -921,7 +921,7 @@ async function main(): Promise<void> {
     let rawSeen = 0;
     player.on('catalog_raw', ({ bytes, text }) => {
       rawSeen++;
-      const head = text === null ? '(not UTF-8)' : JSON.stringify(text.slice(0, 120));
+      const head = text === null ? '(not UTF-8)' : text.slice(0, 120);
       log(`Catalog raw #${rawSeen}: ${bytes}B ${head}`);
     });
   }

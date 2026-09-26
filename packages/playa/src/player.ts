@@ -121,6 +121,8 @@ export class Player {
 
   // Controllers
   private volumeCtrl: VolumeController | null = null;
+  /** Live-edge aim from the catalog target, applied to each audio output. */
+  private liveEdgeTargetSec: number | null = null;
   private timeCtrl: TimeController | null = null;
 
   // Adapter instances (held for lifecycle)
@@ -476,6 +478,7 @@ export class Player {
         // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
         // output must not add a second, divergent delay of its own.
         const real = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+        if (this.liveEdgeTargetSec !== null) real.setTargetAheadSec(this.liveEdgeTargetSec);
         this.audioOutput = real;
         this.deferredAudio.activate(real);
       }
@@ -585,6 +588,9 @@ export class Player {
           // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
           // output must not add a second, divergent delay of its own.
           this.audioOutput = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+          if (this.liveEdgeTargetSec !== null) {
+            this.audioOutput.setTargetAheadSec(this.liveEdgeTargetSec);
+          }
           return this.audioOutput;
         },
       });
@@ -651,12 +657,14 @@ export class Player {
       this._audioTracks = mapAudioTracks(e.catalog);
       const hasCmaf = e.catalog.tracks.some(track => track.packaging === 'cmaf');
 
-      // The live-edge lead is part of the end-to-end latency, so aim it at the
-      // target the publisher declared rather than a fixed default that can
-      // exceed the whole budget.
+      // Aim the live edge at the declared target. The audio output is built
+      // later, at pipeline creation, so the aim is stored for it too.
       const targetMs = this.options.targetLatencyMs
         ?? Math.max(0, ...e.catalog.tracks.map((t) => Number(t.targetLatency) || 0));
-      if (targetMs > 0) this.audioOutput?.setTargetAheadSec((targetMs / 1000) / 2);
+      if (targetMs > 0) {
+        this.liveEdgeTargetSec = (targetMs / 1000) / 2;
+        this.audioOutput?.setTargetAheadSec(this.liveEdgeTargetSec);
+      }
 
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';

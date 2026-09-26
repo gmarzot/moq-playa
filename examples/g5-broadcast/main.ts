@@ -461,7 +461,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const stream = source === 'camera'
         ? await cap.startCamera({
           width: 1280, height: 720,
-          frameRate: { min: 24, ideal: captureFps },
+          // ideal only: a min is mandatory and hides devices that cannot meet it.
+          frameRate: { ideal: captureFps },
         })
         : await cap.startScreen({ video: true, audio: false });
       // The tracks only become real HERE — MediaCapture.stop() before this
