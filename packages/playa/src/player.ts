@@ -651,6 +651,13 @@ export class Player {
       this._audioTracks = mapAudioTracks(e.catalog);
       const hasCmaf = e.catalog.tracks.some(track => track.packaging === 'cmaf');
 
+      // The live-edge lead is part of the end-to-end latency, so aim it at the
+      // target the publisher declared rather than a fixed default that can
+      // exceed the whole budget.
+      const targetMs = this.options.targetLatencyMs
+        ?? Math.max(0, ...e.catalog.tracks.map((t) => Number(t.targetLatency) || 0));
+      if (targetMs > 0) this.audioOutput?.setTargetAheadSec((targetMs / 1000) / 2);
+
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';
       this.applyVolumeState();

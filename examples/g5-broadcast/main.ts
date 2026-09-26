@@ -59,6 +59,10 @@ const catalogIntervalMs = parseInt(params.get('catalogInterval') ?? '1000', 10);
 /** `?debug=1`: per-second ingest snapshots and catalog re-emissions in the log,
  *  so a soak leaves a copyable time series. */
 const debug = params.get('debug') === '1';
+/** Capture frame rate. One frame period is pure latency before encode even
+ *  starts — 42ms at 24fps, 17ms at 60. `ideal` lets the camera negotiate
+ *  down rather than fail outright. */
+const captureFps = parseInt(params.get('fps') ?? '60', 10);
 /** `?audioDatagram=1`: publish audio as OBJECT_DATAGRAMs rather than one
  *  subgroup stream per 20ms chunk. draft-18 only. */
 const audioDatagrams = params.get('audioDatagram') === '1';
@@ -106,6 +110,7 @@ const namespace = params.get('ns') ?? mintNamespace();
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
   const sBitrateMode = document.getElementById('s-bitrate-mode') as HTMLSelectElement;
+  const sFps = document.getElementById('s-fps') as HTMLInputElement;
   const sTarget = document.getElementById('s-target') as HTMLInputElement;
   const sCatalogInterval = document.getElementById('s-catalog-interval') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
@@ -140,6 +145,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
     sBitrateMode.value = bitrateMode ?? '';
+    sFps.value = String(captureFps);
     sTarget.value = String(targetLatencyMs);
     sCatalogInterval.value = String(catalogIntervalMs);
     sDebug.checked = debug;
@@ -165,6 +171,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
     if (sBitrateMode.value) np.set('bitrateMode', sBitrateMode.value);
+    if (sFps.value && sFps.value !== '60') np.set('fps', sFps.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     if (sCatalogInterval.value && sCatalogInterval.value !== '1000') np.set('catalogInterval', sCatalogInterval.value);
     if (sDebug.checked) np.set('debug', '1');
@@ -455,7 +462,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ctx.onCancel(() => { try { cap.stop(); } catch { /* not started */ } });
       capture = cap;
       const stream = source === 'camera'
-        ? await cap.startCamera({ width: 1280, height: 720, frameRate: 30 })
+        ? await cap.startCamera({
+          width: 1280, height: 720,
+          frameRate: { min: 24, ideal: captureFps },
+        })
         : await cap.startScreen({ video: true, audio: false });
       // The tracks only become real HERE — MediaCapture.stop() before this
       // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
@@ -651,6 +661,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // FETCH responder here, so the player's default SUBSCRIBE + Joining
       // FETCH path has no fallback it will accept.
       viewerParams.set('catalogBootstrap', 'subscribe');
+      // A verbose broadcaster is being debugged; the viewer it hands out
+      // should be too, or half the exchange is silent.
+      if (debug) viewerParams.set('debug', '1');
       viewerParams.set('v', String(negotiatedDraft));
       const hashParam = params.get('hash');
       if (hashParam) viewerParams.set('hash', hashParam);

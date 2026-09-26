@@ -27,8 +27,12 @@ const LIVE_EDGE_TARGET_AHEAD_SEC = 0.15;
  * shifts pitch: 1.02 is a third of a semitone, 1.05 is nearly a full one.
  */
 const CHASE_RATE = 1.02;
-/** Chase engages above target + this, releases at target (hysteresis). */
-const CHASE_ON_SEC = 0.1;
+/** Hysteresis above target before the chase engages, as a fraction of the
+ *  target. Fixed milliseconds cannot serve both a 50ms and a 500ms target:
+ *  at 50ms a flat 100ms band is twice the whole latency budget. */
+const CHASE_ON_RATIO = 0.66;
+/** Floor for that band, so a very small target does not chatter. */
+const CHASE_ON_MIN_SEC = 0.02;
 
 /**
  * WebAudio playout behind AudioOutputLike.
@@ -87,8 +91,8 @@ export class WebAudioOutput implements AudioOutputLike {
   private _underrunCount = 0;
   private hasScheduled = false;
 
-  private readonly maxAheadSec: number;
-  private readonly targetAheadSec: number;
+  private maxAheadSec: number;
+  private targetAheadSec: number;
   private _chasing = false;
   private _liveEdgeSnapCount = 0;
   private _leadSec: number | null = null;
@@ -163,6 +167,25 @@ export class WebAudioOutput implements AudioOutputLike {
     // that is not moving, so the chain must be dropped and re-anchored rather
     // than resumed against a backlog that was never real.
     this.audioCtx.addEventListener('statechange', this.onStateChange);
+  }
+
+  /** Band above target before the chase engages. */
+  private get chaseOnSec(): number {
+    return Math.max(CHASE_ON_MIN_SEC, this.targetAheadSec * CHASE_ON_RATIO);
+  }
+
+  /**
+   * Re-aim the live edge once the catalog's target latency is known.
+   *
+   * The lead this class allows is part of the end-to-end latency, so a fixed
+   * default cannot serve every target — at a 50ms target the 150ms default is
+   * three times the whole budget and the chase never engages. Clamped to the
+   * construction default: this narrows the edge, never widens it.
+   */
+  setTargetAheadSec(sec: number): void {
+    if (!Number.isFinite(sec) || sec <= 0) return;
+    this.targetAheadSec = Math.min(sec, LIVE_EDGE_TARGET_AHEAD_SEC);
+    this.maxAheadSec = Math.max(this.maxAheadSec, this.targetAheadSec);
   }
 
   private readonly onStateChange = (): void => {
@@ -256,7 +279,7 @@ export class WebAudioOutput implements AudioOutputLike {
           this._liveEdgeSnapCount++;
           this._chasing = false;
           startTime = landing;
-        } else if (lead > this.targetAheadSec + CHASE_ON_SEC) {
+        } else if (lead > this.targetAheadSec + this.chaseOnSec) {
           this._chasing = true;
         } else if (lead <= this.targetAheadSec) {
           this._chasing = false;

@@ -419,6 +419,24 @@ describe('computePlaybackDelayUs — the ONE shared playout cushion', () => {
     expect(computePlaybackDelayUs(undefined, undefined)).toBe(200_000);
     expect(computePlaybackDelayUs(undefined, 2)).toBe(50_000);
   });
+
+  // The static floor is a guess about jitter; a declared target is what the
+  // publisher asked for. The guess must not silently overrule it.
+  it('a declared target caps the floor, including the adaptive component', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 50_000)).toBe(50_000);
+    expect(computePlaybackDelayUs(400_000, 40, 50_000)).toBe(50_000);
+    expect(computePlaybackDelayUs(120_000, undefined, 30_000)).toBe(30_000);
+  });
+
+  it('a target above the floor does not raise it', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 900_000)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 2, 900_000)).toBe(50_000);
+  });
+
+  it('a zero or absent target leaves the floor alone', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 0)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 40)).toBe(200_000);
+  });
 });
 
 describe('createPipelines — smoothed render cushion wiring (slice A)', () => {

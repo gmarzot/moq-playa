@@ -321,6 +321,11 @@
       <label for="s-bitrate">Video bitrate (kbps)</label>
       <input id="s-bitrate" type="number" min="1" value="2000">
 
+      <label for="s-fps">Capture frame rate</label>
+      <input id="s-fps" type="number" min="1" placeholder="60">
+      <div class="hint">One frame period is latency before encode starts:
+        42ms at 24fps, 17ms at 60. The camera may negotiate lower.</div>
+
       <label for="s-bitrate-mode">Bitrate mode</label>
       <select id="s-bitrate-mode">
         <option value="">Encoder default (variable)</option>
@@ -335,10 +340,8 @@
       <input id="s-target" type="number" min="1" placeholder="200">
       <div class="hint">Published in the catalog; the player's chase set point.</div>
 
-      <label for="s-catalog-interval">Catalog re-emit (ms)</label>
+      <label for="s-catalog-interval">catalog retransmit interval (ms) — 0 = no retransmit</label>
       <input id="s-catalog-interval" type="number" min="0" placeholder="1000">
-      <div class="hint">How often the catalog is republished so a viewer joining
-        later can acquire one. 0 publishes it only at subscribe time.</div>
 
       <label for="s-hash">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)">

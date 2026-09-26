@@ -146,14 +146,23 @@ export interface RecoveryCallbacks {
  * `max(adaptive, static)`: the adaptive component is the video pipeline's
  * effective gap timeout (arrival-jitter EMA); the static floor is 200 ms,
  * or 50 ms when the WebTransport handshake RTT is under 5 ms (LAN/loopback).
+ *
+ * A declared target latency then CAPS the result. The static floor is a
+ * guess about jitter; the target is what the publisher asked for, and a guess
+ * must not silently overrule it — a target the network cannot sustain should
+ * surface as stalls, not as a cushion quietly four times larger than asked.
  */
 export function computePlaybackDelayUs(
   effectiveGapTimeoutUs: number | undefined,
   handshakeRttMs: number | undefined,
+  targetLatencyUs?: number,
 ): number {
   const staticDelayUs = handshakeRttMs !== undefined && handshakeRttMs < 5
     ? 50_000 : 200_000;
-  return Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+  const delayUs = Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+  return targetLatencyUs !== undefined && targetLatencyUs > 0
+    ? Math.min(delayUs, targetLatencyUs)
+    : delayUs;
 }
 
 // ─── createPipelines ─────────────────────────────────────────────────
@@ -239,13 +248,18 @@ export function createPipelines(
   // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
+  // The target is resolved BEFORE the floor so it can cap it: an unset
+  // cushion must not inherit a 200ms static guess when the publisher asked
+  // for less. An explicit renderCushionFloorMs still wins — that is the
+  // operator overriding both.
+  const targetLatencyMs = config.targetLatencyMs ?? trackInfo.targetLatencyMs;
   const cushionFloorUs = config.renderCushionFloorMs !== undefined
     ? config.renderCushionFloorMs * 1000
-    : computePlaybackDelayUs(undefined, handshakeRttMs);
+    : computePlaybackDelayUs(undefined, handshakeRttMs,
+      targetLatencyMs !== undefined ? targetLatencyMs * 1000 : undefined);
   // The cap follows the target latency when one is known (config, else
   // catalog), so jitter cannot grow the cushion past the latency the
   // publisher asked for; an explicit cap wins. A floor above the cap lifts it.
-  const targetLatencyMs = config.targetLatencyMs ?? trackInfo.targetLatencyMs;
   const defaultMaxUs = targetLatencyMs !== undefined
     ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
     : RENDER_CUSHION_MAX_US;

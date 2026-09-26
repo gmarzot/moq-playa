@@ -400,3 +400,28 @@ describe('suspended AudioContext', () => {
     expect(d.close).toHaveBeenCalledOnce();
   });
 });
+
+describe('WebAudioOutput — live edge aimed at the catalog target', () => {
+  it('setTargetAheadSec narrows the edge but never widens past the default', () => {
+    const ctx = new MockAudioContext() as unknown as AudioContext;
+    const out = new WebAudioOutput(ctx);
+
+    // A 50ms end-to-end target: half of it is 25ms of allowed lead.
+    out.setTargetAheadSec(0.025);
+    expect((out as unknown as { targetAheadSec: number }).targetAheadSec).toBeCloseTo(0.025, 5);
+
+    // Clamped to the construction default: this must not widen the edge.
+    out.setTargetAheadSec(5);
+    expect((out as unknown as { targetAheadSec: number }).targetAheadSec).toBeCloseTo(0.15, 5);
+  });
+
+  it('ignores a non-positive or non-finite target', () => {
+    const ctx = new MockAudioContext() as unknown as AudioContext;
+    const out = new WebAudioOutput(ctx);
+    const before = (out as unknown as { targetAheadSec: number }).targetAheadSec;
+    out.setTargetAheadSec(0);
+    out.setTargetAheadSec(-1);
+    out.setTargetAheadSec(Number.NaN);
+    expect((out as unknown as { targetAheadSec: number }).targetAheadSec).toBe(before);
+  });
+});
