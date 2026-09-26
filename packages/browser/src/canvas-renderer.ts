@@ -49,6 +49,7 @@ const FALLBACK_INTERVAL_MS = 16;
 export class CanvasRenderer implements VideoRendererLike {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly queue: QueuedFrame[] = [];
+  private framesDropped = 0;
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
   private firstFrameRendered = false;
@@ -133,6 +134,11 @@ export class CanvasRenderer implements VideoRendererLike {
   }
 
   /** Decoded video held for presentation: newest queued render time ahead of now, in ms. */
+  /** Frames discarded without being painted. */
+  get droppedCount(): number {
+    return this.framesDropped;
+  }
+
   get queuedAheadMs(): number | null {
     if (this.queue.length === 0) return null;
     let newest = this.queue[0]!.renderTimeUs;
@@ -320,9 +326,26 @@ export class CanvasRenderer implements VideoRendererLike {
 
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;
+    // Becoming visible: the queue built while painting was throttled holds
+    // frames whose moment has passed. Keep only the newest so playback
+    // resumes at the live edge instead of replaying the backlog.
+    if (!document.hidden) this.dropAllButNewest();
     this.cancelLoop();
     this.scheduleLoop();
   };
+
+  /** Close and discard every queued frame but the last. */
+  private dropAllButNewest(): void {
+    if (this.queue.length <= 1) return;
+    const newest = this.queue[this.queue.length - 1]!;
+    for (const q of this.queue) {
+      if (q === newest) continue;
+      this.framesDropped++;
+      try { q.frame.close(); } catch { /* already closed */ }
+    }
+    this.queue.length = 0;
+    this.queue.push(newest);
+  }
 
   private scheduleLoop(): void {
     if (document.hidden) {
