@@ -2144,3 +2144,34 @@ describe('sync reference fallback (advertised audio that never delivers)', () =>
         expect(events.some((e) => e.type === 'sync_reference_fallback')).toBe(false);
     });
 });
+
+describe('release budget on a throttled tick', () => {
+    // A hidden tab clamps timers to ~1Hz. A per-tick cap then drains far
+    // slower than media arrives, and the backlog grows without bound.
+    it('a late tick releases the work of the ticks it replaced', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+
+        for (let i = 0; i < 40; i++) {
+            pipeline.pushObject(
+                makeData(0, i),
+                videoHeaders(1_000_000_000n + BigInt(i * 41_000), i === 0,
+                    i === 0 ? new Uint8Array([0x01, 0x64]) : undefined),
+            );
+        }
+
+        // A normal 16ms tick stays near the cap.
+        clock.set(5_016_000);
+        pipeline.tick();
+        const afterNormal = commands.filter((c) => c.type === 'decode_video').length;
+        expect(afterNormal).toBeLessThanOrEqual(6);
+
+        // A 1s tick drains the backlog the missed ticks would have handled.
+        clock.set(6_016_000);
+        pipeline.tick();
+        const afterLate = commands.filter((c) => c.type === 'decode_video').length;
+        expect(afterLate).toBeGreaterThan(afterNormal + 20);
+    });
+});

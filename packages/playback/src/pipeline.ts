@@ -27,6 +27,9 @@ import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from './adaptiv
 import type { RecoveryController } from './recovery.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
 
+/** Ticks' worth of release a single late pass may absorb. */
+const MAX_LATE_TICK_CATCHUP = 64;
+
 // ─── Pipeline ────────────────────────────────────────────────────────
 
 /**
@@ -142,6 +145,8 @@ export class PlaybackPipeline {
 
     /** Max objects to release per tick (video only). 0 = unlimited. */
     private readonly maxReleasePerTick: number;
+    /** Clock reading of the previous release pass. */
+    private lastReleaseUs = 0;
     /** Max groups before shedding old ones. 0 = unlimited. */
     private readonly maxBacklogGroups: number;
 
@@ -626,7 +631,7 @@ export class PlaybackPipeline {
         // Wait for the missing object (QUIC delivers in-order per stream)
         // or let the gap detector timeout and skip the group.
         let released = 0;
-        const budget = this.maxReleasePerTick;
+        const budget = this.releaseBudget();
 
         while (this.buffer.size > 0) {
             // Bounded release: stop after budget objects (0 = unlimited).
@@ -797,6 +802,26 @@ export class PlaybackPipeline {
             this.buffer.insert(evicted);
             return false;
         }
+    }
+
+    /**
+     * Objects this tick may release.
+     *
+     * The cap is per TICK, but a hidden tab clamps timers to ~1Hz — at which
+     * point a fixed cap drains far slower than media arrives and the backlog
+     * grows without bound. Scale it by elapsed time so a late tick does the
+     * work of the ticks it replaced.
+     */
+    private releaseBudget(): number {
+        const cap = this.maxReleasePerTick;
+        if (cap <= 0) return cap; // unlimited
+        const now = this.clock.now();
+        const elapsedUs = this.lastReleaseUs > 0 ? now - this.lastReleaseUs : 0;
+        this.lastReleaseUs = now;
+        // The cap is sized for a ~16ms tick; a longer one earns proportionally
+        // more, bounded so a single pass cannot monopolise the main thread.
+        const ticks = Math.max(1, Math.min(MAX_LATE_TICK_CATCHUP, elapsedUs / 16_000));
+        return Math.ceil(cap * ticks);
     }
 
     private processDataObject(obj: MoqtObjectData): void {
