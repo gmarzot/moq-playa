@@ -45,6 +45,15 @@ export interface MediaPublishConnection {
   ): Promise<bigint>;
   sendObject(streamId: bigint, objectId: unknown, payload: Uint8Array, extensions?: Uint8Array): Promise<void>;
   closeSubgroup(streamId: bigint): Promise<void>;
+  /** draft-18 OBJECT_DATAGRAM. Optional: absent on test doubles and on any
+   *  transport without datagram support, which the caller falls back from. */
+  sendDatagram?(
+    trackAlias: bigint,
+    groupId: bigint,
+    objectId: bigint,
+    payload: Uint8Array,
+    opts?: { publisherPriority?: number; extensions?: Uint8Array },
+  ): Promise<void>;
 }
 
 export interface VideoChunkMeta {
@@ -90,6 +99,14 @@ export interface MediaPublisherOptions {
   /** How long a Forward State 0 pause suppresses production before one chunk
    *  is re-attempted (default 1000ms). Injectable for tests. */
   pauseProbeMs?: number;
+  /**
+   * Publish audio as OBJECT_DATAGRAMs instead of one subgroup stream per
+   * chunk. An Opus frame fits a datagram with room to spare, and this trades
+   * retransmission — which cannot help a frame that misses its render time
+   * anyway — for the stream churn of ~50 opens and closes per second.
+   * draft-18 only; ignored on 14/16 and when the transport has no datagrams.
+   */
+  audioDatagrams?: boolean;
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
@@ -125,6 +142,7 @@ export class MediaPublisher {
   private readonly audioQueueMax: number;
   private readonly audioMaxInFlight: number;
   private readonly pauseProbeMs: number;
+  private readonly audioDatagrams: boolean;
 
   private videoAlias: bigint | null = null;
   private audioAlias: bigint | null = null;
@@ -183,6 +201,8 @@ export class MediaPublisher {
     this.videoQueueMax = options.videoQueueMax ?? 60;
     this.audioQueueMax = options.audioQueueMax ?? 50;
     this.pauseProbeMs = options.pauseProbeMs ?? PAUSE_PROBE_MS;
+    // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
+    this.audioDatagrams = options.audioDatagrams === true && options.draft === 18;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.videoGroupId = BigInt(Date.now());
     this.audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
@@ -516,6 +536,14 @@ export class MediaPublisher {
     }, { wireProfile: locWireProfileForDraft(this.draft) });
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
+    if (this.audioDatagrams && this.connection.sendDatagram) {
+      await this.connection.sendDatagram(
+        this.audioAlias!, groupId, 0n, data,
+        { publisherPriority: 64, ...(extensions ? { extensions } : {}) },
+      );
+      this.noteAudioSent(data.byteLength);
+      return;
+    }
     const streamId = await this.connection.openSubgroup(
       this.wrapInt(this.audioAlias!), this.wrapInt(groupId), this.wrapInt(0n),
       this.subgroupOptions(64),
@@ -527,8 +555,13 @@ export class MediaPublisher {
       throw err;
     }
     await this.trackClose(streamId);
+    this.noteAudioSent(data.byteLength);
+  }
+
+  /** Accounting shared by the stream and datagram audio paths. */
+  private noteAudioSent(bytes: number): void {
     this.audioChunks++;
-    this.audioBytes += data.byteLength;
+    this.audioBytes += bytes;
     this.onCounts?.(this.videoFrames, this.audioChunks);
     if (this.audioQueue.length < this.audioQueueMax) this.audioOverflowing = false;
   }

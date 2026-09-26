@@ -59,6 +59,9 @@ const catalogIntervalMs = parseInt(params.get('catalogInterval') ?? '1000', 10);
 /** `?debug=1`: per-second ingest snapshots and catalog re-emissions in the log,
  *  so a soak leaves a copyable time series. */
 const debug = params.get('debug') === '1';
+/** `?audioDatagram=1`: publish audio as OBJECT_DATAGRAMs rather than one
+ *  subgroup stream per 20ms chunk. draft-18 only. */
+const audioDatagrams = params.get('audioDatagram') === '1';
 /**
  * `?ns=` when given, otherwise one minted per TAB and held in sessionStorage.
  *
@@ -100,6 +103,7 @@ const namespace = params.get('ns') ?? mintNamespace();
   const sTarget = document.getElementById('s-target') as HTMLInputElement;
   const sCatalogInterval = document.getElementById('s-catalog-interval') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
+  const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
 
@@ -132,6 +136,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     sTarget.value = String(targetLatencyMs);
     sCatalogInterval.value = String(catalogIntervalMs);
     sDebug.checked = debug;
+    sAudioDatagram.checked = audioDatagrams;
   }
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
@@ -155,6 +160,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     if (sCatalogInterval.value && sCatalogInterval.value !== '1000') np.set('catalogInterval', sCatalogInterval.value);
     if (sDebug.checked) np.set('debug', '1');
+    if (sAudioDatagram.checked) np.set('audioDatagram', '1');
     const qs = np.toString();
     window.location.href = window.location.pathname + (qs ? '?' + qs : '');
   });
@@ -550,6 +556,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         publisher: {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,
+          audioDatagrams,
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
         },
         log,

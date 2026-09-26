@@ -688,3 +688,51 @@ describe('MediaPublisher — subscription ended under us', () => {
     expect(conn.sends.length).toBeGreaterThan(0);
   });
 });
+
+describe('MediaPublisher — audio over datagrams', () => {
+  /** recordingConnection has no sendDatagram; add one that records. */
+  function withDatagrams(conn: ReturnType<typeof recordingConnection>) {
+    const sent: Array<{ alias: bigint; groupId: bigint; objectId: bigint;
+      payload: Uint8Array; extensions?: Uint8Array | undefined }> = [];
+    (conn as unknown as { sendDatagram: unknown }).sendDatagram = async (
+      alias: bigint, groupId: bigint, objectId: bigint, payload: Uint8Array,
+      opts?: { publisherPriority?: number; extensions?: Uint8Array },
+    ) => { sent.push({ alias, groupId, objectId, payload, extensions: opts?.extensions }); };
+    return sent;
+  }
+
+  it('sends audio as datagrams carrying LOC headers, opening no stream', async () => {
+    const conn = recordingConnection();
+    const sent = withDatagrams(conn);
+    const pub = makePublisher(conn, { draft: 18, audioDatagrams: true });
+    pub.setAudioAlias(3n);
+
+    pub.publishAudio(chunk(0), { timestampUs: 1_000 });
+    pub.publishAudio(chunk(1), { timestampUs: 21_000 });
+    await settle();
+
+    expect(sent).toHaveLength(2);
+    // The stream path must not run at all — that is the churn being removed.
+    expect(conn.opened).toHaveLength(0);
+    expect(sent[0]!.alias).toBe(3n);
+    // Audio is the sync master; without LOC headers the receiver has no
+    // capture timestamp and never establishes a reference.
+    expect(sent[0]!.extensions).toBeInstanceOf(Uint8Array);
+    expect(sent[0]!.extensions!.byteLength).toBeGreaterThan(0);
+    expect(sent[0]!.groupId).not.toBe(sent[1]!.groupId);
+    expect(pub.audioChunkCount).toBe(2);
+  });
+
+  it('stays on streams when the draft is not 18', async () => {
+    const conn = recordingConnection();
+    const sent = withDatagrams(conn);
+    const pub = makePublisher(conn, { draft: 16, audioDatagrams: true });
+    pub.setAudioAlias(3n);
+
+    pub.publishAudio(chunk(0), { timestampUs: 1_000 });
+    await settle();
+
+    expect(sent).toHaveLength(0);
+    expect(conn.opened.length).toBeGreaterThan(0);
+  });
+});
