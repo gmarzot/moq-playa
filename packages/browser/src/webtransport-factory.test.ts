@@ -237,14 +237,14 @@ describe('getStats forwarding', () => {
 });
 
 describe('relay URL scheme', () => {
-  it('rejects moqt:// with a message naming the reason, not a constructor error', async () => {
+  it('rejects moqt:// before dialling', async () => {
     vi.stubGlobal('WebTransport', class {
       ready = Promise.resolve();
       protocol = '';
       constructor() { throw new Error('should never be constructed'); }
     });
     await expect(createWebTransport()('moqt://relay.example.com:4433/moq'))
-      .rejects.toThrow(/must be https:\/\/ for WebTransport.*raw QUIC/s);
+      .rejects.toThrow(/must be an https:\/\/ WebTransport endpoint/);
   });
 
   it('rejects a bare host:port before dialling', async () => {
@@ -254,6 +254,6 @@ describe('relay URL scheme', () => {
       constructor() { throw new Error('should never be constructed'); }
     });
     await expect(createWebTransport()('relay.example.com:4433'))
-      .rejects.toThrow(/must be https:\/\/ for WebTransport/);
+      .rejects.toThrow(/must be an https:\/\/ WebTransport endpoint/);
   });
 });

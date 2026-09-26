@@ -299,11 +299,11 @@
 
       <label for="s-url">Relay URL</label>
       <input id="s-url" type="text" placeholder="default: moqx-main">
-      <div class="hint">Full https:// WebTransport endpoint, scheme through path.
-        Browsers expose no raw QUIC, so moqt:// is not available here.</div>
+      <div class="hint">WebTransport MoQT endpoint.</div>
 
       <label for="s-ns">Namespace</label>
-      <input id="s-ns" type="text" placeholder="minted per load">
+      <input id="s-ns" type="text" placeholder="auto-generated">
+      <div class="hint">Auto-generated per tab; kept across reloads.</div>
 
       <label for="s-version">Draft version</label>
       <select id="s-version">
@@ -331,8 +331,7 @@
 
       <label for="s-fps">Capture frame rate</label>
       <input id="s-fps" type="number" min="1" placeholder="60">
-      <div class="hint">One frame period is latency before encode starts:
-        42ms at 24fps, 17ms at 60. The camera may negotiate lower.</div>
+      <div class="hint">One frame period is latency: 42ms at 24, 17ms at 60.</div>
 
       <label for="s-keyframe">Keyframe interval (frames)</label>
       <input id="s-keyframe" type="number" min="1" value="60">

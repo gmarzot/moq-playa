@@ -62,12 +62,11 @@ export function createWebTransport(
   options?: WebTransportFactoryOptions,
 ): (url: string) => Promise<WebTransportLike> {
   return async (url: string): Promise<WebTransportLike> => {
-    // Browsers expose no raw QUIC.
     if (!/^https:\/\//i.test(url)) {
       const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1];
       throw new Error(
-        `Relay URL must be https:// for WebTransport, got ${scheme ? `${scheme}://` : `"${url}"`}`
-        + ' — browsers expose no raw QUIC',
+        'Relay URL must be an https:// WebTransport endpoint, got '
+        + (scheme ? `${scheme}://` : `"${url}"`),
       );
     }
     // Build options as a plain object — WebTransportOptions varies by environment.
