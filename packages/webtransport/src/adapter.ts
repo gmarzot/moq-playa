@@ -19,6 +19,7 @@ import {
   SubgroupIdMode,
   SubgroupFlags,
   SubgroupFlags18,
+  DatagramFlags18,
   ObjectStatus,
   ProtocolViolationError,
   encodeSubgroupHeader,
@@ -4760,14 +4761,15 @@ export class MoqtConnection {
 
   /**
    * Send a draft-18 OBJECT_DATAGRAM for an accepted subscription (§11.3.1).
-   * Uses the assigned Track Alias and vi64 encoding. Narrow happy path: a plain
-   * object datagram (no status, properties, or end-of-group flags).
+   * Uses the assigned Track Alias and vi64 encoding. No status or
+   * end-of-group; Properties ride when `extensions` is given, which is what
+   * carries LOC headers (a capture timestamp among them) on datagram media.
    *
    * @param trackAlias Track alias (from acceptSubscribe)
    * @param groupId Group ID
    * @param objectId Object ID
    * @param payload Object payload bytes
-   * @param opts Optional publisherPriority (default 128)
+   * @param opts publisherPriority (default 128) and encoded object Properties
    * @see draft-ietf-moq-transport-18 §11.3.1
    */
   async sendDatagram(
@@ -4775,7 +4777,7 @@ export class MoqtConnection {
     groupId: bigint,
     objectId: bigint,
     payload: Uint8Array,
-    opts?: { publisherPriority?: number },
+    opts?: { publisherPriority?: number; extensions?: Uint8Array },
   ): Promise<void> {
     if (this.session.draftVersion !== 18) {
       throw new MoqtConnectionError('sendDatagram is draft-18 only', { errorSource: 'data' });
@@ -4788,13 +4790,15 @@ export class MoqtConnection {
     const assoc = this.beginPublishOp(trackAlias, 'sendDatagram');
     try {
       const bytes = encodeObjectDatagram18({
-        typeByte: 0x00, // plain OBJECT_DATAGRAM: priority present, no flags
+        // Priority present; PROPERTIES only when there are some to carry —
+        // the encoder rejects the flag and the field disagreeing.
+        typeByte: opts?.extensions ? DatagramFlags18.PROPERTIES : 0x00,
         trackAlias,
         groupId,
         objectId,
         publisherPriority: opts?.publisherPriority ?? 128,
         isEndOfGroup: false,
-        extensions: undefined,
+        extensions: opts?.extensions,
         payload,
         status: undefined,
       });

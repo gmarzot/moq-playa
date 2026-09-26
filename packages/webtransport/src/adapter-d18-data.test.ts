@@ -1369,6 +1369,30 @@ describe('MoqtConnection(18) publisher data send for accepted inbound SUBSCRIBE 
     expect(datagram.objectId).toBe(5n);
     expect(datagram.publisherPriority).toBe(3);
     expect(datagram.payload).toEqual(new Uint8Array([0x01, 0x02]));
+    // No Properties asked for, so the flag must be clear.
+    expect(datagram.extensions).toBeUndefined();
+  });
+
+  // Datagram media carries its LOC headers (a capture timestamp among them) in
+  // object Properties; without them a receiver has no sync reference at all.
+  it('sendDatagram carries object Properties and sets the PROPERTIES flag', async () => {
+    const { conn, transport } = await subscribed(7n);
+    const props = new Uint8Array([0x10, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+
+    await conn.sendDatagram(7n, 9n, 1n, new Uint8Array([0xaa]), {
+      publisherPriority: 4,
+      extensions: props,
+    });
+
+    expect(transport.sentDatagrams.length).toBe(1);
+    const raw = transport.sentDatagrams[0]!;
+    expect(raw[0]! & 0x01).toBe(0x01);   // DatagramFlags18.PROPERTIES
+    const { datagram } = decodeObjectDatagram18(raw, 0);
+    expect(datagram.trackAlias).toBe(7n);
+    expect(datagram.groupId).toBe(9n);
+    expect(datagram.objectId).toBe(1n);
+    expect(datagram.extensions).toEqual(props);
+    expect(datagram.payload).toEqual(new Uint8Array([0xaa]));
   });
 });
 
