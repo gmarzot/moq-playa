@@ -78,6 +78,13 @@ export class WebCodecsVideoEncoder {
       framerate?: number;
       keyframeInterval?: number;
       latencyMode?: 'quality' | 'realtime';
+      /**
+       * `constant` holds output near the target instead of letting complex
+       * frames and keyframes burst, which is what turns into transient
+       * queuing delay and late frames on a latency-sensitive path. The spec
+       * default is `variable`.
+       */
+      bitrateMode?: 'constant' | 'variable';
     },
   ): void {
     this.keyframeInterval = options?.keyframeInterval ?? DEFAULT_KEYFRAME_INTERVAL;
@@ -124,6 +131,7 @@ export class WebCodecsVideoEncoder {
       bitrate: options?.bitrate ?? DEFAULT_BITRATE,
       framerate: options?.framerate ?? 30,
       latencyMode: options?.latencyMode ?? 'realtime',
+      ...(options?.bitrateMode ? { bitrateMode: options.bitrateMode } : {}),
     };
 
     this.encoder.configure(config);

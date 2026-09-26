@@ -62,6 +62,11 @@ const debug = params.get('debug') === '1';
 /** `?audioDatagram=1`: publish audio as OBJECT_DATAGRAMs rather than one
  *  subgroup stream per 20ms chunk. draft-18 only. */
 const audioDatagrams = params.get('audioDatagram') === '1';
+/** `?bitrateMode=constant`: hold encoder output near the target instead of
+ *  letting complex frames and keyframes burst. Unset uses the spec default. */
+const bitrateMode: 'constant' | 'variable' | undefined =
+  params.get('bitrateMode') === 'constant' ? 'constant'
+    : params.get('bitrateMode') === 'variable' ? 'variable' : undefined;
 /**
  * `?ns=` when given, otherwise one minted per TAB and held in sessionStorage.
  *
@@ -100,6 +105,7 @@ const namespace = params.get('ns') ?? mintNamespace();
   const sCodec = document.getElementById('s-codec') as HTMLSelectElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
+  const sBitrateMode = document.getElementById('s-bitrate-mode') as HTMLSelectElement;
   const sTarget = document.getElementById('s-target') as HTMLInputElement;
   const sCatalogInterval = document.getElementById('s-catalog-interval') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
@@ -133,6 +139,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     sCodec.value = videoCodec;
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
+    sBitrateMode.value = bitrateMode ?? '';
     sTarget.value = String(targetLatencyMs);
     sCatalogInterval.value = String(catalogIntervalMs);
     sDebug.checked = debug;
@@ -157,6 +164,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
+    if (sBitrateMode.value) np.set('bitrateMode', sBitrateMode.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     if (sCatalogInterval.value && sCatalogInterval.value !== '1000') np.set('catalogInterval', sCatalogInterval.value);
     if (sDebug.checked) np.set('debug', '1');
@@ -491,8 +499,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         framerate: fps,
         keyframeInterval,
         latencyMode: 'realtime',
+        ...(bitrateMode ? { bitrateMode } : {}),
       });
-      log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`);
+      log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`
+        + ` · ${bitrateMode ?? 'variable'} bitrate`);
       if (audio) {
         const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });
         ctx.onCancel(() => { try { ae.destroy(); } catch { /* already destroyed */ } });

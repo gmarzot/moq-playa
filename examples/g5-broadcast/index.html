@@ -321,6 +321,13 @@
       <label for="s-bitrate">Video bitrate (kbps)</label>
       <input id="s-bitrate" type="number" min="1" value="2000">
 
+      <label for="s-bitrate-mode">Bitrate mode</label>
+      <select id="s-bitrate-mode">
+        <option value="">Encoder default (variable)</option>
+        <option value="constant">Constant — smoother output, less burst</option>
+        <option value="variable">Variable</option>
+      </select>
+
       <label for="s-keyframe">Keyframe interval (frames)</label>
       <input id="s-keyframe" type="number" min="1" value="60">
 
