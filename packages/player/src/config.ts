@@ -309,6 +309,19 @@ export interface PlaybackTuningConfig {
    * Joining Fetch references a subscription with any other filter.
    */
   readonly warmStartCurrentGroup?: boolean;
+
+  /**
+   * Static floor of the LOC render cushion in milliseconds: the minimum
+   * playout delay video and audio schedule ahead of arrival.
+   * Default: 200, or 50 when the WebTransport handshake RTT is under 5 ms.
+   */
+  readonly renderCushionFloorMs?: number;
+
+  /**
+   * Cap of the LOC render cushion in milliseconds; bounds how far arrival
+   * jitter can raise the playout delay. Default: 750. Never below the floor.
+   */
+  readonly renderCushionMaxMs?: number;
 }
 
 /** Latency and catch-up options. */
@@ -434,6 +447,24 @@ export interface RecoveryConfig {
    * Default: 10_000. Set 0 to disable both bootstrap deadlines.
    */
   readonly cmafBootstrapTimeoutMs?: number;
+
+  /**
+   * CMAF first-frame bootstrap deadline EXTENSION ceiling.
+   *
+   * The `cmaf_first_frame` deadline (`cmafBootstrapTimeoutMs`) is renewed
+   * each time a video segment is appended, as long as media keeps arriving —
+   * a fixed 10s deadline from `cmaf_init` alone misfires on longer-RTT paths
+   * (e.g. long-haul QUIC handshakes) where legitimate startup buffering can
+   * take longer than 10s even though delivery is healthy the whole time.
+   * This caps the total renewal window measured from `cmaf_init`: once
+   * elapsed time since init exceeds this value, renewal stops and the next
+   * `cmafBootstrapTimeoutMs` deadline is allowed to fire — so a genuinely
+   * broken decode path (segments arriving, appendBuffer succeeding, but the
+   * browser never painting a frame) still surfaces as fatal instead of
+   * buffering forever.
+   * Default: 60_000. Only meaningful when `cmafBootstrapTimeoutMs` > 0.
+   */
+  readonly cmafFirstFrameMaxWaitMs?: number;
 
   /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
@@ -687,6 +718,7 @@ export const DEFAULT_PLAYER_CONFIG = {
 
   // CMAF bootstrap (0 disables)
   cmafBootstrapTimeoutMs: 10_000,
+  cmafFirstFrameMaxWaitMs: 60_000,
 
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
@@ -744,12 +776,21 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     ['livenessResetProbeMs', config.livenessResetProbeMs],
     ['livenessRestartBackoffMs', config.livenessRestartBackoffMs],
     ['livenessHealthyResetMs', config.livenessHealthyResetMs],
+    ['renderCushionFloorMs', config.renderCushionFloorMs],
+    ['renderCushionMaxMs', config.renderCushionMaxMs],
   ];
 
   for (const [name, value] of msFields) {
     if (value !== undefined && value <= 0) {
       throw new RangeError(`${name} must be > 0, got ${value}`);
     }
+  }
+
+  if (config.renderCushionFloorMs !== undefined && config.renderCushionMaxMs !== undefined
+      && config.renderCushionMaxMs < config.renderCushionFloorMs) {
+    throw new RangeError(
+      `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
+    );
   }
 
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
@@ -760,6 +801,12 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // cmafBootstrapTimeoutMs: >= 0 (0 disables the bootstrap deadlines)
   if (config.cmafBootstrapTimeoutMs !== undefined && config.cmafBootstrapTimeoutMs < 0) {
     throw new RangeError(`cmafBootstrapTimeoutMs must be >= 0 (0 disables), got ${config.cmafBootstrapTimeoutMs}`);
+  }
+
+  // cmafFirstFrameMaxWaitMs: > 0 (it bounds renewal, not a disable switch)
+  if (config.cmafFirstFrameMaxWaitMs !== undefined
+      && (!Number.isFinite(config.cmafFirstFrameMaxWaitMs) || config.cmafFirstFrameMaxWaitMs <= 0)) {
+    throw new RangeError(`cmafFirstFrameMaxWaitMs must be finite and > 0, got ${config.cmafFirstFrameMaxWaitMs}`);
   }
 
   if (config.authority !== undefined && config.authority.trim().length === 0) {

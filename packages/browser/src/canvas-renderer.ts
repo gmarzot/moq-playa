@@ -102,6 +102,23 @@ export class CanvasRenderer implements VideoRendererLike {
   }
 
   /**
+   * Match the backing store to the frame's display size (display, not coded:
+   * coded dimensions carry codec macroblock padding and any pixel aspect
+   * ratio). Frames without the fields (older stubs) leave the canvas alone.
+   */
+  private sizeCanvasTo(frame: unknown): void {
+    const f = frame as { displayWidth?: number; displayHeight?: number;
+                         codedWidth?: number; codedHeight?: number };
+    const w = f.displayWidth ?? f.codedWidth;
+    const h = f.displayHeight ?? f.codedHeight;
+    if (!w || !h) return;
+    const canvas = this.ctx.canvas;
+    if (canvas.width === w && canvas.height === h) return;
+    canvas.width = w;
+    canvas.height = h;
+  }
+
+  /**
    * Enqueue a decoded frame for presentation.
    *
    * Frames are held until renderTick() presents them at the right time.
@@ -113,6 +130,19 @@ export class CanvasRenderer implements VideoRendererLike {
       return;
     }
     this.queue.push({ frame: frame as VideoFrame, renderTimeUs });
+  }
+
+  /** Decoded video held for presentation: newest queued render time ahead of now, in ms. */
+  get queuedAheadMs(): number | null {
+    if (this.queue.length === 0) return null;
+    let newest = this.queue[0]!.renderTimeUs;
+    for (const e of this.queue) if (e.renderTimeUs > newest) newest = e.renderTimeUs;
+    return Math.max(0, (newest - this.clock.now()) / 1000);
+  }
+
+  /** Decoded frames waiting for their render time. */
+  get queueLength(): number {
+    return this.queue.length;
   }
 
   /**
@@ -154,6 +184,11 @@ export class CanvasRenderer implements VideoRendererLike {
         // Used for drift detection in the feedback path.
         const captureTimestampUs = BigInt(entry.frame.timestamp);
 
+        // The backing store must match the frame, not the element's CSS box:
+        // a canvas that was never sized keeps the 300x150 HTML default, and
+        // every frame would be downscaled to it and stretched back by CSS.
+        // Resizing clears the canvas, so only on a genuine size change.
+        this.sizeCanvasTo(entry.frame);
         this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
 
         // frame.close() is NON-NEGOTIABLE — GPU memory outside GC

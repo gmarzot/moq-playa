@@ -419,6 +419,24 @@ describe('computePlaybackDelayUs — the ONE shared playout cushion', () => {
     expect(computePlaybackDelayUs(undefined, undefined)).toBe(200_000);
     expect(computePlaybackDelayUs(undefined, 2)).toBe(50_000);
   });
+
+  // The static floor is a guess about jitter; a declared target is what the
+  // publisher asked for. The guess must not silently overrule it.
+  it('a declared target caps the floor, including the adaptive component', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 50_000)).toBe(50_000);
+    expect(computePlaybackDelayUs(400_000, 40, 50_000)).toBe(50_000);
+    expect(computePlaybackDelayUs(120_000, undefined, 30_000)).toBe(30_000);
+  });
+
+  it('a target above the floor does not raise it', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 900_000)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 2, 900_000)).toBe(50_000);
+  });
+
+  it('a zero or absent target leaves the floor alone', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 0)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 40)).toBe(200_000);
+  });
 });
 
 describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
@@ -464,6 +482,57 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     // detector consumes — remains the raw adaptive 2000ms, untouched by
     // the smoother.
     expect(result.videoPipeline!.effectiveGapTimeoutUs).toBe(2_000_000);
+  });
+
+  it('renderCushionFloorMs overrides the RTT-derived floor', () => {
+    const low = createPipelines(minimalConfig({ renderCushionFloorMs: 50 }), mockClock, LOC_AV, mockCallbacks(), 40);
+    expect(low.getRenderCushionUs!()).toBe(50_000);
+    const high = createPipelines(minimalConfig({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks(), 2);
+    expect(high.getRenderCushionUs!()).toBe(900_000);
+  });
+
+  it('renderCushionMaxMs caps scheduled adoption; a floor above the default cap lifts it', () => {
+    const withDecoder = (overrides: Partial<MoqtPlayerConfig>) => minimalConfig({
+      ...overrides,
+      createVideoDecoder: () => ({
+        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+        state: 'unconfigured', decodeQueueSize: 0, ondequeue: null,
+      }) as any,
+    });
+    // The scheduling path advances the smoother; its first update snaps to
+    // the clamped target.
+    const schedule = (r: ReturnType<typeof createPipelines>) => {
+      Object.defineProperty(r.videoPipeline, 'effectiveGapTimeoutUs', {
+        get: () => 2_000_000, configurable: true,
+      });
+      (r.commandDispatcher as any)._getPlaybackDelayUs();
+    };
+
+    const capped = createPipelines(withDecoder({ renderCushionFloorMs: 50, renderCushionMaxMs: 120 }), mockClock, LOC_AV, mockCallbacks());
+    schedule(capped);
+    expect(capped.getRenderCushionUs!()).toBe(120_000);
+
+    const lifted = createPipelines(withDecoder({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks());
+    schedule(lifted);
+    expect(lifted.getRenderCushionUs!()).toBe(900_000);
+
+    // No explicit cap: the catalog target latency is the ceiling, and a
+    // config target latency overrides the catalog's.
+    const byCatalog = createPipelines(withDecoder({ renderCushionFloorMs: 50 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(byCatalog);
+    expect(byCatalog.getRenderCushionUs!()).toBe(100_000);
+
+    const byConfig = createPipelines(withDecoder({ renderCushionFloorMs: 50, targetLatencyMs: 300 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(byConfig);
+    expect(byConfig.getRenderCushionUs!()).toBe(300_000);
+
+    // An explicit cap still wins over the target.
+    const explicit = createPipelines(withDecoder({ renderCushionFloorMs: 50, renderCushionMaxMs: 600 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(explicit);
+    expect(explicit.getRenderCushionUs!()).toBe(600_000);
   });
 
   it('CMAF sessions expose no LOC render cushion', () => {

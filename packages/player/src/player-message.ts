@@ -109,7 +109,7 @@ export interface ControlMessageContext {
   /** Called when SUBSCRIBE_OK matches a pending media subscription. @see §9.10 */
   onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio') => void;
   /** Called when REQUEST_ERROR matches a pending media subscription. @see §9.8 */
-  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
+  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint, retryInterval?: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
   onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint, statusCode: bigint, errorReason: string) => void;
   /**
@@ -376,7 +376,14 @@ export function handleControlMessage(
         ctx.activeSubscriptions.delete(errReqId);
         ctx.subscriptionManager?.unregisterTrack(alias);
         ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
-          msg.errorReason ?? '', BigInt(msg.errorCode));
+          msg.errorReason ?? '', BigInt(msg.errorCode),
+          msg.retryInterval !== undefined ? BigInt(msg.retryInterval) : undefined);
+      } else if (!pendingErr && !ctx.pendingMediaSubs.has(errReqId)) {
+        // A refusal for a request nobody is waiting on: the id may belong to
+        // a fetch or a switch candidate handled below, but an unmatched one
+        // would otherwise vanish.
+        ctx.log.warn('REQUEST_ERROR reqId=%s code=0x%s reason="%s" — no pending media subscription',
+          errReqId.toString(), BigInt(msg.errorCode).toString(16), msg.errorReason ?? '');
       }
 
       // Catalog-bootstrap fetch: INVALID_RANGE (empty track) vs any other

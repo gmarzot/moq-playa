@@ -138,4 +138,14 @@ export interface PlayerStats {
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
   readonly sessionAgeMs: number;
+  /** Total stalled time. */
+  readonly stallDurationMs: number;
+  readonly gapCount: number;
+  /** A/V skew EWMA (LOC path), null when unknown. */
+  readonly avSkewMs: number | null;
+  /** Media playable ahead of the playhead: contiguous buffered range on
+   *  the MSE path, scheduled audio on the WebCodecs path. */
+  readonly cushionMs: number | null;
+  /** WebCodecs audio buffers that arrived after the chain ran dry. */
+  readonly audioUnderruns: number;
 }

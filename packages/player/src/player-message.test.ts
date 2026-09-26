@@ -256,7 +256,29 @@ describe('handleControlMessage', () => {
     expect(ctx.pendingMediaSubs.size).toBe(0);
     expect(ctx.activeSubscriptions.size).toBe(0);
     expect(unregisterTrack).toHaveBeenCalledWith(5n);
-    expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n);
+    expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n, undefined);
+  });
+
+  it('forwards REQUEST_ERROR retry interval to the media subscribe error', () => {
+    const onMediaSubscribeError = vi.fn();
+    const ctx = createContext({
+      onMediaSubscribeError,
+      subscriptionManager: {
+        registerTrack: vi.fn(),
+        unregisterTrack: vi.fn(),
+        getMediaType: vi.fn(),
+      } as any,
+    });
+    ctx.pendingMediaSubs.set(7n, { trackName: 'video', mediaType: 'video' });
+
+    handleControlMessage({
+      type: 'REQUEST_ERROR', requestId: 7n,
+      errorCode: 0x10n, errorReason: 'no such namespace or track',
+      retryInterval: 3n,
+    } as ControlMessage, ctx);
+
+    expect(onMediaSubscribeError).toHaveBeenCalledWith(
+      7n, 'video', 'video', 'no such namespace or track', 0x10n, 3n);
   });
 
   it('ignores unhandled message types', () => {

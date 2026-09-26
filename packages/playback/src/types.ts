@@ -103,7 +103,28 @@ export type PlaybackEvent =
     | RecoveryEvent
     | CatchUpChangedEvent
     | BacklogShedEvent
-    | PartialGroupAbandonedEvent;
+    | PartialGroupAbandonedEvent
+    | SyncReferenceFallbackEvent
+    | AudioReanchoredEvent;
+
+/** Advertised audio produced no referenceable frame within the bound, so
+ *  video anchored the shared reference itself. */
+export interface SyncReferenceFallbackEvent {
+    readonly type: 'sync_reference_fallback';
+    /** How long video waited on audio before anchoring (µs). */
+    readonly waitedUs: number;
+}
+
+/**
+ * Audio stayed later than the drop threshold for a sustained run, so the
+ * shared sync reference was moved to the current audio frame. Without it,
+ * audio arriving later than the first frame's transit is dropped forever.
+ */
+export interface AudioReanchoredEvent {
+    readonly type: 'audio_reanchored';
+    /** How late the frame that triggered the re-anchor was (µs). */
+    readonly lateByUs: number;
+}
 
 /** A partial video GOP was abandoned before END_OF_GROUP was received. */
 export interface PartialGroupAbandonedEvent {

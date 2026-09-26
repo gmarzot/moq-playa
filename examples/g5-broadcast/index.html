@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>G5 Broadcast</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* The UA's [hidden] rule loses to any class selector that sets display. */
+    [hidden] { display: none !important; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
+
+    .wrapper { max-width: 1440px; margin: 0 auto; padding: 24px; }
+
+    h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: #fff; }
+    .attrib-note {
+      color: #666; font-size: .75rem; margin-top: 18px;
+      padding-top: 10px; border-top: 1px solid #222;
+    }
+    .attrib-note a { color: #8a94a6; text-decoration: none; border-bottom: 1px solid #333; }
+    .attrib-note a:hover { color: #b8c2d0; border-bottom-color: #555; }
+
+    /* Two-column layout: preview+controls+metrics left, catalog right. */
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(400px, 44%);
+      gap: 20px;
+      align-items: stretch;
+    }
+    .main-col { min-width: 0; }
+    .cat-col { position: relative; min-width: 0; }
+    .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
+    .layout.cat-hidden .cat-col { display: none; }
+
+    /* Preview */
+    .preview-container {
+      position: relative; width: 100%; aspect-ratio: 16/9;
+      background: #000; border-radius: 8px; overflow: hidden;
+    }
+    .preview-container video { width: 100%; height: 100%; object-fit: contain; }
+    .live-badge {
+      position: absolute; top: 12px; left: 12px;
+      background: #c0392b; color: #fff;
+      padding: 3px 10px; border-radius: 4px;
+      font-size: 11px; font-weight: 700; letter-spacing: 1px;
+    }
+
+    button {
+      background: #333; color: #eee; border: 1px solid #555;
+      padding: 8px 20px; border-radius: 6px; cursor: pointer;
+      font-size: 0.9rem; transition: background 0.15s;
+    }
+    button:hover { background: #444; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.mini { padding: 4px 12px; font-size: .8rem; color: #bbb; border-color: #444; }
+
+    /* One line always. The spacer absorbs the shrink; past that the layout
+       stacks, rather than the row overflowing under the catalog. */
+    .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: nowrap; }
+    .controls .spacer { flex: 1; min-width: 0; }
+    .controls .state-badge,
+    .controls button.mini {
+      font-size: .85rem; padding: 6px 12px;
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 5px; line-height: 1; white-space: nowrap; flex-shrink: 0;
+    }
+
+    .state-badge {
+      font-size: 0.8rem; padding: 3px 10px; border-radius: 12px;
+      background: #333; color: #888;
+    }
+    .state-badge.live { background: #1a3a1a; color: #4d4; }
+    .state-badge.starting { background: #3a3a1a; color: #cc4; }
+    .state-badge.error { background: #3a1a1a; color: #c44; }
+
+    /* Metrics strip */
+    .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
+    .diag-grid {
+      display: flex; flex-wrap: wrap; justify-content: space-between;
+      gap: 12px 18px; font-variant-numeric: tabular-nums;
+    }
+    .diag-grid .cell {
+      flex: 0 1 auto; white-space: nowrap;
+      color: #8a94a6; text-transform: uppercase; letter-spacing: .04em;
+      font-size: .72rem; line-height: 1.25;
+    }
+    .diag-grid .cell b {
+      display: block; color: #e8e8f0; font-weight: 600; font-size: 1.1rem;
+      text-transform: none; letter-spacing: 0; white-space: nowrap; margin-top: 4px;
+    }
+    .diag-grid .cell b .u {
+      font-size: .68rem; font-weight: 500; color: #8a94a6;
+      margin-left: 3px; letter-spacing: .03em;
+    }
+    /* Blue names the stream, green measures it, amber marks what should stay
+       at zero, grey is inactive. */
+    .diag-grid .cell b.str { color: #6cf; }
+    .diag-grid .cell b.num { color: #4d4; }
+    .diag-grid .cell b.fault { color: #d9922e; }
+    .diag-grid .cell b.idle { color: #8a94a6; }
+
+    .adv { margin-top: 10px; }
+    .adv > summary {
+      cursor: pointer; color: #8a94a6; font-size: .72rem;
+      text-transform: uppercase; letter-spacing: .04em; padding: 4px 0;
+    }
+    .adv > summary:hover { color: #b8c2d0; }
+    .adv[open] > summary { color: #b8c2d0; }
+    .adv .diag-grid { padding: 6px 0 2px; }
+
+    /* Catalog panel — exactly the bytes published on the catalog track. */
+    .catalog-panel {
+      position: absolute; inset: 0 0 12px 0;
+      display: flex; flex-direction: column;
+      background: #1a1a2e; border-radius: 8px; padding: 10px 14px;
+    }
+    .cat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .cat-head .chart-label {
+      font-size: .95rem; color: #aab; font-weight: 600; white-space: nowrap;
+      text-transform: uppercase; letter-spacing: .04em;
+    }
+    .cat-head .chart-label b { font-size: 1rem; color: #4d4; font-weight: 600; }
+    .cat-head button {
+      background: #333; color: #bbb; border: 1px solid #555;
+      border-radius: 6px; padding: 3px 10px; font-size: .78rem; cursor: pointer;
+    }
+    .cat-tracks {
+      display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
+      font-size: 1rem; font-variant-numeric: tabular-nums;
+    }
+    /* One line per track: the summary ellipsises rather than wrapping under
+       the name, so every track row is the same height. */
+    .cat-track {
+      display: flex; flex-wrap: nowrap; gap: 8px; align-items: baseline;
+      color: #aab; padding: 5px 0; border-bottom: 1px solid #23233a;
+    }
+    .cat-track:last-child { border-bottom: 0; }
+    .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
+    .cat-track .dt {
+      color: #6cf; font-weight: 600; font-size: .9rem;
+      min-width: 0; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .cat-track .pk {
+      color: #4d4; border: 1px solid #2f5a34; border-radius: 4px;
+      background: #16271a; padding: 1px 6px; text-transform: uppercase;
+      font-weight: 700; font-size: .68rem; letter-spacing: .06em;
+    }
+    /* Subscription state per track: what the RELAY is pulling, not viewers. */
+    .cat-track .sub {
+      border-radius: 4px; padding: 1px 6px; text-transform: uppercase;
+      font-weight: 700; font-size: .68rem; letter-spacing: .06em;
+      border: 1px solid #3a3a52; background: #23233a; color: #8a94a6;
+    }
+    .cat-track .sub.on { color: #4d4; border-color: #2f5a34; background: #16271a; }
+    .cat-track .sub.paused { color: #d9922e; border-color: #5a4a2f; background: #271f16; }
+    .cat-track .sub.retired { color: #c44; border-color: #5a2f2f; background: #271616; }
+    .json-wrap { position: relative; display: flex; flex: 1; min-height: 0; margin-top: 10px; }
+    .cat-json {
+      margin: 0; padding: 10px 12px; background: #12121f;
+      border-radius: 6px; font-family: monospace; font-size: 1rem;
+      line-height: 1.5; flex: 1; min-width: 0; min-height: 0; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all; color: #9fb0c4;
+    }
+
+    /* A copy control rides the top-right of the pane it belongs to. */
+    .log-wrap { position: relative; margin-top: 12px; }
+    .copy {
+      position: absolute; top: 10px; right: 24px; z-index: 1; opacity: .5;
+      background: #23233a; border-color: #3a3a52;
+    }
+    .copy:hover, .copy:focus-visible { opacity: 1; }
+    pre#log {
+      background: #1a1a2e; color: rgba(255,255,255,0.6);
+      padding: 12px 16px; border-radius: 8px;
+      font-family: monospace; font-size: 0.8rem; line-height: 1.5;
+      /* A floating copy button over a one-line box reads as broken; the panel
+         keeps a consistent height from the first line. */
+      min-height: 140px; max-height: 220px;
+      overflow-y: auto; white-space: pre-wrap;
+    }
+
+    @media (max-width: 1120px) {
+      .layout { grid-template-columns: 1fr; }
+      .cat-col { position: static; }
+      .catalog-panel { position: static; margin-top: 12px; }
+      /* Stacked, the panel has no column height to fill — the JSON pane needs
+         an explicit one or it collapses to the header. */
+      .json-wrap { flex: none; }
+      .cat-json { flex: none; min-height: 220px; max-height: 45vh; }
+    }
+
+    /* Settings / share modals */
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+      z-index: 100; backdrop-filter: blur(4px);
+    }
+    .modal-backdrop.visible { display: flex; align-items: center; justify-content: center; }
+    .modal {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      padding: 20px; width: min(500px, 92vw); max-height: 86vh; overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    }
+    .modal h2 { font-size: 1rem; margin-bottom: 4px; }
+    .modal .lede { color: #888; font-size: .8rem; margin-bottom: 8px; }
+    .modal label {
+      display: block; font-size: .7rem; color: #888; margin: 12px 0 4px;
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .modal input[type=text], .modal input[type=number], .modal select {
+      width: 100%; padding: 7px 9px; border-radius: 6px;
+      border: 1px solid #444; background: #222; color: #eee;
+      font-family: monospace; font-size: .85rem;
+    }
+    .modal input:focus, .modal select:focus { outline: none; border-color: #2a6; }
+    .modal .hint { font-size: .68rem; color: #666; margin-top: 3px; }
+    .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+    .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
+    .modal #settings-apply, .modal #share-open { background: #2a6; border-color: #2a6; color: #fff; }
+    .modal #settings-apply:hover, .modal #share-open:hover { background: #2b7; }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <h1>G5 Broadcast</h1>
+
+    <div class="layout" id="layout">
+      <div class="main-col">
+        <div class="preview-container">
+          <video id="preview" autoplay muted playsinline></video>
+          <div class="live-badge" id="live-badge" hidden>LIVE</div>
+        </div>
+
+        <div class="controls">
+          <button id="start-camera">Camera</button>
+          <button id="start-screen">Screen</button>
+          <button id="stop" disabled>Stop</button>
+          <span class="spacer"></span>
+          <span class="state-badge" id="state">idle</span>
+          <button id="share-btn" class="mini" type="button" hidden>⧉ viewer link</button>
+          <button id="settings-btn" class="mini" type="button" title="Broadcast settings">⚙ settings</button>
+          <button id="cat-restore" class="mini" hidden>catalog</button>
+        </div>
+
+      </div>
+
+      <div class="cat-col">
+        <div class="catalog-panel" id="catalog-panel">
+          <div class="cat-head">
+            <span class="chart-label">published catalog <b id="cat-meta">not yet</b></span>
+            <button id="cat-toggle" type="button">hide</button>
+          </div>
+          <div class="cat-tracks" id="cat-tracks"></div>
+          <div class="json-wrap">
+            <button id="cat-copy" class="mini copy" type="button">copy</button>
+            <pre class="cat-json" id="cat-json"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="diag">
+      <div class="diag-grid" id="diag-grid"></div>
+    </div>
+
+    <div class="log-wrap">
+      <button id="log-copy" class="mini copy" type="button">copy</button>
+      <pre id="log"></pre>
+    </div>
+
+    <details class="adv" id="adv-panel">
+      <summary>transport (QUIC / WebTransport)</summary>
+      <div class="diag-grid" id="adv-grid"></div>
+    </details>
+
+    <footer class="attrib-note">Built on <a href="https://github.com/openmoq/moq-playa" target="_blank" rel="noopener noreferrer">openmoq/moq-playa</a>.</footer>
+  </div>
+
+  <!-- Share modal -->
+  <div id="share-backdrop" class="modal-backdrop">
+    <div class="modal">
+      <h2>Viewer link</h2>
+      <div class="lede">Opens g5-player against this relay and namespace.</div>
+      <input id="share-url" type="text" readonly>
+      <div id="share-copied" class="hint" style="color:#4d4" hidden>Copied to clipboard.</div>
+      <div class="btn-row">
+        <button id="share-close" type="button">Close</button>
+        <button id="share-copy" type="button">Copy</button>
+        <button id="share-open" type="button">Open in new tab</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-backdrop" class="modal-backdrop">
+    <div class="modal">
+      <h2>Broadcast settings</h2>
+      <div class="lede">Applying reloads the page with these as URL parameters.</div>
+
+      <label for="s-url">Relay URL</label>
+      <input id="s-url" type="text" placeholder="default: moqx-main">
+      <div class="hint">WebTransport MoQT endpoint.</div>
+
+      <label for="s-ns">Namespace</label>
+      <input id="s-ns" type="text" placeholder="auto-generated">
+      <div class="hint">Auto-generated per tab; kept across reloads.</div>
+
+      <label for="s-version">Draft version</label>
+      <select id="s-version">
+        <option value="18">Draft 18 (default)</option>
+        <option value="16">Draft 16</option>
+        <option value="14">Draft 14</option>
+      </select>
+
+      <label for="s-codec">Video codec</label>
+      <select id="s-codec">
+        <option value="avc1.42001f">H.264 Baseline</option>
+        <option value="avc1.640028">H.264 High</option>
+        <option value="av01.0.04M.08">AV1 Main</option>
+      </select>
+
+      <label for="s-bitrate-mode">Bitrate mode</label>
+      <select id="s-bitrate-mode">
+        <option value="">Encoder default</option>
+        <option value="constant">Constant</option>
+        <option value="variable">Variable</option>
+      </select>
+
+      <label for="s-bitrate">Video bitrate (kbps)</label>
+      <input id="s-bitrate" type="number" min="1" value="2000">
+
+      <label for="s-fps">Capture frame rate</label>
+      <input id="s-fps" type="number" min="1" placeholder="60">
+      <div class="hint">42ms of latency at 24fps, 17ms at 60.</div>
+
+      <label for="s-keyframe">Keyframe interval (frames)</label>
+      <input id="s-keyframe" type="number" min="1" value="60">
+
+      <label for="s-target">Target playback latency (ms)</label>
+      <input id="s-target" type="number" min="1" placeholder="200">
+
+      <label for="s-catalog-interval">catalog retransmit interval (ms)</label>
+      <input id="s-catalog-interval" type="number" min="0" placeholder="1000">
+      <div class="hint">0 = no retransmit.</div>
+
+      <label for="s-hash">Certificate hash</label>
+      <input id="s-hash" type="text" placeholder="(none)">
+
+      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+        <input id="s-audio-datagram" type="checkbox" style="width:auto">
+        <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
+          audio over datagrams (draft 18 only)</label>
+      </div>
+
+      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+        <input id="s-debug" type="checkbox" style="width:auto">
+        <label for="s-debug" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
+          verbose logging</label>
+      </div>
+
+      <div class="btn-row">
+        <button id="settings-cancel" type="button">Cancel</button>
+        <button id="settings-apply" type="button">Apply &amp; reload</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

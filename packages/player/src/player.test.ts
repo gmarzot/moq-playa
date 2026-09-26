@@ -4623,9 +4623,9 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       // Should have logged "Connecting to ..." and "Session established"
-      const calls = spyInfo.mock.calls.map(c => c[1]);
-      expect(calls).toContain('Connecting to %s');
-      expect(calls.some((c: string) => c.startsWith('Session established'))).toBe(true);
+      const calls = spyInfo.mock.calls.map(c => c[0]);
+      expect(calls).toContain('[moqt] Connecting to %s');
+      expect(calls.some((c: string) => c.startsWith('[moqt] Session established'))).toBe(true);
 
       vi.restoreAllMocks();
     });
@@ -4661,8 +4661,8 @@ describe('MoqtPlayer', () => {
 
       // Wait for async subscription wiring
       await vi.waitFor(() => {
-        const calls = spyInfo.mock.calls.map(c => c[1]);
-        expect(calls).toContain('Catalog received: %d tracks');
+        const calls = spyInfo.mock.calls.map(c => c[0]);
+        expect(calls).toContain('[moqt] Catalog received: %d tracks');
       });
 
       vi.restoreAllMocks();
@@ -4742,7 +4742,7 @@ describe('MoqtPlayer', () => {
 
       // Wait for subscription wiring
       await vi.waitFor(() => {
-        expect(spyInfo.mock.calls.some(c => c[1] === 'Catalog received: %d tracks')).toBe(true);
+        expect(spyInfo.mock.calls.some(c => c[0] === '[moqt] Catalog received: %d tracks')).toBe(true);
       });
 
       spyDebug.mockClear();
@@ -4760,7 +4760,7 @@ describe('MoqtPlayer', () => {
       });
 
       // Video objects log at info level with [OBJ] prefix for debugging
-      const infoCalls = spyInfo.mock.calls.map(c => c[1]);
+      const infoCalls = spyInfo.mock.calls.map(c => c[0]);
       expect(infoCalls.some((c: string) => typeof c === 'string' && c.includes('[OBJ]'))).toBe(true);
 
       vi.restoreAllMocks();
@@ -4783,7 +4783,7 @@ describe('MoqtPlayer', () => {
       adapter._triggerError(new Error('control stream closed'));
 
       expect(spyError).toHaveBeenCalled();
-      const errorCalls = spyError.mock.calls.map(c => c[1]);
+      const errorCalls = spyError.mock.calls.map(c => c[0]);
       expect(errorCalls.some(c => typeof c === 'string' && c.includes('Error'))).toBe(true);
       // Info-level messages should be suppressed
       expect(spyInfo).not.toHaveBeenCalled();
@@ -6442,9 +6442,8 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('a player that never declared intent leaves the adapter default alone', async () => {
-      // Backward compatibility: stating `false` here would stop an embedder
-      // that relies on the adapter starting once media arrives.
+    it('a player that never declared intent tells the adapter not to play', async () => {
+      // The player owns startup: an adapter must never start on its own.
       const adapter = createMockAdapter();
       const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
       const player = new MoqtPlayer({
@@ -6458,7 +6457,7 @@ describe('MoqtPlayer', () => {
 
       await deliverCmafCatalog(adapter);
 
-      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
       await player.destroy();
     });
 
@@ -6505,7 +6504,8 @@ describe('MoqtPlayer', () => {
       await loadPromise;
       await deliverCmafCatalog(adapter);
 
-      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
+      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalledWith(true);
       await player.destroy();
     });
 
@@ -8153,6 +8153,7 @@ describe('MoqtPlayer', () => {
         // new codec isn't supported (or any other MSE-level failure).
         changeType: vi.fn(() => Promise.reject(new Error('mock changeType rejected'))),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8176,6 +8177,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8228,6 +8230,7 @@ describe('MoqtPlayer', () => {
       expect((adapter.subscribe as any).mock.calls.length).toBe(subscribesBefore + 1);
       expect(switchingFn).toHaveBeenCalledTimes(1);
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
 
       // Ack the new subscription with a DIFFERENT trackAlias so the
       // SUBSCRIBE_OK handler registers the track with the
@@ -8270,6 +8273,7 @@ describe('MoqtPlayer', () => {
       });
       // No "switched" event ever fires for the failed switch.
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
       // An `error` event also surfaces (PlayerErrorCode.VIDEO_DECODE_ERROR).
       expect(errorFn).toHaveBeenCalled();
 
@@ -8341,6 +8345,7 @@ describe('MoqtPlayer', () => {
         // changeType resolves successfully — the happy path.
         changeType: vi.fn(() => Promise.resolve()),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8364,6 +8369,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8439,6 +8445,7 @@ describe('MoqtPlayer', () => {
       expect(ctCodec).toBe('hvc1.1.6.L93.90');
       expect(ctInit).toBeInstanceOf(Uint8Array);
       expect(Array.from(ctInit as Uint8Array)).toEqual([0x10, 0x11, 0x12, 0x13]);
+      expect(selectCmafTrack).toHaveBeenCalledWith('video', 'video_hevc');
 
       // Commit-time event fired exactly once with the right payload.
       expect(switchedFn).toHaveBeenCalledTimes(1);

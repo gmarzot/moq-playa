@@ -25,6 +25,7 @@ import { parseVideoFrameMarking, encodeVideoFrameMarking } from './video.js';
 import { parseAudioLevel, encodeAudioLevel } from './audio.js';
 
 const CAPTURE_TIMESTAMP = BigInt(LocExtensionId.CAPTURE_TIMESTAMP); // 0x02
+const TIMESTAMP = BigInt(LocExtensionId.TIMESTAMP); // 0x10
 const VIDEO_FRAME_MARKING = BigInt(LocExtensionId.VIDEO_FRAME_MARKING); // 0x04
 const AUDIO_LEVEL = BigInt(LocExtensionId.AUDIO_LEVEL); // 0x06
 const VIDEO_CONFIG = BigInt(LocExtensionId.VIDEO_CONFIG); // 0x0d
@@ -37,6 +38,7 @@ const VIDEO_CONFIG = BigInt(LocExtensionId.VIDEO_CONFIG); // 0x0d
  */
 export function resolveLocHeaders(propertyMap: PropertyMap): LocHeaders {
   let captureTimestamp: bigint | undefined;
+  let legacyCaptureTimestamp: bigint | undefined;
   let videoFrameMarking: LocHeaders['videoFrameMarking'];
   let audioLevel: LocHeaders['audioLevel'];
   let videoConfig: Uint8Array | undefined;
@@ -46,8 +48,11 @@ export function resolveLocHeaders(propertyMap: PropertyMap): LocHeaders {
     if (typeof value === 'bigint') {
       // Even id → integer value.
       switch (id) {
-        case CAPTURE_TIMESTAMP:
+        case TIMESTAMP:
           captureTimestamp = value;
+          break;
+        case CAPTURE_TIMESTAMP:
+          legacyCaptureTimestamp = value;
           break;
         case VIDEO_FRAME_MARKING:
           videoFrameMarking = parseVideoFrameMarking(value);
@@ -73,6 +78,7 @@ export function resolveLocHeaders(propertyMap: PropertyMap): LocHeaders {
   }
 
   const result: Record<string, unknown> = {};
+  captureTimestamp ??= legacyCaptureTimestamp;
   if (captureTimestamp !== undefined) result['captureTimestamp'] = captureTimestamp;
   if (videoFrameMarking !== undefined) result['videoFrameMarking'] = videoFrameMarking;
   if (audioLevel !== undefined) result['audioLevel'] = audioLevel;

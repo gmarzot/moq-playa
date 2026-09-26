@@ -388,8 +388,11 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
 
   it('draft-18 LOC extensions use the vi64 profile: they parse as d18 and are NOT d16 bytes', async () => {
     const timestampUs = Date.now() * 1000; // a current capture timestamp
+    // Pin the wall clock to the chunk's own base so the per-track rebase is a
+    // no-op here: this test is about the wire profile, not about anchoring.
+    const wallClockUs = () => timestampUs;
     const conn18 = recordingConnection();
-    const pub18 = makePublisher(conn18, { draft: 18 });
+    const pub18 = makePublisher(conn18, { draft: 18, wallClockUs });
     pub18.setVideoAlias(2n);
     pub18.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
@@ -403,7 +406,7 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     // The same publisher under draft 16 emits DIFFERENT bytes (QUIC-varint
     // profile) — proving the profile is draft-bound, not fixed.
     const conn16 = recordingConnection();
-    const pub16 = makePublisher(conn16, { draft: 16 });
+    const pub16 = makePublisher(conn16, { draft: 16, wallClockUs });
     pub16.setVideoAlias(2n);
     pub16.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
@@ -543,5 +546,39 @@ describe('MediaPublisher — audio publication concurrency', () => {
     await conn.releaseAll();
     await drainPromise;
     expect(drained).toBe(true);
+  });
+});
+
+describe('MediaPublisher — wall-clock rebase', () => {
+  it('anchors video and audio independently: a shared anchor would throw one track off', async () => {
+    const conn = recordingConnection();
+    const wall = 1_700_000_000_000_000;
+    // Chrome hands the two tracks unrelated bases: boot-relative video,
+    // context-relative audio. This is the case that broke rendering.
+    const pub = makePublisher(conn, { draft: 18, wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 208_027_000_000 });
+    pub.publishAudio(chunk(2), { timestampUs: 107_000_000 });
+    await settle();
+
+    const profile = { wireProfile: locWireProfileForDraft(18) };
+    const stamps = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).captureTimestamp!);
+    // Both land on the wall clock despite bases ~208,000 s apart.
+    for (const t of stamps) expect(t).toBe(BigInt(wall));
+  });
+
+  it('keeps spacing after the anchor rather than re-anchoring every chunk', async () => {
+    const conn = recordingConnection();
+    const wall = 1_700_000_000_000_000;
+    const pub = makePublisher(conn, { draft: 18, wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 5_000_000 });
+    pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 5_040_000 });
+    await settle();
+
+    const profile = { wireProfile: locWireProfileForDraft(18) };
+    const stamps = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).captureTimestamp!);
+    expect(stamps[1]! - stamps[0]!).toBe(40_000n);
   });
 });

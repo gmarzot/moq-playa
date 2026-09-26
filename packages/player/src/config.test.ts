@@ -37,6 +37,7 @@ describe('DEFAULT_PLAYER_CONFIG', () => {
     expect(DEFAULT_PLAYER_CONFIG.maxDecodeErrors).toBe(10);
     expect(DEFAULT_PLAYER_CONFIG.gapEscalationWindowMs).toBe(10_000);
     expect(DEFAULT_PLAYER_CONFIG.cmafBootstrapTimeoutMs).toBe(10_000);
+    expect(DEFAULT_PLAYER_CONFIG.cmafFirstFrameMaxWaitMs).toBe(60_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessTimeoutMs).toBe(10_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessResetProbeMs).toBe(2_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessMaxRestarts).toBe(3);
@@ -124,6 +125,10 @@ describe('validateConfig', () => {
 
   it('rejects negative cmafBootstrapTimeoutMs', () => {
     expect(() => validateConfig(minConfig({ cmafBootstrapTimeoutMs: -1 }))).toThrow(RangeError);
+  });
+
+  it.each([NaN, Infinity])('rejects non-finite cmafFirstFrameMaxWaitMs: %s', (value) => {
+    expect(() => validateConfig(minConfig({ cmafFirstFrameMaxWaitMs: value }))).toThrow(RangeError);
   });
 
   // ── warm start (joining FETCH) ──
@@ -294,6 +299,22 @@ describe('validateConfig', () => {
 
   it('accepts targetLatencyMs > 0', () => {
     expect(() => validateConfig(minConfig({ targetLatencyMs: 1000 }))).not.toThrow();
+  });
+
+  // ── renderCushionFloorMs / renderCushionMaxMs ──
+
+  it('rejects renderCushionFloorMs <= 0 and renderCushionMaxMs <= 0', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 0 }))).toThrow(RangeError);
+    expect(() => validateConfig(minConfig({ renderCushionMaxMs: -1 }))).toThrow(RangeError);
+  });
+
+  it('rejects renderCushionMaxMs below renderCushionFloorMs', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 300, renderCushionMaxMs: 200 }))).toThrow(RangeError);
+  });
+
+  it('accepts a render cushion floor at or below its max', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 50 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 400 }))).not.toThrow();
   });
 
   // ── deliveryTimeoutMs ──

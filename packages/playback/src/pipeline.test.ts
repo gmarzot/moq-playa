@@ -98,6 +98,7 @@ function createPipeline(opts: {
     config?: PlaybackConfig;
     sync?: SyncController;
     recovery?: import('./recovery.js').RecoveryController;
+    getPlaybackDelayUs?: () => number;
 }) {
     const commands: DecoderCommand[] = [];
     const events: PlaybackEvent[] = [];
@@ -115,6 +116,7 @@ function createPipeline(opts: {
         onCommand: (cmd) => commands.push(cmd),
         onEvent: (evt) => events.push(evt),
         recovery: opts.recovery,
+        ...(opts.getPlaybackDelayUs ? { getPlaybackDelayUs: opts.getPlaybackDelayUs } : {}),
     });
 
     return { pipeline, commands, events, sync };
@@ -2001,5 +2003,144 @@ describe('PlaybackPipeline', () => {
             const decodes = commands.filter(c => c.type === 'decode_audio');
             expect(decodes.length).toBe(1);
         });
+    });
+
+    describe('audio lateness re-anchor', () => {
+        // The reference is set from the first audio frame's transit. Audio
+        // that then stays >100 ms later than that (a publisher clock step, a
+        // transit increase) used to be dropped for the rest of the session
+        // while video kept rendering.
+        const FRAME_US = 21_333;
+        const C0 = 1_000_000_000n;
+
+        function setup(cushionUs?: number) {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            // Production passes lateFrameThresholdMs (100 ms); the standalone default is 500.
+            const sync = new SyncController({
+                driftThresholdUs: DEFAULT_CONFIG.driftThresholdUs, dropThresholdUs: 100_000, clock,
+            });
+            const ctx = createPipeline({
+                mediaType: 'audio', clock, sync,
+                ...(cushionUs !== undefined ? { getPlaybackDelayUs: () => cushionUs } : {}),
+            });
+            ctx.pipeline.configure(new Uint8Array([0x01]));
+            ctx.pipeline.pushObject(makeData(0, 0), audioHeaders(C0));
+            ctx.pipeline.tick();
+            let group = 1;
+            // Frame `group` arrives `lateUs` after its reference-mapped time.
+            const push = (lateUs: number) => {
+                clock.set(5_000_000 + group * FRAME_US + lateUs);
+                ctx.pipeline.pushObject(makeData(group, 0), audioHeaders(C0 + BigInt(group * FRAME_US)));
+                ctx.pipeline.tick();
+                group++;
+            };
+            const decodes = () => ctx.commands.filter(c => c.type === 'decode_audio').length;
+            const reanchors = () => ctx.events.filter(e => e.type === 'audio_reanchored');
+            return { ...ctx, clock, push, decodes, reanchors };
+        }
+
+        it('drops a short late run, then re-anchors and resumes decoding', () => {
+            const s = setup();
+            expect(s.sync.hasReference).toBe(true);
+            const before = s.decodes();
+
+            for (let i = 0; i < 10; i++) s.push(150_000);     // ~200 ms of lateness
+            expect(s.decodes()).toBe(before);
+            expect(s.reanchors()).toHaveLength(0);
+
+            for (let i = 0; i < 20; i++) s.push(150_000);
+            expect(s.reanchors()).toHaveLength(1);
+            expect((s.reanchors()[0] as { lateByUs: number }).lateByUs).toBeGreaterThanOrEqual(150_000);
+            // Frames 1..12 dropped, frame 13 re-anchors, 14..30 are on time again.
+            expect(s.decodes()).toBe(before + 18);
+        });
+
+        it('an on-time frame ends the late run (one jittery frame never re-anchors)', () => {
+            const s = setup();
+            for (let i = 0; i < 40; i++) s.push(i % 2 === 0 ? 150_000 : 0);
+            expect(s.reanchors()).toHaveLength(0);
+        });
+
+        it('audio the playout cushion still covers is decoded, not dropped', () => {
+            // 120 ms late against the uncushioned timeline is on time with a
+            // 150 ms cushion; only lateness past cushion + threshold drops.
+            const s = setup(150_000);
+            const before = s.decodes();
+            for (let i = 0; i < 20; i++) s.push(120_000);
+            expect(s.decodes()).toBe(before + 20);
+            expect(s.pipeline.lateAudioDrops).toBe(0);
+
+            for (let i = 0; i < 5; i++) s.push(300_000);     // 150 ms past the cushion
+            expect(s.decodes()).toBe(before + 20);
+            expect(s.pipeline.lateAudioDrops).toBe(5);
+        });
+
+        it('re-anchors at most once per 2 s', () => {
+            const s = setup();
+            for (let i = 0; i < 13; i++) s.push(150_000);     // first re-anchor
+            expect(s.reanchors()).toHaveLength(1);
+
+            // Another 150 ms step right away: a sustained run, but inside 2 s.
+            for (let i = 0; i < 40; i++) s.push(300_000);     // ~850 ms
+            expect(s.reanchors()).toHaveLength(1);
+
+            for (let i = 0; i < 80; i++) s.push(300_000);     // past 2 s since the first
+            expect(s.reanchors()).toHaveLength(2);
+        });
+    });
+});
+
+describe('sync reference fallback (advertised audio that never delivers)', () => {
+    it('video anchors the reference itself once the bound elapses, and says so', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        // videoOnly is NOT set: the catalog advertised an audio track, so only
+        // the audio pipeline may normally anchor the shared reference.
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+
+        pipeline.pushObject(
+            makeData(0, 0),
+            videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])),
+        );
+        pipeline.tick();
+        // No audio has arrived, so nothing may anchor yet.
+        expect(sync.hasReference).toBe(false);
+
+        // Still inside the bound.
+        clock.set(5_000_000 + 1_900_000);
+        pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_333n, false));
+        pipeline.tick();
+        expect(sync.hasReference).toBe(false);
+        expect(events.some((e) => e.type === 'sync_reference_fallback')).toBe(false);
+
+        // Past it: video anchors, and the reason is reported exactly once.
+        clock.set(5_000_000 + 2_100_000);
+        pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_666n, false));
+        pipeline.tick();
+        expect(sync.hasReference).toBe(true);
+        expect(events.filter((e) => e.type === 'sync_reference_fallback')).toHaveLength(1);
+
+        clock.set(5_000_000 + 3_000_000);
+        pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_099_999n, false));
+        pipeline.tick();
+        expect(events.filter((e) => e.type === 'sync_reference_fallback')).toHaveLength(1);
+    });
+
+    it('audio arriving inside the bound keeps priority — no fallback fires', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true));
+        pipeline.tick();
+
+        sync.setAudioReference(1_000_000_000n);   // audio lands first
+
+        clock.set(5_000_000 + 5_000_000);
+        pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_333n, false));
+        pipeline.tick();
+
+        expect(events.some((e) => e.type === 'sync_reference_fallback')).toBe(false);
     });
 });
