@@ -7335,6 +7335,19 @@ export class MoqtPlayer {
     });
   }
 
+  /** Re-join at the live edge, abandoning whatever is buffered. For callers that
+   *  know playback was suspended (frozen tab, sleep) and the buffer is stale. */
+  jumpToLive(reason: string): void {
+    if (!this.connection) return;
+    this.log.info('Jump to live: %s', reason);
+    this.requestFreshSubscriptionStart('video');
+    this.requestFreshSubscriptionStart('audio');
+    this.emitter.emit('recovery_action', {
+      type: 'recovery_action',
+      action: { type: 'jump_to_live' },
+    });
+  }
+
   private requestFreshSubscriptionStart(
     mediaType: 'video' | 'audio',
     startGroup?: bigint,
