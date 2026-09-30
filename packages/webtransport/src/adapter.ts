@@ -6502,6 +6502,11 @@ export class MoqtConnection {
   ): Promise<DataStreamReadTerminal> {
     let previousObjectId: bigint = 0n;
     let isFirstObject = true;
+    // Socket stamps for the object being assembled; `busyMs` is time spent between reads.
+    // A successful decode's own cost is charged to the next object.
+    let socketLastMs = performance.now();
+    let socketFirstMs = socketLastMs;
+    let busyMs = 0;
 
     while (true) {
       // Gate: see `locallyDiscardedReaders`.
@@ -6553,6 +6558,9 @@ export class MoqtConnection {
                 extensions: object.extensions,
                 properties: object.extensions,
                 payload: object.payload,
+                socketFirstMs,
+                socketLastMs,
+                assemblyBusyMs: busyMs,
               } satisfies MoqtObjectData;
 
           // -06 §4.9: emit object_id_delta (raw delta, not resolved absolute ID)
@@ -6575,6 +6583,8 @@ export class MoqtConnection {
           }
           previousObjectId = object.objectId;
           isFirstObject = false;
+          socketFirstMs = socketLastMs; // the next object starts where this ended
+          busyMs = 0;
           continue; // Try to decode another object from remaining buffer
         } catch (e) {
           if (!(e instanceof RangeError)) throw e;
@@ -6583,7 +6593,9 @@ export class MoqtConnection {
       }
 
       // Read more bytes from the stream
+      busyMs += performance.now() - socketLastMs;
       const { value, done } = await reader.read();
+      socketLastMs = performance.now();
       if (done) {
         // Our own cancellation also settles a pending read as `done`. It is
         // not a peer FIN: no synthesized END_OF_GROUP, no subscription close,
