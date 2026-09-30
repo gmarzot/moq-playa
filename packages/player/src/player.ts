@@ -89,6 +89,10 @@ const SWITCH_STAGING_MAX_OBJECTS = 100;
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 
+/** Pipeline drain cadence (~60fps), for both the timer and the arrival pump. */
+const TICK_INTERVAL_MS = 16;
+const TICK_INTERVAL_US = TICK_INTERVAL_MS * 1_000;
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /** Catalog track name per MSF §5.1.10. */
@@ -505,6 +509,12 @@ export class MoqtPlayer {
 
   /** Tick interval handle for pipeline processing. */
   private tickInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Clock reading of the last tick, shared by the timer and the arrival pump. */
+  private lastTickUs = 0;
+
+  /** tick() stages objects, which re-enters the arrival path. */
+  private tickInProgress = false;
 
   /**
    * Guard against double sync reset within a single tick cycle.
@@ -1897,6 +1907,7 @@ export class MoqtPlayer {
       if (this.stateMachine.state === PlayerState.PAUSED) return;
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
       pipeline?.pushObject(obj, headers);
+      this.pumpDrain();
     };
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
@@ -4420,12 +4431,32 @@ export class MoqtPlayer {
   /**
    * Tick playback pipelines — drain buffers, evaluate gaps, emit commands.
    *
-   * Called automatically by play() on a 16ms interval.
+   * Driven by the 16ms interval and, via pumpDrain(), by object arrivals.
+   * A re-entrant call returns without work.
    * Exposed publicly for testing and manual control.
    *
    * @see draft-ietf-moq-loc-01 §4.2 (decode order)
    */
   tick(): void {
+    if (this.tickInProgress) return;
+    this.tickInProgress = true;
+    this.lastTickUs = this.clock.now();
+    try {
+      this.runTick();
+    } finally {
+      this.tickInProgress = false;
+    }
+  }
+
+  /** Run a tick from the arrival path when one is due. Chrome clamps timers to
+   *  1 Hz in a hidden, inaudible tab; arrivals are not throttled. */
+  private pumpDrain(): void {
+    if (this.tickInProgress) return;
+    if (this.clock.now() - this.lastTickUs < TICK_INTERVAL_US) return;
+    this.tick();
+  }
+
+  private runTick(): void {
     // Clear the per-tick sync reset guard. If both pipelines skip_forward
     // in the same tick, only the first (audio) resets the sync controller.
     this.syncResetThisTick = false;
@@ -7704,7 +7735,7 @@ export class MoqtPlayer {
   /** Start pipeline tick interval (~60fps). */
   private startTicking(): void {
     if (this.tickInterval) return;
-    this.tickInterval = setInterval(() => this.tick(), 16);
+    this.tickInterval = setInterval(() => this.tick(), TICK_INTERVAL_MS);
   }
 
   /** Stop pipeline tick interval. */

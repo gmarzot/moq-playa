@@ -2682,7 +2682,8 @@ describe('MoqtPlayer', () => {
         trackExtensions: [],
       } as ControlMessage);
 
-      // Push 2 objects into a buffer of size 1 → overflow → recovery
+      // Buffer of size 1; the clock is frozen, so only the first arrival pumps a
+      // tick and the next two overflow → recovery.
       clockTime = 1_000_000;
       adapter._triggerObject(1n, {
         kind: 'data',
@@ -2701,6 +2702,16 @@ describe('MoqtPlayer', () => {
         subgroupId: varint(0),
         objectId: varint(1),
         payload: new Uint8Array([0xBB]),
+        extensions: undefined,
+        publisherPriority: 128,
+      } as MoqtObject);
+      adapter._triggerObject(1n, {
+        kind: 'data',
+        trackAlias: varint(51n),
+        groupId: varint(0),
+        subgroupId: varint(0),
+        objectId: varint(2),
+        payload: new Uint8Array([0xCC]),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
