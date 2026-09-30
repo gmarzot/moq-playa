@@ -26,7 +26,9 @@ import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
 import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
-import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
+import type {
+  MoqtObject, MoqtObjectData, ObjectDatagram, SubgroupHeader,
+} from '@moqt/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
 import { BufferBasedController } from '@moqt/playback';
@@ -512,6 +514,11 @@ export class MoqtPlayer {
 
   /** Clock reading of the last tick, shared by the timer and the arrival pump. */
   private lastTickUs = 0;
+
+  /** Socket-to-engine spans per object, newest first, capped at DELIVERY_SPAN_SAMPLES. */
+  private readonly deliverySpans: Array<
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> = [];
+  private static readonly DELIVERY_SPAN_SAMPLES = 512;
 
   /** tick() stages objects, which re-enters the arrival path. */
   private tickInProgress = false;
@@ -1856,6 +1863,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
+        this.recordDeliverySpans(obj);
         if (mediaType === 'video' && bytes > 0) {
           const gid = BigInt(obj.groupId);
           if (gid !== this.bwEstimatorGroupId) {
@@ -4445,6 +4453,29 @@ export class MoqtPlayer {
       this.runTick();
     } finally {
       this.tickInProgress = false;
+    }
+  }
+
+  /** Per-object socket-to-engine spans, newest first. Empty on a transport
+   *  that does not stamp. */
+  get deliveryBreakdown(): ReadonlyArray<
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> {
+    return this.deliverySpans;
+  }
+
+  private recordDeliverySpans(obj: MoqtObjectData): void {
+    const { socketFirstMs, socketLastMs, assemblyBusyMs } = obj;
+    if (socketFirstMs === undefined || socketLastMs === undefined) return;
+    const assemblyMs = assemblyBusyMs ?? 0;
+    this.deliverySpans.unshift({
+      // Socket span less read-loop work.
+      transferMs: Math.max(0, socketLastMs - socketFirstMs - assemblyMs),
+      assemblyMs,
+      decodeMs: Math.max(0, performance.now() - socketLastMs),
+      bytes: obj.payload?.byteLength ?? 0,
+    });
+    if (this.deliverySpans.length > MoqtPlayer.DELIVERY_SPAN_SAMPLES) {
+      this.deliverySpans.length = MoqtPlayer.DELIVERY_SPAN_SAMPLES;
     }
   }
 
