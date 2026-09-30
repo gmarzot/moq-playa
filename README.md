@@ -4,7 +4,7 @@
 
 Reference implementation of **Media over QUIC Transport (MoQT)** in TypeScript, with browser WebTransport and experimental native QUIC support for Node.js.
 
-Full stack from transport to viewport, published under two npm scopes so you
+Full stack from transport to viewport, published under one npm scope so you
 pick the integration path that fits:
 
 - **`@openmoq/*`** — the reference-implementation building blocks: protocol core, playback, and browser adapters, composed however you need.

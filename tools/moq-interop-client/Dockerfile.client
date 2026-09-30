@@ -38,6 +38,8 @@ RUN node --experimental-quic -e \
 FROM node-quic AS builder
 WORKDIR /app
 COPY tools/moq-interop-client/package.json tools/moq-interop-client/package-lock.json ./
+# Registry dependencies are third-party tooling only. MoQ libraries below come
+# from this checkout, including before the new package names exist on npm.
 RUN npm ci --no-audit --no-fund
 
 # Build the transport-neutral adapter and native binding from this checkout.
@@ -69,6 +71,9 @@ RUN ln -s /app/node_modules /local/node_modules \
 COPY tools/moq-interop-client/tsconfig.json ./
 COPY tools/moq-interop-client/src ./src
 RUN npx tsc -p tsconfig.json
+RUN test ! -e node_modules/@moqt && test ! -e node_modules/@playa \
+ && node --input-type=module -e \
+      "for (const name of ['@openmoq/transport', '@openmoq/webtransport', '@openmoq/quic']) await import(name)"
 
 # Tests use a separate output tree. The final stage copies their marker, which
 # makes them a mandatory image-build gate without shipping test-only code.
