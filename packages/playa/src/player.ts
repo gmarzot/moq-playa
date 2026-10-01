@@ -110,7 +110,9 @@ export class Player {
 
   /** When the page went away, for the duration reported on the way back. */
   private awaySinceMs: number | null = null;
-  /** Away at least this long and the buffer is stale: re-join live rather than play it out. */
+  /** When the page was frozen. Only a frozen page stops draining; a hidden one keeps up. */
+  private frozenSinceMs: number | null = null;
+  /** Frozen at least this long and the buffer is stale: re-join live rather than play it out. */
   private static readonly RESUME_JUMP_TO_LIVE_MS = 3_000;
 
   /** The MSE autoplay ladder may mute the element itself; mirror it. */
@@ -527,18 +529,22 @@ export class Player {
 
   // ─── Cleanup ─────────────────────────────────────────────────────
 
-  /** Report page-lifecycle transitions; re-join live after RESUME_JUMP_TO_LIVE_MS away. */
+  /** Report page-lifecycle transitions; re-join live after RESUME_JUMP_TO_LIVE_MS frozen. */
   private readonly onLifecycle = (kind: 'hidden' | 'visible' | 'frozen' | 'resumed'): void => {
     if (kind === 'hidden' || kind === 'frozen') {
       this.awaySinceMs ??= Date.now();
+      if (kind === 'frozen') this.frozenSinceMs ??= Date.now();
       this.emitter.emit('lifecycle', { state: kind });
       return;
     }
-    const awayMs = this.awaySinceMs === null ? 0 : Date.now() - this.awaySinceMs;
+    const now = Date.now();
+    const awayMs = this.awaySinceMs === null ? 0 : now - this.awaySinceMs;
+    const frozenMs = this.frozenSinceMs === null ? 0 : now - this.frozenSinceMs;
     this.awaySinceMs = null;
+    this.frozenSinceMs = null;
     this.emitter.emit('lifecycle', { state: kind, awayMs });
-    if (awayMs >= Player.RESUME_JUMP_TO_LIVE_MS && this.state === 'playing') {
-      this.engine.jumpToLive(`resumed after ${(awayMs / 1000).toFixed(1)}s away`);
+    if (frozenMs >= Player.RESUME_JUMP_TO_LIVE_MS && this.state === 'playing') {
+      this.engine.jumpToLive(`resumed after ${(frozenMs / 1000).toFixed(1)}s frozen`);
     }
   };
 

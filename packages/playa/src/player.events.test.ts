@@ -2,7 +2,7 @@
  * Facade event forwarding: engine events re-emitted in the facade's shape.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import { Player } from './player.js';
 import type { SessionClosedEvent } from './events.js';
 
@@ -80,5 +80,41 @@ describe('Player — session_closed', () => {
     (player as any).engine.emitter.emit('session_closed', { type: 'session_closed' });
 
     expect(seen).toEqual([{}]);
+  });
+});
+
+// ─── page lifecycle ──────────────────────────────────────────────────
+
+describe('Player — page lifecycle', () => {
+  let now: MockInstance<() => number>;
+  beforeEach(() => { now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000); });
+  afterEach(() => { now.mockRestore(); });
+
+  function playing() {
+    const player = createPlayer();
+    (player as any)._state = 'playing';
+    const jumpToLive = vi.fn();
+    (player as any).engine.jumpToLive = jumpToLive;
+    const lifecycle = (kind: 'hidden' | 'visible' | 'frozen' | 'resumed') =>
+      (player as any).onLifecycle(kind);
+    return { jumpToLive, lifecycle };
+  }
+
+  it('a tab hidden and shown again keeps playing where it is', () => {
+    const { jumpToLive, lifecycle } = playing();
+    lifecycle('hidden');
+    now.mockReturnValue(1_010_000);
+    lifecycle('visible');
+    expect(jumpToLive).not.toHaveBeenCalled();
+  });
+
+  it('a page frozen for 3 s or more re-joins at the live edge', () => {
+    const { jumpToLive, lifecycle } = playing();
+    lifecycle('hidden');
+    lifecycle('frozen');
+    now.mockReturnValue(1_010_000);
+    lifecycle('resumed');
+    lifecycle('visible');
+    expect(jumpToLive).toHaveBeenCalledOnce();
   });
 });
