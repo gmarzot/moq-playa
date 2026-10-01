@@ -26,6 +26,7 @@ export type {
   StallEvent,
   StallRecoveredEvent,
   LifecycleEvent,
+  SessionClosedEvent,
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';

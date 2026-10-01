@@ -48,6 +48,8 @@ export interface PlayerEventMap {
   'stall_recovered': StallRecoveredEvent;
   /** The page was suspended or restored by the browser. */
   'lifecycle': LifecycleEvent;
+  /** The connection to the relay closed. */
+  'session_closed': SessionClosedEvent;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -146,6 +148,12 @@ export interface LifecycleEvent {
   readonly state: 'hidden' | 'visible' | 'frozen' | 'resumed';
   /** How long the page spent away, on the transition back. */
   readonly awayMs?: number;
+}
+
+export interface SessionClosedEvent {
+  /** Session termination code, when the close carried one. */
+  readonly code?: number;
+  readonly reason?: string;
 }
 
 export interface ErrorEvent {

@@ -737,6 +737,13 @@ export class Player {
       this.emitter.emit('stall_recovered', { durationMs: e.durationMs });
     });
 
+    this.engine.on('session_closed', (e) => {
+      this.emitter.emit('session_closed', {
+        ...(e.error !== undefined ? { code: e.error } : {}),
+        ...(e.reason !== undefined ? { reason: e.reason } : {}),
+      });
+    });
+
     this.engine.on('state_changed', (e) => {
       if (e.to === 'ended') {
         this.timeCtrl?.stop();
