@@ -312,6 +312,10 @@ async function main(): Promise<void> {
   player.on('session_closed', ({ code, reason }) => {
     log(`Session closed${code !== undefined ? ` (code ${code})` : ''}${reason ? `: ${reason}` : ''}`);
   });
+  player.on('session_reconnecting', ({ attempt, delayMs }) => {
+    log(`Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`);
+  });
+  player.on('session_migrated', () => log('Session re-established'));
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
   const renderCushionMs = (): number | null =>
