@@ -756,6 +756,16 @@ export class MoqtConnection {
   }
 
   /**
+   * Whether an abort rejected because the transport already ended the stream:
+   * the peer's STOP_SENDING, answered with RESET_STREAM, or the session closing.
+   * @see W3C WebTransport (WebTransportError.source)
+   */
+  private static endedByTransport(err: unknown): boolean {
+    const source = (err as { source?: unknown } | null | undefined)?.source;
+    return source === 'stream' || source === 'session';
+  }
+
+  /**
    * Run a fire-and-forget teardown thunk, swallowing BOTH a synchronous throw
    * and an asynchronous rejection — the thunk is invoked INSIDE the try, so a
    * sync throw from cancel()/abort() cannot escape and abort the terminal
@@ -788,11 +798,10 @@ export class MoqtConnection {
   }
 
   /**
-   * §5.1.1 ("MUST reset any open streams associated with the SUBSCRIBE"):
-   * reset every open publisher stream for `requestId` and, if the reset cannot
-   * be PROVEN, fail closed. Centralized so no cancellation path can silently
-   * leave an unreset stream behind — an unreachable JS writer is still an open
-   * transport stream, and only closing the session resets it.
+   * Reset every open publisher stream for `requestId` before a PUBLISH_DONE
+   * (§5.1.1: "MUST NOT send it until it has closed all related streams"). An
+   * unproven reset fails closed: only closing the session resets a stream whose
+   * abort is stuck behind its writer's pending close.
    *
    * @returns true when every stream was proven reset.
    */
@@ -805,6 +814,21 @@ export class MoqtConnection {
       );
     }
     return allReset;
+  }
+
+  /**
+   * §5.1.1 on a subscriber's cancellation: reset every open publisher stream for
+   * `requestId`. Nothing is announced afterwards, so an unproven reset is
+   * reported rather than fatal; each queued abort still runs once its writer's
+   * pending close or write settles.
+   */
+  private async resetCancelledPublisherStreams(requestId: bigint, context: string): Promise<void> {
+    if (await this.abortPublisherStreamsForRequest(requestId)) return;
+    this.onError?.(new MoqtConnectionError(
+      `${context}: open streams for request ${requestId} not proven reset within `
+      + `${MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS}ms; their aborts stay queued (§5.1.1)`,
+      { errorSource: 'data', isFatal: false },
+    ));
   }
 
   /** Await `op`, contained, but never longer than `ms`. True if it settled. */
@@ -1097,7 +1121,9 @@ export class MoqtConnection {
    * adapter), but the TRANSPORT stream is still open and its deferred FIN could
    * yet reach the peer. §5.1.1 therefore forbids proceeding to PUBLISH_DONE —
    * the caller must fail closed (see {@link resetPublisherStreamsOrFail}), and
-   * closing the session is what actually resets the stream.
+   * closing the session is what actually resets the stream. A subscriber's
+   * cancellation announces nothing, so it only reports
+   * (see {@link resetCancelledPublisherStreams}).
    */
   private static readonly PUBLISHER_ABORT_DEADLINE_MS = 1000;
 
@@ -2299,7 +2325,7 @@ export class MoqtConnection {
     this.settlePendingAliasOwnership(requestId);
     // §5.1.1: if this was an outbound PUBLISH whose subscriber cancelled (peer
     // reset the PUBLISH request stream), RESET our open data streams for it too.
-    await this.resetPublisherStreamsOrFail(requestId, 'peer stream close');
+    await this.resetCancelledPublisherStreams(requestId, 'peer stream close');
     this.fetchGroupOrder.delete(requestId);
   }
 
@@ -4460,12 +4486,10 @@ export class MoqtConnection {
    * whether ALL of them were proven reset within
    * {@link PUBLISHER_ABORT_DEADLINE_MS}.
    *
-   * @returns true when every abort fulfilled — the only state in which
-   *   PUBLISH_DONE is permitted (§5.1.1: "MUST NOT send it until it has closed
-   *   all related streams"). false when an abort rejected or did not settle:
-   *   an unreachable JS writer is still an OPEN transport stream whose pending
-   *   FIN could reach the peer after the terminal, so the caller must fail
-   *   closed rather than announce a clean end.
+   * @returns true when every stream was proven reset: its abort fulfilled, or
+   *   rejected because the transport had already ended the stream. Only then is
+   *   PUBLISH_DONE permitted (§5.1.1). false when an abort rejected otherwise or
+   *   did not settle: that writer may still be an open transport stream.
    */
   private async abortPublisherStreamsForRequest(requestId: bigint): Promise<boolean> {
     // ALL ownership transfer happens SYNCHRONOUSLY, before the first await:
@@ -4493,19 +4517,19 @@ export class MoqtConnection {
         if (st) {
           this.outgoingStreams.delete(sid);
           // INITIATE every cancellation before awaiting any individual one.
-          // The FULFILMENT of each abort is what proves the stream was reset
-          // (§5.1.1), so a rejection is recorded, not swallowed.
+          // An abort proves the reset (§5.1.1) when it fulfils, or when it
+          // rejects because the transport already ended the stream.
           aborts.push(
             st.writer.abort(new Error('subscription cancelled — RESET_STREAM (§5.1.1)'))
-              .then(() => true, () => false),
+              .then(() => true, (err: unknown) => MoqtConnection.endedByTransport(err)),
           );
         }
       }
     }
     // BOUNDED: see PUBLISHER_ABORT_DEADLINE_MS. A hung FIN defers its writer's
     // abort indefinitely; terminalization must still reach A terminal — but an
-    // unproven reset forbids PUBLISH_DONE (§5.1.1), so report the outcome and
-    // let the caller fail closed instead of claiming the streams are closed.
+    // unproven reset forbids PUBLISH_DONE (§5.1.1), so report the outcome rather
+    // than claim the streams are closed.
     const allReset = await this.allFulfilledWithin(aborts, MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS);
     // Do NOT delete pendingPublishOps here: an openSubgroup already past its
     // beginPublishOp but still awaiting createUnidirectionalStream holds a live
@@ -5274,7 +5298,7 @@ export class MoqtConnection {
           // §5.1.1 (draft-14/16): an inbound UNSUBSCRIBE cancels the
           // subscription — RESET the publisher's open data streams for it.
           if (message.type === 'UNSUBSCRIBE') {
-            await this.resetPublisherStreamsOrFail(
+            await this.resetCancelledPublisherStreams(
               (message as { requestId: bigint }).requestId, 'inbound subscription cancellation');
           }
           // §9.18 (draft-14/16): an inbound FETCH_CANCEL — the fetcher stopped
@@ -5550,7 +5574,7 @@ export class MoqtConnection {
       // §5.1.1: the subscriber cancelled — RESET every publisher data stream
       // still open for this subscription and drop its accounting, so no more
       // objects can be written for a subscription the peer abandoned.
-      if (wasSubscribe) await this.resetPublisherStreamsOrFail(requestId, 'subscription teardown');
+      if (wasSubscribe) await this.resetCancelledPublisherStreams(requestId, 'subscription teardown');
       // The peer ended its direction; FIN ours too so the stream fully closes
       // instead of lingering half-open (idempotent if already terminated).
       await ctx.terminate();
