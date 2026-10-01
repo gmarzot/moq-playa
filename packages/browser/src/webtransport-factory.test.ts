@@ -66,6 +66,32 @@ describe('createWebTransport', () => {
     expect(capturedOptions.protocols).toEqual(['moqt-18']);
   });
 
+  it('passes congestionControl to the constructor, and omits it when unset', async () => {
+    await createWebTransport({ draftVersion: 18, congestionControl: 'low-latency' })(
+      'https://relay.example.com/moq');
+    expect(capturedOptions.congestionControl).toBe('low-latency');
+
+    await createWebTransport({ draftVersion: 18 })('https://relay.example.com/moq');
+    expect('congestionControl' in capturedOptions).toBe(false);
+  });
+
+  it('reports the congestion-control class the browser applied', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = 'moqt-18';
+      congestionControl = 'default'; // the hint was not honored
+      constructor(_url: string, _options?: any) {}
+    });
+    const wt = await createWebTransport({ draftVersion: 18, congestionControl: 'low-latency' })(
+      'https://relay.example.com/moq');
+    expect(wt.congestionControl).toBe('default');
+  });
+
+  it('leaves congestionControl absent when the browser does not report it', async () => {
+    const wt = await createWebTransport({ draftVersion: 18 })('https://relay.example.com/moq');
+    expect('congestionControl' in wt).toBe(false);
+  });
+
   it('returned wrapper exposes incomingBidirectionalStreams when the transport has it', async () => {
     // draft-18 inbound request streams arrive as peer-initiated bidi streams; the
     // wrapper must surface the real transport's incomingBidirectionalStreams.

@@ -47,6 +47,13 @@ export interface WebTransportFactoryOptions {
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
   readonly draftVersion?: 14 | 16 | 18;
+
+  /**
+   * Congestion-control preference for the WebTransport constructor. A hint the
+   * browser may ignore; what it applied is reported as `congestionControl` on
+   * the returned transport.
+   */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 }
 
 /**
@@ -81,6 +88,7 @@ export function createWebTransport(
           value: options.certHash,
         }];
       }
+      if (options?.congestionControl) opts.congestionControl = options.congestionControl;
       if (!withProtocols) return opts;
       // Protocol negotiation via WT-Available-Protocols (§3.1).
       // Draft-14 and below used "moq-00" ALPN over raw QUIC, but over WebTransport
@@ -167,10 +175,12 @@ export function createWebTransport(
     };
 
     const protocol = (transport as any).protocol as string | undefined;
+    const congestionControl = (transport as any).congestionControl as string | undefined;
     // Absent when unsupported, so callers can tell that from empty stats.
     const getStats = (transport as WebTransportLike).getStats;
     return {
       ...(protocol !== undefined ? { protocol } : {}),
+      ...(congestionControl !== undefined ? { congestionControl } : {}),
       ...(getStats ? { getStats: () => getStats.call(transport) } : {}),
       ...wrappedTransport,
     } satisfies WebTransportLike;

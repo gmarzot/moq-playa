@@ -47,6 +47,10 @@ export interface WebTransportLike {
    */
   readonly protocol?: string;
 
+  /** Congestion-control class the browser applied, where it reports one.
+   *  @see W3C WebTransport (congestionControl) */
+  readonly congestionControl?: string;
+
   /**
    * QUIC handshake RTT in milliseconds. Set by the transport factory.
    * Used by the startup buffer to classify network conditions.
