@@ -58,6 +58,8 @@ const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
 const catalogIntervalMs = parseInt(params.get('catalogInterval') ?? '1000', 10);
 /** `?debug=1`: per-second ingest snapshots and catalog re-emissions. */
 const debug = params.get('debug') === '1';
+/** `?status=0` hides the state overlay, which is on by default on this page. */
+const showStatus = params.get('status') !== '0';
 /** Capture frame rate. One frame period is latency before encode starts:
  *  42ms at 24fps, 17ms at 60. */
 const captureFps = parseInt(params.get('fps') ?? '60', 10);
@@ -110,6 +112,7 @@ const namespace = params.get('ns') ?? mintNamespace();
   const sFps = document.getElementById('s-fps') as HTMLInputElement;
   const sTarget = document.getElementById('s-target') as HTMLInputElement;
   const sCatalogInterval = document.getElementById('s-catalog-interval') as HTMLInputElement;
+  const sStatus = document.getElementById('s-status') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
   const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
   const applyBtn = document.getElementById('settings-apply')!;
@@ -145,6 +148,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     sFps.value = String(captureFps);
     sTarget.value = String(targetLatencyMs);
     sCatalogInterval.value = String(catalogIntervalMs);
+    sStatus.checked = showStatus;
     sDebug.checked = debug;
     sAudioDatagram.checked = audioDatagrams;
   }
@@ -171,6 +175,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (sFps.value && sFps.value !== '60') np.set('fps', sFps.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     if (sCatalogInterval.value && sCatalogInterval.value !== '1000') np.set('catalogInterval', sCatalogInterval.value);
+    if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked) np.set('audioDatagram', '1');
     const qs = np.toString();
@@ -182,6 +187,7 @@ const namespace = params.get('ns') ?? mintNamespace();
 
 const preview = document.getElementById('preview') as HTMLVideoElement;
 const stateBadge = document.getElementById('state')!;
+stateBadge.hidden = !showStatus;
 const shareBtn = document.getElementById('share-btn') as HTMLButtonElement;
 const shareBackdrop = document.getElementById('share-backdrop')!;
 const shareUrlInput = document.getElementById('share-url') as HTMLInputElement;
@@ -190,11 +196,11 @@ const shareCopied = document.getElementById('share-copied')!;
 const shareOpenBtn = document.getElementById('share-open')!;
 const shareCloseBtn = document.getElementById('share-close')!;
 let currentViewerLink = '';
-const liveBadge = document.getElementById('live-badge')!;
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
 const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
 const catMeta = document.getElementById('cat-meta')!;
+const catSize = document.getElementById('cat-size')!;
 const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
@@ -227,8 +233,6 @@ function setState(label: string, cls: BroadcastState): void {
 // replacement's UI, so resetBroadcastUi clears it.
 let currentPublisher: MediaPublisher | null = null;
 let currentConnection: MoqtConnection | null = null;
-let currentDraft: number | null = null;
-let captureRes = '—';
 let liveSinceMs: number | null = null;
 let catalogJsonText = '';
 
@@ -248,6 +252,10 @@ function wireCopy(btn: HTMLButtonElement, text: () => string): void {
 
 // ─── Published catalog ───────────────────────────────────────────────
 
+/** Audio, then video, then anything else in the order it arrived. */
+const trackRank = (name: unknown): number =>
+  name === 'audio' ? 0 : name === 'video' ? 1 : 2;
+
 /** Render the catalog from the SAME builder the catalog track publishes, so
  *  the panel cannot drift from the bytes on the wire. */
 function renderCatalogPanel(params: BroadcastCatalogParams): void {
@@ -255,17 +263,28 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
   const text = new TextDecoder().decode(bytes);
   catalogJsonText = text;
   let tracks: Array<Record<string, unknown>> = [];
+  let version: unknown;
   try {
-    const doc = JSON.parse(text) as { tracks?: Array<Record<string, unknown>> };
+    const doc = JSON.parse(text) as
+      { tracks?: Array<Record<string, unknown>>; version?: unknown };
     tracks = doc.tracks ?? [];
+    version = doc.version;
     catJson.textContent = JSON.stringify(doc, null, 2);
   } catch {
     catJson.textContent = text;
   }
-  catMeta.textContent = `${tracks.length} track(s) · ${bytes.byteLength}B`;
-  catTracks.replaceChildren(...tracks.map((t) => {
+  // Same header shape as the player's catalog panel.
+  const packagings = [...new Set(tracks.map((t) => String(t['packaging'])))].join(', ');
+  catMeta.textContent = packagings
+    ? `${packagings} (v${String(version ?? '?')})` : `v${String(version ?? '?')}`;
+  catSize.textContent = ` · ${bytes.byteLength}B`;
+  // Display order only; the published catalog keeps its own.
+  const ordered = [...tracks].sort(
+    (a, b) => trackRank(a['name']) - trackRank(b['name']));
+  catTracks.replaceChildren(...ordered.map((t) => {
     const row = document.createElement('div');
-    row.className = 'cat-track';
+    const role = t['name'] === 'video' ? ' video' : t['name'] === 'audio' ? ' audio' : '';
+    row.className = `cat-track${role}`;
     // 24000/1001 arrives as 23.976043701171875; three places is the most that
     // distinguishes real rates.
     const fps = Number(Number(t['framerate']).toFixed(3));
@@ -273,8 +292,7 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
       ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
       : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`;
     row.innerHTML = `<span class="nm">${String(t['name'])}</span>`
-      + `<span class="pk">${String(t['packaging'])}</span>`
-      + `<span class="sub" data-track="${String(t['name'])}">pending</span>`
+      + `<span class="sub" data-track="${String(t['name'])}" hidden></span>`
       + `<span class="dt">${detail}</span>`;
     return row;
   }));
@@ -287,13 +305,13 @@ function renderTrackStates(): void {
   const retired = new Set(currentPublisher?.retiredTracks ?? []);
   for (const el of catTracks.querySelectorAll<HTMLElement>('.sub')) {
     const track = el.dataset['track'] ?? '';
-    const live = liveSinceMs !== null;
-    let cls = '', label = 'pending';
+    // Shown only when a track is paused or retired.
+    let cls = '', label = '';
     if (retired.has(track)) { cls = 'retired'; label = 'retired'; }
     else if (paused.has(track)) { cls = 'paused'; label = 'paused'; }
-    else if (live) { cls = 'on'; label = 'forwarding'; }
     el.className = `sub ${cls}`.trim();
     el.textContent = label;
+    el.hidden = label === '';
   }
 }
 
@@ -330,16 +348,18 @@ function renderMetrics(): void {
   const qv = p?.videoQueueDepth ?? 0, qa = p?.audioQueueDepth ?? 0;
   const backlog = qv > q.video / 2 || qa > q.audio / 2;
 
+  // Measurements only; relay, namespace and draft are on the title line.
   diagGrid.innerHTML = [
-    cell('uptime', up, liveSinceMs === null ? 'idle' : ''),
+    cell('bitrate a/v', p ? `${aKbps.toFixed(0)}/${vKbps.toFixed(0)}${u('kbps')}` : '—', p ? 'num' : 'idle'),
     cell('fps enc', p ? fpsEnc.toFixed(0) : '—', p ? 'num' : 'idle'),
-    cell('bitrate v/a', p ? `${vKbps.toFixed(0)}/${aKbps.toFixed(0)}${u('kbps')}` : '—', p ? 'num' : 'idle'),
-    cell('objects v/a', p ? `${p.frameCount}/${p.audioChunkCount}` : '—', p ? '' : 'idle'),
-    cell('keyframes', p ? String(p.keyframeCount) : '—', p ? '' : 'idle'),
-    cell('queue v/a', p ? `${qv}/${qa}${u(`of ${q.video}/${q.audio}`)}` : '—', backlog ? 'fault' : p ? '' : 'idle'),
-    cell('capture', captureRes, captureRes === '—' ? 'idle' : 'str'),
-    cell('namespace', namespace, 'str'),
-    cell('draft', currentDraft ? String(currentDraft) : '—', currentDraft ? 'str' : 'idle'),
+    // A setting published in the catalog, so it reads the same live or idle.
+    cell('target', `${targetLatencyMs}${u('ms')}`, 'num'),
+    cell('objects a/v', p ? `${p.audioChunkCount}/${p.frameCount}` : '—', p ? 'num' : 'idle'),
+    cell('keyframes', p ? String(p.keyframeCount) : '—', p ? 'num' : 'idle'),
+    // Frames waiting for the wire, against the depth where shedding starts.
+    cell('queue a/v', p ? `${qa}/${qv}${u(`max ${q.audio}/${q.video}`)}` : '—',
+      backlog ? 'fault' : p ? 'num' : 'idle'),
+    cell('uptime', up, liveSinceMs === null ? 'idle' : 'num'),
   ].join('');
   renderTrackStates();
 }
@@ -369,6 +389,11 @@ setInterval(() => {
 }, 1000);
 renderMetrics();
 
+function setText(id: string, value: string): void {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
 /** `?debug=1`: one line per second while publishing, so an overnight soak
  *  leaves a copyable time series rather than only a final reading. */
 function logSnapshot(): void {
@@ -387,6 +412,10 @@ function logSnapshot(): void {
 // which one a soak ran on. Echo the whole configuration before anything starts.
 log(`Namespace: ${namespace}`);
 log(`Relay: ${params.get('url') ?? `${DEFAULT_RELAY} (default)`}`);
+// https is implied on this page.
+setText('conn-relay', (params.get('url') ?? DEFAULT_RELAY).replace(/^https:\/\//, ''));
+setText('conn-ns', namespace);
+setText('conn-draft', String(broadcastDraft));
 log(`Draft: ${broadcastDraft} · codec ${videoCodec} · ${videoBitrate / 1000}kbps · `
   + `keyframe every ${keyframeInterval} · target ${targetLatencyMs}ms`);
 
@@ -557,7 +586,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       await conn.connect(transport, { maxRequestId: varint(100) });
       ctx.throwIfCancelled();
       negotiatedDraft = conn.draftVersion;
-      currentDraft = negotiatedDraft;
+      // Show the negotiated draft.
+      setText('conn-draft', String(negotiatedDraft));
       currentConnection = conn;
       log(`Session established (draft-${negotiatedDraft}).`);
 
@@ -588,7 +618,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         ...(debug ? { onCatalogReemitted: (bytes: number) => log(`Catalog re-emitted (${bytes} bytes)`) } : {}),
         onCatalogPublished: () => {
           setState('live', 'live');
-          liveBadge.hidden = false;
           liveSinceMs ??= Date.now();
         },
         // Only the CURRENT attempt's session may drive the global stop.
@@ -672,7 +701,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       if (hashParam) viewerParams.set('hash', hashParam);
       currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
       shareBtn.hidden = false;
-      captureRes = `${width}x${height}`;
       renderCatalogPanel({
         videoCodec, width, height, fps, videoBitrate, targetLatencyMs,
         ...(audio ? { audio } : {}),
@@ -714,12 +742,10 @@ async function stopBroadcast(): Promise<void> {
 function resetBroadcastUi(): void {
   preview.srcObject = null;
   setState('idle', 'idle');
-  liveBadge.hidden = true;
   shareBtn.hidden = true;
   currentPublisher = null;
   currentConnection = null;
-  currentDraft = null;
-  captureRes = '—';
+  setText('conn-draft', String(broadcastDraft));
   liveSinceMs = null;
   lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
   startCameraBtn.disabled = false;
