@@ -7340,6 +7340,12 @@ export class MoqtPlayer {
   jumpToLive(reason: string): void {
     if (!this.connection) return;
     this.log.info('Jump to live: %s', reason);
+    // As the stall path does: drop the backlog, refuse stale groups still in
+    // flight, and re-anchor on what arrives next.
+    for (const pipeline of [this.videoPipeline, this.audioPipeline]) {
+      pipeline?.reset(pipeline.currentGroupId + 1n);
+    }
+    this.syncController?.reset();
     this.requestFreshSubscriptionStart('video');
     this.requestFreshSubscriptionStart('audio');
     this.emitter.emit('recovery_action', {

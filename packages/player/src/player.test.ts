@@ -11345,3 +11345,32 @@ describe('MSE gap-jump escalation and wiring', () => {
     await player.destroy();
   });
 });
+
+describe('MoqtPlayer.jumpToLive', () => {
+  it('resets both pipelines past their current group and the sync reference before re-subscribing', () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    const order: string[] = [];
+    const video = { currentGroupId: 41n, reset: vi.fn(() => { order.push('video reset'); }) };
+    const audio = { currentGroupId: 900n, reset: vi.fn(() => { order.push('audio reset'); }) };
+    const sync = { reset: vi.fn(() => { order.push('sync reset'); }) };
+    const requestUpdate = vi.fn(async () => { order.push('update'); });
+    Object.assign(player as any, {
+      videoPipeline: video,
+      audioPipeline: audio,
+      syncController: sync,
+      connection: { requestUpdate },
+    });
+    (player as any).activeSubscriptions.set(2n, { mediaType: 'video', trackName: 'video' });
+    (player as any).activeSubscriptions.set(3n, { mediaType: 'audio', trackName: 'audio' });
+
+    player.jumpToLive('test');
+
+    expect(video.reset).toHaveBeenCalledWith(42n);
+    expect(audio.reset).toHaveBeenCalledWith(901n);
+    expect(sync.reset).toHaveBeenCalledOnce();
+    expect(requestUpdate.mock.calls.map((c: any[]) => c[1].subscriptionFilter.type))
+      .toEqual(['NextGroupStart', 'NextGroupStart']);
+    expect(order.indexOf('update')).toBeGreaterThan(order.indexOf('sync reset'));
+  });
+});
