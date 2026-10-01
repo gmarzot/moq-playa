@@ -70,6 +70,11 @@ const audioDatagrams = params.get('audioDatagram') === '1';
 const bitrateMode: 'constant' | 'variable' | undefined =
   params.get('bitrateMode') === 'constant' ? 'constant'
     : params.get('bitrateMode') === 'variable' ? 'variable' : undefined;
+/** `?congestionControl=low-latency|throughput`: a hint to the browser's QUIC
+ *  congestion controller. Unset leaves the browser default. */
+const congestionControl: 'low-latency' | 'throughput' | undefined =
+  params.get('congestionControl') === 'low-latency' ? 'low-latency'
+    : params.get('congestionControl') === 'throughput' ? 'throughput' : undefined;
 /**
  * `?ns=` when given, otherwise one minted per TAB and held in sessionStorage.
  *
@@ -105,6 +110,7 @@ const namespace = params.get('ns') ?? mintNamespace();
   const sNs = document.getElementById('s-ns') as HTMLInputElement;
   const sHash = document.getElementById('s-hash') as HTMLInputElement;
   const sVersion = document.getElementById('s-version') as HTMLSelectElement;
+  const sCc = document.getElementById('s-cc') as HTMLSelectElement;
   const sCodec = document.getElementById('s-codec') as HTMLSelectElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
@@ -141,6 +147,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     sNs.value = namespace;
     sHash.value = params.get('hash') ?? '';
     sVersion.value = String(broadcastDraft);
+    sCc.value = congestionControl ?? '';
     sCodec.value = videoCodec;
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
@@ -168,6 +175,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (ns) np.set('ns', ns);
     if (sHash.value.trim()) np.set('hash', sHash.value.trim());
     if (sVersion.value) np.set('v', sVersion.value);
+    if (sCc.value) np.set('congestionControl', sCc.value);
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
@@ -577,7 +585,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       resolvedRelayUrl = relayUrl;
 
       log(`Connecting to ${relayUrl}...`);
-      const transportFactory = createWebTransport({ ...(certHash ? { certHash } : {}), draftVersion: broadcastDraft });
+      const transportFactory = createWebTransport({
+        ...(certHash ? { certHash } : {}),
+        draftVersion: broadcastDraft,
+        ...(congestionControl ? { congestionControl } : {}),
+      });
       // Each resource is adopted the moment it exists — a cancellation or a
       // handshake failure between these awaits must not leak the transport or
       // the connection.
@@ -605,6 +617,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       setText('conn-draft', String(negotiatedDraft));
       currentConnection = conn;
       log(`Session established (draft-${negotiatedDraft}).`);
+      log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
+        + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
         catalog: {
