@@ -2,7 +2,7 @@
  * G5 Player
  *
  * Plays LOC and CMAF through the relay and instruments what it sees: a metrics
- * row of health counters, four charts on one shared time axis, the catalog as
+ * row of health counters, three charts on one shared time axis, the catalog as
  * delivered, and a transport panel. Built on openmoq/moq-playa; the engine is
  * theirs, the instrument is not.
  */
@@ -12,6 +12,9 @@ import {
   namespace, certHash, draftVersion, catalogBootstrap, warmStart,
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
 } from '../shared/cert.js';
+
+/** `?status=1` shows the playback state over the picture (off by default). */
+const showStatus = new URLSearchParams(location.search).get('status') === '1';
 
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
@@ -29,19 +32,18 @@ const volumeBar = document.getElementById('volume') as HTMLInputElement;
 const muteBtn = document.getElementById('mute-btn') as HTMLButtonElement;
 const qualitySelect = document.getElementById('quality') as HTMLSelectElement;
 const stateBadge = document.getElementById('state')!;
+stateBadge.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
 const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
 const latSpark = document.getElementById('lat-spark') as HTMLCanvasElement;
 const jitSpark = document.getElementById('jit-spark') as HTMLCanvasElement;
 const cusSpark = document.getElementById('cus-spark') as HTMLCanvasElement;
-const cusVal = document.getElementById('cus-val')!;
+const cusAVal = document.getElementById('cus-a')!;
+const cusVVal = document.getElementById('cus-v')!;
+const cusDVal = document.getElementById('cus-d')!;
 const cusTarget = document.getElementById('cus-target')!;
 const cusCushion = document.getElementById('cus-cushion')!;
-const bufSpark = document.getElementById('buf-spark') as HTMLCanvasElement;
-const bufDVal = document.getElementById('bufd-val')!;
-const bufVVal = document.getElementById('bufv-val')!;
-const bufAVal = document.getElementById('bufa-val')!;
 const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const latMax = document.getElementById('lat-max')!;
@@ -49,6 +51,7 @@ const latLabel = document.getElementById('lat-label')!;
 const jitVal = document.getElementById('jit-val')!;
 const catalogPanel = document.getElementById('catalog-panel')!;
 const catMeta = document.getElementById('cat-meta')!;
+const catSize = document.getElementById('cat-size')!;
 const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
@@ -58,6 +61,11 @@ const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
 const layoutEl = document.getElementById('layout')!;
 const logEl = document.getElementById('log')!;
 const playerContainer = document.getElementById('player-container')!;
+
+const setText = (id: string, value: string): void => {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+};
 
 function log(msg: string): void {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
@@ -71,7 +79,7 @@ function log(msg: string): void {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
   const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'cushion', 'cushionMax',
-    'catchUp', 'catalogBootstrap', 'authority', 'hash', 'warmStart', 'debug'];
+    'catchUp', 'catalogBootstrap', 'authority', 'hash', 'status', 'debug'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const backdrop = byId('settings-backdrop');
@@ -85,7 +93,7 @@ function log(msg: string): void {
   const fBootstrap = byId<HTMLSelectElement>('s-bootstrap');
   const fAuthority = byId<HTMLInputElement>('s-authority');
   const fHash = byId<HTMLInputElement>('s-hash');
-  const fWarm = byId<HTMLInputElement>('s-warm');
+  const fStatus = byId<HTMLInputElement>('s-status');
   const fDebug = byId<HTMLInputElement>('s-debug');
   const advSec = byId<HTMLDetailsElement>('s-adv');
 
@@ -103,7 +111,7 @@ function log(msg: string): void {
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
     fAuthority.value = p.get('authority') ?? '';
     fHash.value = p.get('hash') ?? '';
-    fWarm.checked = p.get('warmStart') === '1';
+    fStatus.checked = p.get('status') === '1';
     fDebug.checked = p.get('debug') === '1';
     // Open Advanced when anything in it is set, so a non-default is never hidden.
     advSec.open = MANAGED.slice(3).some((k) => p.has(k));
@@ -133,7 +141,7 @@ function log(msg: string): void {
     set('catalogBootstrap', fBootstrap.value);
     set('authority', fAuthority.value.trim());
     set('hash', fHash.value.trim());
-    if (fWarm.checked) next.set('warmStart', '1');
+    if (fStatus.checked) next.set('status', '1');
     if (fDebug.checked) next.set('debug', '1');
     const qs = next.toString();
     location.href = location.pathname + (qs ? `?${qs}` : '');
@@ -277,13 +285,25 @@ async function main(): Promise<void> {
     }
     return video;
   };
+  // Fires at the detection threshold; the outage length comes with stall_recovered.
   player.on('stall', ({ durationMs }) => {
     const video = watchVideo();
     const where = video
       ? ` start: ${stallStartSnap || '?'} · end: ${describeVideo(video)}` : '';
-    log(`Stall: ${durationMs.toFixed(0)}ms${where}`);
+    log(`Stall detected after ${durationMs.toFixed(0)}ms${where}`);
     stallStartSnap = '';
-    stallMarks.push(cushionSamples.length);
+    stallMarks.push(queuedASamples.length);
+  });
+
+  player.on('stall_recovered', ({ durationMs }) => {
+    log(`Stall recovered — outage ${(durationMs / 1000).toFixed(2)}s`);
+  });
+
+  // Page suspensions otherwise look like network gaps in the log.
+  player.on('lifecycle', ({ state, awayMs }) => {
+    log(awayMs === undefined
+      ? `Page ${state}`
+      : `Page ${state} after ${(awayMs / 1000).toFixed(1)}s away`);
   });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
@@ -307,6 +327,12 @@ async function main(): Promise<void> {
     // Amber only once a counter has something to report; white at zero.
     const FAULT = (n: number) => (n > 0 ? 'fault' : '');
     const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
+    // Session-long counters: exact below 10k, then compact (12.3K, 1.20M).
+    const fmtCount = (n: number): string => {
+      if (n < 10_000) return String(n);
+      if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`;
+      return `${(n / 1_000_000).toFixed(2)}M`;
+    };
     // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
@@ -321,37 +347,42 @@ async function main(): Promise<void> {
     const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
-      // Frames that were decoded but never presented are the interesting part,
-      // so the pair stays together rather than in two separate columns.
-      cell('bitrate v/a', `${fmtKbps(trackKbps('video'))}/${fmtKbps(trackKbps('audio'))}`, 'kbps', NUM),
-      cell('rend/dec', `${s.framesRendered ?? 0}/${s.framesDecoded ?? 0}`, '', NUM),
+      cell('bitrate a/v', `${fmtKbps(trackKbps('audio'))}/${fmtKbps(trackKbps('video'))}`, 'kbps', NUM),
       // Cross-stream arrival order, not a fault: LOC audio is one group per frame
       // on its own QUIC stream and independent streams carry no ordering between
       // them. The settle time is the one with a cliff in front of it — past the
       // adaptive gap timeout the object is discarded and costs a sync reset — so
       // it, not the count, is what goes amber.
-      cell('reorder v/a',
-        `${seqStat('video', 'reorders')}/${seqStat('audio', 'reorders')}`,
+      cell('reorder a/v',
+        `${fmtCount(seqStat('audio', 'reorders'))}/${fmtCount(seqStat('video', 'reorders'))}`,
         `&le;${settleMs.toFixed(0)}ms`, NUM, settleTone),
       // Worst event-loop lag in the window. Tens of ms is ordinary scheduling;
       // hundreds means the thread is blocked or the tab is being throttled.
-      cell('lag ms', lagSamples.length ? lagWorst.toFixed(0) : '—', '',
+      cell('lag', lagSamples.length ? lagWorst.toFixed(0) : '—', 'ms',
         lagWorst > 100 ? 'fault' : NUM),
-      // Render cushion rides the queued-ahead chart label and A/V skew has a
-      // chart of its own: this row is for facts and fault counts, not gauges.
+      // Clock divergence removed from the latency chart; amber past 10 ms/min.
+      cell('clk drift',
+        clockDriftMsPerMin != null ? clockDriftMsPerMin.toFixed(1) : '—', 'ms/min',
+        clockDriftMsPerMin != null && Math.abs(clockDriftMsPerMin) > 10 ? 'fault' : NUM),
+      // Worst object in the window: transit / reassembly / routing ms, then its size.
+      cell('slowest t/a/d', worstDelivery(), worstDeliverySize(),
+        worstDeliveryLocalMs() > 50 ? 'fault' : NUM),
+      // Queue depths are on the queued chart; this row is facts and fault counts.
       ...(locPath ? [
-        cell('resyncs', String(syncResets), '', FAULT(syncResets)),
-        cell('underruns', String(s.audioUnderruns ?? 0), '', FAULT(s.audioUnderruns ?? 0)),
+        cell('resyncs', fmtCount(syncResets), '', FAULT(syncResets)),
+        cell('underruns', fmtCount(s.audioUnderruns ?? 0), '', FAULT(s.audioUnderruns ?? 0)),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
-        cell('late/snap', `${(player as any).engine?.stats?.loc?.audioLateDrops ?? 0}`
-          + `/${(player as any).audioOutput?.liveEdgeSnapCount ?? 0}`, '',
+        cell('late/snap',
+          `${fmtCount((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)}`
+          + `/${fmtCount((player as any).audioOutput?.liveEdgeSnapCount ?? 0)}`, '',
           FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
             + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
       ] : []),
-      cell('dropped', String(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
+      cell('dropped', fmtCount(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.
-      cell('obj lost v/a', `${seqStat('video', 'lost')}/${seqStat('audio', 'lost')}`, '',
+      cell('obj lost a/v',
+        `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`, '',
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
         FAULT(s.stallCount ?? 0)),
@@ -370,10 +401,13 @@ async function main(): Promise<void> {
   // capture timestamps it degrades to arrival-interval deviation.
 
   // Raw per-object latency with arrival times, trimmed to a window. The chart
-  // series below are filled on the 250 ms tick instead of per object, so all
-  // four charts share one time axis (180 samples = 45 s) and features line up.
+  // series below are filled on the tick instead of per object, so every chart
+  // shares one time axis (180 samples = 45 s) and features line up.
+  const TICK_MS = 250;
   const latWindow: Array<[number, number]> = [];
   const LAT_WINDOW_MS = 4_000;
+  /** Clock divergence rate from the drift fit, in ms per minute. */
+  let clockDriftMsPerMin: number | null = null;
   // Both curves are the printed p50 and p95 over the same window, so the lines
   // and the numbers cannot disagree. Max stays a readout: as a curve it is one
   // sample wide and reads as noise.
@@ -383,15 +417,11 @@ async function main(): Promise<void> {
   // across the whole charted span. p95 over ~120 samples cannot be moved by a
   // lone spike, so this is the only series here that sees one.
   const latTickMaxSamples: number[] = [];
-  // Per-tick floor, for the offset estimate below.
-  const latMinSamples: number[] = [];
   const jitSamples: number[] = [];
-  // Playout cushion: media buffered ahead of the playhead, sampled every
-  // 250ms — MSE from the <video> element's buffered ranges, WebCodecs
-  // from the engine's buffer-depth stat. Starvation (cushion ≈ 0 at a
-  // stall marker) points at the player; a healthy cushion points wire-ward.
-  const cushionSamples: number[] = [];
-  const bufDeltaSamples: number[] = [];
+  // Per-track queued media ahead of the playhead, one sample per tick. The audio
+  // series also carries the stall-mark indices.
+  const queuedASamples: number[] = [];
+  const queuedVSamples: number[] = [];
   // Event-loop lag: how late a timer that does nothing actually runs. The 250 ms
   // tick below cannot measure this — setInterval waits for its own callback, so
   // its period carries this page's draw cost. A bare probe carries only
@@ -440,6 +470,52 @@ async function main(): Promise<void> {
   const percentile = (a: number[], p: number): number => {
     const s = [...a].sort((x, y) => x - y);
     return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0;
+  };
+
+  /** The object with the worst socket-to-engine total in the window. */
+  type DeliverySpan =
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number };
+  const worstSpan = (): DeliverySpan | null => {
+    const spans = (player as any).engine?.deliveryBreakdown as DeliverySpan[] | undefined;
+    if (!spans?.length) return null;
+    let worst = spans[0]!;
+    let worstTotal = -1;
+    for (const s of spans) {
+      const total = s.transferMs + s.assemblyMs + s.decodeMs;
+      if (total > worstTotal) { worstTotal = total; worst = s; }
+    }
+    return worst;
+  };
+  const worstDelivery = (): string => {
+    const s = worstSpan();
+    return s === null ? '—'
+      : `${s.transferMs.toFixed(0)}/${s.assemblyMs.toFixed(0)}/${s.decodeMs.toFixed(0)}`;
+  };
+  /** The worst object's size, shown in the unit slot. */
+  const worstDeliverySize = (): string => {
+    const s = worstSpan();
+    return s === null ? '' : `ms @${(s.bytes / 1024).toFixed(0)}K`;
+  };
+  /** The share of the worst object that was spent in this stack, not in transit. */
+  const worstDeliveryLocalMs = (): number => {
+    const s = worstSpan();
+    return s === null ? 0 : s.assemblyMs + s.decodeMs;
+  };
+
+  /** Least-squares fit of the per-tick latency floor against tick index, from
+   *  session start: its slope is the clock divergence. */
+  const driftFit = { n: 0, sx: 0, sy: 0, sxx: 0, sxy: 0 };
+  /** Ticks before a slope is reported — below this it is fitting jitter. */
+  const DRIFT_MIN_SAMPLES = 120;
+  const addDriftSample = (floorMs: number): number | null => {
+    const k = driftFit.n;
+    driftFit.n++;
+    driftFit.sx += k; driftFit.sy += floorMs;
+    driftFit.sxx += k * k; driftFit.sxy += k * floorMs;
+    if (driftFit.n < DRIFT_MIN_SAMPLES) return null;
+    const denom = driftFit.n * driftFit.sxx - driftFit.sx * driftFit.sx;
+    if (denom === 0) return null;
+    return (driftFit.n * driftFit.sxy - driftFit.sx * driftFit.sy) / denom;
   };
 
   // Per-track object continuity. Arrival order is not delivery order: LOC audio
@@ -624,60 +700,46 @@ async function main(): Promise<void> {
 
   /** Two series on one scale — only comparable on a shared axis. */
   function drawSpark2(canvas: HTMLCanvasElement, a: number[], aColor: string,
-                      b: number[], bColor: string): void {
+                      b: number[], bColor: string, refLine = 0,
+                      marks?: number[]): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const w = canvas.width = canvas.clientWidth * devicePixelRatio;
     const h = canvas.height = canvas.clientHeight * devicePixelRatio;
     ctx.clearRect(0, 0, w, h);
-    const max = Math.max(1, ...a.filter(Number.isFinite), ...b.filter(Number.isFinite)) * 1.15;
+    const max = Math.max(1, refLine,
+      ...a.filter(Number.isFinite), ...b.filter(Number.isFinite)) * 1.15;
+    const xOf = (i: number, n: number) => (i / (n - 1)) * w;
+    const yOf = (v: number) => h - (v / max) * (h - 6) - 3;
+    if (refLine > 0) {
+      ctx.beginPath();
+      ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
+      ctx.moveTo(0, yOf(refLine));
+      ctx.lineTo(w, yOf(refLine));
+      ctx.strokeStyle = '#667';
+      ctx.lineWidth = devicePixelRatio;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    for (const m of marks ?? []) {
+      if (m < 0 || m >= a.length) continue;
+      ctx.fillStyle = 'rgba(204, 68, 68, 0.55)';
+      ctx.fillRect(xOf(m, a.length) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
+    }
     for (const [data, color] of [[a, aColor], [b, bColor]] as Array<[number[], string]>) {
       if (data.filter(Number.isFinite).length < 2) continue;
       ctx.beginPath();
       let pen = false;
       data.forEach((v, i) => {
         if (!Number.isFinite(v)) { pen = false; return; }
-        const x = (i / (data.length - 1)) * w;
-        const y = h - (v / max) * (h - 6) - 3;
+        const x = xOf(i, data.length);
+        const y = yOf(v);
         if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
       });
       ctx.strokeStyle = color;
       ctx.lineWidth = devicePixelRatio;
       ctx.stroke();
     }
-  }
-
-  /** Signed series around a zero rule: only the divergence is the signal. */
-  function drawDelta(canvas: HTMLCanvasElement, data: number[]): void {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const w = canvas.width = canvas.clientWidth * devicePixelRatio;
-    const h = canvas.height = canvas.clientHeight * devicePixelRatio;
-    ctx.clearRect(0, 0, w, h);
-    const zeroY = h / 2;
-    ctx.beginPath();
-    ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
-    ctx.moveTo(0, zeroY);
-    ctx.lineTo(w, zeroY);
-    ctx.strokeStyle = '#667';
-    ctx.lineWidth = devicePixelRatio;
-    ctx.stroke();
-    ctx.setLineDash([]);
-    const live = data.filter(Number.isFinite);
-    if (live.length < 2) return;
-    // A floor on the scale keeps normal ±ms wobble from looking like drift.
-    const span = Math.max(100, ...live.map(Math.abs)) * 1.15;
-    ctx.beginPath();
-    let pen = false;
-    data.forEach((v, i) => {
-      if (!Number.isFinite(v)) { pen = false; return; }
-      const x = (i / (data.length - 1)) * w;
-      const y = zeroY - (v / span) * (h / 2 - 3);
-      if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
-    });
-    ctx.strokeStyle = '#d9922e';
-    ctx.lineWidth = devicePixelRatio;
-    ctx.stroke();
   }
 
   // ── Transport panel (QUIC/WebTransport) ───────────────────────────
@@ -741,20 +803,9 @@ async function main(): Promise<void> {
       const ms = (player as any).engine?.mediaSource;
       if (ms && ms.debug === false) ms.debug = true;
     }
-    // Contiguous cushion only (facade-computed per path). Zero with appends
-    // still landing means the playhead is parked at a hole.
+    // Per-track depth ahead of the playhead: MSE SourceBuffers on CMAF; on LOC
+    // the render queue and the audio scheduled in WebAudio.
     const tickNowMs = performance.now();
-    const cushionMs = player.stats.cushionMs;
-    if (player.state !== 'idle') {
-      cushionSamples.push(cushionMs ?? NaN);
-      if (cushionSamples.length > 180) {
-        cushionSamples.shift();
-        for (let i = 0; i < stallMarks.length; i++) stallMarks[i]!--;
-        while (stallMarks.length && stallMarks[0]! < 0) stallMarks.shift();
-      }
-    }
-    // Per-track buffer: MSE SourceBuffers on CMAF; on LOC the renderer's
-    // queued video against the audio output's scheduled audio.
     const eng = (player as any).engine;
     const byKind = eng?.mediaSource?.getBufferAheadMsByKind?.();
     const vMs = byKind ? byKind.video
@@ -763,27 +814,28 @@ async function main(): Promise<void> {
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
     if (player.state !== 'idle') {
-      pushSample(bufDeltaSamples, vMs != null && aMs != null ? vMs - aMs : NaN);
+      queuedASamples.push(aMs ?? NaN);
+      if (queuedASamples.length > 180) {
+        queuedASamples.shift();
+        for (let i = 0; i < stallMarks.length; i++) stallMarks[i]!--;
+        while (stallMarks.length && stallMarks[0]! < 0) stallMarks.shift();
+      }
+      pushSample(queuedVSamples, vMs ?? NaN);
     }
 
     // Sample the measurements onto the shared time axis before drawing.
     const latRaw = latWindow.map(([, v]) => v);
-    if (latRaw.length) pushSample(latMinSamples, Math.min(...latRaw));
-    // Clocks that disagree — or a publisher whose capture stamps run ahead of
-    // its own clock — put every sample below zero by a constant. The floor of
-    // the charted window is that constant: subtracting it leaves the spikes,
-    // the jitter and the shape, which is what the chart is for. Zero offset
-    // when the samples are already positive, so a synced pair reads absolute.
-    // A low percentile rather than the outright floor: one bad stamp must not
-    // re-base the whole chart for the length of the window.
-    const latOffset = latMinSamples.length
-      ? Math.min(0, percentile(latMinSamples, 0.05)) : 0;
-    const latVals = latOffset
-      ? latRaw.map((v) => Math.max(0, v - latOffset)) : latRaw;
+    // Remove the clock-rate divergence accumulated since load. The constant
+    // offset stays: one-way delay cannot separate it from transit.
+    const driftSlope = latRaw.length ? addDriftSample(Math.min(...latRaw)) : null;
+    clockDriftMsPerMin = driftSlope !== null ? driftSlope * (60_000 / TICK_MS) : null;
+    const driftSinceStartMs = driftSlope !== null ? driftSlope * (driftFit.n - 1) : 0;
+    const latVals = driftSinceStartMs
+      ? latRaw.map((v) => v - driftSinceStartMs) : latRaw;
     // Every series takes exactly one slot per tick, NaN where there is nothing
-    // to report, so all four charts share one time axis and a feature at the
-    // same x is the same instant. Skipping a slot silently stretches that
-    // chart's window past the others'.
+    // to report, so every chart shares one time axis and a feature at the same
+    // x is the same instant. Skipping a slot silently stretches that chart's
+    // window past the others'.
     const have = latVals.length > 0;
     pushSample(latP50Samples, have ? percentile(latVals, 0.5) : NaN);
     pushSample(latP95Samples, have ? percentile(latVals, 0.95) : NaN);
@@ -792,13 +844,13 @@ async function main(): Promise<void> {
 
     drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
     drawSpark(jitSpark, jitSamples, '#d9922e');
-    drawSpark(cusSpark, cushionSamples, '#4d4', targetLatencyMs, stallMarks);
-    drawDelta(bufSpark, bufDeltaSamples);
-    bufDVal.textContent = (vMs != null && aMs != null)
-      ? `${vMs - aMs >= 0 ? '+' : ''}${(vMs - aMs).toFixed(0)}` : '—';
-    bufVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
-    bufAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
-    cusVal.textContent = lastFinite(cushionSamples)?.toFixed(0) ?? '—';
+    drawSpark2(cusSpark, queuedASamples, '#6cf', queuedVSamples, '#a98cf0',
+               targetLatencyMs, stallMarks);
+    cusAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
+    cusVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
+    // a − v, following the order the pair is printed in.
+    cusDVal.textContent = (vMs != null && aMs != null)
+      ? `${aMs - vMs >= 0 ? '+' : ''}${(aMs - vMs).toFixed(0)}` : '—';
     cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
     // One measurement (queued) against one setting (target). The render
     // cushion is a third name for the same region and pub_media pins it equal
@@ -811,7 +863,7 @@ async function main(): Promise<void> {
     // there is none to read — the value carries the difference, not the name.
     const chaseRate = audioOut ? (audioOut.chasing ? 1.02 : 1) : rateNow;
     cusCushion.innerHTML = audioOut || rateNow !== 1
-      ? `rate: <b${chaseRate > 1 ? '' : ' class="idle"'}>${chaseRate.toFixed(2)}×</b>`
+      ? `rate: <b${chaseRate > 1 ? '' : ' class="idle"'}>${chaseRate.toFixed(2)}x</b>`
       : '';
 
     // A large queue with an idle chase is a contradiction: the controller acts on
@@ -836,21 +888,24 @@ async function main(): Promise<void> {
       latP95.textContent = percentile(latVals, 0.95).toFixed(0);
       latMax.textContent = maxFinite(latTickMaxSamples)?.toFixed(0) ?? '—';
     }
-    // The offset is a publisher stamping artifact, not a playback figure, so it
-    // stays off the label and rides a hover instead. Empty title falls through
-    // to the chart's own explanation.
-    latLabel.title = latOffset
-      ? `Capture stamps run ${(-latOffset / 1000).toFixed(1)}s ahead of this `
-        + 'browser\'s clock, so these are delay above the best sample in the '
-        + 'window, not one-way delay. The publisher reports the same offset as '
-        + 'its own send lag; it is a stamping artifact, not latency.'
+    // Drift details ride the label's hover; an empty title falls back to the chart's.
+    latLabel.title = clockDriftMsPerMin !== null
+      ? `This browser's clock and the publisher's run ${clockDriftMsPerMin.toFixed(1)} `
+        + `ms/min apart; the ${driftSinceStartMs.toFixed(0)} ms that has accumulated `
+        + 'since this page loaded is removed. Any constant difference between the '
+        + 'two clocks remains, because a one-way measurement cannot tell it from '
+        + 'transit — read these as relative, not as true one-way delay.'
       : '';
     jitVal.textContent = lastFinite(jitSamples)?.toFixed(1) ?? '—';
-  }, 250);
+  }, TICK_MS);
 
   // ── CMSF / MSF catalog panel ──────────────────────────────────────
   // Redrawn only on catalog events (initial + deltas), never per frame.
   // Catalog values are remote input: built as text nodes, never HTML.
+
+  /** Audio, then video, then anything else in the order it arrived. */
+  const trackRank = (role: unknown): number =>
+    role === 'audio' ? 0 : role === 'video' ? 1 : 2;
 
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
@@ -861,22 +916,21 @@ async function main(): Promise<void> {
     targetLatencyMs = Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
     const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
-    catMeta.textContent = [
-      `v${cat?.version ?? '?'}`,
-      `${tracks.length} track${tracks.length === 1 ? '' : 's'}`,
-      packagings,
-      cat?.initDataList?.length ? `${cat.initDataList.length} initData` : '',
-    ].filter(Boolean).join(' · ');
+    // Same header shape as the broadcaster's catalog panel.
+    catMeta.textContent = packagings
+      ? `${packagings} (v${cat?.version ?? '?'})` : `v${cat?.version ?? '?'}`;
 
-    catTracks.replaceChildren(...tracks.map((t) => {
+    // Display order only; the catalog keeps its published order.
+    const ordered = [...tracks].sort((a, b) => trackRank(a.role ?? a.name) - trackRank(b.role ?? b.name));
+    catTracks.replaceChildren(...ordered.map((t) => {
       const row = document.createElement('div');
-      row.className = 'cat-track';
+      // Whitelisted: remote input must not reach the class attribute.
+      const role = (t.role ?? t.name) === 'video' ? ' video'
+        : (t.role ?? t.name) === 'audio' ? ' audio' : '';
+      row.className = `cat-track${role}`;
       const name = document.createElement('span');
       name.className = 'nm';
       name.textContent = `${t.name ?? '(unnamed)'}:`;
-      const pkg = document.createElement('span');
-      pkg.className = 'pk';
-      pkg.textContent = (t.packaging ?? '?').toUpperCase();
       // Remote input: a text node, never markup.
       const detail = document.createElement('span');
       detail.className = 'dt';
@@ -890,9 +944,8 @@ async function main(): Promise<void> {
         t.channelConfig ? `${t.channelConfig}ch` : '',
         t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',
         t.initRef ? `init=${t.initRef}` : '',
-        t.targetLatency ? `target=${t.targetLatency}ms` : '',
       ].filter(Boolean).join(' · ');
-      row.append(name, pkg, detail);
+      row.append(name, detail);
       return row;
     }));
 
@@ -915,16 +968,15 @@ async function main(): Promise<void> {
     log('Catalog changed');
     renderCatalog(catalog);
   });
-  // `?debug=1`: the delivered bytes, for diagnosing a producer whose catalog
-  // objects do not parse. One line per object, so it stays behind the flag.
-  if (debug) {
-    let rawSeen = 0;
-    player.on('catalog_raw', ({ bytes, text }) => {
-      rawSeen++;
-      const head = text === null ? '(not UTF-8)' : text.slice(0, 120);
-      log(`Catalog raw #${rawSeen}: ${bytes}B ${head}`);
-    });
-  }
+  // Size goes in the header; `?debug=1` also logs each object's head.
+  let rawSeen = 0;
+  player.on('catalog_raw', ({ bytes, text }) => {
+    rawSeen++;
+    catSize.textContent = ` · ${bytes}B`;
+    if (!debug) return;
+    const head = text === null ? '(not UTF-8)' : text.slice(0, 120);
+    log(`Catalog raw #${rawSeen}: ${bytes}B ${head}`);
+  });
 
   const setCatalogHidden = (hidden: boolean): void => {
     layoutEl.classList.toggle('cat-hidden', hidden);
@@ -962,6 +1014,10 @@ async function main(): Promise<void> {
 
   log(`Relay: ${relayUrl}`);
   log(`Namespace: ${namespace}`);
+  // https is implied on this page.
+  setText('conn-relay', relayUrl.replace(/^https:\/\//, ''));
+  setText('conn-ns', namespace);
+  setText('conn-draft', draftVersion === undefined ? 'auto' : String(draftVersion));
   player.load().catch((err) => log(`Fatal: ${(err as Error).message}`));
 }
 
