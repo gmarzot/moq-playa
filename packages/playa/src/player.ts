@@ -691,6 +691,10 @@ export class Player {
       this.emitter.emit('stall', { durationMs: e.durationMs });
     });
 
+    this.engine.on('stall_recovered', (e) => {
+      this.emitter.emit('stall_recovered', { durationMs: e.durationMs });
+    });
+
     this.engine.on('state_changed', (e) => {
       if (e.to === 'ended') {
         this.timeCtrl?.stop();

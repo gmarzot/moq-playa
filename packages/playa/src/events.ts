@@ -42,10 +42,10 @@ export interface PlayerEventMap {
   /** Quality level switched (ABR or manual). */
   'qualitychange': QualitychangeEvent;
 
-  /** Playback stalled (buffering). */
+  /** Playback stalled. `durationMs` is detection latency, not the outage length. */
   'stall': StallEvent;
-  /** Playback resumed after stall. */
-  'unstall': Record<string, never>;
+  /** A stall ended, with the full outage length. */
+  'stall_recovered': StallRecoveredEvent;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -130,6 +130,11 @@ export interface QualitychangeEvent {
 }
 
 export interface StallEvent {
+  readonly durationMs: number;
+}
+
+export interface StallRecoveredEvent {
+  /** Outage length, onset to recovery. */
   readonly durationMs: number;
 }
 
