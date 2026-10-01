@@ -50,6 +50,10 @@ export interface PlayerEventMap {
   'lifecycle': LifecycleEvent;
   /** The connection to the relay closed. */
   'session_closed': SessionClosedEvent;
+  /** A fresh session will be attempted after `delayMs`. */
+  'session_reconnecting': SessionReconnectingEvent;
+  /** A new session took over, after a reconnect or a relay GOAWAY. */
+  'session_migrated': Record<string, never>;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -154,6 +158,12 @@ export interface SessionClosedEvent {
   /** Session termination code, when the close carried one. */
   readonly code?: number;
   readonly reason?: string;
+}
+
+export interface SessionReconnectingEvent {
+  /** 1 for the first attempt after the close. */
+  readonly attempt: number;
+  readonly delayMs: number;
 }
 
 export interface ErrorEvent {

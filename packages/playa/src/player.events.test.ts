@@ -83,6 +83,32 @@ describe('Player — session_closed', () => {
   });
 });
 
+// ─── reconnect ───────────────────────────────────────────────────────
+
+describe('Player — reconnect', () => {
+  it('forwards session_reconnecting with the attempt and delay', () => {
+    const player = createPlayer();
+    const seen: unknown[] = [];
+    player.on('session_reconnecting', (e) => seen.push(e));
+
+    (player as any).engine.emitter.emit('session_reconnecting', {
+      type: 'session_reconnecting', attempt: 2, delayMs: 2_000,
+    });
+
+    expect(seen).toEqual([{ attempt: 2, delayMs: 2_000 }]);
+  });
+
+  it('forwards session_migrated', () => {
+    const player = createPlayer();
+    const migrated = vi.fn();
+    player.on('session_migrated', migrated);
+
+    (player as any).engine.emitter.emit('session_migrated', { type: 'session_migrated' });
+
+    expect(migrated).toHaveBeenCalledOnce();
+  });
+});
+
 // ─── page lifecycle ──────────────────────────────────────────────────
 
 describe('Player — page lifecycle', () => {

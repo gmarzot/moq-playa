@@ -750,6 +750,14 @@ export class Player {
       });
     });
 
+    this.engine.on('session_reconnecting', (e) => {
+      this.emitter.emit('session_reconnecting', { attempt: e.attempt, delayMs: e.delayMs });
+    });
+
+    this.engine.on('session_migrated', () => {
+      this.emitter.emit('session_migrated', {});
+    });
+
     this.engine.on('state_changed', (e) => {
       if (e.to === 'ended') {
         this.timeCtrl?.stop();
