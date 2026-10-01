@@ -309,6 +309,9 @@ async function main(): Promise<void> {
       ? `Page ${state}`
       : `Page ${state} after ${(awayMs / 1000).toFixed(1)}s away`);
   });
+  player.on('session_closed', ({ code, reason }) => {
+    log(`Session closed${code !== undefined ? ` (code ${code})` : ''}${reason ? `: ${reason}` : ''}`);
+  });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
   const renderCushionMs = (): number | null =>
