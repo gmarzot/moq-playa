@@ -67,9 +67,13 @@ const setText = (id: string, value: string): void => {
   if (el) el.textContent = value;
 };
 
+/** Lines kept; the oldest are dropped past this. */
+const MAX_LOG_LINES = 2000;
+
 function log(msg: string): void {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
-  logEl.textContent += `[${ts}] ${msg}\n`;
+  logEl.append(`[${ts}] ${msg}\n`);
+  while (logEl.childNodes.length > MAX_LOG_LINES) logEl.firstChild!.remove();
   logEl.scrollTop = logEl.scrollHeight;
 }
 
@@ -658,13 +662,22 @@ async function main(): Promise<void> {
     }
   });
 
+  /** Backing-store size for the element. Assigning width or height reallocates
+   *  and clears the canvas, so it is done only when the size changed. */
+  function fitCanvas(canvas: HTMLCanvasElement): [number, number] {
+    const w = Math.floor(canvas.clientWidth * devicePixelRatio);
+    const h = Math.floor(canvas.clientHeight * devicePixelRatio);
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    return [w, h];
+  }
+
   function drawSpark(canvas: HTMLCanvasElement, data: number[],
                      color: string, refLine = 0,
                      marks?: number[]): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    const w = canvas.width = canvas.clientWidth * devicePixelRatio;
-    const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+    const [w, h] = fitCanvas(canvas);
     ctx.clearRect(0, 0, w, h);
     const live = data.filter(Number.isFinite);
     if (live.length < 2) return;
@@ -704,8 +717,7 @@ async function main(): Promise<void> {
                       marks?: number[]): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    const w = canvas.width = canvas.clientWidth * devicePixelRatio;
-    const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+    const [w, h] = fitCanvas(canvas);
     ctx.clearRect(0, 0, w, h);
     const max = Math.max(1, refLine,
       ...a.filter(Number.isFinite), ...b.filter(Number.isFinite)) * 1.15;
