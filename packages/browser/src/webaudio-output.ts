@@ -70,7 +70,7 @@ export class WebAudioOutput implements AudioOutputLike {
   /**
    * Scheduled-buffer ring for playhead observability: which capture
    * timestamp is coming out of the speakers right now. One entry per
-   * scheduled buffer; pruned lazily once playout passes a buffer's end.
+   * scheduled buffer; dropped once playout passes its end, on schedule and on read.
    * `captureUs` is the chunk's CaptureTimestamp as passed to schedule().
    * AudioData.timestamp is only a fallback: decoders may rebase it.
    */
@@ -308,6 +308,7 @@ export class WebAudioOutput implements AudioOutputLike {
     // Playhead observability: record what was scheduled where, so
     // playheadCaptureUs() can answer "what capture timestamp is being heard
     // right now." Also the drop set for a live-edge snap.
+    this.pruneScheduledRing(now);
     this.scheduledRing.push({ captureUs, startSec: startTime, durSec, rate, source });
 
     // Track for flush/destroy cleanup
@@ -369,18 +370,22 @@ export class WebAudioOutput implements AudioOutputLike {
    */
   playheadCaptureUs(): number | null {
     const now = this.audioCtx.currentTime;
-    // Lazy prune: drop buffers whose playout has fully passed.
+    this.pruneScheduledRing(now);
+
+    const playing = this.scheduledRing[0];
+    if (!playing || now < playing.startSec) return null; // silent: starved or not yet started
+    const intoBufferSec = now - playing.startSec;
+    return playing.captureUs + intoBufferSec * playing.rate * 1_000_000;
+  }
+
+  /** Drop ring entries whose playout has fully passed. */
+  private pruneScheduledRing(now: number): void {
     let firstLive = 0;
     while (firstLive < this.scheduledRing.length
         && this.scheduledRing[firstLive]!.startSec + this.scheduledRing[firstLive]!.durSec <= now) {
       firstLive++;
     }
     if (firstLive > 0) this.scheduledRing.splice(0, firstLive);
-
-    const playing = this.scheduledRing[0];
-    if (!playing || now < playing.startSec) return null; // silent: starved or not yet started
-    const intoBufferSec = now - playing.startSec;
-    return playing.captureUs + intoBufferSec * playing.rate * 1_000_000;
   }
 
   /** Cancel all scheduled audio. */

@@ -145,6 +145,17 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
     expect(out.playheadCaptureUs()).toBeCloseTo(5_000_000 + 199 * 20_000 + 10_000, 0);
   });
 
+  it('prunes played-out buffers on schedule, with no playhead read (audio-only)', () => {
+    const { ctx, out } = makeOutput();
+    ctx.currentTime = 1.0;
+    for (let i = 0; i < 500; i++) {
+      out.schedule(audioData(5_000_000 + i * 20_000), 1_000_000 + i * 20_000);
+      ctx.currentTime += 0.020;
+    }
+    // Only buffers not yet fully played remain.
+    expect(out['scheduledRing'].length).toBeLessThanOrEqual(2);
+  });
+
   it('uses the passed capture timestamp over the decoded one (decoder rebasing)', () => {
     const { ctx, out } = makeOutput();
     ctx.currentTime = 1.0;
