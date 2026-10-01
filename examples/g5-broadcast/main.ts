@@ -447,12 +447,16 @@ shareCopyBtn.addEventListener('click', () => {
 });
 
 shareOpenBtn.addEventListener('click', (e) => {
-  if (e.ctrlKey || e.metaKey) {
-    // A separate window at this window's size. A popup carries less browser
-    // chrome than a tabbed window, so the outer size is matched after opening.
-    const win = window.open(currentViewerLink, '_blank',
-      `popup,width=${window.innerWidth},height=${window.innerHeight}`);
-    win?.resizeTo(window.outerWidth, window.outerHeight);
+  if (e.ctrlKey || e.metaKey || e.shiftKey) {
+    // A separate window at this window's size, opened on the next task: inside
+    // the click, Chrome applies the held modifier instead (Ctrl = background
+    // tab). A popup carries less chrome than a tabbed window, so the outer size
+    // is matched after opening.
+    const features = `popup,width=${window.innerWidth},height=${window.innerHeight}`;
+    setTimeout(() => {
+      const win = window.open(currentViewerLink, '_blank', features);
+      win?.resizeTo(window.outerWidth, window.outerHeight);
+    }, 0);
   } else {
     window.open(currentViewerLink, '_blank');
   }
