@@ -11374,3 +11374,101 @@ describe('MoqtPlayer.jumpToLive', () => {
     expect(order.indexOf('update')).toBeGreaterThan(order.indexOf('sync reset'));
   });
 });
+
+describe('MoqtPlayer — reconnect after the session closes', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** A loaded player in PLAYING whose later connections come from `next`. */
+  async function loaded(
+    first: ReturnType<typeof createMockAdapter>,
+    opts: { playing: boolean; createTransport?: MoqtPlayerConfig['createTransport'] },
+  ) {
+    const next: ReturnType<typeof createMockAdapter>[] = [];
+    const createConnection = vi.fn(() =>
+      (createConnection.mock.calls.length === 1 ? first : (next.shift() ?? createMockAdapter())) as
+        unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      ...createConfig(first),
+      createConnection,
+      ...(opts.createTransport ? { createTransport: opts.createTransport } : {}),
+    });
+    const loading = player.load();
+    await resolveConnect(first);
+    await loading;
+    if (opts.playing && player.state !== PlayerState.PLAYING) {
+      (player as any).transitionState(PlayerState.PLAYING);
+    }
+    return { player, createConnection, next };
+  }
+
+  it('reconnects 1 s after a close during playback and reports the migration', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection, next } = await loaded(first, { playing: true });
+    const second = createMockAdapter();
+    next.push(second);
+    vi.useFakeTimers();
+    const reconnecting: unknown[] = [];
+    const migrated = vi.fn();
+    player.on('session_reconnecting', (e) => reconnecting.push(e));
+    player.on('session_migrated', migrated);
+
+    first._triggerClose(0x1, 'relay restarted');
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(createConnection).toHaveBeenCalledTimes(2);
+    await resolveConnect(second);
+    await vi.waitFor(() => expect(migrated).toHaveBeenCalledOnce());
+    expect((player as any).reconnect).toBeNull();
+    await player.destroy();
+  });
+
+  it('backs off between failed attempts and ends fatal after the last', async () => {
+    const first = createMockAdapter();
+    const createTransport = vi.fn(async () => ({}) as any);
+    const { player } = await loaded(first, { playing: true, createTransport });
+    createTransport.mockRejectedValue(new Error('relay down'));
+    vi.useFakeTimers();
+    const delays: number[] = [];
+    const fatal: PlayerError[] = [];
+    player.on('session_reconnecting', (e) => delays.push(e.delayMs));
+    player.on('error', (e) => { if (e.error.severity === 'fatal') fatal.push(e.error); });
+
+    first._triggerClose(0x1, 'relay restarted');
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, ...Array(7).fill(15_000)]);
+    expect(fatal).toHaveLength(1);
+    expect(fatal[0]!.code).toBe(PlayerErrorCode.CONNECTION_LOST);
+    expect(fatal[0]!.message).toMatch(/relay restarted.*11 attempts/);
+    expect(player.state).toBe(PlayerState.ERROR);
+  });
+
+  it('destroy() cancels a pending reconnect', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection } = await loaded(first, { playing: true });
+    vi.useFakeTimers();
+
+    first._triggerClose(0x1, 'relay restarted');
+    await player.destroy();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(createConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reconnect a session that closes before playback starts', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection } = await loaded(first, { playing: false });
+    expect(player.state).not.toBe(PlayerState.PLAYING);
+    vi.useFakeTimers();
+    const reconnecting = vi.fn();
+    player.on('session_reconnecting', reconnecting);
+
+    first._triggerClose(0x1, 'relay restarted');
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(reconnecting).not.toHaveBeenCalled();
+    expect(createConnection).toHaveBeenCalledTimes(1);
+    await player.destroy();
+  });
+});

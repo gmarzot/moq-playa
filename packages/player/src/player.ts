@@ -626,6 +626,16 @@ export class MoqtPlayer {
   /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
   private recoveryUpdateBlockedUntilUs = 0;
   private recoveryUpdateFailures = 0;
+  /** Reconnect after the current session closed during playback; null when none is pending. */
+  private reconnect: {
+    attempt: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    readonly closeReason: string;
+  } | null = null;
+  /** Delay before each reconnect attempt; later attempts reuse the last. */
+  private static readonly RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+  /** Attempts before giving up: about two minutes with the delays above. */
+  private static readonly RECONNECT_MAX_ATTEMPTS = 11;
 
   private static readonly MAX_RECOVERY_PARKED_OBJECTS = 256;
   private static readonly MAX_RECOVERY_PARKED_BYTES = 4 * 1024 * 1024;
@@ -4657,6 +4667,8 @@ export class MoqtPlayer {
     // in-flight transaction sees _destroyed at its next validation and rolls back;
     // detaching + closing the candidate here stops its callbacks and unblocks it.
     this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
+    if (this.reconnect?.timer) clearTimeout(this.reconnect.timer);
+    this.reconnect = null;
     if (this.currentMigration) {
       const txn = this.currentMigration;
       this.currentMigration = null;
@@ -5092,6 +5104,8 @@ export class MoqtPlayer {
           error,
           reason,
         }));
+        this.scheduleReconnect(reason
+          ?? (error !== undefined ? `code 0x${error.toString(16)}` : 'clean close'));
       },
 
       onError: (error) => {
@@ -7354,11 +7368,55 @@ export class MoqtPlayer {
     });
   }
 
+  /**
+   * Reconnect after the current session closed during playback: a migration to
+   * the configured URL on a fresh connection, retried with backoff, fatal after
+   * RECONNECT_MAX_ATTEMPTS. Each failed attempt rolls back cleanly.
+   */
+  private scheduleReconnect(closeReason: string): void {
+    if (this._destroyed || this.currentMigration) return;
+    if (!this.config.createConnection || !this.config.createTransport) return;
+    const state = this.stateMachine.state;
+    if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED) return;
+    const r = this.reconnect ??= { attempt: 0, timer: null, closeReason };
+    if (r.timer !== null) return;
+    if (r.attempt >= MoqtPlayer.RECONNECT_MAX_ATTEMPTS) {
+      this.reconnect = null;
+      this.emitError(createPlayerError(
+        'fatal', 'connection', PlayerErrorCode.CONNECTION_LOST,
+        `Session closed (${r.closeReason}); reconnect gave up after ${r.attempt} attempts`,
+      ));
+      if (this.stateMachine.state !== PlayerState.ERROR) {
+        this.transitionState(PlayerState.ERROR);
+      }
+      this.stopTicking();
+      return;
+    }
+    r.attempt++;
+    const delays = MoqtPlayer.RECONNECT_DELAYS_MS;
+    const delayMs = delays[Math.min(r.attempt, delays.length) - 1]!;
+    this.emitter.emit('session_reconnecting', { type: 'session_reconnecting', attempt: r.attempt, delayMs });
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      if (this._destroyed || this.reconnect !== r) return;
+      this.migrate(this.config.createConnection!()).then(
+        () => { if (this.reconnect === r) this.reconnect = null; },
+        (err: unknown) => {
+          this.log.warn('Reconnect attempt %d failed: %s',
+            r.attempt, err instanceof Error ? err.message : String(err));
+          if (this.reconnect === r) this.scheduleReconnect(r.closeReason);
+        },
+      );
+    }, delayMs);
+  }
+
   private requestFreshSubscriptionStart(
     mediaType: 'video' | 'audio',
     startGroup?: bigint,
   ): void {
     if (!this.connection) return;
+    // The session is gone; the reconnect re-subscribes.
+    if (this.reconnect !== null) return;
     // Re-issuing on every failure exhausts the request-ID space.
     if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
@@ -7419,6 +7477,8 @@ export class MoqtPlayer {
     const monitor = this.livenessMonitor;
     if (!monitor) return;
     if (this.stateMachine.state !== PlayerState.PLAYING) return;
+    // Restarts cannot succeed on a closed session; the reconnect owns recovery.
+    if (this.reconnect !== null) return;
     monitor.reconcile(this.collectLivenessTracks());
     monitor.check(performance.now());
   }

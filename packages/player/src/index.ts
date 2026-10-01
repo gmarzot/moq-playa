@@ -30,6 +30,7 @@ export type {
   SessionEstablishedEvent,
   SessionGoawayEvent,
   SessionClosedEvent,
+  SessionReconnectingEvent,
   SessionErrorEvent,
   PlayerErrorEvent,
   CatalogRawEvent,
