@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import type { AnchorReport } from './media-publisher.js';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
 import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
@@ -640,6 +641,51 @@ describe('MediaPublisher — wall-clock rebase', () => {
     const profile = { wireProfile: locWireProfileForDraft(18) };
     const stamps = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).captureTimestamp!);
     expect(stamps[1]! - stamps[0]!).toBe(40_000n);
+  });
+
+  it('measures what the first chunk cost the anchor, without changing a stamp', async () => {
+    const conn = recordingConnection();
+    // The first chunk arrives 500 ms late and the rest 10 ms, so the anchor banks 490 ms.
+    const delaysUs = [500_000, ...Array.from({ length: 60 }, () => 10_000)];
+    let i = 0;
+    const base = 1_700_000_000_000_000;
+    const reports: AnchorReport[] = [];
+    const pub = makePublisher(conn, {
+      draft: 18,
+      wallClockUs: () => base + i * 40_000 + delaysUs[i]!,
+      timeOriginUs: () => null,
+      onAnchor: (r: AnchorReport) => reports.push(r),
+    });
+    pub.setVideoAlias(2n);
+    for (; i < delaysUs.length; i++) {
+      pub.publishVideo(chunk(i), { isKeyframe: i === 0, timestampUs: i * 40_000 });
+      await settle();
+    }
+
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.track).toBe('video');
+    expect(reports[0]!.excessUs).toBe(490_000);
+    // Spacing is untouched: the measurement does not move the anchor.
+    const profile = { wireProfile: locWireProfileForDraft(18) };
+    const stamps = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).captureTimestamp!);
+    expect(stamps[1]! - stamps[0]!).toBe(40_000n);
+  });
+
+  it('omits the timeOrigin comparison where there is no performance timeline', async () => {
+    const conn = recordingConnection();
+    const reports: AnchorReport[] = [];
+    const pub = makePublisher(conn, {
+      draft: 18,
+      wallClockUs: () => 1_700_000_000_000_000,
+      timeOriginUs: () => null,
+      onAnchor: (r: AnchorReport) => reports.push(r),
+    });
+    pub.setVideoAlias(2n);
+    for (let n = 0; n < 60; n++) {
+      pub.publishVideo(chunk(n), { isKeyframe: n === 0, timestampUs: n * 40_000 });
+      await settle();
+    }
+    expect(reports[0]!.timeOriginDeltaUs).toBeUndefined();
   });
 });
 

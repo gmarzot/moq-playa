@@ -68,6 +68,20 @@ export interface AudioChunkMeta {
   timestampUs: number;
 }
 
+/** The capture-clock anchor in use, measured against the best offset observed. */
+export interface AnchorReport {
+  readonly track: 'video' | 'audio';
+  /** The offset actually in use: the first chunk's `now - timestamp`. */
+  readonly anchorUs: number;
+  /** The lowest `now - timestamp` seen over the settling window. */
+  readonly minObservedUs: number;
+  /** anchorUs - minObservedUs: what the first chunk's delay cost this track. */
+  readonly excessUs: number;
+  /** anchorUs - performance.timeOrigin; absent without a performance timeline.
+   *  Small means the capture timestamps are on that timeline. */
+  readonly timeOriginDeltaUs?: number;
+}
+
 export interface MediaPublisherOptions {
   /** Wraps a bigint as the wire integer type (the example passes `varint`). */
   wrapInt: (n: bigint) => unknown;
@@ -80,6 +94,14 @@ export interface MediaPublisherOptions {
    * first chunk timestamp. Injectable for tests. Default `Date.now() * 1000`.
    */
   wallClockUs?: () => number;
+  /**
+   * Wall-clock microseconds of the page's time origin, or null where there is
+   * no performance timeline. Injectable for tests. Default `performance.timeOrigin`.
+   */
+  timeOriginUs?: () => number | null;
+  /** Called once per track, after ANCHOR_SETTLE_OBSERVATIONS chunks, with the
+   *  anchor measured against the best offset seen. */
+  onAnchor?: (report: AnchorReport) => void;
   /** Failure sink — publication errors are contained, never unhandled. */
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
@@ -125,11 +147,22 @@ export class MediaPublisher {
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
   private readonly wallClockUs: () => number;
-  // Offset from each track's WebCodecs timestamp base to the wall clock, fixed
-  // at that track's first chunk. Separate per track: the browser may hand audio
-  // and video timestamps on different bases.
+  /** Observations per track before the anchor's error is reported. */
+  private static readonly ANCHOR_SETTLE_OBSERVATIONS = 60;
+  private readonly timeOriginUs: () => number | null;
+  private readonly onAnchor: ((report: AnchorReport) => void) | null;
+  /**
+   * Offset from each track's WebCodecs timestamp base to the wall clock, set at the
+   * track's first chunk. Fixed, because the stamps' spacing is the media timeline the
+   * receiver paces on; per track, because Chrome's video and audio bases are unrelated
+   * (boot-relative vs context-relative). The first chunk's delay is banked; see AnchorReport.
+   */
   private videoTsOffsetUs: number | null = null;
   private audioTsOffsetUs: number | null = null;
+  /** Lowest `now - timestamp` seen per track: the anchor we could have had. */
+  private readonly minObservedUs = new Map<string, number>();
+  private readonly anchorObservations = new Map<string, number>();
+  private readonly anchorReported = new Set<string>();
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
   private readonly videoQueueMax: number;
@@ -190,6 +223,9 @@ export class MediaPublisher {
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
     this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
+    this.timeOriginUs = options.timeOriginUs
+      ?? (() => (typeof performance === 'undefined' ? null : performance.timeOrigin * 1000));
+    this.onAnchor = options.onAnchor ?? null;
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
@@ -453,12 +489,36 @@ export class MediaPublisher {
    */
   private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
     const key = track === 'video' ? 'videoTsOffsetUs' : 'audioTsOffsetUs';
-    let offset = this[key];
-    if (offset === null) {
-      offset = this.wallClockUs() - timestampUs;
-      this[key] = offset;
-    }
-    return BigInt(Math.round(timestampUs + offset));
+    const observed = this.wallClockUs() - timestampUs;
+    this[key] ??= observed;
+    this.observeAnchor(track, observed);
+    return BigInt(Math.round(timestampUs + this[key]));
+  }
+
+  /**
+   * Track the lowest `now - timestamp` per track and, after ANCHOR_SETTLE_OBSERVATIONS
+   * chunks, report the anchor against it once. Measures only: the anchor and the
+   * emitted stamps do not change.
+   */
+  private observeAnchor(track: 'video' | 'audio', observedUs: number): void {
+    if (this.anchorReported.has(track)) return;
+    const min = this.minObservedUs.get(track);
+    if (min === undefined || observedUs < min) this.minObservedUs.set(track, observedUs);
+    const n = (this.anchorObservations.get(track) ?? 0) + 1;
+    this.anchorObservations.set(track, n);
+    if (n < MediaPublisher.ANCHOR_SETTLE_OBSERVATIONS) return;
+
+    this.anchorReported.add(track);
+    const anchorUs = track === 'video' ? this.videoTsOffsetUs! : this.audioTsOffsetUs!;
+    const minObservedUs = this.minObservedUs.get(track)!;
+    const origin = this.timeOriginUs();
+    this.onAnchor?.({
+      track,
+      anchorUs,
+      minObservedUs,
+      excessUs: anchorUs - minObservedUs,
+      ...(origin === null ? {} : { timeOriginDeltaUs: anchorUs - origin }),
+    });
   }
 
   private videoExtensions(meta: VideoChunkMeta): Uint8Array | undefined {

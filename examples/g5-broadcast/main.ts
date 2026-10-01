@@ -575,6 +575,12 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,
           audioDatagrams,
+          // The anchor's measured error, once per track.
+          onAnchor: ({ track, excessUs, timeOriginDeltaUs }) => log(
+            `Capture anchor ${track}: first chunk cost `
+            + `${(excessUs / 1000).toFixed(1)}ms vs the best seen`
+            + (timeOriginDeltaUs === undefined ? ''
+              : `, ${(timeOriginDeltaUs / 1000).toFixed(1)}ms from timeOrigin`)),
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
         },
         log,
