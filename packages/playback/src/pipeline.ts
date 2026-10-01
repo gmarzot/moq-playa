@@ -132,6 +132,9 @@ export class PlaybackPipeline {
     private static readonly AUDIO_REANCHOR_AFTER_US = 250_000;
     /** Minimum spacing between audio re-anchors. */
     private static readonly AUDIO_REANCHOR_MIN_INTERVAL_US = 2_000_000;
+    /** Lookahead left in place when the reference walks down, so ordinary
+     *  jitter does not make frames late. */
+    private static readonly REFERENCE_TOLERANCE_US = 20_000;
 
     /**
  * Throttle flag — set by decoder feedback when queue depth is high.
@@ -902,8 +905,10 @@ export class PlaybackPipeline {
                     // transit. Audio that stays later than that by more than
                     // the drop threshold would otherwise be dropped for the
                     // rest of the session while video keeps rendering.
-                    this.sync.setAudioReference(headers.captureTimestamp);
-                    this.onEvent({ type: 'audio_reanchored', lateByUs: -timing.offsetUs });
+                    // Bounded step; early frames walk it back via lowerReference.
+                    const lateByUs = -timing.offsetUs;
+                    this.sync.reanchorAudioBounded(lateByUs);
+                    this.onEvent({ type: 'audio_reanchored', lateByUs });
                     renderTimeUs = this.clock.now();
                 } else {
                     if (this.mediaType === 'audio') this._lateAudioDrops++;
@@ -912,7 +917,13 @@ export class PlaybackPipeline {
             } else if (timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
             } else {
-                if (this.mediaType === 'audio') this._lateAudioSinceUs = null;
+                if (this.mediaType === 'audio') {
+                    this._lateAudioSinceUs = null;
+                    // Only audio lowers the shared reference, so video cannot pull
+                    // it past what audio sustains. The shift applies from the next frame.
+                    this.sync.lowerReference(
+                        timing.offsetUs, PlaybackPipeline.REFERENCE_TOLERANCE_US);
+                }
                 renderTimeUs = timing.renderTimeUs;
             }
         } else {

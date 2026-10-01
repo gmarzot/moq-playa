@@ -2088,6 +2088,46 @@ describe('PlaybackPipeline', () => {
             for (let i = 0; i < 80; i++) s.push(300_000);     // past 2 s since the first
             expect(s.reanchors()).toHaveLength(2);
         });
+
+        it('a re-anchor step is bounded, so the reference cannot jump far', () => {
+            const s = setup();
+            for (let i = 0; i < 13; i++) s.push(3_000_000);   // 3 s late
+            expect(s.reanchors()).toHaveLength(1);
+            expect(s.sync.baselineDebtUs).toBe(100_000);      // not 3 s
+        });
+
+        it('the shift is retired by the frames that follow it', () => {
+            const s = setup();
+            for (let i = 0; i < 13; i++) s.push(150_000);
+            expect(s.sync.baselineDebtUs).toBeGreaterThan(0);
+
+            // On-time frames walk the shifted anchor back, down to the tolerance.
+            for (let i = 0; i < 40; i++) s.push(0);
+            expect(s.sync.baselineDebtUs).toBe(20_000);
+        });
+
+        it('startup slack is retired by frames that beat the anchor', () => {
+            // Frames arriving 80 ms early walk the anchor toward them.
+            const s = setup();
+            const before = s.sync.computeVideoRenderTime(C0 + 1_000_000n)!.renderTimeUs;
+            for (let i = 0; i < 40; i++) s.push(-80_000);   // 80 ms EARLY
+            const after = s.sync.computeVideoRenderTime(C0 + 1_000_000n)!.renderTimeUs;
+            expect(before - after).toBeGreaterThan(50_000);
+            expect(s.reanchors()).toHaveLength(0);
+        });
+
+        it('a late run never walks the anchor in — grows on impairment only', () => {
+            const s = setup();
+            for (let i = 0; i < 13; i++) s.push(150_000);
+            for (let i = 0; i < 200; i++) s.push(0);          // retires the shift
+            expect(s.sync.baselineDebtUs).toBe(20_000);       // the tolerance
+
+            const anchored = s.sync.computeVideoRenderTime(C0 + 1_000_000n)!.renderTimeUs;
+            // Late, and short of the sustained window that would re-anchor.
+            for (let i = 0; i < 7; i++) s.push(300_000);
+            expect(s.sync.computeVideoRenderTime(C0 + 1_000_000n)!.renderTimeUs)
+                .toBe(anchored);
+        });
     });
 });
 
