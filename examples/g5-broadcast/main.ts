@@ -446,7 +446,18 @@ shareCopyBtn.addEventListener('click', () => {
   });
 });
 
-shareOpenBtn.addEventListener('click', () => window.open(currentViewerLink, '_blank'));
+shareOpenBtn.addEventListener('click', (e) => {
+  if (e.ctrlKey || e.metaKey) {
+    // A separate window at this window's size. A popup carries less browser
+    // chrome than a tabbed window, so the outer size is matched after opening.
+    const win = window.open(currentViewerLink, '_blank',
+      `popup,width=${window.innerWidth},height=${window.innerHeight}`);
+    win?.resizeTo(window.outerWidth, window.outerHeight);
+  } else {
+    window.open(currentViewerLink, '_blank');
+  }
+  shareBackdrop.classList.remove('visible');
+});
 shareCloseBtn.addEventListener('click', () => shareBackdrop.classList.remove('visible'));
 shareBackdrop.addEventListener('click', (e) => {
   if (e.target === shareBackdrop) shareBackdrop.classList.remove('visible');
