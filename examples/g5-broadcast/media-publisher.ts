@@ -526,7 +526,8 @@ export class MediaPublisher {
       captureTimestamp: this.toWallClockUs('video', meta.timestampUs),
       videoFrameMarking: {
         independent: meta.isKeyframe,
-        discardable: !meta.isKeyframe,
+        // No temporal layers, so every P-frame is a reference for the next.
+        discardable: false,
         baseLayerSync: false,
         startOfFrame: true,
         endOfFrame: true,

@@ -478,6 +478,22 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
   });
 });
 
+describe('MediaPublisher — frame marking', () => {
+  it('marks no frame discardable: without temporal layers every P-frame is a reference', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { draft: 18 });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    pub.publishVideo(chunk(1), delta());
+    await conn.releaseAll();
+
+    const profile = { wireProfile: locWireProfileForDraft(18) };
+    const marks = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).videoFrameMarking);
+    expect(marks.map((m) => m?.independent)).toEqual([true, false]);
+    expect(marks.map((m) => m?.discardable)).toEqual([false, false]);
+  });
+});
+
 describe('MediaPublisher — bounded backpressure', () => {
   it('video: sustained chunks far beyond the cap stay bounded; recovery is a keyframe at Object 0', async () => {
     const conn = recordingConnection({ holdSends: true });
