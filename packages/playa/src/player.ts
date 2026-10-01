@@ -108,6 +108,11 @@ export class Player {
   private ownsCanvas = false;
   private ownsVideo = false;
 
+  /** When the page went away, for the duration reported on the way back. */
+  private awaySinceMs: number | null = null;
+  /** Away at least this long and the buffer is stale: re-join live rather than play it out. */
+  private static readonly RESUME_JUMP_TO_LIVE_MS = 3_000;
+
   /** The MSE autoplay ladder may mute the element itself; mirror it. */
   private readonly syncMutedFromElement = (): void => {
     const el = this.videoElement;
@@ -165,6 +170,7 @@ export class Player {
     this._autoQuality = options.autoQuality ?? DEFAULTS.autoQuality;
     this._volume = this.clampVolume(options.volume ?? DEFAULTS.volume);
     this._muted = options.muted ?? DEFAULTS.muted;
+    this.installLifecycleListeners();
 
     // Detect decode strategy
     this.strategy = detectStrategy();
@@ -521,8 +527,44 @@ export class Player {
 
   // ─── Cleanup ─────────────────────────────────────────────────────
 
+  /** Report page-lifecycle transitions; re-join live after RESUME_JUMP_TO_LIVE_MS away. */
+  private readonly onLifecycle = (kind: 'hidden' | 'visible' | 'frozen' | 'resumed'): void => {
+    if (kind === 'hidden' || kind === 'frozen') {
+      this.awaySinceMs ??= Date.now();
+      this.emitter.emit('lifecycle', { state: kind });
+      return;
+    }
+    const awayMs = this.awaySinceMs === null ? 0 : Date.now() - this.awaySinceMs;
+    this.awaySinceMs = null;
+    this.emitter.emit('lifecycle', { state: kind, awayMs });
+    if (awayMs >= Player.RESUME_JUMP_TO_LIVE_MS && this.state === 'playing') {
+      this.engine.jumpToLive(`resumed after ${(awayMs / 1000).toFixed(1)}s away`);
+    }
+  };
+
+  private readonly onVisibilityChange = (): void =>
+    this.onLifecycle(document.hidden ? 'hidden' : 'visible');
+  private readonly onFreeze = (): void => this.onLifecycle('frozen');
+  private readonly onResume = (): void => this.onLifecycle('resumed');
+
+  /** No-op without a DOM (tests, Node). */
+  private installLifecycleListeners(): void {
+    if (typeof document === 'undefined') return;
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    document.addEventListener('freeze', this.onFreeze);
+    document.addEventListener('resume', this.onResume);
+  }
+
+  private removeLifecycleListeners(): void {
+    if (typeof document === 'undefined') return;
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    document.removeEventListener('freeze', this.onFreeze);
+    document.removeEventListener('resume', this.onResume);
+  }
+
   /** Destroy the player and release all resources. */
   async destroy(): Promise<void> {
+    this.removeLifecycleListeners();
     this.timeCtrl?.stop();
     this.stopStatsTimer();
     this.renderer?.destroy();

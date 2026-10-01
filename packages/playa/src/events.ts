@@ -46,6 +46,8 @@ export interface PlayerEventMap {
   'stall': StallEvent;
   /** A stall ended, with the full outage length. */
   'stall_recovered': StallRecoveredEvent;
+  /** The page was suspended or restored by the browser. */
+  'lifecycle': LifecycleEvent;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -136,6 +138,14 @@ export interface StallEvent {
 export interface StallRecoveredEvent {
   /** Outage length, onset to recovery. */
   readonly durationMs: number;
+}
+
+/** A browser page-lifecycle transition. A frozen tab runs no timers or socket
+ *  reads, so its gap otherwise looks like a network failure. */
+export interface LifecycleEvent {
+  readonly state: 'hidden' | 'visible' | 'frozen' | 'resumed';
+  /** How long the page spent away, on the transition back. */
+  readonly awayMs?: number;
 }
 
 export interface ErrorEvent {
