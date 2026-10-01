@@ -64,6 +64,9 @@ importers:
       '@openmoq/msf':
         specifier: workspace:*
         version: link:../packages/msf
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../packages/playa
       '@openmoq/playback':
         specifier: workspace:*
         version: link:../packages/playback
@@ -76,9 +79,6 @@ importers:
       '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../packages/webtransport
-      '@openmoq/playa':
-        specifier: workspace:*
-        version: link:../packages/playa
     devDependencies:
       vite:
         specifier: ^6.4.3
@@ -157,6 +157,66 @@ importers:
       '@openmoq/player':
         specifier: workspace:*
         version: link:../player
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/compat-browser:
+    dependencies:
+      '@openmoq/browser':
+        specifier: workspace:*
+        version: link:../browser
+
+  packages/compat-loc:
+    dependencies:
+      '@openmoq/loc':
+        specifier: workspace:*
+        version: link:../loc
+
+  packages/compat-locmaf:
+    dependencies:
+      '@openmoq/locmaf':
+        specifier: workspace:*
+        version: link:../locmaf
+
+  packages/compat-msf:
+    dependencies:
+      '@openmoq/msf':
+        specifier: workspace:*
+        version: link:../msf
+
+  packages/compat-playa:
+    dependencies:
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../playa
+
+  packages/compat-playback:
+    dependencies:
+      '@openmoq/playback':
+        specifier: workspace:*
+        version: link:../playback
+
+  packages/compat-player:
+    dependencies:
+      '@openmoq/player':
+        specifier: workspace:*
+        version: link:../player
+
+  packages/compat-quic:
+    dependencies:
+      '@openmoq/quic':
+        specifier: workspace:*
+        version: link:../quic
+
+  packages/compat-transport:
+    dependencies:
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+
+  packages/compat-webtransport:
+    dependencies:
       '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport

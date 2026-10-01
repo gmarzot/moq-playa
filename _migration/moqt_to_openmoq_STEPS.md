@@ -4,6 +4,11 @@ Rename the nine published `@moqt/*` packages to `@openmoq/*`, and rename `@playa
 
 This migration does not change the supported transport drafts. Land it on `main` (drafts 14/16/18), then merge it into the experimental draft branch. Keep experimental releases separate from the stable npm channel. Publishing, deprecating packages, and pushing release tags each require explicit approval.
 
+The old names remain as thin compatibility packages in `packages/compat-*`.
+They re-export the matching canonical version without runtime warnings. See
+[package compatibility](../docs/package-compatibility.md) for the release and
+verification contract. Existing published versions are not overwritten.
+
 1. **COMPLETE/TA** Create the `@openmoq` organization on npmjs.com and confirm you are an owner of the existing `@moqt/*` packages and of `@playa/player`. Ownership of those packages is what lets you deprecate them later. Keep the `@moqt` and `@playa` npm orgs after the rename so the old names cannot be re-registered.
 
 2. **COMPLETE/TA** In one repo change, rename these packages and every specifier that points at them:
@@ -33,11 +38,11 @@ This migration does not change the supported transport drafts. Land it on `main`
 
 6. **TA** On each of the ten new npm packages, including `@openmoq/playa`, add this repo's `publish.yml` as a trusted publisher, using the same OIDC settings the workflow comments already describe. `_migration/step6_trusted_publisher_check.sh` checks package visibility only; it does not verify the trusted-publisher configuration.
 
-7. **RAY** After trusted publishing is configured, use the normal release process on `main` to bump to the next version and push a new release tag. That tag is the first CI publish of the ten `@openmoq/*` packages, including `@openmoq/playa`. Do not move or recreate the existing `v0.5.9` tag: it identifies the pre-migration source.
+7. **RAY** After trusted publishing is configured, use the normal release process on `main` to bump to the next version and push a new release tag. That tag publishes ten canonical `@openmoq/*` packages and ten compatibility packages under the old names. Keep trusted publishing configured for both sets. Do not move or recreate the existing `v0.5.9` tag: it identifies the pre-migration source.
 
 8. Verify the interop image publication from the migration commit. No follow-up package-pin change is needed: the image already builds its MoQ libraries from source, independently of the npm bootstrap.
 
-9. **RAY** After confirming the replacement packages are installable, deprecate the nine old `@moqt/*` packages and `@playa/player`:
+9. **RAY** After confirming the canonical and compatibility releases are installable, deprecate the nine old `@moqt/*` packages and `@playa/player`:
 
 ```sh
 bash _migration/step9_deprecate_old_scopes.sh
@@ -45,4 +50,4 @@ bash _migration/step9_deprecate_old_scopes.sh
 
    Run this while logged in as an owner of the `@moqt` packages and of `@playa/player`. It checks that all replacements are visible before changing any deprecation notices, then uses package specs such as `@moqt/player@*` to deprecate all old versions. Installing the old names still succeeds and prints the warning. Installing `@openmoq/playa` does not. Keep ownership of the `@moqt` and `@playa` npm orgs so those names cannot be re-registered.
 
-10. Confirm the release from step 7 published all ten packages and that consumers can install them. This check does not require another version bump.
+10. Confirm the release from step 7 published all twenty packages and that consumers can install them. This check does not require another version bump. Reapply the old-name deprecation notices after future compatibility releases; notices on previously published versions do not automatically cover new uploads.

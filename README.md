@@ -10,6 +10,10 @@ pick the integration path that fits:
 - **`@openmoq/*`** — the reference-implementation building blocks: protocol core, playback, and browser adapters, composed however you need.
 - **`@openmoq/playa`** — the batteries-included, drop-in browser player built on `@openmoq/*`.
 
+The previous `@moqt/*` names and `@playa/player` are retained as compatibility
+re-exports. Use the new names for new integrations; see
+[package compatibility](docs/package-compatibility.md) for migration details.
+
 ---
 
 ## Quick Start

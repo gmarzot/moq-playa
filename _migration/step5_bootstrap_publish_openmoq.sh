@@ -30,7 +30,7 @@ require_clean_tree
 echo "==> Packing publishable packages"
 mkdir -p release
 rm -f release/*.tgz || true
-pnpm --filter "./packages/*" pack --pack-destination "$PWD/release"
+pnpm --filter "@openmoq/*" pack --pack-destination "$PWD/release"
 
 echo "==> Verifying tarball package names"
 expected=(
