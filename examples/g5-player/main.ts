@@ -296,7 +296,7 @@ async function main(): Promise<void> {
       ? ` start: ${stallStartSnap || '?'} · end: ${describeVideo(video)}` : '';
     log(`Stall detected after ${durationMs.toFixed(0)}ms${where}`);
     stallStartSnap = '';
-    stallMarks.push(queuedASamples.length);
+    stallMarks.push(performance.now());
   });
 
   player.on('stall_recovered', ({ durationMs }) => {
@@ -412,9 +412,13 @@ async function main(): Promise<void> {
   // capture timestamps it degrades to arrival-interval deviation.
 
   // Raw per-object latency with arrival times, trimmed to a window. The chart
-  // series below are filled on the tick instead of per object, so every chart
-  // shares one time axis (180 samples = 45 s) and features line up.
+  // series below are filled on the tick instead of per object and drawn against
+  // the tick's time, so every chart shares one time axis and features line up.
   const TICK_MS = 250;
+  /** Time span each chart shows. */
+  const CHART_SPAN_MS = 45_000;
+  /** Tick times; every chart series holds one value per entry. */
+  const sampleAtMs: number[] = [];
   const latWindow: Array<[number, number]> = [];
   const LAT_WINDOW_MS = 4_000;
   /** Clock divergence rate from the drift fit, in ms per minute. */
@@ -429,8 +433,7 @@ async function main(): Promise<void> {
   // lone spike, so this is the only series here that sees one.
   const latTickMaxSamples: number[] = [];
   const jitSamples: number[] = [];
-  // Per-track queued media ahead of the playhead, one sample per tick. The audio
-  // series also carries the stall-mark indices.
+  // Per-track queued media ahead of the playhead, one sample per tick.
   const queuedASamples: number[] = [];
   const queuedVSamples: number[] = [];
   // Event-loop lag: how late a timer that does nothing actually runs. The 250 ms
@@ -445,7 +448,8 @@ async function main(): Promise<void> {
   let lastChaseNoteMs = 0;
   const lagProbe = (): void => {
     const now = performance.now();
-    if (lagDueAt) lagSamples.push([now, Math.max(0, now - lagDueAt)]);
+    // A hidden page's timers are clamped by Chrome; that is not this page's lag.
+    if (lagDueAt && !document.hidden) lagSamples.push([now, Math.max(0, now - lagDueAt)]);
     while (lagSamples.length && now - lagSamples[0]![0] > SETTLE_WINDOW_MS) {
       lagSamples.shift();
     }
@@ -453,6 +457,9 @@ async function main(): Promise<void> {
     setTimeout(lagProbe, LAG_PERIOD_MS);
   };
   setTimeout(lagProbe, LAG_PERIOD_MS);
+  // The probe armed before a visibility change fires late; it must not sample.
+  document.addEventListener('visibilitychange', () => { lagDueAt = 0; });
+  /** Stall detection times, drawn over the queue chart. */
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
   let audioCodec: string | null = null;
@@ -462,9 +469,14 @@ async function main(): Promise<void> {
   let jitterEwma = 0;
   let expectedIntervalMs = 0;
   (window as any).__player = player;
-  const pushSample = (a: number[], v: number) => {
-    a.push(v);
-    if (a.length > 180) a.shift();
+  const chartSeries = [sampleAtMs, latP50Samples, latP95Samples, latTickMaxSamples,
+    jitSamples, queuedASamples, queuedVSamples];
+  /** Drop samples and stall marks older than the chart span. */
+  const trimSamples = (nowMs: number): void => {
+    while (sampleAtMs.length && nowMs - sampleAtMs[0]! > CHART_SPAN_MS) {
+      for (const s of chartSeries) s.shift();
+    }
+    while (stallMarks.length && nowMs - stallMarks[0]! > CHART_SPAN_MS) stallMarks.shift();
   };
 
   // Series carry NaN for "nothing to report" so the charts stay on one axis;
@@ -513,20 +525,41 @@ async function main(): Promise<void> {
     return s === null ? 0 : s.assemblyMs + s.decodeMs;
   };
 
-  /** Least-squares fit of the per-tick latency floor against tick index, from
-   *  session start: its slope is the clock divergence. */
-  const driftFit = { n: 0, sx: 0, sy: 0, sxx: 0, sxy: 0 };
-  /** Ticks before a slope is reported — below this it is fitting jitter. */
-  const DRIFT_MIN_SAMPLES = 120;
-  const addDriftSample = (floorMs: number): number | null => {
-    const k = driftFit.n;
-    driftFit.n++;
-    driftFit.sx += k; driftFit.sy += floorMs;
-    driftFit.sxx += k * k; driftFit.sxy += k * floorMs;
-    if (driftFit.n < DRIFT_MIN_SAMPLES) return null;
-    const denom = driftFit.n * driftFit.sxx - driftFit.sx * driftFit.sx;
-    if (denom === 0) return null;
-    return (driftFit.n * driftFit.sxy - driftFit.sx * driftFit.sy) / denom;
+  /** Per-tick latency floor [time ms, floor ms], visible ticks only. */
+  const driftSamples: Array<[number, number]> = [];
+  /** Long enough to see a slope, short enough that a clock step ages out. */
+  const DRIFT_WINDOW_MS = 10 * 60_000;
+  /** Below this span the slope is fitting jitter. */
+  const DRIFT_MIN_SPAN_MS = 60_000;
+  /** Fitted floor when the fit first became usable: the level corrections return to. */
+  let driftRefFloorMs: number | null = null;
+  /** Last usable estimate, held while the window refills after a hidden stretch. */
+  let lastDrift: { msPerMin: number; correctionMs: number } | null = null;
+  const addDriftSample = (atMs: number, floorMs: number): void => {
+    driftSamples.push([atMs, floorMs]);
+    while (atMs - driftSamples[0]![0] > DRIFT_WINDOW_MS) driftSamples.shift();
+  };
+  /**
+   * Least-squares line through the recent floor samples against time: its slope
+   * is the clock divergence, and the distance of its value at `atMs` from the
+   * reference level is what the latency series subtract.
+   */
+  const driftEstimate = (atMs: number): { msPerMin: number; correctionMs: number } | null => {
+    const n = driftSamples.length;
+    if (n < 2 || driftSamples[n - 1]![0] - driftSamples[0]![0] < DRIFT_MIN_SPAN_MS) return lastDrift;
+    const t0 = driftSamples[0]![0];
+    let sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (const [t, y] of driftSamples) {
+      const x = t - t0;
+      sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    const denom = n * sxx - sx * sx;
+    if (denom === 0) return lastDrift;
+    const slope = (n * sxy - sx * sy) / denom;
+    const fittedMs = (sy - slope * sx) / n + slope * (atMs - t0);
+    driftRefFloorMs ??= fittedMs;
+    lastDrift = { msPerMin: slope * 60_000, correctionMs: fittedMs - driftRefFloorMs };
+    return lastDrift;
   };
 
   // Per-track object continuity. Arrival order is not delivery order: LOC audio
@@ -679,7 +712,27 @@ async function main(): Promise<void> {
     return [w, h];
   }
 
-  function drawSpark(canvas: HTMLCanvasElement, data: number[],
+  /** Samples further apart than this are drawn as a gap (a hidden page, a stalled tick). */
+  const CHART_GAP_MS = 4 * TICK_MS;
+
+  /** x for a time on a chart of width `w` ending at `nowMs`. */
+  const chartX = (atMs: number, nowMs: number, w: number) =>
+    ((atMs - (nowMs - CHART_SPAN_MS)) / CHART_SPAN_MS) * w;
+
+  /** Trace one series against the sample times; NaN and time gaps lift the pen. */
+  function traceSeries(ctx: CanvasRenderingContext2D, data: number[], nowMs: number,
+                       w: number, yOf: (v: number) => number): void {
+    let pen = false;
+    data.forEach((v, i) => {
+      if (!Number.isFinite(v)) { pen = false; return; }
+      const x = chartX(sampleAtMs[i]!, nowMs, w);
+      if (pen && sampleAtMs[i]! - sampleAtMs[i - 1]! <= CHART_GAP_MS) ctx.lineTo(x, yOf(v));
+      else ctx.moveTo(x, yOf(v));
+      pen = true;
+    });
+  }
+
+  function drawSpark(canvas: HTMLCanvasElement, nowMs: number, data: number[],
                      color: string, refLine = 0,
                      marks?: number[]): void {
     const ctx = canvas.getContext('2d');
@@ -690,7 +743,6 @@ async function main(): Promise<void> {
     if (live.length < 2) return;
     const max = Math.max(...live, refLine) * 1.15 || 1;
     const yOf = (v: number) => h - (v / max) * (h - 6) - 3;
-    const xOf = (i: number) => (i / (data.length - 1)) * w;
     if (refLine > 0) {
       ctx.beginPath();
       ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
@@ -702,24 +754,18 @@ async function main(): Promise<void> {
       ctx.setLineDash([]);
     }
     for (const m of marks ?? []) {
-      if (m < 0 || m >= data.length) continue;
       ctx.fillStyle = 'rgba(204, 68, 68, 0.55)';
-      ctx.fillRect(xOf(m) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
+      ctx.fillRect(chartX(m, nowMs, w) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
     }
     ctx.beginPath();
-    // A gap in the data lifts the pen rather than drawing through it.
-    let pen = false;
-    data.forEach((v, i) => {
-      if (!Number.isFinite(v)) { pen = false; return; }
-      if (pen) ctx.lineTo(xOf(i), yOf(v)); else { ctx.moveTo(xOf(i), yOf(v)); pen = true; }
-    });
+    traceSeries(ctx, data, nowMs, w, yOf);
     ctx.strokeStyle = color;
     ctx.lineWidth = devicePixelRatio;
     ctx.stroke();
   }
 
   /** Two series on one scale — only comparable on a shared axis. */
-  function drawSpark2(canvas: HTMLCanvasElement, a: number[], aColor: string,
+  function drawSpark2(canvas: HTMLCanvasElement, nowMs: number, a: number[], aColor: string,
                       b: number[], bColor: string, refLine = 0,
                       marks?: number[]): void {
     const ctx = canvas.getContext('2d');
@@ -728,7 +774,6 @@ async function main(): Promise<void> {
     ctx.clearRect(0, 0, w, h);
     const max = Math.max(1, refLine,
       ...a.filter(Number.isFinite), ...b.filter(Number.isFinite)) * 1.15;
-    const xOf = (i: number, n: number) => (i / (n - 1)) * w;
     const yOf = (v: number) => h - (v / max) * (h - 6) - 3;
     if (refLine > 0) {
       ctx.beginPath();
@@ -741,20 +786,13 @@ async function main(): Promise<void> {
       ctx.setLineDash([]);
     }
     for (const m of marks ?? []) {
-      if (m < 0 || m >= a.length) continue;
       ctx.fillStyle = 'rgba(204, 68, 68, 0.55)';
-      ctx.fillRect(xOf(m, a.length) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
+      ctx.fillRect(chartX(m, nowMs, w) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
     }
     for (const [data, color] of [[a, aColor], [b, bColor]] as Array<[number[], string]>) {
       if (data.filter(Number.isFinite).length < 2) continue;
       ctx.beginPath();
-      let pen = false;
-      data.forEach((v, i) => {
-        if (!Number.isFinite(v)) { pen = false; return; }
-        const x = xOf(i, data.length);
-        const y = yOf(v);
-        if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
-      });
+      traceSeries(ctx, data, nowMs, w, yOf);
       ctx.strokeStyle = color;
       ctx.lineWidth = devicePixelRatio;
       ctx.stroke();
@@ -832,38 +870,37 @@ async function main(): Promise<void> {
     const aMs = byKind ? byKind.audio
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
-    if (player.state !== 'idle') {
-      queuedASamples.push(aMs ?? NaN);
-      if (queuedASamples.length > 180) {
-        queuedASamples.shift();
-        for (let i = 0; i < stallMarks.length; i++) stallMarks[i]!--;
-        while (stallMarks.length && stallMarks[0]! < 0) stallMarks.shift();
-      }
-      pushSample(queuedVSamples, vMs ?? NaN);
-    }
+    // A hidden page's ticks are clamped to 1 Hz or slower and measure the clamp,
+    // so they leave a gap on the charts instead of a sample.
+    const sampling = !document.hidden;
 
-    // Sample the measurements onto the shared time axis before drawing.
     const latRaw = latWindow.map(([, v]) => v);
-    // Remove the clock-rate divergence accumulated since load. The constant
-    // offset stays: one-way delay cannot separate it from transit.
-    const driftSlope = latRaw.length ? addDriftSample(Math.min(...latRaw)) : null;
-    clockDriftMsPerMin = driftSlope !== null ? driftSlope * (60_000 / TICK_MS) : null;
-    const driftSinceStartMs = driftSlope !== null ? driftSlope * (driftFit.n - 1) : 0;
-    const latVals = driftSinceStartMs
-      ? latRaw.map((v) => v - driftSinceStartMs) : latRaw;
-    // Every series takes exactly one slot per tick, NaN where there is nothing
-    // to report, so every chart shares one time axis and a feature at the same
-    // x is the same instant. Skipping a slot silently stretches that chart's
-    // window past the others'.
-    const have = latVals.length > 0;
-    pushSample(latP50Samples, have ? percentile(latVals, 0.5) : NaN);
-    pushSample(latP95Samples, have ? percentile(latVals, 0.95) : NaN);
-    pushSample(latTickMaxSamples, have ? Math.max(...latVals) : NaN);
-    pushSample(jitSamples, prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
+    // Remove the clock divergence. The constant offset stays: one-way delay
+    // cannot separate it from transit.
+    if (sampling && latRaw.length) addDriftSample(tickNowMs, Math.min(...latRaw));
+    const drift = driftEstimate(tickNowMs);
+    clockDriftMsPerMin = drift?.msPerMin ?? null;
+    const driftCorrectionMs = drift?.correctionMs ?? 0;
+    const latVals = driftCorrectionMs
+      ? latRaw.map((v) => v - driftCorrectionMs) : latRaw;
+    // Every series takes a value on every sampled tick, NaN where there is
+    // nothing to report, so all of them index the same sample times.
+    if (sampling) {
+      const have = latVals.length > 0;
+      const active = player.state !== 'idle';
+      sampleAtMs.push(tickNowMs);
+      latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
+      latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
+      latTickMaxSamples.push(have ? Math.max(...latVals) : NaN);
+      jitSamples.push(prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
+      queuedASamples.push(active ? (aMs ?? NaN) : NaN);
+      queuedVSamples.push(active ? (vMs ?? NaN) : NaN);
+    }
+    trimSamples(tickNowMs);
 
-    drawSpark2(latSpark, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
-    drawSpark(jitSpark, jitSamples, '#d9922e');
-    drawSpark2(cusSpark, queuedASamples, '#6cf', queuedVSamples, '#a98cf0',
+    drawSpark2(latSpark, tickNowMs, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
+    drawSpark(jitSpark, tickNowMs, jitSamples, '#d9922e');
+    drawSpark2(cusSpark, tickNowMs, queuedASamples, '#6cf', queuedVSamples, '#a98cf0',
                targetLatencyMs, stallMarks);
     cusAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
@@ -909,9 +946,9 @@ async function main(): Promise<void> {
     }
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = clockDriftMsPerMin !== null
-      ? `This browser's clock and the publisher's run ${clockDriftMsPerMin.toFixed(1)} `
-        + `ms/min apart; the ${driftSinceStartMs.toFixed(0)} ms that has accumulated `
-        + 'since this page loaded is removed. Any constant difference between the '
+      ? `This browser's clock and the publisher's ran ${clockDriftMsPerMin.toFixed(1)} `
+        + `ms/min apart over the last ten minutes; the ${driftCorrectionMs.toFixed(0)} ms `
+        + 'the latency floor has moved since it was first fitted is removed. Any constant difference between the '
         + 'two clocks remains, because a one-way measurement cannot tell it from '
         + 'transit — read these as relative, not as true one-way delay.'
       : '';
