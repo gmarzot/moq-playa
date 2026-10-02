@@ -2498,6 +2498,7 @@ export class MoqtPlayer {
     this.mediaSource?.setPlaybackIntent?.(false);
     this._stats.recordPlayStop();
     this.stopTicking();
+    this.clearStallPark();
 
     // Flush pre-scheduled audio and queued video frames immediately
     this.commandDispatcher?.flush();
@@ -4544,6 +4545,11 @@ export class MoqtPlayer {
   private videoRecoveryActive = false;
   private videoRecoveryHealthyRenders = 0;
   private static readonly RECOVERY_HEALTHY_THRESHOLD = 3;
+  /** Pending skip-forward for a detected stall; cleared when a frame renders. */
+  private stallParkTimer: ReturnType<typeof setTimeout> | null = null;
+  /** How long a detected stall waits for delivery to resume before skipping
+   *  to the next keyframe. */
+  private static readonly STALL_PARK_MS = 1_500;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
 
   private isLocDeliveryHealthy(): boolean {
@@ -4669,6 +4675,7 @@ export class MoqtPlayer {
     this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
     if (this.reconnect?.timer) clearTimeout(this.reconnect.timer);
     this.reconnect = null;
+    this.clearStallPark();
     if (this.currentMigration) {
       const txn = this.currentMigration;
       this.currentMigration = null;
@@ -6250,14 +6257,7 @@ export class MoqtPlayer {
         this.consecutiveStallCount++;
         this.videoRecoveryActive = true;
         this.videoRecoveryHealthyRenders = 0;
-
-        // Flush stale backlog AND reject in-flight objects from the old
-        // subscription. Pass currentGroupId+1 as targetGroupId so the
-        // pipeline's minAcceptGroupId gates out stale groups that arrive
-        // after the REQUEST_UPDATE but before the relay switches.
-        const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
-        this.videoPipeline?.reset(minFreshGroup);
-        this.syncController?.reset();
+        this.clearStallPark();
 
         // Jump to live: when stalls persist (3+ consecutive without a
         // rendered frame), the player has fallen behind the live edge.
@@ -6265,6 +6265,7 @@ export class MoqtPlayer {
         // from NOW, and resume from the next keyframe.
         if (this.consecutiveStallCount >= 3) {
           this.consecutiveStallCount = 0;
+          this.flushVideoForRecovery();
           this.log.warn('Jump to live: %d consecutive stalls — flushing and resubscribing', 3);
 
           // Tell relay to restart from live edge
@@ -6280,28 +6281,21 @@ export class MoqtPlayer {
         // Relay signals overload via PUBLISH_DONE/TOO_FAR_BEHIND;
         // network bottlenecks produce no server signal, so the player
         // must self-detect via stall rate.
-        if (this.recoveryController) {
-          const action = this.recoveryController.evaluate({ type: 'stall' as any, durationMs } as any);
-          this.emitter.emit('recovery_action', {
-            type: 'recovery_action',
-            action,
-          });
-          doRecoveryAction(action, 'video', this.qualityController, this.log, {
-            onQualityReduced: (newTrack) => {
-              // No stats here — deferred to completePendingVideoSwitch.
-              this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
-                this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
-              });
-            },
-            onResubscribe: (mt, sg) => this.requestFreshSubscriptionStart(mt, sg),
-            onTerminate: (_reason) => {
-              if (this.stateMachine.state !== PlayerState.ERROR) {
-                this.transitionState(PlayerState.ERROR);
-              }
-              this.stopTicking();
-            },
-          });
+        const action = this.recoveryController?.evaluate({ type: 'stall' as any, durationMs } as any);
+        if (action?.type === 'skip_forward') {
+          // A delivery gap usually resumes with the group intact; skipping now
+          // would discard it and wait for the next keyframe. Skip only if no
+          // frame renders within the bound.
+          this.stallParkTimer = setTimeout(() => {
+            this.stallParkTimer = null;
+            if (this._destroyed || this.isTerminalState()) return;
+            this.flushVideoForRecovery();
+            this.applyStallRecovery(action);
+          }, MoqtPlayer.STALL_PARK_MS);
+          return;
         }
+        this.flushVideoForRecovery();
+        if (action) this.applyStallRecovery(action);
       },
       onDecodeError: (mediaType, error) => {
         if (this.stateMachine.state === PlayerState.ERROR) return;
@@ -6404,6 +6398,7 @@ export class MoqtPlayer {
       },
       onFrameRendered: (_captureTimestampUs, _actualRenderUs) => {
         this._stats.recordFrameRendered();
+        this.clearStallPark();
         if (this.videoRecoveryActive) {
           // Pipeline reset(minFreshGroup) rejects stale in-flight objects,
           // so any frame reaching here is genuinely fresh relay data.
@@ -7354,6 +7349,7 @@ export class MoqtPlayer {
   jumpToLive(reason: string): void {
     if (!this.connection) return;
     this.log.info('Jump to live: %s', reason);
+    this.clearStallPark();
     // As the stall path does: drop the backlog, refuse stale groups still in
     // flight, and re-anchor on what arrives next.
     for (const pipeline of [this.videoPipeline, this.audioPipeline]) {
@@ -7365,6 +7361,42 @@ export class MoqtPlayer {
     this.emitter.emit('recovery_action', {
       type: 'recovery_action',
       action: { type: 'jump_to_live' },
+    });
+  }
+
+  private clearStallPark(): void {
+    if (this.stallParkTimer === null) return;
+    clearTimeout(this.stallParkTimer);
+    this.stallParkTimer = null;
+  }
+
+  /**
+   * Drop the video backlog and refuse stale groups still in flight (the
+   * pipeline's minAcceptGroupId), so playback resumes at the next keyframe.
+   */
+  private flushVideoForRecovery(): void {
+    const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
+    this.videoPipeline?.reset(minFreshGroup);
+    this.syncController?.reset();
+  }
+
+  /** Publish and carry out the recovery controller's answer to a video stall. */
+  private applyStallRecovery(action: RecoveryAction): void {
+    this.emitter.emit('recovery_action', { type: 'recovery_action', action });
+    doRecoveryAction(action, 'video', this.qualityController, this.log, {
+      onQualityReduced: (newTrack) => {
+        // No stats here — deferred to completePendingVideoSwitch.
+        this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
+          this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
+        });
+      },
+      onResubscribe: (mt, sg) => this.requestFreshSubscriptionStart(mt, sg),
+      onTerminate: (_reason) => {
+        if (this.stateMachine.state !== PlayerState.ERROR) {
+          this.transitionState(PlayerState.ERROR);
+        }
+        this.stopTicking();
+      },
     });
   }
 

@@ -9083,19 +9083,47 @@ describe('MoqtPlayer', () => {
 
       const recoveryEvents: any[] = [];
       player.on('recovery_action' as any, (evt: any) => recoveryEvents.push(evt));
+      vi.useFakeTimers();
+      try {
+        renderer.onStall?.(508);
+        // The skip waits for delivery to resume first.
+        expect(recoveryEvents).toEqual([]);
 
-      // Fire a stall — recovery controller should evaluate and
-      // the result should be emitted as an event, not silently filtered
-      renderer.onStall?.(508);
+        // Nothing rendered within the bound: the action is carried out, and
+        // skip_forward asks the relay for fresh data (REQUEST_UPDATE).
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(recoveryEvents.length).toBeGreaterThan(0);
+        expect(adapter.requestUpdate.mock.calls.length).toBeGreaterThan(0);
+      } finally {
+        vi.useRealTimers();
+      }
 
-      // The stall should produce SOME recovery event (skip_forward,
-      // reduce_quality, or jump_to_live) — it must not be silently dropped
-      expect(recoveryEvents.length).toBeGreaterThan(0);
+      await player.destroy();
+    });
 
-      // skip_forward from stall triggers requestFreshSubscriptionStart →
-      // adapter.requestUpdate (REQUEST_UPDATE to relay for fresh data)
-      await new Promise(r => setTimeout(r, 0));
-      expect(adapter.requestUpdate.mock.calls.length).toBeGreaterThan(0);
+    it('a frame rendered while a stall waits keeps the group: no skip, no relay restart', async () => {
+      const adapter = createMockAdapter();
+      const renderer = createMockRenderer();
+      const decoder = createMockVideoDecoder();
+      const player = await loadWithAbr(adapter, renderer, decoder);
+
+      const recoveryEvents: any[] = [];
+      player.on('recovery_action' as any, (evt: any) => recoveryEvents.push(evt));
+      const flushesBefore = renderer.flush.mock.calls.length;
+      const updatesBefore = adapter.requestUpdate.mock.calls.length;
+      vi.useFakeTimers();
+      try {
+        renderer.onStall?.(508);
+        await vi.advanceTimersByTimeAsync(700);
+        renderer.onFrameRendered?.(1000n, clockTimeUs);
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(recoveryEvents).toEqual([]);
+        expect(adapter.requestUpdate.mock.calls.length).toBe(updatesBefore);
+        expect(renderer.flush.mock.calls.length).toBe(flushesBefore);
+      } finally {
+        vi.useRealTimers();
+      }
 
       await player.destroy();
     });
