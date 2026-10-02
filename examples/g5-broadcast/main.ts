@@ -25,6 +25,7 @@ import type { MediaPublisher } from './media-publisher.js';
 import { log } from '../shared/log.js';
 import { certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
+import { copyOnClick } from '../shared/copyable.js';
 import {
   WebCodecsVideoEncoder,
   WebCodecsAudioEncoder,
@@ -420,9 +421,12 @@ function logSnapshot(): void {
 // which one a soak ran on. Echo the whole configuration before anything starts.
 log(`Namespace: ${namespace}`);
 log(`Relay: ${params.get('url') ?? `${DEFAULT_RELAY} (default)`}`);
-// https is implied on this page.
-setText('conn-relay', (params.get('url') ?? DEFAULT_RELAY).replace(/^https:\/\//, ''));
+setText('conn-relay', params.get('url') ?? DEFAULT_RELAY);
 setText('conn-ns', namespace);
+for (const id of ['conn-relay', 'conn-ns']) {
+  const el = document.getElementById(id);
+  if (el) copyOnClick(el);
+}
 setText('conn-draft', String(broadcastDraft));
 log(`Draft: ${broadcastDraft} · codec ${videoCodec} · ${videoBitrate / 1000}kbps · `
   + `keyframe every ${keyframeInterval} · target ${targetLatencyMs}ms`);

@@ -30,6 +30,7 @@
     .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
     .layout.cat-hidden .cat-col { display: none; }
     h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: #fff; }
+    h1 .five { color: #e42126; }
     /* Session identity after the title. */
     h1 .conn {
       font-size: .82rem; font-weight: 500; color: #8a94a6;
@@ -40,6 +41,15 @@
     h1 .conn b {
       color: #6cf; font-weight: 700;
       text-transform: none; letter-spacing: 0;
+    }
+    h1 .conn b.copyable { cursor: copy; position: relative; }
+    h1 .conn b.copyable:hover { text-decoration: underline dotted; }
+    /* Floats above the value so the heading does not reflow. */
+    h1 .conn b.copied::after {
+      content: 'copied'; position: absolute; left: 50%; bottom: calc(100% + 4px);
+      transform: translateX(-50%); padding: 1px 6px; border-radius: 3px;
+      background: #2a2f3a; color: #cfd6e4; font-size: .7rem; font-weight: 500;
+      white-space: nowrap; pointer-events: none;
     }
     .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
     .attrib-note {
@@ -399,7 +409,7 @@
 </head>
 <body>
   <div class="wrapper">
-    <h1>G5 Player<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span></h1>
+    <h1>G<span class="five">5</span> Player<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span></h1>
 
     <div class="layout" id="layout">
     <div class="main-col">

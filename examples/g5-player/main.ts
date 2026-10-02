@@ -22,6 +22,7 @@ const catchUpRate: number | undefined = (() => {
   return Number.isFinite(v) && v >= 1 ? v : undefined;
 })();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
+import { copyOnClick } from '../shared/copyable.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 
@@ -1070,9 +1071,12 @@ async function main(): Promise<void> {
 
   log(`Relay: ${relayUrl}`);
   log(`Namespace: ${namespace}`);
-  // https is implied on this page.
-  setText('conn-relay', relayUrl.replace(/^https:\/\//, ''));
+  setText('conn-relay', relayUrl);
   setText('conn-ns', namespace);
+  for (const id of ['conn-relay', 'conn-ns']) {
+    const el = document.getElementById(id);
+    if (el) copyOnClick(el);
+  }
   setText('conn-draft', draftVersion === undefined ? 'auto' : String(draftVersion));
   player.load().catch((err) => log(`Fatal: ${(err as Error).message}`));
 }
