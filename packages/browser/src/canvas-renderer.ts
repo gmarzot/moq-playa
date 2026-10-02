@@ -329,7 +329,13 @@ export class CanvasRenderer implements VideoRendererLike {
     // Becoming visible: the queue built while painting was throttled holds
     // frames whose moment has passed. Keep only the newest so playback
     // resumes at the live edge instead of replaying the backlog.
-    if (!document.hidden) this.dropAllButNewest();
+    if (!document.hidden) {
+      this.dropAllButNewest();
+      // Throttled painting while hidden is not a stall: time the next one from
+      // now. A stall already detected before the page was hidden keeps running.
+      if (this.lastRenderTimeMs > 0) this.lastRenderTimeMs = performance.now();
+      if (this.stallEpisode !== null && !this.stallEpisode.detected) this.stallEpisode = null;
+    }
     this.cancelLoop();
     this.scheduleLoop();
   };
