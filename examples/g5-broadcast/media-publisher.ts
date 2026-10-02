@@ -259,7 +259,8 @@ export class MediaPublisher {
    * suppressed until a probe re-attempts one chunk.
    */
   private pauseTrack(track: 'video' | 'audio', err: unknown): boolean {
-    if (!String((err as Error)?.message ?? '').includes('§5.1')) return false;
+    // Not the bare "§5.1": cancellation errors cite §5.1.1.
+    if (!String((err as Error)?.message ?? '').includes('Forward State 0')) return false;
     if (track === 'video') {
       this.videoQueue.length = 0;
       // Resume at a keyframe: dependents published across the gap are useless.
@@ -285,23 +286,35 @@ export class MediaPublisher {
   }
 
   /**
-   * A subscription ended under us — the viewer paused, closed, or the relay
-   * tore it down. Retire the track: drop its queue and clear its alias, which
-   * the publish guards already treat as "do not produce". A later SUBSCRIBE
-   * calls setVideoAlias/setAudioAlias and production resumes.
-   *
-   * Without this every subsequent chunk raises the same §10.11 error — 50 a
-   * second on audio — until the session dies under the noise.
+   * The track's subscription ended — the viewer left or the relay tore it
+   * down. Drop the queue and clear the alias, which the publish guards treat
+   * as "do not produce"; a later SUBSCRIBE calls setVideoAlias/setAudioAlias
+   * and production resumes. The adapter has already reset the subscription's
+   * streams, so the open video subgroup is forgotten, not closed, and the next
+   * keyframe opens a fresh one.
    */
-  private retireTrack(track: 'video' | 'audio', err: unknown): boolean {
-    if (!String((err as Error)?.message ?? '').includes('§10.11')) return false;
-    if (track === 'video') { this.videoAlias = null; this.videoQueue.length = 0; }
-    else { this.audioAlias = null; this.audioQueue.length = 0; }
+  endTrack(track: 'video' | 'audio'): void {
+    if (track === 'video') {
+      this.videoAlias = null;
+      this.videoQueue.length = 0;
+      this.videoStreamId = null;
+    } else {
+      this.audioAlias = null;
+      this.audioQueue.length = 0;
+    }
+    this.paused.delete(track);
+    this.pauseReported.delete(track);
     if (!this.retired.has(track)) {
       this.retired.add(track);
       this.report(`${track} retired`, new Error(
         `subscription ended; ${track} production paused until a new SUBSCRIBE`));
     }
+  }
+
+  /** A §10.11 publish error: the subscription ended before we were told. */
+  private retireTrack(track: 'video' | 'audio', err: unknown): boolean {
+    if (!String((err as Error)?.message ?? '').includes('§10.11')) return false;
+    this.endTrack(track);
     return true;
   }
 

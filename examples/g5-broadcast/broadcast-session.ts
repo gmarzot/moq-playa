@@ -64,6 +64,10 @@ export class BroadcastSession {
   private retired = false;
   /** Re-emission timer for the catalog track, and the alias it publishes on. */
   private catalogTimer: ReturnType<typeof setInterval> | null = null;
+  /** The track each accepted SUBSCRIBE serves, by request ID. */
+  private readonly subscribedTrack = new Map<bigint, string>();
+  /** The request currently served for each track. */
+  private readonly currentRequest = new Map<string, bigint>();
   /** Session-owned in-flight work (catalog publication) that shutdown()
    *  must account for. */
   private readonly pendingWork = new Set<Promise<void>>();
@@ -98,7 +102,8 @@ export class BroadcastSession {
    * failed re-emission is reported once and the interval continues.
    */
   private startCatalogReemission(alias: bigint): void {
-    if (this.catalogTimer !== null) return;
+    // A new catalog subscription has its own alias; the old one is gone.
+    this.stopCatalogReemission();
     const periodMs = this.opts.catalogIntervalMs ?? 1_000;
     if (periodMs <= 0) return;
     let reportedFailure = false;
@@ -146,6 +151,13 @@ export class BroadcastSession {
       this.safeLog(`Failed to serve "${trackName}" subscription: ${(err as Error)?.message ?? err}`);
     };
 
+    const served = trackName === 'catalog' || trackName === 'video'
+      || (trackName === 'audio' && !!this.opts.catalog.audio);
+    if (served) {
+      this.subscribedTrack.set(requestId, trackName);
+      this.currentRequest.set(trackName, requestId);
+    }
+
     if (trackName === 'catalog') {
       // Catalog publication is SESSION-OWNED work: tracked so shutdown()
       // accounts for it; the retired-guard keeps a stale completion from
@@ -190,6 +202,24 @@ export class BroadcastSession {
       this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n), `Unknown track: ${trackName}`)
         .catch(report);
     }
+  }
+
+  /**
+   * The relay ended a subscription, as it does upstream once its last viewer
+   * leaves. The namespace stays published: the track idles until a new
+   * SUBSCRIBE. A close for a request a newer SUBSCRIBE already replaced
+   * changes nothing.
+   */
+  handleSubscribeClosed(requestId: bigint): void {
+    if (this.retired) return;
+    const track = this.subscribedTrack.get(requestId);
+    if (track === undefined) return;
+    this.subscribedTrack.delete(requestId);
+    this.safeLog(`Relay unsubscribed from "${track}" (reqId=${requestId})`);
+    if (this.currentRequest.get(track) !== requestId) return;
+    this.currentRequest.delete(track);
+    if (track === 'catalog') this.stopCatalogReemission();
+    else if (track === 'video' || track === 'audio') this.publisher.endTrack(track);
   }
 
   /**

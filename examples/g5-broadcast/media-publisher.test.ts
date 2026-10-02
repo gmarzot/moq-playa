@@ -749,6 +749,75 @@ describe('MediaPublisher — subscription ended under us', () => {
     expect(pub.retiredTracks).not.toContain('audio');
     expect(conn.sends.length).toBeGreaterThan(0);
   });
+
+  it('endTrack stops production, and the next keyframe opens a fresh subgroup on the new alias', async () => {
+    const conn = recordingConnection();
+    const errors: string[] = [];
+    const pub = makePublisher(conn, { onError: (ctx) => errors.push(ctx) });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    pub.publishVideo(chunk(1), delta());
+    await settle();
+    const oldStream = conn.opened[0]!.streamId;
+
+    pub.endTrack('video');
+    pub.endTrack('video');
+    pub.publishVideo(chunk(2), delta());   // nothing is produced while ended
+    await settle();
+    expect(errors.filter((e) => e.includes('retired'))).toHaveLength(1);
+    expect(pub.retiredTracks).toEqual(['video']);
+    expect(conn.sends).toHaveLength(2);
+
+    pub.setVideoAlias(5n);
+    pub.publishVideo(chunk(3), delta());   // a delta cannot start the new subscription
+    pub.publishVideo(chunk(4), kf());
+    await settle();
+    expect(conn.opened).toHaveLength(2);
+    expect(conn.opened[1]!.alias).toBe(5n);
+    expect(conn.sends.slice(2).map((s) => [s.streamId, s.payload[0]]))
+      .toEqual([[conn.opened[1]!.streamId, 4]]);
+    expect(conn.closed).not.toContain(oldStream);   // the adapter already reset it
+  });
+
+  it('a cancellation error citing §5.1.1 is not taken as a Forward State 0 pause', async () => {
+    const conn = recordingConnection();
+    conn.openSubgroup = async () => {
+      throw new MoqtConnectionError(
+        'openSubgroup: subscription for track alias 2 was cancelled while opening the stream (§5.1.1)',
+        { errorSource: 'data' });
+    };
+    const errors: string[] = [];
+    const pub = makePublisher(conn, { onError: (ctx) => errors.push(ctx) });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    expect(pub.pausedTracks).toEqual([]);
+    expect(errors).toEqual(['video publish']);
+  });
+
+  it('endTrack clears a pause, so a new SUBSCRIBE resumes at once', async () => {
+    const conn = recordingConnection();
+    const realSend = conn.sendObject.bind(conn);
+    let forwarding = false;
+    conn.sendObject = (sid, oid, payload, ext) => (forwarding
+      ? realSend(sid, oid, payload, ext)
+      : Promise.reject(new Error(
+        `sendObject: stream ${String(sid)} belongs to a subscription with `
+        + 'Forward State 0 — no Objects may be sent (§5.1)')));
+    const pub = makePublisher(conn, { onError: () => {} });   // default probe interval
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    expect(pub.pausedTracks).toEqual(['video']);
+
+    pub.endTrack('video');
+    forwarding = true;
+    pub.setVideoAlias(5n);
+    pub.publishVideo(chunk(1), kf());
+    await settle();
+    expect(pub.pausedTracks).toEqual([]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1]);
+  });
 });
 
 describe('MediaPublisher — audio over datagrams', () => {

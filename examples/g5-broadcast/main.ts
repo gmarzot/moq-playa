@@ -665,6 +665,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       conn.onSubscribe = (requestId, _ns, trackName) => {
         session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
       };
+      conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
       return session;
     },
 

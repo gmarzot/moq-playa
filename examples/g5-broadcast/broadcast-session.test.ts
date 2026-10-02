@@ -406,3 +406,101 @@ describe('BroadcastSession — catalog re-emission (late joiners)', () => {
     }
   });
 });
+
+describe('BroadcastSession — subscription ended by the relay', () => {
+  function loggedSession(conn: BroadcastSessionConnection, catalogIntervalMs = 0) {
+    const lines: string[] = [];
+    const session = new BroadcastSession(conn, {
+      catalog: CATALOG,
+      publisher: { wrapInt, draft: 16 },
+      log: (m) => lines.push(m),
+      catalogIntervalMs,
+    });
+    return { session, lines };
+  }
+
+  /** Records the alias of every subgroup the connection opens. */
+  function recordAliases(conn: ReturnType<typeof recordingConnection>): bigint[] {
+    const aliases: bigint[] = [];
+    const realOpen = conn.openSubgroup.bind(conn);
+    conn.openSubgroup = async (...args: Parameters<typeof realOpen>) => {
+      aliases.push(args[0] as bigint);
+      return realOpen(...args);
+    };
+    return aliases;
+  }
+
+  it('an ended audio subscription retires the track until a new SUBSCRIBE re-arms it', async () => {
+    const conn = recordingConnection();
+    const { session, lines } = loggedSession(conn);
+    session.handleSubscribe(5n, 'audio');
+    await settle();
+    expect(session.publisher.audioAliasArmed).toBe(1n);
+
+    session.handleSubscribeClosed(5n);
+    expect(lines).toContain('Relay unsubscribed from "audio" (reqId=5)');
+    expect(session.publisher.audioAliasArmed).toBeNull();
+    expect(session.publisher.retiredTracks).toEqual(['audio']);
+
+    session.handleSubscribe(9n, 'audio');
+    await settle();
+    expect(session.publisher.audioAliasArmed).toBe(2n);
+    expect(session.publisher.retiredTracks).toEqual([]);
+  });
+
+  it('a new catalog SUBSCRIBE moves re-emission to its own alias', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const aliases = recordAliases(conn);
+      const { session } = loggedSession(conn, 50);
+      session.handleSubscribe(1n, 'catalog');           // alias 1
+      await vi.advanceTimersByTimeAsync(120);
+
+      session.handleSubscribe(3n, 'catalog');           // alias 2, no close in between
+      await vi.advanceTimersByTimeAsync(0);
+      const atSwitch = aliases.length;
+      await vi.advanceTimersByTimeAsync(160);
+      expect(aliases.length).toBeGreaterThan(atSwitch);
+      expect(aliases.slice(atSwitch).every((a) => a === 2n)).toBe(true);
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('catalog re-emission stops when its subscription ends', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const aliases = recordAliases(conn);
+      const { session, lines } = loggedSession(conn, 50);
+      session.handleSubscribe(1n, 'catalog');
+      await vi.advanceTimersByTimeAsync(120);
+      expect(aliases.length).toBeGreaterThan(1);
+
+      session.handleSubscribeClosed(1n);
+      const atEnd = aliases.length;
+      await vi.advanceTimersByTimeAsync(300);
+      expect(aliases.length).toBe(atEnd);
+      expect(lines).toContain('Relay unsubscribed from "catalog" (reqId=1)');
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a close for a replaced request leaves the newer subscription serving', async () => {
+    const conn = recordingConnection();
+    const { session, lines } = loggedSession(conn);
+    session.handleSubscribe(3n, 'video');
+    session.handleSubscribe(7n, 'video');               // the relay subscribed again
+    await settle();
+    expect(session.publisher.videoAliasArmed).toBe(2n);
+
+    session.handleSubscribeClosed(3n);
+    expect(lines).toContain('Relay unsubscribed from "video" (reqId=3)');
+    expect(session.publisher.videoAliasArmed).toBe(2n);
+    expect(session.publisher.retiredTracks).toEqual([]);
+  });
+});
