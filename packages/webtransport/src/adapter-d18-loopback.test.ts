@@ -730,11 +730,10 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     expect(String(server.session.state).toLowerCase()).not.toBe('established');
   }, 15_000);
 
-  it('an ORDINARY cancellation whose reset is unproven also fails closed (§5.1.1 applies everywhere)', async () => {
-    // The MUST-reset rule is not specific to the failed-update transaction: a
-    // plain subscription cancellation that cannot reset its streams must close
-    // the session too, or an unreset stream survives silently.
-    const { client, server, b, reqId } = await activePair();
+  it('an ordinary cancellation whose reset is unproven keeps the session and reports it (§5.1.1)', async () => {
+    // Nothing is announced after a subscriber's cancellation, so there is no
+    // terminal to protect: the failure is reported and the session serves on.
+    const { client, server, b, reqId, errors } = await activePair();
     const origCreate = b.createUnidirectionalStream.bind(b);
     (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
       async () => {
@@ -747,11 +746,79 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     await flush();
 
-    // Ordinary path: the subscriber unsubscribes.
     await client.unsubscribe(reqId);
     await flush(); await flush(); await flush();
 
-    expect(String(server.session.state).toLowerCase()).not.toBe('established');
+    expect(String(server.session.state).toLowerCase()).toBe('established');
+    expect(errors.some((e) => /not proven reset/.test(e.message))).toBe(true);
+    expect(errors.filter((e) => (e as { isFatal?: boolean }).isFatal)).toEqual([]);
+
+    // A later SUBSCRIBE for the track is served on the same session.
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream = origCreate;
+    let nextSubReqId = -1n;
+    server.onSubscribe = (rid) => { nextSubReqId = rid; };
+    await client.subscribe(ns('live'), nm('vid'), { forward: 1 } as never);
+    await flush();
+    await server.acceptSubscribe(nextSubReqId, 8n);
+    await flush();
+    expect(server.session.getIncomingSubscription(nextSubReqId)).toBeDefined();
+  }, 15_000);
+
+  /** A subgroup stream whose FIN stays in flight until `failFin` rejects it. */
+  function holdFin(b: { createUnidirectionalStream: () => Promise<unknown> }): { failFin: (err: unknown) => void } {
+    const handle = { failFin: (_err: unknown) => { /* replaced once the FIN is in flight */ } };
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    b.createUnidirectionalStream = async () => {
+      await origCreate();
+      return new WritableStream<Uint8Array>({
+        write() { /* accept the header */ },
+        close() { return new Promise<void>((_, reject) => { handle.failFin = reject; }); },
+      });
+    };
+    return handle;
+  }
+  /** The error a browser raises on a send stream when the peer sends STOP_SENDING. */
+  const stopSending = () => Object.assign(new Error('Received STOP_SENDING'), { source: 'stream', streamErrorCode: 0 });
+
+  it('a FIN in flight that the peer\'s STOP_SENDING fails counts as reset on cancellation (§5.1.1)', async () => {
+    // Web Streams defers abort() behind the in-flight close and rejects it when
+    // that close fails; a WebTransport stream error means the stream is reset.
+    const { client, server, b, reqId, errors } = await activePair();
+    const held = holdFin(b as never);
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    server.closeSubgroup(sid).catch(() => { /* the FIN fails by design */ });
+    await flush();
+
+    await client.unsubscribe(reqId);
+    await flush();
+    // The abort is queued behind the FIN before the peer's STOP_SENDING lands.
+    expect((server as unknown as { outgoingStreams: Map<bigint, unknown> }).outgoingStreams.has(sid)).toBe(false);
+    held.failFin(stopSending());
+    await flush(); await flush(); await flush();
+
+    expect(String(server.session.state).toLowerCase()).toBe('established');
+    expect(errors.filter((e) => /not proven reset/.test(e.message))).toEqual([]);
+  }, 15_000);
+
+  it('a stream the transport already ended counts as closed for PUBLISH_DONE (§5.1.1)', async () => {
+    const pair = await activePair();
+    const { client, server, b, reqId, clientMsgs } = pair;
+    const held = holdFin(b as never);
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    server.closeSubgroup(sid).catch(() => { /* the FIN fails by design */ });
+    await flush();
+    await pausePair(pair);
+
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush();
+    expect((server as unknown as { outgoingStreams: Map<bigint, unknown> }).outgoingStreams.has(sid)).toBe(false);
+    held.failFin(stopSending());
+    for (let i = 0; i < 8 && doneMsgs(clientMsgs).length === 0; i++) await flush();
+
+    const dones = doneMsgs(clientMsgs);
+    expect(dones).toHaveLength(1);
+    expect(BigInt(dones[0]!.statusCode)).toBe(0x8n);       // UPDATE_FAILED
+    expect(String(server.session.state).toLowerCase()).toBe('established');
   }, 15_000);
 
   it('a fail-closed local reset closes with INTERNAL_ERROR, not PROTOCOL_VIOLATION', async () => {
