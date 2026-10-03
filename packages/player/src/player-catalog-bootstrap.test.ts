@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
+import { CATALOG_BOOTSTRAP_INACTIVITY_MS } from './catalog-bootstrap.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject, DataStreamHeader } from '@openmoq/transport';
@@ -101,6 +102,16 @@ async function loadPlayer(adapter: ReturnType<typeof createMockAdapter>, cfg?: P
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
+
+async function expireCatalogWait(action: () => void): Promise<void> {
+    vi.useFakeTimers();
+    try {
+        action();
+        await vi.advanceTimersByTimeAsync(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
+    } finally {
+        vi.useRealTimers();
+    }
+}
 
 /** SUBSCRIBE_OK for the catalog subscription (no LARGEST_OBJECT parameter). */
 function ackCatalog(adapter: ReturnType<typeof createMockAdapter>, reqId = 1n, alias = 1n): void {
@@ -396,17 +407,17 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         expect(events).toEqual(['catalog_received']);
     });
 
-    it('#17b: refusal WITHOUT a known largest → rung-2 legacy resubscribe (AbsoluteStart)', async () => {
+    it('refusal without a known largest waits, then times out to AbsoluteStart', async () => {
         const adapter = createMockAdapter(16);
         await loadPlayer(adapter);
         await flush();
-        // No SUBSCRIBE_OK largest exists → rung 1 is skipped by design and the
-        // refusal falls through to rung 2. (The rung-1 wire shape with a known
-        // largest is asserted in the F5/F8 test below.)
-        adapter._triggerMessage({
-            type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x10n),
-            retryInterval: varint(0n), errorReason: 'track not found',
-        } as unknown as ControlMessage);
+        await expireCatalogWait(() => {
+            adapter._triggerMessage({
+                type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x10n),
+                retryInterval: varint(0n), errorReason: 'track not found',
+            } as unknown as ControlMessage);
+            expect(adapter.unsubscribe).not.toHaveBeenCalled();
+        });
         await flush(); await flush();
         // Rung 2: unsubscribe the LargestObject sub, fresh AbsoluteStart{0,0}.
         expect(adapter.unsubscribe).toHaveBeenCalledTimes(1);
@@ -555,10 +566,10 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         const adapter = createMockAdapter(16);
         await loadPlayer(adapter);
         await flush();
-        adapter._triggerMessage({
+        await expireCatalogWait(() => adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x10n),
             retryInterval: varint(0n), errorReason: 'refused',
-        } as unknown as ControlMessage);
+        } as unknown as ControlMessage));
         await flush(); await flush();
         expect(adapter.subscribe).toHaveBeenCalledTimes(2);
         const resubOpts = adapter.subscribe.mock.calls[1]![2];
@@ -665,13 +676,13 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
             (c: unknown[]) => (c[2] as { subscriptionFilter?: { type?: string } })?.subscriptionFilter?.type === 'LargestObject').length;
         expect(candidateSubs()).toBe(2);                      // initial + candidate
 
-        // Candidate's join AND its rung-1 fetch both refused → ladder exhausts
-        // → candidate failure, NOT another resubscribe loop.
+        // Candidate's join is refused before SUBSCRIBE_OK. Its bounded wait
+        // expires into candidate failure, not another resubscribe loop.
         const candJoinId = BigInt(await adapter.joiningFetch.mock.results[1]!.value);
-        adapter._triggerMessage({
+        await expireCatalogWait(() => adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(candJoinId), errorCode: varint(0x10n),
             retryInterval: varint(0n), errorReason: 'refused',
-        } as unknown as ControlMessage);
+        } as unknown as ControlMessage));
         await flush(); await flush();
         expect(errors.length).toBeGreaterThan(0);             // degraded surfaced
         expect(candidateSubs()).toBe(2);                      // NO recursive candidate
@@ -2496,12 +2507,12 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         const adapter = createMockAdapter(16);
         const { player } = await loadPlayer(adapter);
         await flush();
-        // The joining fetch is REFUSED with no known largest BEFORE the
-        // catalog SUBSCRIBE_OK → rung 2 unsubscribes the pre-OK request 1.
-        adapter._triggerMessage({
+        // Refusal before SUBSCRIBE_OK retains the request until the bounded
+        // wait expires; rung 2 then settles that pre-OK ownership.
+        await expireCatalogWait(() => adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
             retryInterval: varint(0n), errorReason: 'joining fetch not supported',
-        } as unknown as ControlMessage);
+        } as unknown as ControlMessage));
         await flush(); await flush();
         const binds = (player as unknown as { pendingAliasBinds: Set<bigint> }).pendingAliasBinds;
         expect(binds.has(1n)).toBe(false);   // dead request settled, not leaked
@@ -3368,6 +3379,20 @@ describe('catalog bootstrap wiring — exception-safe terminal cleanup', () => {
 });
 
 describe('catalog bootstrap wiring — strict mode and draft boundaries', () => {
+    it('strict mode refuses an early join failure without waiting for SUBSCRIBE_OK', async () => {
+        const adapter = createMockAdapter(18);
+        const { events, errors } = await loadPlayer(adapter, { catalogBootstrap: 'strict' });
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
+            retryInterval: varint(0n), errorReason: 'joining fetch not supported',
+        } as unknown as ControlMessage);
+        await flush();
+        expect(errors.some((e) => (e as { severity?: string }).severity === 'fatal')).toBe(true);
+        expect(adapter.fetch).not.toHaveBeenCalled();
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        expect(events).toEqual([]);
+    });
+
     it('STRICT standards mode never falls off the joining path — a refused join is FATAL, no emulation, no resubscribe', async () => {
         const adapter = createMockAdapter(16);
         const { events, errors } = await loadPlayer(adapter, { catalogBootstrap: 'strict' });

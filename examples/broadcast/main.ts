@@ -18,6 +18,7 @@ import { varint } from '@openmoq/transport';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
+import { createBroadcastAuthorization } from './authorization.js';
 import type { AttemptResources } from './broadcast-attempt.js';
 import { log } from '../shared/log.js';
 import { namespace, certHash, draftVersion } from '../shared/cert.js';
@@ -127,6 +128,17 @@ const statResContainer = document.getElementById('stat-res-container')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
 const startScreenBtn = document.getElementById('start-screen') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop') as HTMLButtonElement;
+const authEnabled = document.getElementById('auth-enabled') as HTMLInputElement;
+const authProfile = document.getElementById('auth-profile') as HTMLSelectElement;
+const authToken = document.getElementById('auth-token') as HTMLInputElement;
+
+function updateAuthorizationControls(busy = false): void {
+  authEnabled.disabled = busy;
+  authProfile.disabled = busy || !authEnabled.checked;
+  authToken.disabled = busy || !authEnabled.checked;
+}
+authEnabled.addEventListener('change', () => updateAuthorizationControls());
+updateAuthorizationControls();
 
 // MoQ state. Everything a broadcast touches — capture, encoders, connection,
 // media publisher, alias allocator, audio settings — is owned by the
@@ -167,6 +179,14 @@ startScreenBtn.addEventListener('click', () => startBroadcast('screen'));
 stopBtn.addEventListener('click', stopBroadcast);
 
 async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
+  let authorization: ReturnType<typeof createBroadcastAuthorization>;
+  try {
+    authorization = createBroadcastAuthorization({ enabled: authEnabled.checked, profile: authProfile.value, token: authToken.value });
+  } catch (err) {
+    statusEl.textContent = (err as Error).message;
+    return;
+  }
+  updateAuthorizationControls(true);
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
   stopBtn.disabled = false;
@@ -289,7 +309,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ctx.onCancel(() => {
         try { (transport as unknown as { close(): void }).close(); } catch { /* already closed */ }
       });
-      await conn.connect(transport, { maxRequestId: varint(100) });
+      await conn.connect(transport, {
+        maxRequestId: varint(100),
+        ...(authorization ? { authorization: { ...authorization, relayUrl } } : {}),
+      });
       ctx.throwIfCancelled();
       const negotiatedDraft = conn.draftVersion;
       log(`Session established (draft-${negotiatedDraft}).`);
@@ -443,4 +466,5 @@ function resetBroadcastUi(): void {
   startCameraBtn.disabled = false;
   startScreenBtn.disabled = false;
   stopBtn.disabled = true;
+  updateAuthorizationControls();
 }

@@ -64,6 +64,21 @@ await connection.connect(transport, {
 The supplied `relayUrl` must identify the actual connected destination. Generic
 transport facades do not expose a URL for the adapter to verify independently.
 
+## Broadcast example
+
+The broadcast example is anonymous by default. Enable CAT4MOQ authorization in
+its Source panel and paste the issuer's padded base64 token (with or without a
+`base64:` prefix). The standard profile uses type 1; select moqx compatibility
+explicitly for a deployment requiring type 16. The grant must permit SETUP and
+PUBLISH_NAMESPACE for the selected namespace. The same token is supplied to any
+other authorized outgoing requests on that connection.
+
+Credentials remain in page memory. Reloading, including applying connection
+settings, clears them and disables authorization. They are not saved to browser
+storage, query parameters, logs, or viewer links. A viewer needs its own
+subscriber grant when the relay requires one. Stop before replacing an expired
+token; the example does not contact an issuer or refresh credentials.
+
 ## Failure and migration behavior
 
 Provider failure, empty credentials, timeout or connection closure rejects the

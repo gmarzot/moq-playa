@@ -535,6 +535,8 @@ export class Player {
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
           this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock });
+          // Catalog discovery can create the pipeline after play() has returned.
+          if (this._state === 'playing') this.renderer.start();
           return this.renderer;
         },
         createAudioOutput: () => {

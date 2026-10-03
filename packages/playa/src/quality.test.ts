@@ -60,6 +60,27 @@ beforeEach(() => {
 
 // ─── mapLevels ───────────────────────────────────────────────────────
 
+describe('late renderer creation', () => {
+  for (const state of ['idle', 'playing', 'paused'] as const) {
+    it(`creates a renderer matching the ${state} playback state`, async () => {
+      const player = new Player(mockElement(), {
+        url: 'https://relay.example.com/moq', namespace: 'test',
+      });
+      const engine = (player as any).engine;
+      engine.play = vi.fn();
+      engine.pause = vi.fn();
+      engine.destroy = vi.fn(async () => {});
+      if (state !== 'idle') player.play();
+      if (state === 'paused') player.pause();
+
+      const renderer = engine.config.createRenderer();
+      expect((renderer as any).running).toBe(state === 'playing');
+      await player.destroy();
+      expect((renderer as any).running).toBe(false);
+    });
+  }
+});
+
 describe('mapLevels', () => {
   const catalog: CatalogState = {
     tracks: [
