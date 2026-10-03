@@ -530,6 +530,20 @@ export class MoqtConnection {
     forward: boolean,
   ) => void | Promise<void>;
 
+  /**
+   * Called after the Forward State of a subscription we accepted changes
+   * through a peer REQUEST_UPDATE. Same timing as
+   * {@link onPublishForwardStateChange}: a pause is reported before the
+   * response write settles, a resume once the acknowledgement is written.
+   * Updates to a subscription not yet accepted are not reported; use
+   * {@link getSubscribeForwardState} to read the current state. Exceptions
+   * from this observer are reported to `onError` and contained.
+   */
+  onSubscribeForwardStateChange?: (
+    requestId: bigint,
+    forward: boolean,
+  ) => void | Promise<void>;
+
   /** Called when the control stream or connection closes. */
   onClose?: (error?: number, reason?: string) => void;
 
@@ -1905,6 +1919,27 @@ export class MoqtConnection {
   }
 
   /**
+   * Current Forward State of a subscription we accepted: `true` when the
+   * subscriber wants Objects, `false` at Forward State 0, `undefined` when
+   * `requestId` is not an accepted, live subscription.
+   */
+  getSubscribeForwardState(requestId: bigint): boolean | undefined {
+    const sub = this.session.getIncomingSubscription(requestId);
+    if (sub === undefined || sub.state !== SubscriptionState.ESTABLISHED) return undefined;
+    return sub.forwardState === ForwardState.ACTIVE;
+  }
+
+  /** The new Forward State of an accepted subscription when it moved from `before`. */
+  private changedSubscribeForwardState(
+    requestId: bigint | undefined,
+    before: boolean | undefined,
+  ): boolean | undefined {
+    if (requestId === undefined || before === undefined) return;
+    const after = this.getSubscribeForwardState(requestId);
+    return after !== undefined && after !== before ? after : undefined;
+  }
+
+  /**
    * The outbound PUBLISH whose Forward State `message` may change, or undefined:
    * a PUBLISH_OK / REQUEST_OK names it by requestId, a REQUEST_UPDATE by
    * existingRequestId (already stamped on draft-18 by the request stream).
@@ -1934,26 +1969,37 @@ export class MoqtConnection {
   }
 
   /** Report a Forward-State observer failure without letting `onError` escape. */
-  private reportPublishForwardObserverError(err: unknown): void {
+  private reportForwardObserverError(err: unknown): void {
     try {
       this.onError?.(err instanceof Error ? err : new Error(String(err)));
     } catch { /* application observers cannot interrupt protocol processing */ }
   }
 
   /** Deliver a Forward-State transition without letting observers poison I/O. */
-  private notifyPublishForwardChange(requestId: bigint, forward: boolean): void {
-    const observer = this.onPublishForwardStateChange;
+  private notifyForwardChange(
+    observer: ((requestId: bigint, forward: boolean) => void | Promise<void>) | undefined,
+    requestId: bigint,
+    forward: boolean,
+  ): void {
     if (!observer) return;
     try {
       const result = observer(requestId, forward);
       if (result) {
         void Promise.resolve(result).catch((err) => {
-          this.reportPublishForwardObserverError(err);
+          this.reportForwardObserverError(err);
         });
       }
     } catch (err) {
-      this.reportPublishForwardObserverError(err);
+      this.reportForwardObserverError(err);
     }
+  }
+
+  private notifyPublishForwardChange(requestId: bigint, forward: boolean): void {
+    this.notifyForwardChange(this.onPublishForwardStateChange, requestId, forward);
+  }
+
+  private notifySubscribeForwardChange(requestId: bigint, forward: boolean): void {
+    this.notifyForwardChange(this.onSubscribeForwardStateChange, requestId, forward);
   }
 
   private async deliverRequestResponse(message: DecodedControlMessage, requestId: bigint): Promise<void> {
@@ -5213,8 +5259,13 @@ export class MoqtConnection {
             existingRequestId?: bigint;
           });
           const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
+          // The same for a subscription we accepted.
+          const subFwdTarget = message.type === 'REQUEST_UPDATE'
+            ? (message as { existingRequestId?: bigint }).existingRequestId : undefined;
+          const subFwdBefore = subFwdTarget === undefined ? undefined : this.getSubscribeForwardState(subFwdTarget);
           const actions = this.session.handleControlMessage(message);
           const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
+          const subFwdAfter = this.changedSubscribeForwardState(subFwdTarget, subFwdBefore);
           // Start protocol output before invoking application code. A pause
           // observer may terminalize the PUBLISH reentrantly; queuing the update
           // response first preserves control-message order while still exposing
@@ -5223,10 +5274,16 @@ export class MoqtConnection {
           if (fwdTarget !== undefined && fwdAfter === false) {
             this.notifyPublishForwardChange(fwdTarget, false);
           }
+          if (subFwdTarget !== undefined && subFwdAfter === false) {
+            this.notifySubscribeForwardChange(subFwdTarget, false);
+          }
           await actionExecution;
           await doneDiscard;
           if (fwdTarget !== undefined && fwdAfter === true) {
             this.notifyPublishForwardChange(fwdTarget, true);
+          }
+          if (subFwdTarget !== undefined && subFwdAfter === true) {
+            this.notifySubscribeForwardChange(subFwdTarget, true);
           }
           // Fire AFTER session processing so incomingSubscriptions is populated
           // when acceptSubscribe is called (§5.1: admission = a NEW SM identity,
@@ -5708,10 +5765,13 @@ export class MoqtConnection {
       const updateId = (message as { requestId: bigint }).requestId;
       const stamped = { ...message, existingRequestId: originalId } as ControlMessage;
       this.onMessage?.(stamped);
+      const subFwdBefore = ctx.openerKind === 'subscribe'
+        ? this.getSubscribeForwardState(originalId) : undefined;
       const actions = this.session.handleControlMessage(stamped, {
         requestId: updateId,
         existingRequestId: originalId,
       });
+      const subFwdAfter = this.changedSubscribeForwardState(originalId, subFwdBefore);
       // §10.9: respond with exactly one REQUEST_OK / REQUEST_ERROR on THIS stream.
       // If handling produced a session close (e.g. unknown/invalid update), do
       // NOT also write a success response — close and stop.
@@ -5747,8 +5807,14 @@ export class MoqtConnection {
         await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
         return;
       }
-      if (send) await ctx.writeMessage(send.message);
+      // A pause is reported before the response write settles, a resume after.
+      const responseWrite = send ? ctx.writeMessage(send.message) : Promise.resolve();
+      if (subFwdAfter === false) this.notifySubscribeForwardChange(originalId, false);
+      await responseWrite;
       await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
+      if (send?.message.type !== 'REQUEST_ERROR' && subFwdAfter === true) {
+        this.notifySubscribeForwardChange(originalId, true);
+      }
       // d18 §10.11: a FAILED subscription update terminates the subscription —
       // PUBLISH_DONE(UPDATE_FAILED) with a truthful Stream Count on the
       // subscription's own request stream, then sealed.
