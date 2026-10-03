@@ -82,6 +82,21 @@ export interface AnchorReport {
   readonly timeOriginDeltaUs?: number;
 }
 
+/**
+ * Each track's capture clock against the wall clock over one period: the lowest
+ * `now - timestamp` seen, minus the track's anchor. The minimum strips per-chunk
+ * encode and queue delay, so growth across reports is the track's clock running
+ * slow against the wall clock, and the video − audio gap is the A/V offset a
+ * receiver syncing on these stamps inherits.
+ */
+export interface DriftReport {
+  /** Wall-clock time since the first chunk was anchored. */
+  readonly elapsedMs: number;
+  /** Null for a track with no chunk in the period. */
+  readonly videoUs: number | null;
+  readonly audioUs: number | null;
+}
+
 export interface MediaPublisherOptions {
   /** Wraps a bigint as the wire integer type (the example passes `varint`). */
   wrapInt: (n: bigint) => unknown;
@@ -102,6 +117,10 @@ export interface MediaPublisherOptions {
   /** Called once per track, after ANCHOR_SETTLE_OBSERVATIONS chunks, with the
    *  anchor measured against the best offset seen. */
   onAnchor?: (report: AnchorReport) => void;
+  /** Called every `driftReportMs` of wall clock with both tracks' drift. */
+  onDrift?: (report: DriftReport) => void;
+  /** Drift report period (default 60000ms); 0 disables. */
+  driftReportMs?: number;
   /** Failure sink — publication errors are contained, never unhandled. */
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
@@ -166,6 +185,13 @@ export class MediaPublisher {
   private readonly minObservedUs = new Map<string, number>();
   private readonly anchorObservations = new Map<string, number>();
   private readonly anchorReported = new Set<string>();
+  private readonly onDrift: ((report: DriftReport) => void) | null;
+  private readonly driftReportMs: number;
+  /** Wall clock (µs) at the first anchored chunk, and at the current period's start. */
+  private driftStartUs: number | null = null;
+  private driftPeriodStartUs = 0;
+  /** Lowest `now - timestamp` per track in the current period. */
+  private readonly driftPeriodMin = new Map<string, number>();
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
   private readonly videoQueueMax: number;
@@ -235,6 +261,12 @@ export class MediaPublisher {
     this.timeOriginUs = options.timeOriginUs
       ?? (() => (typeof performance === 'undefined' ? null : performance.timeOrigin * 1000));
     this.onAnchor = options.onAnchor ?? null;
+    if (options.driftReportMs !== undefined
+        && !(Number.isFinite(options.driftReportMs) && options.driftReportMs >= 0)) {
+      throw new Error(`driftReportMs must be a non-negative number, got ${options.driftReportMs}`);
+    }
+    this.onDrift = options.onDrift ?? null;
+    this.driftReportMs = options.driftReportMs ?? 60_000;
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
@@ -559,10 +591,43 @@ export class MediaPublisher {
    */
   private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
     const key = track === 'video' ? 'videoTsOffsetUs' : 'audioTsOffsetUs';
-    const observed = this.wallClockUs() - timestampUs;
+    const nowUs = this.wallClockUs();
+    const observed = nowUs - timestampUs;
     this[key] ??= observed;
     this.observeAnchor(track, observed);
+    this.observeDrift(track, observed, nowUs);
     return BigInt(Math.round(timestampUs + this[key]));
+  }
+
+  /** Keep each track's lowest `now - timestamp` per period and report it
+   *  against the track's anchor when the period ends. */
+  private observeDrift(track: 'video' | 'audio', observedUs: number, nowUs: number): void {
+    if (!this.onDrift || this.driftReportMs <= 0) return;
+    if (this.driftStartUs === null) {
+      this.driftStartUs = nowUs;
+      this.driftPeriodStartUs = nowUs;
+    }
+    const min = this.driftPeriodMin.get(track);
+    if (min === undefined || observedUs < min) this.driftPeriodMin.set(track, observedUs);
+    if (nowUs - this.driftPeriodStartUs < this.driftReportMs * 1000) return;
+
+    const drift = (t: 'video' | 'audio'): number | null => {
+      const periodMin = this.driftPeriodMin.get(t);
+      const anchor = t === 'video' ? this.videoTsOffsetUs : this.audioTsOffsetUs;
+      return periodMin === undefined || anchor === null ? null : periodMin - anchor;
+    };
+    const report: DriftReport = {
+      elapsedMs: (nowUs - this.driftStartUs) / 1000,
+      videoUs: drift('video'),
+      audioUs: drift('audio'),
+    };
+    this.driftPeriodMin.clear();
+    this.driftPeriodStartUs = nowUs;
+    try {
+      this.onDrift(report);
+    } catch (err) {
+      this.report('drift report', err);
+    }
   }
 
   /**

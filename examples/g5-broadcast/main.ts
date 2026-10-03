@@ -653,6 +653,16 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
             + `${(excessUs / 1000).toFixed(1)}ms vs the best seen`
             + (timeOriginDeltaUs === undefined ? ''
               : `, ${(timeOriginDeltaUs / 1000).toFixed(1)}ms from timeOrigin`)),
+          // Each track's capture clock against the wall clock, per minute.
+          onDrift: ({ elapsedMs, videoUs, audioUs }) => {
+            const ms = (us: number) => `${us >= 0 ? '+' : ''}${(us / 1000).toFixed(1)}ms`;
+            const parts = [
+              ...(videoUs !== null ? [`video ${ms(videoUs)}`] : []),
+              ...(audioUs !== null ? [`audio ${ms(audioUs)}`] : []),
+              ...(videoUs !== null && audioUs !== null ? [`video−audio ${ms(videoUs - audioUs)}`] : []),
+            ];
+            log(`Capture drift at ${(elapsedMs / 60_000).toFixed(1)} min: ${parts.join(', ')}`);
+          },
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
           onKeyframeNeeded: () => videoEncoder?.requestKeyframe(),
         },

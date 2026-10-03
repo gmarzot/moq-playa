@@ -936,3 +936,47 @@ describe('MediaPublisher — relay Forward State changes', () => {
     expect(errors).toEqual(['keyframe request']);
   });
 });
+
+describe('MediaPublisher — capture clock drift', () => {
+  it('reports each track\'s drift against its anchor once per period', async () => {
+    let wallUs = 1_700_000_000_000_000;
+    const reports: Array<{ elapsedMs: number; videoUs: number | null; audioUs: number | null }> = [];
+    const pub = makePublisher(recordingConnection(), {
+      draft: 18,
+      wallClockUs: () => wallUs,
+      driftReportMs: 10,
+      onDrift: (r) => reports.push(r),
+    });
+    pub.setVideoAlias(2n);
+    // The wall clock advances 1000 µs a frame, the video stamps 990: the
+    // video clock runs slow by 10 µs a frame.
+    for (let k = 0; k <= 20; k++) {
+      wallUs = 1_700_000_000_000_000 + k * 1_000;
+      pub.publishVideo(chunk(k), { isKeyframe: k === 0, timestampUs: k * 990 });
+      await settle();
+    }
+    expect(reports).toHaveLength(2);
+    // The first period includes the anchoring chunk; the second starts at
+    // frame 11, where the stamps are 110 µs behind.
+    expect(reports[1]).toEqual({ elapsedMs: 20, videoUs: 110, audioUs: null });
+  });
+
+  it('a throwing drift sink is reported, not raised', async () => {
+    let wallUs = 1_700_000_000_000_000;
+    const errors: string[] = [];
+    const pub = makePublisher(recordingConnection(), {
+      draft: 18,
+      wallClockUs: () => wallUs,
+      driftReportMs: 1,
+      onDrift: () => { throw new Error('sink bug'); },
+      onError: (ctx) => errors.push(ctx),
+    });
+    pub.setVideoAlias(2n);
+    for (let k = 0; k <= 2; k++) {
+      wallUs += 1_000;
+      pub.publishVideo(chunk(k), { isKeyframe: k === 0, timestampUs: k * 1_000 });
+      await settle();
+    }
+    expect(errors).toContain('drift report');
+  });
+});
