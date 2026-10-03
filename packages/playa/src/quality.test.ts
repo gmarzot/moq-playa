@@ -168,6 +168,24 @@ describe('Player.setQuality', () => {
 
 // ─── Render sink choice on catalog_received ───────────────────────────
 
+describe('Player authorization options', () => {
+  it('passes the credential provider and trust options to its engine', async () => {
+    const authorization = { getTokens: vi.fn(async () => [{ tokenType: 1n, value: new Uint8Array([1]) }]),
+      timeoutMs: 500, allowedRelayOrigins: ['https://trusted.example'] };
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'live/test', authorization });
+    try {
+      expect((player as any).engine.config.authorization).toBe(authorization);
+      expect(authorization.getTokens).not.toHaveBeenCalled();
+    } finally { await player.destroy(); }
+  });
+
+  it('does not discard an explicitly invalid credential configuration', () => {
+    expect(() => new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'live/test',
+      authorization: null as unknown as import('./types.js').PlayerOptions['authorization'],
+    })).toThrow('authorization');
+  });
+});
+
 describe('Player sink choice (MSE <video> vs <canvas>)', () => {
   it('keeps the canvas visible for LOCMAF frame decoding', async () => {
     const player = new Player(mockElement(), {

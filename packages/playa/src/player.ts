@@ -568,6 +568,9 @@ export class Player {
     if (opts.authTokens) {
       (base as unknown as Record<string, unknown>).authTokens = opts.authTokens;
     }
+    if (opts.authorization !== undefined) {
+      Object.assign(base, { authorization: opts.authorization });
+    }
 
     // Power-user escape hatch: merge moqtPlayerConfig overrides last
     if (opts.moqtPlayerConfig) {

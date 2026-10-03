@@ -139,6 +139,14 @@ testImport('MoqtConnection',     `import { MoqtConnection } from '@openmoq/webtr
 testImport('MoqtConnectionError', `import { MoqtConnectionError } from '@openmoq/webtransport'; if (!MoqtConnectionError) throw 1;`);
 testImport('connectQuic',         `import { connectQuic, parseMoqtUri } from '@openmoq/quic'; if (typeof connectQuic !== 'function') throw 1; if (parseMoqtUri('moqt://example.com/moq').setup.path !== '/moq') throw 1;`);
 testImport('MoqtPlayer',         `import { MoqtPlayer } from '@openmoq/player'; if (!MoqtPlayer) throw 1;`);
+for (const pkg of ['webtransport', 'player', 'playa']) {
+  testImport(`CAT helper from @openmoq/${pkg}`, [
+    `import { catToken, AuthorizationError } from '@openmoq/${pkg}';`,
+    'const bytes = new Uint8Array([1, 2]);',
+    'const token = catToken(bytes); bytes[0] = 9;',
+    "if (token.tokenType !== 1n || token.value[0] !== 1 || new AuthorizationError('test').name !== 'AuthorizationError') throw 1;",
+  ].join(' '));
+}
 testImport('checkSupport',       `import { checkSupport } from '@openmoq/player'; if (!checkSupport) throw 1;`);
 testImport('PlayerErrorCode',    `import { PlayerErrorCode } from '@openmoq/player'; if (!PlayerErrorCode) throw 1;`);
 testImport('varint',             `import { varint } from '@openmoq/transport'; if (!varint) throw 1;`);

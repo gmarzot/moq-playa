@@ -3616,7 +3616,7 @@ export class MoqtPlayer {
 
   private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
     const createTransport = this.config.createTransport!;
-    const setupOptions = buildSetupOptions(this.config);
+    const setupOptions = buildSetupOptions(this.config, url);
     await this.runMigrationTransaction(newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions);
 
     this._stats.recordReconnect();
@@ -4038,12 +4038,14 @@ export class MoqtPlayer {
     const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
+    let pendingAttempt: number | null = null;
 
     const coord = new CatalogBootstrap({
       applyAt: (loc, payload, opts) => this.catalogManager!.processCatalogObjectAt(loc, payload, opts),
       resetManager: () => this.catalogManager?.reset(),
       currentState: () => this.catalogManager?.currentState ?? null,
       issueJoiningFetch: (attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4053,7 +4055,11 @@ export class MoqtPlayer {
               joiningRequestId: this.catalogRequestId,
               joiningStart: 0n,
               groupOrder: varint(0x1n), // ascending — explicit on every bootstrap fetch
-              onRequestId: (id: bigint) => { myFetchReqId = id; this.registerBootstrapFetch(conn, id, attempt, gen); },
+              onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
+                myFetchReqId = id;
+                this.registerBootstrapFetch(conn, id, attempt, gen);
+              },
             } as never);
           } catch (err) {
             if (!live()) return;
@@ -4072,6 +4078,7 @@ export class MoqtPlayer {
         })();
       },
       issueStandaloneFetch: (range, attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4086,7 +4093,11 @@ export class MoqtPlayer {
               endGroup: range.endGroupWholeOf,
               endObject: 0n,
               groupOrder: varint(0x1n),
-              onRequestId: (id: bigint) => { myFetchReqId = id; this.registerBootstrapFetch(conn, id, attempt, gen); },
+              onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
+                myFetchReqId = id;
+                this.registerBootstrapFetch(conn, id, attempt, gen);
+              },
             } as never);
           } catch (err) {
             if (!live()) return;
@@ -4104,6 +4115,7 @@ export class MoqtPlayer {
         })();
       },
       cancelFetch: () => {
+        pendingAttempt = null;
         const fetch = this.bootstrapFetch;
         this.bootstrapFetch = null;
         if (fetch) this.retireBootstrapFetch(fetch.conn, fetch.reqId, { attempt: fetch.attempt });
@@ -4385,6 +4397,7 @@ export class MoqtPlayer {
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     const manager = new CatalogManager(namespaceDisplay(this.config.namespace));
+    let pendingAttempt: number | null = null;
 
     const failCandidate = (reason: string): void => {
       if (!ownedAsCandidate()) return; // post-adoption failures follow main-role paths
@@ -4396,6 +4409,7 @@ export class MoqtPlayer {
       resetManager: () => manager.reset(),
       currentState: () => manager.currentState,
       issueJoiningFetch: (attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4407,6 +4421,7 @@ export class MoqtPlayer {
               joiningStart: 0n,
               groupOrder: varint(0x1n),
               onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
                   this.catalogRecovery!.fetch = { reqId: id, attempt };
@@ -4441,6 +4456,7 @@ export class MoqtPlayer {
         })();
       },
       issueStandaloneFetch: (range, attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4451,6 +4467,7 @@ export class MoqtPlayer {
               endGroup: range.endGroupWholeOf, endObject: 0n,
               groupOrder: varint(0x1n),
               onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
                   this.catalogRecovery!.fetch = { reqId: id, attempt };
@@ -4485,6 +4502,7 @@ export class MoqtPlayer {
         })();
       },
       cancelFetch: () => {
+        pendingAttempt = null;
         if (ownedAsCandidate()) {
           const r = this.catalogRecovery!;
           if (r.fetch) {

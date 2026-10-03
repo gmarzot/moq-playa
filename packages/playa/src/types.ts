@@ -32,6 +32,8 @@ export interface PlayerOptions {
   readonly draftVersion?: 14 | 16 | 18;
   /** Auth tokens for CLIENT_SETUP. */
   readonly authTokens?: Uint8Array[];
+  /** Issuer-supplied credentials for SETUP and subsequent requests. */
+  readonly authorization?: MoqtPlayerConfig['authorization'];
 
   // ── Playback ──
 

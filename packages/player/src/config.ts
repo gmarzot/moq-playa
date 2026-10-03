@@ -12,7 +12,7 @@
  * @module
  */
 
-import type { MoqtConnection, WebTransportLike } from '@openmoq/webtransport';
+import type { MoqtConnection, WebTransportLike, ConnectionAuthorization } from '@openmoq/webtransport';
 import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
 import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
 import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
@@ -62,6 +62,11 @@ export interface KnownTrackConfig {
 }
 
 // ─── Category Interfaces (documentation grouping — type stays flat) ───
+
+export interface PlayerAuthorization extends Omit<ConnectionAuthorization, 'relayUrl'> {
+  /** Additional trusted relay origins for GOAWAY migration. Default: original origin only. */
+  readonly allowedRelayOrigins?: readonly string[];
+}
 
 /** Connection options. */
 export interface ConnectionConfig {
@@ -154,6 +159,8 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   readonly authTokens?: Uint8Array[];
+  /** Credentials for SETUP and every authorized request, including recovery and reconnects. */
+  readonly authorization?: PlayerAuthorization;
 
   /**
    * MOQT implementation identifier included in CLIENT_SETUP.
@@ -745,6 +752,15 @@ export const DEFAULT_PLAYER_CONFIG = {
  * into a stream.
  */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
+    throw new TypeError('Invalid authorization configuration');
+  }
+  if (config.authorization && config.authTokens !== undefined) {
+    throw new TypeError('Specify authorization or authTokens, not both');
+  }
+  if (config.authorization && config.connection) {
+    throw new TypeError('Configure authorization when connecting an externally owned connection, not on its player');
+  }
   // subscriberPriority: 0–255 (§9.2.2.3)
   if (config.subscriberPriority !== undefined) {
     if (!Number.isInteger(config.subscriberPriority) || config.subscriberPriority < 0 || config.subscriberPriority > 255) {

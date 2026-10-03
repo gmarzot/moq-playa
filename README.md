@@ -385,6 +385,7 @@ npx tsc --noEmit -p packages/browser/tsconfig.json
 
 - [Simulation](docs/simulation.md) — Deterministic protocol-confidence harness (golden vectors, codec property tests, seeded scenario runner) for MoQT drafts 14/16/18
 - [Catalog Testing](docs/catalog-testing.md) — Integration harness for validating catalog subscription against a live relay
+- [Authorization](docs/authorization.md) — CAT4MOQ credential providers for players and connections
 
 ---
 
