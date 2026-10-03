@@ -153,6 +153,11 @@ export class WebCodecsVideoEncoder {
     this.frameCount++;
   }
 
+  /** Encode the next frame as a keyframe; the interval counts from it. */
+  requestKeyframe(): void {
+    this.frameCount = 0;
+  }
+
   /** Flush pending frames. */
   async flush(): Promise<void> {
     if (!this.encoder || this.encoder.state !== 'configured') return;

@@ -645,6 +645,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
             + (timeOriginDeltaUs === undefined ? ''
               : `, ${(timeOriginDeltaUs / 1000).toFixed(1)}ms from timeOrigin`)),
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
+          onKeyframeNeeded: () => videoEncoder?.requestKeyframe(),
         },
         log,
         catalogIntervalMs,
@@ -670,6 +671,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
       };
       conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
+      conn.onSubscribeForwardStateChange = (requestId, forward) =>
+        session.handleForwardChange(requestId, forward);
+      // A draft-18 resume must carry the Largest Location (§5.1).
+      conn.setLargestLocationProvider((requestId) => session.largestLocation(requestId));
       return session;
     },
 

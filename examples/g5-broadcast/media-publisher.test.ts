@@ -867,3 +867,72 @@ describe('MediaPublisher — audio over datagrams', () => {
     expect(conn.opened.length).toBeGreaterThan(0);
   });
 });
+
+describe('MediaPublisher — relay Forward State changes', () => {
+  it('a pause stops production quietly and keeps the alias; a resume restarts video at a keyframe', async () => {
+    const conn = recordingConnection();
+    const errors: string[] = [];
+    let keyframeRequests = 0;
+    const pub = makePublisher(conn, {
+      onError: (ctx) => errors.push(ctx),
+      onKeyframeNeeded: () => { keyframeRequests++; },
+      pauseProbeMs: 1,
+    });
+    pub.setVideoAlias(2n);
+    const afterBind = keyframeRequests;
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+
+    pub.setForward('video', false);
+    pub.publishVideo(chunk(1), delta());
+    pub.publishVideo(chunk(2), kf());
+    await new Promise((r) => setTimeout(r, 5));   // past any retry window
+    pub.publishVideo(chunk(3), kf());
+    await settle();
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0]);
+    expect(pub.videoAliasArmed).toBe(2n);
+    expect(errors).toEqual([]);
+
+    pub.setForward('video', true);
+    expect(keyframeRequests).toBe(afterBind + 1);
+    pub.publishVideo(chunk(4), delta());          // no reference after the gap
+    pub.publishVideo(chunk(5), kf());
+    await settle();
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0, 5]);
+  });
+
+  it('reports the largest location sent per track', async () => {
+    const conn = recordingConnection({ holdCloses: true });
+    const pub = makePublisher(conn);
+    expect(pub.largestLocation('video')).toBeNull();
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    pub.publishVideo(chunk(1), delta());
+    await settle();
+    expect(pub.largestLocation('video')).toEqual({ group: conn.opened[0]!.groupId, object: 1n });
+
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(2), { timestampUs: 0 });
+    pub.publishAudio(chunk(3), { timestampUs: 20_000 });
+    await settle();
+    const [earlier, later] = conn.opened.slice(1).map((o) => o.groupId);
+    await conn.releaseLastClose();                // the later chunk finishes first
+    expect(pub.largestLocation('audio')).toEqual({ group: later, object: 0n });
+    await conn.releaseCloses();
+    expect(pub.largestLocation('audio')).toEqual({ group: later, object: 0n });
+    expect(earlier! < later!).toBe(true);
+  });
+
+  it('binding a video alias requests a keyframe, and a throwing hook is reported', () => {
+    const errors: string[] = [];
+    let calls = 0;
+    const pub = makePublisher(recordingConnection(), {
+      onError: (ctx) => errors.push(ctx),
+      onKeyframeNeeded: () => { calls++; if (calls === 2) throw new Error('encoder closed'); },
+    });
+    pub.setVideoAlias(2n);
+    expect(calls).toBe(1);
+    expect(() => pub.setVideoAlias(5n)).not.toThrow();
+    expect(errors).toEqual(['keyframe request']);
+  });
+});

@@ -64,6 +64,7 @@ export class BroadcastSession {
   private retired = false;
   /** Re-emission timer for the catalog track, and the alias it publishes on. */
   private catalogTimer: ReturnType<typeof setInterval> | null = null;
+  private catalogAlias: bigint | null = null;
   /** The track each accepted SUBSCRIBE serves, by request ID. */
   private readonly subscribedTrack = new Map<bigint, string>();
   /** The request currently served for each track. */
@@ -104,6 +105,7 @@ export class BroadcastSession {
   private startCatalogReemission(alias: bigint): void {
     // A new catalog subscription has its own alias; the old one is gone.
     this.stopCatalogReemission();
+    this.catalogAlias = alias;
     const periodMs = this.opts.catalogIntervalMs ?? 1_000;
     if (periodMs <= 0) return;
     let reportedFailure = false;
@@ -218,8 +220,59 @@ export class BroadcastSession {
     this.safeLog(`Relay unsubscribed from "${track}" (reqId=${requestId})`);
     if (this.currentRequest.get(track) !== requestId) return;
     this.currentRequest.delete(track);
-    if (track === 'catalog') this.stopCatalogReemission();
-    else if (track === 'video' || track === 'audio') this.publisher.endTrack(track);
+    if (track === 'catalog') {
+      this.stopCatalogReemission();
+      this.catalogAlias = null;
+    } else if (track === 'video' || track === 'audio') {
+      this.publisher.endTrack(track);
+    }
+  }
+
+  /**
+   * The relay changed a subscription's Forward State (§5.1), as it does when
+   * its viewers pause or return. Media pauses and resumes in the publisher;
+   * the catalog holds re-emission and, on a resume, is sent at once.
+   */
+  handleForwardChange(requestId: bigint, forward: boolean): void {
+    if (this.retired) return;
+    const track = this.subscribedTrack.get(requestId);
+    if (track === undefined || this.currentRequest.get(track) !== requestId) return;
+    this.safeLog(`Relay ${forward ? 'resumed' : 'paused'} "${track}" (reqId=${requestId})`);
+    if (track === 'video' || track === 'audio') {
+      this.publisher.setForward(track, forward);
+    } else if (!forward) {
+      this.stopCatalogReemission();
+    } else if (this.catalogAlias !== null) {
+      this.resendCatalog(this.catalogAlias);
+    }
+  }
+
+  /**
+   * Largest Location for a subscription, which a draft-18 resume must report.
+   * The catalog reports none: each of its groups is a complete catalog, and a
+   * resume sends a fresh one.
+   */
+  largestLocation(requestId: bigint): { group: bigint; object: bigint } | null {
+    const track = this.subscribedTrack.get(requestId);
+    return track === 'video' || track === 'audio' ? this.publisher.largestLocation(track) : null;
+  }
+
+  /** Send the catalog now, then resume re-emitting it on `alias`. */
+  private resendCatalog(alias: bigint): void {
+    let payload: Uint8Array;
+    try {
+      payload = buildCatalogPayload(this.opts.catalog);
+    } catch {
+      return; // the first publish already proved the params build
+    }
+    const work = publishCatalogGroup(
+      this.connection as never, alias, payload, { draft: this.opts.publisher.draft },
+    ).then(() => {
+      if (!this.retired && this.catalogAlias === alias) this.startCatalogReemission(alias);
+    }).catch((err: unknown) => {
+      this.safeLog(`Catalog resend failed: ${(err as Error)?.message ?? err}`);
+    });
+    this.trackWork(work);
   }
 
   /**

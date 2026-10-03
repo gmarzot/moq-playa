@@ -407,29 +407,29 @@ describe('BroadcastSession — catalog re-emission (late joiners)', () => {
   });
 });
 
+function loggedSession(conn: BroadcastSessionConnection, catalogIntervalMs = 0) {
+  const lines: string[] = [];
+  const session = new BroadcastSession(conn, {
+    catalog: CATALOG,
+    publisher: { wrapInt, draft: 16 },
+    log: (m) => lines.push(m),
+    catalogIntervalMs,
+  });
+  return { session, lines };
+}
+
+/** Records the alias of every subgroup the connection opens. */
+function recordAliases(conn: ReturnType<typeof recordingConnection>): bigint[] {
+  const aliases: bigint[] = [];
+  const realOpen = conn.openSubgroup.bind(conn);
+  conn.openSubgroup = async (...args: Parameters<typeof realOpen>) => {
+    aliases.push(args[0] as bigint);
+    return realOpen(...args);
+  };
+  return aliases;
+}
+
 describe('BroadcastSession — subscription ended by the relay', () => {
-  function loggedSession(conn: BroadcastSessionConnection, catalogIntervalMs = 0) {
-    const lines: string[] = [];
-    const session = new BroadcastSession(conn, {
-      catalog: CATALOG,
-      publisher: { wrapInt, draft: 16 },
-      log: (m) => lines.push(m),
-      catalogIntervalMs,
-    });
-    return { session, lines };
-  }
-
-  /** Records the alias of every subgroup the connection opens. */
-  function recordAliases(conn: ReturnType<typeof recordingConnection>): bigint[] {
-    const aliases: bigint[] = [];
-    const realOpen = conn.openSubgroup.bind(conn);
-    conn.openSubgroup = async (...args: Parameters<typeof realOpen>) => {
-      aliases.push(args[0] as bigint);
-      return realOpen(...args);
-    };
-    return aliases;
-  }
-
   it('an ended audio subscription retires the track until a new SUBSCRIBE re-arms it', async () => {
     const conn = recordingConnection();
     const { session, lines } = loggedSession(conn);
@@ -502,5 +502,88 @@ describe('BroadcastSession — subscription ended by the relay', () => {
     expect(lines).toContain('Relay unsubscribed from "video" (reqId=3)');
     expect(session.publisher.videoAliasArmed).toBe(2n);
     expect(session.publisher.retiredTracks).toEqual([]);
+  });
+});
+
+describe('BroadcastSession — relay Forward State changes', () => {
+  const frame = (tag: number) => [new Uint8Array([tag]), { isKeyframe: true, timestampUs: tag }] as const;
+
+  it('a media pause and resume reach the publisher; a replaced request is ignored', async () => {
+    const conn = recordingConnection();
+    const { session, lines } = loggedSession(conn);
+    session.handleSubscribe(3n, 'video');
+    await settle();
+
+    session.handleForwardChange(3n, false);
+    expect(lines).toContain('Relay paused "video" (reqId=3)');
+    session.publisher.publishVideo(...frame(1));
+    await settle();
+    expect(conn.sends).toHaveLength(0);
+
+    session.handleForwardChange(3n, true);
+    expect(lines).toContain('Relay resumed "video" (reqId=3)');
+    session.publisher.publishVideo(...frame(2));
+    await settle();
+    expect(conn.sends).toHaveLength(1);
+
+    session.handleSubscribe(7n, 'video');               // the relay subscribed again
+    await settle();
+    session.handleForwardChange(3n, false);             // late, on the old request
+    session.publisher.publishVideo(...frame(3));
+    await settle();
+    expect(conn.sends).toHaveLength(2);
+  });
+
+  it('a catalog pause holds re-emission; a resume sends one at once and re-emission restarts', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const aliases = recordAliases(conn);
+      const { session } = loggedSession(conn, 50);
+      session.handleSubscribe(1n, 'catalog');
+      await vi.advanceTimersByTimeAsync(0);
+
+      session.handleForwardChange(1n, false);
+      const atPause = aliases.length;
+      await vi.advanceTimersByTimeAsync(300);
+      expect(aliases.length).toBe(atPause);
+
+      session.handleForwardChange(1n, true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(aliases.length).toBe(atPause + 1);         // sent at once
+      await vi.advanceTimersByTimeAsync(160);
+      expect(aliases.length).toBeGreaterThan(atPause + 1);
+      expect(aliases.every((a) => a === 1n)).toBe(true);
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('with re-emission off, a resume still sends the catalog once', async () => {
+    const conn = recordingConnection();
+    const aliases = recordAliases(conn);
+    const { session } = loggedSession(conn, 0);
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    session.handleForwardChange(1n, false);
+    session.handleForwardChange(1n, true);
+    await settle();
+    expect(aliases).toEqual([1n, 1n]);
+  });
+
+  it('reports the publisher\'s largest location for media and none for the catalog', async () => {
+    const conn = recordingConnection();
+    const { session } = loggedSession(conn);
+    session.handleSubscribe(1n, 'catalog');
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    expect(session.largestLocation(3n)).toBeNull();
+
+    session.publisher.publishVideo(...frame(1));
+    await settle();
+    expect(session.largestLocation(3n)).not.toBeNull();
+    expect(session.largestLocation(3n)).toEqual(session.publisher.largestLocation('video'));
+    expect(session.largestLocation(1n)).toBeNull();
   });
 });

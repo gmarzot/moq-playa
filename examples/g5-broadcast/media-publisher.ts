@@ -123,6 +123,9 @@ export interface MediaPublisherOptions {
   /** Publish audio as OBJECT_DATAGRAMs rather than a subgroup stream per
    *  chunk: no retransmission, no per-chunk stream churn. draft-18 only. */
   audioDatagrams?: boolean;
+  /** Video needs a keyframe now: a new subscription or a resume. The page
+   *  asks its encoder for one. */
+  onKeyframeNeeded?: () => void;
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
@@ -170,6 +173,10 @@ export class MediaPublisher {
   private readonly audioMaxInFlight: number;
   private readonly pauseProbeMs: number;
   private readonly audioDatagrams: boolean;
+  private readonly onKeyframeNeeded: (() => void) | null;
+  /** Largest (group, object) sent per track; Largest Location for a resume. */
+  private videoLargest: { group: bigint; object: bigint } | null = null;
+  private audioLargest: { group: bigint; object: bigint } | null = null;
 
   private videoAlias: bigint | null = null;
   private audioAlias: bigint | null = null;
@@ -203,6 +210,8 @@ export class MediaPublisher {
   private readonly retired = new Set<string>();
   /** Tracks the relay has stopped forwarding (Forward State 0). */
   private readonly paused = new Set<string>();
+  /** Tracks the relay reported paused; only its resume clears them. */
+  private readonly forwardPaused = new Set<string>();
   /** Pause episodes already reported, so a probe failure is not re-announced. */
   private readonly pauseReported = new Set<string>();
 
@@ -234,13 +243,58 @@ export class MediaPublisher {
     // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
     this.audioDatagrams = options.audioDatagrams === true && options.draft === 18;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
+    this.onKeyframeNeeded = options.onKeyframeNeeded ?? null;
     this.videoGroupId = BigInt(Date.now());
     this.audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
   }
 
-  /** Bind the relay-subscribed aliases (from the accepted SUBSCRIBEs). */
-  setVideoAlias(alias: bigint): void { this.videoAlias = alias; this.retired.delete('video'); }
+  /** Bind the relay-subscribed aliases (from the accepted SUBSCRIBEs). A new
+   *  video subscription starts at a keyframe, requested now. */
+  setVideoAlias(alias: bigint): void {
+    this.videoAlias = alias;
+    this.retired.delete('video');
+    this.requestKeyframe();
+  }
   setAudioAlias(alias: bigint): void { this.audioAlias = alias; this.retired.delete('audio'); }
+
+  /**
+   * The relay changed a track's Forward State (§5.1). A pause drops the queue
+   * and suppresses production until the resume; video then restarts at a
+   * keyframe, requested at once.
+   */
+  setForward(track: 'video' | 'audio', forward: boolean): void {
+    if (!forward) {
+      this.forwardPaused.add(track);
+      if (track === 'video') {
+        this.videoQueue.length = 0;
+        this.videoContinuityLost = true;
+      } else {
+        this.audioQueue.length = 0;
+      }
+      return;
+    }
+    this.forwardPaused.delete(track);
+    this.paused.delete(track);
+    this.pauseReported.delete(track);
+    if (track === 'video') {
+      this.videoContinuityLost = true;
+      this.requestKeyframe();
+    }
+  }
+
+  /** Largest (group, object) sent on a track, or null before its first. */
+  largestLocation(track: 'video' | 'audio'): { group: bigint; object: bigint } | null {
+    return track === 'video' ? this.videoLargest : this.audioLargest;
+  }
+
+  /** The keyframe hook is application code: a throw is reported, not raised. */
+  private requestKeyframe(): void {
+    try {
+      this.onKeyframeNeeded?.();
+    } catch (err) {
+      this.report('keyframe request', err);
+    }
+  }
 
   /** The alias each track currently publishes to, or null when unarmed. */
   get videoAliasArmed(): bigint | null { return this.videoAlias; }
@@ -303,6 +357,7 @@ export class MediaPublisher {
       this.audioQueue.length = 0;
     }
     this.paused.delete(track);
+    this.forwardPaused.delete(track);
     this.pauseReported.delete(track);
     if (!this.retired.has(track)) {
       this.retired.add(track);
@@ -336,7 +391,8 @@ export class MediaPublisher {
    * or the video alias is not yet bound (never a stale-alias send).
    */
   publishVideo(data: Uint8Array, meta: VideoChunkMeta): void {
-    if (this.stopped || this.videoAlias === null || this.paused.has('video')) return;
+    if (this.stopped || this.videoAlias === null
+        || this.paused.has('video') || this.forwardPaused.has('video')) return;
     if (this.videoQueue.length >= this.videoQueueMax) {
       // Overflow: the queued dependents can never all be delivered in time —
       // continuity is lost. Invalidate the whole backlog and recover at the
@@ -358,7 +414,8 @@ export class MediaPublisher {
 
   /** Enqueue one encoded audio chunk (same contract as {@link publishVideo}). */
   publishAudio(data: Uint8Array, meta: AudioChunkMeta): void {
-    if (this.stopped || this.audioAlias === null || this.paused.has('audio')) return;
+    if (this.stopped || this.audioAlias === null
+        || this.paused.has('audio') || this.forwardPaused.has('audio')) return;
     if (this.audioQueue.length >= this.audioQueueMax) {
       // Audio chunks are independently decodable — drop the OLDEST to keep
       // the live edge. Report once per overflow episode.
@@ -587,6 +644,7 @@ export class MediaPublisher {
       this.trackClose(broken);
       throw err;
     }
+    this.videoLargest = { group: this.videoGroupId, object: this.videoObjectId };
     this.videoObjectId++;
     this.videoFrames++;
     this.videoBytes += data.byteLength;
@@ -605,7 +663,7 @@ export class MediaPublisher {
         this.audioAlias!, groupId, 0n, data,
         { publisherPriority: 64, ...(extensions ? { extensions } : {}) },
       );
-      this.noteAudioSent(data.byteLength);
+      this.noteAudioSent(data.byteLength, groupId);
       return;
     }
     const streamId = await this.connection.openSubgroup(
@@ -619,11 +677,15 @@ export class MediaPublisher {
       throw err;
     }
     await this.trackClose(streamId);
-    this.noteAudioSent(data.byteLength);
+    this.noteAudioSent(data.byteLength, groupId);
   }
 
-  /** Accounting shared by the stream and datagram audio paths. */
-  private noteAudioSent(bytes: number): void {
+  /** Accounting shared by the stream and datagram audio paths. Concurrent
+   *  publications finish out of order, so the largest group is a max. */
+  private noteAudioSent(bytes: number, groupId: bigint): void {
+    if (this.audioLargest === null || groupId > this.audioLargest.group) {
+      this.audioLargest = { group: groupId, object: 0n };
+    }
     this.audioChunks++;
     this.audioBytes += bytes;
     this.onCounts?.(this.videoFrames, this.audioChunks);
