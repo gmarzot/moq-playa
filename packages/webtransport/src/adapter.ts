@@ -900,8 +900,9 @@ export class MoqtConnection {
    * Called (draft-18) when an accepted inbound SUBSCRIBE's request stream is closed
    * or reset by the subscriber — i.e. the subscriber unsubscribed (§3.3.2; draft-18
    * removed the UNSUBSCRIBE message, so cancellation IS a request-stream teardown).
-   * This is a normal lifecycle end, NOT an error: the session's per-subscription
-   * state is already cleaned and the connection stays open. A publisher (e.g. a relay)
+   * The session's per-subscription state is already removed. Notification precedes
+   * the reset wait so the publisher can stop queued work promptly; an unproven
+   * reset can still close the session (§5.1.1). A publisher (e.g. a relay)
    * uses it to drop just that subscription — without waiting for the whole connection
    * to close — which is what ABR quality-switching needs. Mirrors
    * {@link onSubscribeNamespaceClosed} / {@link onSubscribeTracksClosed}.
@@ -4561,9 +4562,9 @@ export class MoqtConnection {
    * whether ALL of them were proven reset within
    * {@link PUBLISHER_ABORT_DEADLINE_MS}.
    *
-   * @returns true when every abort fulfilled — the only state in which
+   * @returns true when every transport reset was proven — the only state in which
    *   PUBLISH_DONE is permitted (§5.1.1: "MUST NOT send it until it has closed
-   *   all related streams"). false when an abort rejected or did not settle:
+   *   all related streams"). false when a reset rejected or did not settle:
    *   an unreachable JS writer is still an OPEN transport stream whose pending
    *   FIN could reach the peer after the terminal, so the caller must fail
    *   closed rather than announce a clean end.
@@ -4594,17 +4595,25 @@ export class MoqtConnection {
         if (st) {
           this.outgoingStreams.delete(sid);
           // INITIATE every cancellation before awaiting any individual one.
-          // The FULFILMENT of each abort is what proves the stream was reset
-          // (§5.1.1), so a rejection is recorded, not swallowed.
-          aborts.push(
-            st.writer.abort(new Error('subscription cancelled — RESET_STREAM (§5.1.1)'))
-              .then(() => true, () => false),
-          );
+          // A backend can normalize its reset evidence (browser WebTransport
+          // §7.4 rejects an interrupted FIN after a successful reset). Without
+          // that contract, only abort fulfillment proves the reset (§5.1.1).
+          const reason = new Error('subscription cancelled — RESET_STREAM (§5.1.1)');
+          try {
+            aborts.push(
+              (this.transport?.resetSendStream
+                ? this.transport.resetSendStream(st.writer, reason, st.closing)
+                : st.writer.abort(reason))
+                .then(() => true, () => false),
+            );
+          } catch {
+            aborts.push(Promise.resolve(false));
+          }
         }
       }
     }
-    // BOUNDED: see PUBLISHER_ABORT_DEADLINE_MS. A hung FIN defers its writer's
-    // abort indefinitely; terminalization must still reach A terminal — but an
+    // BOUNDED: see PUBLISHER_ABORT_DEADLINE_MS. A generic sink's hung FIN can
+    // defer abort indefinitely; terminalization must still reach a terminal, but an
     // unproven reset forbids PUBLISH_DONE (§5.1.1), so report the outcome and
     // let the caller fail closed instead of claiming the streams are closed.
     const allReset = await this.allFulfilledWithin(aborts, MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS);
@@ -5637,7 +5646,12 @@ export class MoqtConnection {
       // fetch fail immediately rather than continuing to write during the teardown
       // awaits below. The writers are aborted afterward.
       const fetchWriters = this.detachFetchStreamsForRequest(requestId);
-      await this.executeActions(this.session.handleInboundRequestClosed(requestId));
+      const actions = this.session.handleInboundRequestClosed(requestId);
+      if (wasSubscribe) {
+        try { this.onSubscribeClosed?.(requestId); }
+        catch { /* application callbacks must not prevent the required resets */ }
+      }
+      await this.executeActions(actions);
       this.inboundRequestContexts.delete(requestId);
       if (pubAlias !== undefined) await this.discardOpenStreamsForAlias(pubAlias);
       // §5.1.1: the subscriber cancelled — RESET every publisher data stream
@@ -5669,9 +5683,6 @@ export class MoqtConnection {
         this.deferredUpdateResponses.delete(requestId);
         await this.settleParkedJoins(requestId, false);
       }
-      // §3.3.2: a subscriber resetting its SUBSCRIBE stream IS the draft-18
-      // unsubscribe — surface it so the publisher can drop just that subscription.
-      if (wasSubscribe) this.onSubscribeClosed?.(requestId);
       return;
     }
     // An UNBOUND inbound stream (no valid opener yet) that failed — surface it.

@@ -359,6 +359,13 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       conn.onSubscribe = (requestId, _ns, trackName) => {
         session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
       };
+      conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
+      const logMessage = conn.onMessage;
+      conn.onMessage = (message) => {
+        // Draft-14/16 use UNSUBSCRIBE; draft-18 uses onSubscribeClosed (§5.1.1).
+        if (message.type === 'UNSUBSCRIBE') session.handleSubscribeClosed(message.requestId);
+        logMessage?.(message);
+      };
       return session;
     },
 
