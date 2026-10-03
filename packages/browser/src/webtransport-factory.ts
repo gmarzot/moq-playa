@@ -47,6 +47,13 @@ export interface WebTransportFactoryOptions {
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
   readonly draftVersion?: 14 | 16 | 18;
+
+  /**
+   * Congestion-control preference for the WebTransport constructor. A hint the
+   * browser may ignore; what it applied is reported as `congestionControl` on
+   * the returned transport.
+   */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 }
 
 /**
@@ -62,6 +69,13 @@ export function createWebTransport(
   options?: WebTransportFactoryOptions,
 ): (url: string) => Promise<WebTransportLike> {
   return async (url: string): Promise<WebTransportLike> => {
+    if (!/^https:\/\//i.test(url)) {
+      const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1];
+      throw new Error(
+        'Relay URL must be an https:// WebTransport endpoint, got '
+        + (scheme ? `${scheme}://` : `"${url}"`),
+      );
+    }
     // Build options as a plain object — WebTransportOptions varies by environment.
     // §3.1: WT-Available-Protocols for MOQT version negotiation.
     // Default: offer ['moqt-16']. Draft-14 does not send protocols —
@@ -74,6 +88,7 @@ export function createWebTransport(
           value: options.certHash,
         }];
       }
+      if (options?.congestionControl) opts.congestionControl = options.congestionControl;
       if (!withProtocols) return opts;
       // Protocol negotiation via WT-Available-Protocols (§3.1).
       // Draft-14 and below used "moq-00" ALPN over raw QUIC, but over WebTransport
@@ -121,15 +136,17 @@ export function createWebTransport(
       if (!firstOpts.protocols) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
+      // Draft-16+ negotiate the version only via WT-Protocol. A session
+      // without it leaves the server with no draft, and a draft-18 uni
+      // control stream on such a session is a protocol violation (moqx
+      // segfaults on it). So an explicit 16/18 pin never retries bare.
+      if (options?.draftVersion && options.draftVersion >= 15) {
+        throw new Error(`WebTransport connection failed: ${detail}`);
+      }
       // Strict UAs (Safari 26) fail the session when WT-Available-Protocols
-      // negotiation does not complete. MOQT does not require it — the
-      // CLIENT_SETUP version list (§9.3) negotiates in-band — so retry
-      // once without offering before giving up.
-      //
-      // In auto mode, the fallback has no transport.protocol, so the adapter
-      // uses its default draft unless the caller passed draftVersion
-      // explicitly. Callers that need deterministic draft selection should
-      // pass draftVersion.
+      // negotiation does not complete. In auto mode retry once without
+      // offering; the fallback has no transport.protocol, so the adapter
+      // uses its default draft.
       try {
         connected = await attempt(false);
       } catch (retryErr) {
@@ -158,8 +175,13 @@ export function createWebTransport(
     };
 
     const protocol = (transport as any).protocol as string | undefined;
+    const congestionControl = (transport as any).congestionControl as string | undefined;
+    // Absent when unsupported, so callers can tell that from empty stats.
+    const getStats = (transport as WebTransportLike).getStats;
     return {
       ...(protocol !== undefined ? { protocol } : {}),
+      ...(congestionControl !== undefined ? { congestionControl } : {}),
+      ...(getStats ? { getStats: () => getStats.call(transport) } : {}),
       ...wrappedTransport,
     } satisfies WebTransportLike;
   };

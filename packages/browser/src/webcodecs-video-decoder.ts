@@ -106,6 +106,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
   private lastSubmittedKeyChunkHex = 'none';
   private lastSubmittedKeyChunkBytes: Uint8Array | null = null;
   private lastSubmittedChunkBytes: Uint8Array | null = null;
+  private lastObservedTimestamp: number | null = null;
 
   /**
    * Map from chunk timestamp → renderTimeUs.
@@ -164,6 +165,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     this.lastSubmittedKeyChunkHex = 'none';
     this.lastSubmittedKeyChunkBytes = null;
     this.lastSubmittedChunkBytes = null;
+    this.lastObservedTimestamp = null;
     this.recentObservedChunkSummaries.length = 0;
     this.recentSubmittedChunkSummaries.length = 0;
 
@@ -218,11 +220,15 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     if (!prepared) return;
     const { data, droppedReason } = prepared;
 
-    // Track observed chunk
+    // Track observed chunk. `dt` is the capture-timestamp step from the
+    // previous chunk: a missing frame reads as a double-length step.
     this.observedChunkCount++;
-    this.lastObservedChunkSummary = this.strategy.describeChunk
+    const dt = this.lastObservedTimestamp === null
+      ? '' : `|dt=${Math.round((chunk.timestamp - this.lastObservedTimestamp) / 1000)}ms`;
+    this.lastObservedTimestamp = chunk.timestamp;
+    this.lastObservedChunkSummary = (this.strategy.describeChunk
       ? this.strategy.describeChunk(data, chunk.type, this.lastDescription)
-      : `#${this.observedChunkCount}|type=${chunk.type}|bytes=${data.byteLength}`;
+      : `#${this.observedChunkCount}|type=${chunk.type}|bytes=${data.byteLength}`) + dt;
     this.recentObservedChunkSummaries.push(this.lastObservedChunkSummary);
     if (this.recentObservedChunkSummaries.length > MAX_CHUNK_HISTORY) {
       this.recentObservedChunkSummaries.shift();

@@ -67,6 +67,11 @@ export interface MediaPublisherOptions {
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
+  /**
+   * Wall clock in microseconds since the Unix epoch, anchoring each track's
+   * first chunk timestamp. Injectable for tests. Default `Date.now() * 1000`.
+   */
+  wallClockUs?: () => number;
   /** Failure sink — publication errors are contained, never unhandled. */
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
@@ -102,6 +107,12 @@ export class MediaPublisher {
   private readonly connection: MediaPublishConnection;
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
+  private readonly wallClockUs: () => number;
+  // Offset from each track's WebCodecs timestamp base to the wall clock, fixed
+  // at that track's first chunk. Separate per track: the browser may hand audio
+  // and video timestamps on different bases.
+  private videoTsOffsetUs: number | null = null;
+  private audioTsOffsetUs: number | null = null;
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
   private readonly videoQueueMax: number;
@@ -150,6 +161,7 @@ export class MediaPublisher {
     this.connection = connection;
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
+    this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
@@ -322,9 +334,27 @@ export class MediaPublisher {
     }
   }
 
+  /**
+   * Rebase a WebCodecs chunk timestamp to Unix-epoch microseconds. The first
+   * chunk of each track anchors to the wall clock; later chunks keep their
+   * spacing relative to it. Without this the stamp carries a browser-defined
+   * base, and a receiver using audio as its sync master computes video render
+   * times against an unrelated origin.
+   * @see draft-ietf-moq-loc-04 §2.3.1.1 (Timestamp without Timescale = µs since epoch)
+   */
+  private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
+    const key = track === 'video' ? 'videoTsOffsetUs' : 'audioTsOffsetUs';
+    let offset = this[key];
+    if (offset === null) {
+      offset = this.wallClockUs() - timestampUs;
+      this[key] = offset;
+    }
+    return BigInt(Math.round(timestampUs + offset));
+  }
+
   private videoExtensions(meta: VideoChunkMeta): Uint8Array | undefined {
     return encodeLocHeaders({
-      captureTimestamp: BigInt(Math.round(meta.timestampUs)),
+      captureTimestamp: this.toWallClockUs('video', meta.timestampUs),
       videoFrameMarking: {
         independent: meta.isKeyframe,
         discardable: !meta.isKeyframe,
@@ -381,7 +411,7 @@ export class MediaPublisher {
 
   private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
     const extensions = encodeLocHeaders({
-      captureTimestamp: BigInt(Math.round(meta.timestampUs)),
+      captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
     }, { wireProfile: locWireProfileForDraft(this.draft) });
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.

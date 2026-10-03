@@ -443,7 +443,7 @@ describe('LOC pipeline diagnostics (stutter observability)', () => {
       gapDetectedCount: 0, skipForwardCount: 0, keyframeWaitingCount: 0,
       partialGroupAbandonedCount: 0, backlogShedCount: 0,
       recoveryActionCount: 0, syncResetCount: 0,
-      videoEffectiveGapTimeoutMs: null, renderCushionMs: null,
+      videoEffectiveGapTimeoutMs: null, renderCushionMs: null, audioLateDrops: null,
     });
   });
 

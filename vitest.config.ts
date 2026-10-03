@@ -14,6 +14,7 @@ export default defineConfig({
     alias: {
       '@moqt/transport': resolve(__dirname, 'packages/transport/src/index.ts'),
       '@moqt/webtransport': resolve(__dirname, 'packages/webtransport/src/index.ts'),
+      '@moqt/quic': resolve(__dirname, 'packages/quic/src/index.ts'),
       '@moqt/msf': resolve(__dirname, 'packages/msf/src/index.ts'),
       '@moqt/loc': resolve(__dirname, 'packages/loc/src/index.ts'),
       '@moqt/playback': resolve(__dirname, 'packages/playback/src/index.ts'),
@@ -29,6 +30,7 @@ export default defineConfig({
       'examples/node-relay/src/**/*.test.ts',
       'examples/node-publisher/src/**/*.test.ts',
       'examples/broadcast/**/*.test.ts',
+      'examples/g5-broadcast/**/*.test.ts',
       'examples/shared/**/*.test.ts',
     ],
     // The external-probe differential lane (`*.diff.test.ts`) requires a built

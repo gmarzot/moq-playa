@@ -24,6 +24,10 @@ export type {
   LevelsloadedEvent,
   QualitychangeEvent,
   StallEvent,
+  StallRecoveredEvent,
+  LifecycleEvent,
+  SessionClosedEvent,
+  SessionReconnectingEvent,
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';

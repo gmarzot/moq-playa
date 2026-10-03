@@ -379,6 +379,84 @@ async function flush(): Promise<void> {
 
 // ─── Tests ────────────────────────────────────────────────────────
 
+describe('MseMediaSource — attachment (sourceopen) reporting', () => {
+    it('attached is false until sourceopen creates the SourceBuffers, then onAttached fires once', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        expect(adapter.attached).toBe(false);
+
+        // Browsers defer the attachment while the tab is hidden: initialize()
+        // must not claim attachment before sourceopen.
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(false);
+        expect(onAttached).not.toHaveBeenCalled();
+        // …and appendChunk() has nothing to append to yet (dropped, logged once).
+        adapter.appendChunk('video', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]), 'v');
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+
+        currentMs.open();
+        expect(adapter.attached).toBe(true);
+        expect(onAttached).toHaveBeenCalledTimes(1);
+        expect(currentMs.addSourceBufferCalls).toHaveLength(1);
+        await flush();
+    });
+
+    it('attached is true immediately when the MediaSource is already open at initialize()', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        currentMs.open();
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(true);
+        expect(onAttached).toHaveBeenCalledTimes(1);
+    });
+
+    it('reset() clears attached; a re-initialize re-attaches', async () => {
+        const { adapter } = await makeReadyAdapter();
+        expect(adapter.attached).toBe(true);
+        adapter.reset();
+        expect(adapter.attached).toBe(false);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(true); // MediaSource still open → synchronous doInit
+        await flush();
+    });
+
+    it('reset invalidates a sourceopen deferred by the old initialization', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+
+        adapter.reset();
+        currentMs.open();
+
+        expect(adapter.attached).toBe(false);
+        expect(onAttached).not.toHaveBeenCalled();
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+        expect(currentMs.listenerCount('sourceopen')).toBe(0);
+    });
+
+    it('destroy invalidates a deferred sourceopen and clears its callback', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+
+        adapter.destroy();
+        currentMs.open();
+
+        expect(onAttached).not.toHaveBeenCalled();
+        expect(adapter.onAttached).toBeNull();
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+        expect(currentMs.listenerCount('sourceopen')).toBe(0);
+    });
+});
+
 describe('MseMediaSource — timeline-owned append integration', () => {
     it('non-overlapping segments both get appended', async () => {
         const { adapter, vsb } = await makeReadyAdapter();
@@ -1492,6 +1570,33 @@ describe('playhead-wedge watchdog', () => {
         video.paused = false;
         (adapter as any).maybeChaseLiveEdge();
         expect(video.currentTime).toBeCloseTo(38, 5); // resumes → chase works again
+    });
+
+    it('the watchdog tick chases live with no further appends', () => {
+        // Field case: an occluded tab's element is paused by the UA while
+        // appends keep landing, then the publisher ends. On resume there is
+        // no append left to trigger the chase, so the tick must own it —
+        // otherwise the tab replays its whole backlog (seen: 423 s ahead).
+        vi.useFakeTimers();
+        try {
+            const video = new MockVideoElement();
+            video.buffered = makeTimeRanges([[5, 400]]);
+            video.currentTime = 40;              // 360 s behind, no appends coming
+            video.paused = true;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+            (adapter as any).playTriggered = true;
+            (adapter as any).startWedgeWatchdog();
+
+            vi.advanceTimersByTime(1_000);
+            expect(video.currentTime).toBe(40);  // paused: still untouched
+
+            video.paused = false;
+            vi.advanceTimersByTime(250);
+            expect(video.currentTime).toBeCloseTo(398, 5); // end - targetAheadSec
+            adapter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('a behind-live chase seek does not reset the ladder (the slideshow tripwire)', () => {
@@ -3033,30 +3138,66 @@ describe('buffered-hole gap-jump', () => {
         return { adapter, video, jumps, stalls, errors, check };
     }
 
-    it('jumps across a bounded hole after gapJumpMs, landing just inside the next range', () => {
+    it('jumps across a bounded hole after a width-scaled wait, landing near the next range\'s live edge', () => {
         const { video, jumps, stalls, check } = gapSetup();
-        check(0);          // arms (frozen at 19.25, range end 19.27, hole to 19.78)
-        check(1_000);      // still waiting
+        check(0);          // first sighting (frozen at 19.25, range end 19.27, hole to 19.78)
+        check(1_000);      // second sighting proves the freeze → arms (0.51s hole → 1020ms wait)
         expect(video.seekCount).toBe(0);
 
-        check(2_100);      // wait (2000ms default) elapsed → jump
+        check(2_100);      // wait elapsed → jump
         expect(video.seekCount).toBe(1);
-        expect(video.currentTime).toBeCloseTo(19.79, 5); // 19.78 + 0.01
+        expect(video.currentTime).toBeCloseTo(23, 5); // 25 - targetAheadSec(2)
         expect(jumps).toHaveLength(1);
         expect(jumps[0].from).toBeCloseTo(19.25, 5);
-        expect(jumps[0].to).toBeCloseTo(19.79, 5);
+        expect(jumps[0].to).toBeCloseTo(23, 5);
         expect(jumps[0].holeSec).toBeCloseTo(0.51, 2);
-        expect(jumps[0].waitedMs).toBeGreaterThanOrEqual(2_000);
+        expect(jumps[0].waitedMs).toBeGreaterThanOrEqual(1_000);
         // Exactly one stall record, adapter-emitted, cause-tagged.
         expect(stalls).toHaveLength(1);
         expect(stalls[0].cause).toBe('media-gap');
-        expect(stalls[0].durationMs).toBeGreaterThanOrEqual(2_000);
+        expect(stalls[0].durationMs).toBeGreaterThanOrEqual(1_000);
+    });
+
+    it('jumps when the playhead parks well short of the range end (field case: 0.6s short, 4.17s hole)', () => {
+        // A stalled playhead stops at the last decodable frame, which can be
+        // a second or more before the range end. Distance to the end must not
+        // gate arming — only the frozen playhead and a hole ahead do.
+        const { video, jumps, check } = gapSetup({
+            ranges: [[132.68, 142.51], [146.68, 150.08]],
+            ct: 141.91,
+        });
+        check(0);
+        check(1_000);
+        expect(video.seekCount).toBe(0);
+
+        check(10_000);     // 4.17s hole → wait capped by gapJumpMs (2s)
+        expect(video.seekCount).toBe(1);
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0].from).toBeCloseTo(141.91, 5);
+        expect(jumps[0].holeSec).toBeCloseTo(4.17, 2);
+    });
+
+    it('a coasting playhead well short of the range end does not arm', () => {
+        const { video, jumps, check } = gapSetup({
+            ranges: [[132.68, 142.51], [146.68, 150.08]],
+            ct: 138.0,
+        });
+        check(0);
+        video.currentTime = 138.25;   // still playing
+        video.seekCount = 0;          // the mock counts our own writes as seeks
+        check(1_000);
+        video.currentTime = 138.5;
+        video.seekCount = 0;
+        check(10_000);
+        expect(video.seekCount).toBe(0);
+        expect(jumps).toHaveLength(0);
     });
 
     it('commit-before-publish: a throwing onStall listener does not prevent the seek or onGapJump', () => {
         const { adapter, video, jumps, check } = gapSetup();
         adapter.onStall = () => { throw new Error('listener bug'); };
         check(0);
+        check(1_000);
         expect(() => check(2_100)).not.toThrow();
         expect(video.seekCount).toBe(1);
         expect(jumps).toHaveLength(1);
@@ -3069,6 +3210,7 @@ describe('buffered-hole gap-jump', () => {
     it('episode: post-jump waiting/timeupdate churn cannot double-count the stall', () => {
         const { adapter, video, stalls, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);
         expect(stalls).toHaveLength(1);
         // The jump's own churn:
@@ -3104,13 +3246,14 @@ describe('buffered-hole gap-jump', () => {
     it('candidate drift (nextRangeStart moves) restarts the wait', () => {
         const { video, check } = gapSetup();
         check(0);
+        check(1_000);                                                  // arms: 0.51s hole
         video.buffered = makeTimeRanges([[5, 19.27], [19.60, 25]]);   // hole shrank: new candidate
-        check(1_500);
-        check(2_600);                                                  // only 1.1s since drift
+        check(1_500);                                                  // re-arms: 0.33s hole → 660ms wait
+        check(2_000);                                                  // only 0.5s since drift
         expect(video.seekCount).toBe(0);
-        check(3_600);                                                  // 2.1s since drift
+        check(2_300);                                                  // 0.8s since drift
         expect(video.seekCount).toBe(1);
-        expect(video.currentTime).toBeCloseTo(19.61, 5);
+        expect(video.currentTime).toBeCloseTo(23, 5);
     });
 
     it('movement disarms; a filled hole disarms', () => {
@@ -3155,53 +3298,63 @@ describe('buffered-hole gap-jump', () => {
         expect(video.seekCount).toBe(0);
     });
 
-    it('wide hole: no jump, one gap-too-wide warn, exactly one MediaGapUnrecoverableError after 10s', () => {
+    it('wide hole: one warn, then jumps after the gapJumpMs-capped wait, no fatal', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         const { video, errors, check } = gapSetup({ ranges: [[5, 19.27], [21.29, 25]] }); // hole 2.02
-        for (let t = 0; t <= 9_000; t += 1_000) check(t);
+        check(0);
+        check(1_000);                                                  // arms: 2.02s hole → wait capped at 2000ms
+        check(2_000);
         expect(video.seekCount).toBe(0);
-        expect(errors).toHaveLength(0);
-        const wideWarns = warn.mock.calls.filter((c) => String(c[0]).includes('gap-too-wide'));
+        const wideWarns = warn.mock.calls.filter((c) => String(c[0]).includes('wide buffered hole'));
         expect(wideWarns).toHaveLength(1);
 
-        check(10_100);
-        expect(errors).toHaveLength(1);
-        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
-        check(11_200); check(12_300);
-        expect(errors).toHaveLength(1);                                // spent — never re-emits
+        check(3_100);
+        expect(video.seekCount).toBe(1);
+        expect(video.currentTime).toBeCloseTo(23, 5);
+        expect(errors).toHaveLength(0);
         warn.mockRestore();
     });
 
-    it('a throwing onError listener still yields exactly one escalation (spent before publish)', () => {
-        const { adapter, errors, check } = gapSetup({ ranges: [[5, 19.27], [21.29, 25]] });
+    it('a very wide hole (6s) still jumps: width is never terminal', () => {
+        const { video, errors, check } = gapSetup({ ranges: [[5, 19.27], [25.3, 40]] });
+        check(0);
+        check(1_000);
+        check(3_100);
+        expect(video.seekCount).toBe(1);
+        expect(video.currentTime).toBeCloseTo(38, 5);
+        expect(errors).toHaveLength(0);
+    });
+
+    it('a throwing onError listener still yields exactly one landing fatal (spent before publish)', () => {
+        const { adapter, video, errors, check } = gapSetup();
         let thrown = 0;
         adapter.onError = (e) => { errors.push(e); thrown++; throw new Error('listener bug'); };
-        for (let t = 0; t <= 10_100; t += 1_000) expect(() => check(t)).not.toThrow();
-        check(11_200);
+        check(0);
+        check(1_000);
+        check(2_100);                                                  // jump; landing armed
+        video.readyState = 2;                                          // landing never decodes
+        for (let t = 3_100; t <= 12_200; t += 1_000) expect(() => check(t)).not.toThrow();
+        check(13_300);
         expect(errors).toHaveLength(1);
+        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
         expect(thrown).toBe(1);
     });
 
-    it('boundary: hole of exactly 2.000s still jumps', () => {
+    it('a hole of exactly 2.000s waits the full gapJumpMs cap, then jumps', () => {
         const { video, check } = gapSetup({ ranges: [[5, 19], [21, 25]], ct: 18.95 });
         check(0);
-        check(2_100);
-        expect(video.seekCount).toBe(1);
-        expect(video.currentTime).toBeCloseTo(21.01, 5);
-    });
-
-    it('boundary: a hole of 2.001s is refused (identity tolerance must not widen the policy bound)', () => {
-        const { video, errors, check } = gapSetup({ ranges: [[5, 19], [21.001, 25]], ct: 18.95 });
-        for (let t = 0; t <= 9_000; t += 1_000) check(t);
+        check(1_000);
+        check(2_100);                                                  // 1.1s since arm < 2s cap
         expect(video.seekCount).toBe(0);
-        check(10_100);                                                 // wide-hole escalation applies
-        expect(errors).toHaveLength(1);
-        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
+        check(3_100);
+        expect(video.seekCount).toBe(1);
+        expect(video.currentTime).toBeCloseTo(23, 5);
     });
 
     it('suppressed-waiting evidence survives the episode fallback (no second waiting required)', () => {
         const { adapter, video, stalls, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump; episode armed
         expect(stalls).toHaveLength(1);
         (adapter as any).handleWaiting();                              // the ONLY waiting (seek-generated)
@@ -3226,6 +3379,7 @@ describe('buffered-hole gap-jump', () => {
     it('a failed landing with a single suppressed waiting reaches a bounded fatal (no wedge eligibility needed)', () => {
         const { adapter, video, stalls, errors, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump to 19.79
         (adapter as any).handleWaiting();                              // seek-generated waiting; suppressed
         // Landing never decodes: no playing, no timeupdate, no second
@@ -3245,6 +3399,7 @@ describe('buffered-hole gap-jump', () => {
     it('intent-pause retires the landing watch; resume does not resurrect the old deadline', () => {
         const { adapter, errors, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump; landing armed
         (adapter as any).handleWaiting();                              // suppressed waiting recorded
         adapter.setPlaybackIntent(false);                              // user pause BEFORE any progress
@@ -3264,6 +3419,7 @@ describe('buffered-hole gap-jump', () => {
         ]) {
             const { adapter, video, errors, check } = gapSetup();
             check(0);
+            check(1_000);
             check(2_100);                                              // jump; landing armed
             put(video);                                                // user pause / user seek
             for (let t = 3_100; t <= 15_400; t += 1_000) check(t);
@@ -3277,6 +3433,7 @@ describe('buffered-hole gap-jump', () => {
         video.modelSeekLifecycle = true;                               // real element: assignment latches seeking
         video.autoFireSeeked = false;                                  // …and this seek NEVER settles
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump → our own seek pending
         expect(video.seeking).toBe(true);                              // latched by the jump itself
         for (let t = 3_100; t <= 11_900; t += 1_000) check(t);
@@ -3293,6 +3450,7 @@ describe('buffered-hole gap-jump', () => {
         video.modelSeekLifecycle = true;
         video.autoFireSeeked = false;
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump; landing armed at ~19.79
         video.currentTime = 5;                                         // user seeks elsewhere (still seeking)
         for (let t = 3_100; t <= 15_400; t += 1_000) check(t);
@@ -3303,6 +3461,7 @@ describe('buffered-hole gap-jump', () => {
     it('retiring a landing also retires its transferred waiting evidence (no phantom bandwidth stall)', () => {
         const { adapter, video, stalls, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump
         (adapter as any).handleWaiting();                              // the one suppressed waiting
         check(3_100);
@@ -3320,6 +3479,7 @@ describe('buffered-hole gap-jump', () => {
     it('cancellation during the fallback window prevents the evidence transfer entirely', () => {
         const { adapter, video, stalls, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump
         (adapter as any).handleWaiting();
         check(3_100);                                                  // one fallback tick
@@ -3338,6 +3498,7 @@ describe('buffered-hole gap-jump', () => {
         video.modelSeekLifecycle = true;                               // real element lifecycle,
         video.autoFireSeeked = true;                                   // …seeks settle promptly
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump; landing armed at ~19.79
         video.currentTime = 5;                                         // user scrubs backward…
         await Promise.resolve();                                       // …and the seek completes
@@ -3351,8 +3512,9 @@ describe('buffered-hole gap-jump', () => {
     it('a successful landing clears the landing watchdog (no delayed fatal)', () => {
         const { adapter, video, errors, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump
-        video.currentTime = 20.4;                                      // organic progress past the landing
+        video.currentTime = 23.5;                                      // organic progress past the landing
         video.seekCount = 1;
         (adapter as any).handleTimeUpdate();
         for (let t = 3_100; t <= 14_400; t += 1_000) check(t);
@@ -3396,18 +3558,20 @@ describe('buffered-hole gap-jump', () => {
     it('rate limit: consecutive holes jump at least GAP_JUMP_MIN_INTERVAL_MS apart', () => {
         const { video, check } = gapSetup();
         check(0);
+        check(1_000);
         check(2_100);                                                  // jump #1 at 2.1s
         expect(video.seekCount).toBe(1);
         // Immediately a new hole at the landing.
         video.currentTime = 19.79;
         video.seekCount = 1;                                           // manual move isn't an adapter seek
         video.buffered = makeTimeRanges([[5, 19.80], [20.31, 30]]);
-        check(3_100);                                                  // arms
+        check(3_100);                                                  // first sighting
+        check(4_100);                                                  // arms
         check(5_200);                                                  // wait elapsed but rate limit (2.1+5=7.1s) not
         expect(video.seekCount).toBe(1);
         check(7_300);                                                  // past both → jump #2
         expect(video.seekCount).toBe(2);
-        expect(video.currentTime).toBeCloseTo(20.32, 5);
+        expect(video.currentTime).toBeCloseTo(28, 5);
     });
 
     it('gapJumpMs: 0 disables; constructor rejects NaN, Infinity, and negatives', () => {
@@ -3433,6 +3597,68 @@ describe('buffered-hole gap-jump', () => {
 
         adapter.destroy();
         expect((adapter as any).onGapJump).toBeNull();
+    });
+});
+
+describe('stale-group floor', () => {
+    it('video drops two groups behind the floor, appends one behind; audio is exempt', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const initData = makeInit(1, 100);
+        adapter.initialize({
+            video: { codec: 'avc1.42c01e', initData },
+            audio: { codec: 'mp4a.40.2', initData },
+        });
+        currentMs.open();
+        await flush();
+        await flush();
+        const vsb = currentMs.videoBuffer;
+        const asb = currentMs.audioBuffer;
+        const seg = (bmd: number) => makeSegment({ bmd, defaultDur: 100, sampleCount: 1 });
+
+        adapter.appendChunk('video', seg(1000), 'v', 10n);                 // floor → 10
+        await flush(); await flush();
+        const vBase = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', seg(800), 'v', 8n);                   // two behind: dropped
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(vBase);
+        adapter.appendChunk('video', seg(900), 'v', 9n);                   // previous group: late tail, appends
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(vBase + 1);
+
+        adapter.appendChunk('audio', seg(1000), 'a', 100n);                // audio floor → 100
+        await flush(); await flush();
+        const aBase = asb.appendedPayloads.length;
+        adapter.appendChunk('audio', seg(840), 'a', 92n);                  // 8 groups (~170ms) late: appends
+        await flush(); await flush();
+        expect(asb.appendedPayloads.length).toBe(aBase + 1);
+        adapter.destroy();
+    });
+
+    it('clearTimeline drops the floor so a renumbered epoch is not stale', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        currentMs.open();
+        await flush();
+        await flush();
+        const vsb = currentMs.videoBuffer;
+        const seg = (bmd: number) => makeSegment({ bmd, defaultDur: 100, sampleCount: 1 });
+
+        adapter.appendChunk('video', seg(5000), 'v', 50n);                 // floor → 50
+        await flush(); await flush();
+        expect(adapter.getCommittedGroupFloor('video', 'v')).toBe(50n);
+
+        // Source restart renumbers groups downward; without the floor clear
+        // every chunk of the new epoch reads as stale and is dropped forever.
+        adapter.clearTimeline('video', 'v');
+        expect(adapter.getCommittedGroupFloor('video', 'v')).toBeUndefined();
+
+        const base = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', seg(100), 'v', 1n);
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.destroy();
     });
 });
 

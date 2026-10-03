@@ -26,7 +26,9 @@ import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
 import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
-import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
+import type {
+  MoqtObject, MoqtObjectData, ObjectDatagram, SubgroupHeader,
+} from '@moqt/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
 import { BufferBasedController } from '@moqt/playback';
@@ -89,6 +91,10 @@ const SWITCH_STAGING_MAX_OBJECTS = 100;
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 
+/** Pipeline drain cadence (~60fps), for both the timer and the arrival pump. */
+const TICK_INTERVAL_MS = 16;
+const TICK_INTERVAL_US = TICK_INTERVAL_MS * 1_000;
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /** Catalog track name per MSF §5.1.10. */
@@ -129,6 +135,11 @@ function encodeNamespace(
 /** Display form of a config namespace, joining tuple fields with `/`. */
 function namespaceDisplay(ns: string | readonly string[]): string {
   return typeof ns === 'string' ? ns : ns.join('/');
+}
+
+/** Wire bytes as hex, for reporting what a request actually sent. */
+function hexBytes(b: Uint8Array): string {
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
 /**
@@ -276,7 +287,7 @@ interface MigrationTxn {
  */
 export class MoqtPlayer {
   /** Player version (set at build time). */
-  static readonly version = '0.5.7';
+  static readonly version = '0.5.9';
 
   private readonly config: MoqtPlayerConfig;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
@@ -344,6 +355,8 @@ export class MoqtPlayer {
    * catalog arrived cannot get an adapter that starts anyway.
    */
   private playbackIntent: boolean | null = null;
+  /** Catalog targetLatency of the selected video track (ms); config wins. */
+  private catalogTargetLatencyMs: number | null = null;
   /** Pending `state_changed` announcements; see announceState(). */
   private readonly stateAnnouncements: { from: PlayerStateValue; to: PlayerStateValue }[] = [];
   private announcingState = false;
@@ -374,6 +387,30 @@ export class MoqtPlayer {
 
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
+
+  /**
+   * Wall-clock time `cmaf_init` fulfilled, i.e. when the `cmaf_first_frame`
+   * watchdog expectation was first armed. Used to bound how long video
+   * segment arrivals may keep renewing that deadline — see
+   * `cmafFirstFrameMaxWaitMs`.
+   */
+  private cmafFirstFrameDeadlineStartedAt: number | undefined;
+
+  /** Start of the current hidden interval while the first-frame deadline is pending. */
+  private cmafFirstFrameHiddenAt: number | undefined;
+
+  /**
+   * CMAF media is being held because the MediaSource is not attached yet
+   * (`mediaSource.attached === false`, e.g. hidden tab). See the attach gate
+   * in the CMAF object path and {@link handleCmafMediaSourceAttached}.
+   */
+  private cmafHoldingForAttach = false;
+
+  /** First-frame timeout to re-arm when a hidden document becomes visible. */
+  private cmafFirstFrameDeferredTimeoutMs: number | undefined;
+
+  /** `visibilitychange` listener installed while the first-frame deadline is pending. */
+  private visibilityListener: (() => void) | null = null;
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
@@ -475,6 +512,17 @@ export class MoqtPlayer {
   /** Tick interval handle for pipeline processing. */
   private tickInterval: ReturnType<typeof setInterval> | null = null;
 
+  /** Clock reading of the last tick, shared by the timer and the arrival pump. */
+  private lastTickUs = 0;
+
+  /** Socket-to-engine spans per object, newest first, capped at DELIVERY_SPAN_SAMPLES. */
+  private readonly deliverySpans: Array<
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> = [];
+  private static readonly DELIVERY_SPAN_SAMPLES = 512;
+
+  /** tick() stages objects, which re-enters the arrival path. */
+  private tickInProgress = false;
+
   /**
    * Guard against double sync reset within a single tick cycle.
    * When both audio and video pipelines skip_forward in the same tick,
@@ -569,6 +617,26 @@ export class MoqtPlayer {
     replaying: boolean;
   } | null = null;
   /** Fail-closed recovery-parking bounds (objects / bytes / lifecycle). */
+  /** Cooldown after a failed recovery REQUEST_UPDATE: request IDs are bounded
+   *  by the peer's MAX_REQUEST_ID, and retrying per object exhausts them. */
+  private static readonly RECOVERY_UPDATE_COOLDOWN_US = 5_000_000;
+  /** Catalog objects dropped for an empty payload, and parse failures. */
+  private emptyCatalogObjects = 0;
+  private catalogParseFailures = 0;
+  /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
+  private recoveryUpdateBlockedUntilUs = 0;
+  private recoveryUpdateFailures = 0;
+  /** Reconnect after the current session closed during playback; null when none is pending. */
+  private reconnect: {
+    attempt: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    readonly closeReason: string;
+  } | null = null;
+  /** Delay before each reconnect attempt; later attempts reuse the last. */
+  private static readonly RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+  /** Attempts before giving up: about two minutes with the delays above. */
+  private static readonly RECONNECT_MAX_ATTEMPTS = 11;
+
   private static readonly MAX_RECOVERY_PARKED_OBJECTS = 256;
   private static readonly MAX_RECOVERY_PARKED_BYTES = 4 * 1024 * 1024;
   private static readonly MAX_RECOVERY_PARKED_EVENTS = 64;
@@ -740,6 +808,23 @@ export class MoqtPlayer {
   private _mediaSubsFailed = 0;
 
   /**
+   * What each media SUBSCRIBE put on the wire, by requestId, so a refusal
+   * can report the exact namespace and track bytes sent. Bounded FIFO.
+   */
+  private readonly mediaSubWire = new Map<bigint, string>();
+  private static readonly MEDIA_SUB_WIRE_MAX = 32;
+
+  /** Remember one SUBSCRIBE's wire detail, evicting the oldest past the cap. */
+  private recordMediaSubWire(requestId: bigint, detail: string): void {
+    this.mediaSubWire.set(requestId, detail);
+    while (this.mediaSubWire.size > MoqtPlayer.MEDIA_SUB_WIRE_MAX) {
+      const oldest = this.mediaSubWire.keys().next();
+      if (oldest.done) break;
+      this.mediaSubWire.delete(oldest.value);
+    }
+  }
+
+  /**
    * Active fetches: requestId → track info for routing fetch objects.
    * @see draft-ietf-moq-transport-16 §9.16 (FETCH)
    */
@@ -897,6 +982,22 @@ export class MoqtPlayer {
         // CMAF bootstrap deadlines ESCALATE (fatal); all other
         // expectations keep the historical diagnostic-only behavior.
         if (e.event === 'cmaf_init' || e.event === 'cmaf_first_frame') {
+          // Browsers (Chrome in particular) defer a media element's resource
+          // load — for MSE, the MediaSource attachment that fires
+          // `sourceopen` — while the document is hidden (background tab), and
+          // resume it when the tab becomes visible. Until then no SourceBuffer
+          // exists and nothing can render, no matter how healthy delivery is.
+          // That is not a codec/init mismatch: suspend the deadline instead of
+          // escalating, and re-arm it fresh once the document is visible.
+          if (e.event === 'cmaf_first_frame' && this.documentHidden()) {
+            this.deferCmafFirstFrameDeadline(e.timeoutMs);
+            return;
+          }
+          if (e.event === 'cmaf_first_frame') {
+            this.cmafFirstFrameDeadlineStartedAt = undefined;
+            this.cmafFirstFrameHiddenAt = undefined;
+          }
+          this.removeVisibilityListenerIfIdle();
           const detail = e.event === 'cmaf_init'
             ? 'CMAF media arriving but no init segment materialized (initData / initTrack / in-band ftyp+moov)'
             : 'CMAF MediaSource initialized but no frame rendered (init/codec mismatch?)';
@@ -1001,6 +1102,7 @@ export class MoqtPlayer {
     const locGauges = gapUs !== undefined ? {
       videoEffectiveGapTimeoutMs: gapUs / 1000, // raw adaptive fuse
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
+      audioLateDrops: this.audioPipeline?.lateAudioDrops ?? null,
     } : undefined;
     return Object.freeze(this._stats.snapshot(locGauges));
   }
@@ -1545,6 +1647,10 @@ export class MoqtPlayer {
   private flushCmafStagedBuffer(
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
   ): void {
+    // The replacement is now authoritative. Pin it before replaying staged
+    // bytes so a late object from the retired stream cannot switch the
+    // assembler back after this commit.
+    this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
     const cmafStaged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
     for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload } of cmafStaged) {
@@ -1767,6 +1873,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
+        this.recordDeliverySpans(obj);
         if (mediaType === 'video' && bytes > 0) {
           const gid = BigInt(obj.groupId);
           if (gid !== this.bwEstimatorGroupId) {
@@ -1818,11 +1925,12 @@ export class MoqtPlayer {
       if (this.stateMachine.state === PlayerState.PAUSED) return;
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
       pipeline?.pushObject(obj, headers);
+      this.pumpDrain();
     };
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
-    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj) => {
+    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, headers) => {
       // Liveness: stamp before every early return (gates, staging, drops).
       this.stampMediaArrival(BigInt(obj.trackAlias));
 
@@ -1841,8 +1949,9 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
-      // Emit media_object for CMAF too — sparkline jitter chart needs
-      // inter-arrival timing from all video objects regardless of packaging.
+      // Emit media_object for CMAF too — arrival timing and capture
+      // timestamps are packaging-independent, so latency and jitter are
+      // measured the same way on both paths.
       this.emitter.emit('media_object', {
         type: 'media_object',
         mediaType,
@@ -1852,6 +1961,8 @@ export class MoqtPlayer {
         kind: obj.kind,
         ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
         ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+        ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
+        ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
       });
 
       if (obj.kind !== 'data' || !obj.payload) return;
@@ -1863,6 +1974,21 @@ export class MoqtPlayer {
       // deadline (no more silent pre-init drops).
       if (!this.cmafInitialized) {
         this.handlePreInitCmafObject(mediaType, trackName, obj.payload);
+        return;
+      }
+
+      // Gate: the MediaSource must be attached (MSE `sourceopen`) before
+      // anything can reach a SourceBuffer. Browsers defer that attachment
+      // while the document is hidden (background tab). Hold media here rather
+      // than feeding the assembler, so (a) the shared epoch anchors on the
+      // first segment actually appended and (b) on attach we re-sync to the
+      // next group start — playback resumes at the live edge on a keyframe
+      // instead of on a stale timeline built from dropped segments.
+      if (this.mediaSource?.attached === false) {
+        if (!this.cmafHoldingForAttach) {
+          this.cmafHoldingForAttach = true;
+          this.log.info('[CMAF] MediaSource not attached yet (sourceopen pending — hidden tab?); holding media until attached');
+        }
         return;
       }
 
@@ -1913,14 +2039,16 @@ export class MoqtPlayer {
         return;
       }
 
-      // Early stale-group drop: skip objects from groups older than what
-      // MSE has already committed. Prevents late-arriving old groups from
-      // poisoning the assembler's patchEpoch (false backward-bmd detection).
+      // Early stale-group drop (video only): skip groups older than the one
+      // before what MSE has committed. The immediately previous group's tail
+      // legitimately races the next group's head across concurrent subgroup
+      // streams; the assembler's reorder window places it. Anything older is
+      // replay. Audio is one group per object; no group floor applies.
       const groupId = BigInt(obj.groupId);
-      if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
+      if (mediaType === 'video' && this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
         const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
           .getCommittedGroupFloor(mediaType, trackName);
-        if (floor !== undefined && groupId < floor) return;
+        if (floor !== undefined && groupId + 1n < floor) return;
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
@@ -2370,6 +2498,7 @@ export class MoqtPlayer {
     this.mediaSource?.setPlaybackIntent?.(false);
     this._stats.recordPlayStop();
     this.stopTicking();
+    this.clearStallPark();
 
     // Flush pre-scheduled audio and queued video frames immediately
     this.commandDispatcher?.flush();
@@ -4321,12 +4450,55 @@ export class MoqtPlayer {
   /**
    * Tick playback pipelines — drain buffers, evaluate gaps, emit commands.
    *
-   * Called automatically by play() on a 16ms interval.
+   * Driven by the 16ms interval and, via pumpDrain(), by object arrivals.
+   * A re-entrant call returns without work.
    * Exposed publicly for testing and manual control.
    *
    * @see draft-ietf-moq-loc-01 §4.2 (decode order)
    */
   tick(): void {
+    if (this.tickInProgress) return;
+    this.tickInProgress = true;
+    this.lastTickUs = this.clock.now();
+    try {
+      this.runTick();
+    } finally {
+      this.tickInProgress = false;
+    }
+  }
+
+  /** Per-object socket-to-engine spans, newest first. Empty on a transport
+   *  that does not stamp. */
+  get deliveryBreakdown(): ReadonlyArray<
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> {
+    return this.deliverySpans;
+  }
+
+  private recordDeliverySpans(obj: MoqtObjectData): void {
+    const { socketFirstMs, socketLastMs, assemblyBusyMs } = obj;
+    if (socketFirstMs === undefined || socketLastMs === undefined) return;
+    const assemblyMs = assemblyBusyMs ?? 0;
+    this.deliverySpans.unshift({
+      // Socket span less read-loop work.
+      transferMs: Math.max(0, socketLastMs - socketFirstMs - assemblyMs),
+      assemblyMs,
+      decodeMs: Math.max(0, performance.now() - socketLastMs),
+      bytes: obj.payload?.byteLength ?? 0,
+    });
+    if (this.deliverySpans.length > MoqtPlayer.DELIVERY_SPAN_SAMPLES) {
+      this.deliverySpans.length = MoqtPlayer.DELIVERY_SPAN_SAMPLES;
+    }
+  }
+
+  /** Run a tick from the arrival path when one is due. Chrome clamps timers to
+   *  1 Hz in a hidden, inaudible tab; arrivals are not throttled. */
+  private pumpDrain(): void {
+    if (this.tickInProgress) return;
+    if (this.clock.now() - this.lastTickUs < TICK_INTERVAL_US) return;
+    this.tick();
+  }
+
+  private runTick(): void {
     // Clear the per-tick sync reset guard. If both pipelines skip_forward
     // in the same tick, only the first (audio) resets the sync controller.
     this.syncResetThisTick = false;
@@ -4373,6 +4545,11 @@ export class MoqtPlayer {
   private videoRecoveryActive = false;
   private videoRecoveryHealthyRenders = 0;
   private static readonly RECOVERY_HEALTHY_THRESHOLD = 3;
+  /** Pending skip-forward for a detected stall; cleared when a frame renders. */
+  private stallParkTimer: ReturnType<typeof setTimeout> | null = null;
+  /** How long a detected stall waits for delivery to resume before skipping
+   *  to the next keyframe. */
+  private static readonly STALL_PARK_MS = 1_500;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
 
   private isLocDeliveryHealthy(): boolean {
@@ -4496,6 +4673,9 @@ export class MoqtPlayer {
     // in-flight transaction sees _destroyed at its next validation and rolls back;
     // detaching + closing the candidate here stops its callbacks and unblocks it.
     this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
+    if (this.reconnect?.timer) clearTimeout(this.reconnect.timer);
+    this.reconnect = null;
+    this.clearStallPark();
     if (this.currentMigration) {
       const txn = this.currentMigration;
       this.currentMigration = null;
@@ -4555,6 +4735,10 @@ export class MoqtPlayer {
     this.cmafPendingInit = null;
     this.cmafPreInitDropWarned.clear();
     this.cmafInitDeadlineArmed = false;
+    this.cmafFirstFrameDeadlineStartedAt = undefined;
+    this.cmafFirstFrameHiddenAt = undefined;
+    this.cmafFirstFrameDeferredTimeoutMs = undefined;
+    this.removeVisibilityListener();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -4927,6 +5111,8 @@ export class MoqtPlayer {
           error,
           reason,
         }));
+        this.scheduleReconnect(reason
+          ?? (error !== undefined ? `code 0x${error.toString(16)}` : 'clean close'));
       },
 
       onError: (error) => {
@@ -5588,17 +5774,26 @@ export class MoqtPlayer {
           reason: errorReason,
         });
       },
-      onMediaSubscribeOk: (_requestId, _trackName, _mediaType) => {
+      onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
         this._mediaSubsOk++;
+        this.mediaSubWire.delete(requestId);
       },
-      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode) => {
+      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
         this._mediaSubsFailed++;
         this.emitter.emit('track_subscribe_failed', {
           type: 'track_subscribe_failed', trackName, mediaType, requestId, errorCode, reason,
         });
+        // The wire detail travels in the message: this error reaches the
+        // application log without debug logging, and a refusal of a track
+        // another subscriber is receiving needs the exact bytes sent.
+        const wire = this.mediaSubWire.get(requestId);
+        this.mediaSubWire.delete(requestId);
         this.emitError(createPlayerError(
           'degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`,
+          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`
+          + ` reqId=${requestId.toString()}`
+          + (retryInterval !== undefined ? ` retryIn=${retryInterval.toString()}` : '')
+          + (wire !== undefined ? ` ${wire}` : ''),
         ));
         if (this._mediaSubsFailed === this._mediaSubsExpected && this._mediaSubsOk === 0 && this._mediaSubsExpected > 0) {
           this.emitError(createPlayerError(
@@ -5916,6 +6111,20 @@ export class MoqtPlayer {
     // be re-sent as a new independent object on the next group.
     if (obj.kind === 'gap') return;
 
+    // A zero-length payload carries no catalog; parsing it throws and drives
+    // recovery.
+    if (obj.payload.byteLength === 0) {
+      this.emptyCatalogObjects++;
+      if (this.emptyCatalogObjects === 1) {
+        this.log.warn(
+          'Catalog object with empty payload (group=%s object=%s) — dropped; '
+          + 'further occurrences counted only',
+          String(obj.groupId), String(obj.objectId),
+        );
+      }
+      return;
+    }
+
     // Emit raw payload before parsing — for debugging catalog format issues
     if (obj.payload && obj.payload.byteLength > 0) {
       let text: string | null = null;
@@ -5989,7 +6198,19 @@ export class MoqtPlayer {
         ? PlayerErrorCode.CATALOG_DELTA_ERROR
         : PlayerErrorCode.CATALOG_PARSE_ERROR;
       const cause = err instanceof Error ? err : new Error(String(err));
-      this.emitError(createPlayerError(severity, 'catalog', code, cause.message, { cause }));
+      // Once only: a malformed producer repeats per object, and every emit
+      // drives recovery. Size and head separate truncation from a format
+      // mismatch.
+      this.catalogParseFailures++;
+      if (this.catalogParseFailures === 1) {
+        this.log.warn(
+          'Catalog parse failed (%d bytes, head=%s): %s',
+          obj.payload.byteLength,
+          JSON.stringify(new TextDecoder().decode(obj.payload.subarray(0, 64))),
+          cause.message,
+        );
+        this.emitError(createPlayerError(severity, 'catalog', code, cause.message, { cause }));
+      }
     }
   }
 
@@ -6016,9 +6237,10 @@ export class MoqtPlayer {
     if (this.pipelinesCreated) return;
 
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
+      onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
         this._stats.recordFirstFrameRendered();
-        this.watchdog.fulfill('cmaf_first_frame'); // bootstrap deadline met
+        this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
         this.log.info('First frame rendered');
         this.emitter.emit('first_frame', { type: 'first_frame' });
       },
@@ -6035,14 +6257,7 @@ export class MoqtPlayer {
         this.consecutiveStallCount++;
         this.videoRecoveryActive = true;
         this.videoRecoveryHealthyRenders = 0;
-
-        // Flush stale backlog AND reject in-flight objects from the old
-        // subscription. Pass currentGroupId+1 as targetGroupId so the
-        // pipeline's minAcceptGroupId gates out stale groups that arrive
-        // after the REQUEST_UPDATE but before the relay switches.
-        const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
-        this.videoPipeline?.reset(minFreshGroup);
-        this.syncController?.reset();
+        this.clearStallPark();
 
         // Jump to live: when stalls persist (3+ consecutive without a
         // rendered frame), the player has fallen behind the live edge.
@@ -6050,6 +6265,7 @@ export class MoqtPlayer {
         // from NOW, and resume from the next keyframe.
         if (this.consecutiveStallCount >= 3) {
           this.consecutiveStallCount = 0;
+          this.flushVideoForRecovery();
           this.log.warn('Jump to live: %d consecutive stalls — flushing and resubscribing', 3);
 
           // Tell relay to restart from live edge
@@ -6065,28 +6281,21 @@ export class MoqtPlayer {
         // Relay signals overload via PUBLISH_DONE/TOO_FAR_BEHIND;
         // network bottlenecks produce no server signal, so the player
         // must self-detect via stall rate.
-        if (this.recoveryController) {
-          const action = this.recoveryController.evaluate({ type: 'stall' as any, durationMs } as any);
-          this.emitter.emit('recovery_action', {
-            type: 'recovery_action',
-            action,
-          });
-          doRecoveryAction(action, 'video', this.qualityController, this.log, {
-            onQualityReduced: (newTrack) => {
-              // No stats here — deferred to completePendingVideoSwitch.
-              this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
-                this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
-              });
-            },
-            onResubscribe: (mt, sg) => this.requestFreshSubscriptionStart(mt, sg),
-            onTerminate: (_reason) => {
-              if (this.stateMachine.state !== PlayerState.ERROR) {
-                this.transitionState(PlayerState.ERROR);
-              }
-              this.stopTicking();
-            },
-          });
+        const action = this.recoveryController?.evaluate({ type: 'stall' as any, durationMs } as any);
+        if (action?.type === 'skip_forward') {
+          // A delivery gap usually resumes with the group intact; skipping now
+          // would discard it and wait for the next keyframe. Skip only if no
+          // frame renders within the bound.
+          this.stallParkTimer = setTimeout(() => {
+            this.stallParkTimer = null;
+            if (this._destroyed || this.isTerminalState()) return;
+            this.flushVideoForRecovery();
+            this.applyStallRecovery(action);
+          }, MoqtPlayer.STALL_PARK_MS);
+          return;
         }
+        this.flushVideoForRecovery();
+        if (action) this.applyStallRecovery(action);
       },
       onDecodeError: (mediaType, error) => {
         if (this.stateMachine.state === PlayerState.ERROR) return;
@@ -6189,6 +6398,7 @@ export class MoqtPlayer {
       },
       onFrameRendered: (_captureTimestampUs, _actualRenderUs) => {
         this._stats.recordFrameRendered();
+        this.clearStallPark();
         if (this.videoRecoveryActive) {
           // Pipeline reset(minFreshGroup) rejects stale in-flight objects,
           // so any frame reaching here is genuinely fresh relay data.
@@ -6232,13 +6442,14 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     this.mediaSource = pipelines.mediaSource;
-    // Re-state playback intent on the newly created adapter. play()/pause() can
-    // both happen before the catalog exists, so the adapter that is created
-    // afterwards must inherit the player's CURRENT intent rather than its own
-    // default. `null` means the embedder has never declared one — leave the
-    // adapter's default alone.
-    if (this.playbackIntent !== null) {
-      this.mediaSource?.setPlaybackIntent?.(this.playbackIntent);
+    // Declare playback intent on the newly created adapter. play()/pause() can
+    // both happen before the catalog exists, so the adapter created afterwards
+    // inherits the player's CURRENT intent. Undeclared means not playing: the
+    // player owns startup, the adapter must never start on its own.
+    this.mediaSource?.setPlaybackIntent?.(this.playbackIntent ?? false);
+    const targetLatencyMs = this.config.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    if (targetLatencyMs != null) {
+      this.mediaSource?.setTargetAheadSec?.(targetLatencyMs / 1000);
     }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
 
@@ -6387,14 +6598,128 @@ export class MoqtPlayer {
     for (const [mt, e] of entries) this.cmafAssembler?.setInitSegment?.(mt, e.bytes!);
 
     this._stats.recordDecoderConfigured();
-    this.watchdog.fulfill('cmaf_init');
+    this.fulfillCmafBootstrapDeadline('cmaf_init');
     if (this.config.cmafBootstrapTimeoutMs! > 0) {
       // Second bootstrap deadline: initialized but never rendered a frame
       // (codec/init mismatch class) must not be a silent black player.
-      this.watchdog.expect('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs!);
+      // Renewed on each video segment arrival in buildCmafAssembler's
+      // onSegment (bounded by cmafFirstFrameMaxWaitMs) so a fixed 10s
+      // deadline from here doesn't misfire while delivery is healthy but
+      // startup buffering legitimately takes longer (e.g. long-haul RTT).
+      this.cmafFirstFrameDeadlineStartedAt = Date.now();
+      this.expectCmafBootstrapDeadline('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs!);
     }
     this.log.info('CMAF MediaSource initialized (%s)',
       entries.map(([mt, e]) => `${mt}=${e.bytes!.byteLength}B`).join(' '));
+  }
+
+  /**
+   * The CMAF MediaSource just attached (MSE `sourceopen` → SourceBuffers).
+   * If media was held while unattached, everything the assembler had seen
+   * was dropped before MSE: start its timeline over on what will actually be
+   * appended (re-seeding the init segments it needs for timescales/trex) and
+   * wait for the next group start so the first appended video sample is a
+   * keyframe — i.e. resume at the live edge.
+   */
+  private handleCmafMediaSourceAttached(): void {
+    if (!this.cmafHoldingForAttach) return;
+    this.cmafHoldingForAttach = false;
+    this.cmafAssembler?.reset();
+    if (this.cmafPendingInit) {
+      for (const mt of ['video', 'audio'] as const) {
+        const bytes = this.cmafPendingInit[mt]?.bytes;
+        if (bytes) this.cmafAssembler?.setInitSegment?.(mt, bytes);
+      }
+    }
+    this.cmafVideoSynced = false;
+    this.log.info('[CMAF] MediaSource attached — resuming at the next group start (live edge)');
+  }
+
+  /** Whether a DOM document exists and is currently hidden (background tab). */
+  private documentHidden(): boolean {
+    const doc = (globalThis as { document?: { visibilityState?: string } }).document;
+    return doc?.visibilityState === 'hidden';
+  }
+
+  /** Suspend a CMAF bootstrap deadline while the document is hidden. */
+  private deferCmafFirstFrameDeadline(timeoutMs: number): void {
+    if (this.cmafFirstFrameDeferredTimeoutMs === undefined) {
+      this.log.warn(
+        'CMAF bootstrap deferred: document is hidden (background tab) — the browser '
+        + 'defers media loading until the tab is visible; waiting for cmaf_first_frame');
+    }
+    this.watchdog.fulfill('cmaf_first_frame');
+    this.cmafFirstFrameDeferredTimeoutMs = timeoutMs;
+    if (this.cmafFirstFrameDeadlineStartedAt !== undefined
+        && this.cmafFirstFrameHiddenAt === undefined) {
+      this.cmafFirstFrameHiddenAt = Date.now();
+    }
+    this.installVisibilityListener();
+  }
+
+  /** Arm a CMAF deadline, or park it immediately when the document is hidden. */
+  private expectCmafBootstrapDeadline(event: string, timeoutMs: number): void {
+    if (event === 'cmaf_first_frame') {
+      this.installVisibilityListener();
+      if (this.documentHidden()) {
+        this.deferCmafFirstFrameDeadline(timeoutMs);
+        return;
+      }
+    }
+    this.watchdog.expect(event, timeoutMs);
+  }
+
+  /** Fulfill a CMAF deadline and release its visibility bookkeeping. */
+  private fulfillCmafBootstrapDeadline(event: string): void {
+    this.watchdog.fulfill(event);
+    if (event === 'cmaf_first_frame') {
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
+      this.cmafFirstFrameDeadlineStartedAt = undefined;
+      this.cmafFirstFrameHiddenAt = undefined;
+    }
+    this.removeVisibilityListenerIfIdle();
+  }
+
+  private installVisibilityListener(): void {
+    if (this.visibilityListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    if (!doc) return;
+    this.visibilityListener = () => {
+      if (this.documentHidden()) {
+        if (this.watchdog.activeExpectations.includes('cmaf_first_frame')) {
+          this.deferCmafFirstFrameDeadline(this.config.cmafBootstrapTimeoutMs!);
+        }
+        return;
+      }
+      if (this.cmafFirstFrameHiddenAt !== undefined
+          && this.cmafFirstFrameDeadlineStartedAt !== undefined) {
+        this.cmafFirstFrameDeadlineStartedAt += Date.now() - this.cmafFirstFrameHiddenAt;
+        this.cmafFirstFrameHiddenAt = undefined;
+      }
+      const timeoutMs = this.cmafFirstFrameDeferredTimeoutMs;
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
+      if (timeoutMs !== undefined) {
+        this.log.info('Document visible — re-arming CMAF bootstrap deadline cmaf_first_frame (%dms)', timeoutMs);
+        this.watchdog.expect('cmaf_first_frame', timeoutMs);
+      }
+      this.removeVisibilityListenerIfIdle();
+    };
+    doc.addEventListener('visibilitychange', this.visibilityListener);
+  }
+
+  private removeVisibilityListenerIfIdle(): void {
+    const active = this.watchdog.activeExpectations;
+    if (this.cmafFirstFrameDeferredTimeoutMs === undefined
+        && !active.includes('cmaf_first_frame')) {
+      this.removeVisibilityListener();
+    }
+  }
+
+  private removeVisibilityListener(): void {
+    if (!this.visibilityListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    doc?.removeEventListener('visibilitychange', this.visibilityListener);
+    this.visibilityListener = null;
   }
 
   /** Create the moof+mdat assembler wired to the MediaSource (single site). */
@@ -6413,6 +6738,7 @@ export class MoqtPlayer {
           }
         }
         ms.appendChunk(mediaType, segment, segTrackName, groupId);
+        this.renewCmafFirstFrameDeadline(mediaType);
       },
       onDiscontinuity: (mediaType, trackName) => {
         if ('clearTimeline' in ms) {
@@ -6420,6 +6746,35 @@ export class MoqtPlayer {
         }
       },
     });
+  }
+
+  /**
+   * Renew the `cmaf_first_frame` watchdog deadline on a video segment
+   * arrival, as long as media is still flowing.
+   *
+   * A fixed 10s deadline measured only from `cmaf_init` treats "delivery is
+   * healthy but startup buffering needs more time" (observed on long-haul
+   * RTT paths) the same as "nothing is arriving at all" — firing a fatal
+   * `CMAF_INIT_TIMEOUT` and tearing the player down to `ERROR` even though
+   * the underlying transport is fine and a frame would render moments later.
+   *
+   * Only renews while the expectation is still pending (a no-op after
+   * `onFirstFrame` has already fulfilled it) and only within
+   * `cmafFirstFrameMaxWaitMs` of the original `cmaf_init` — past that
+   * ceiling, renewal stops so a genuinely broken decode path (segments
+   * arriving, appendBuffer succeeding, but the browser never painting a
+   * frame) still surfaces as fatal rather than buffering forever.
+   */
+  private renewCmafFirstFrameDeadline(mediaType: 'video' | 'audio'): void {
+    if (mediaType !== 'video') return;
+    if (!this.config.cmafBootstrapTimeoutMs || this.config.cmafBootstrapTimeoutMs <= 0) return;
+    if (!this.watchdog.activeExpectations.includes('cmaf_first_frame')) return;
+
+    const maxWaitMs = this.config.cmafFirstFrameMaxWaitMs!;
+    const elapsed = Date.now() - (this.cmafFirstFrameDeadlineStartedAt ?? Date.now());
+    if (elapsed >= maxWaitMs) return;
+
+    this.expectCmafBootstrapDeadline('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs);
   }
 
   /**
@@ -6484,7 +6839,7 @@ export class MoqtPlayer {
     }
     if (!this.cmafInitDeadlineArmed && this.config.cmafBootstrapTimeoutMs! > 0) {
       this.cmafInitDeadlineArmed = true;
-      this.watchdog.expect('cmaf_init', this.config.cmafBootstrapTimeoutMs!);
+      this.expectCmafBootstrapDeadline('cmaf_init', this.config.cmafBootstrapTimeoutMs!);
     }
   }
 
@@ -6573,6 +6928,7 @@ export class MoqtPlayer {
     );
     if (selected.video?.targetLatency !== undefined) {
       this._stats.setTargetLatency(selected.video.targetLatency);
+      this.catalogTargetLatencyMs = selected.video.targetLatency;
     }
 
     // §9.2.2: Build subscription options from config
@@ -6603,6 +6959,7 @@ export class MoqtPlayer {
         packaging: audioPackaging,
       }) : undefined,
       isLive: selected.video?.isLive === true || selected.audio?.isLive === true,
+      ...(this.catalogTargetLatencyMs != null ? { targetLatencyMs: this.catalogTargetLatencyMs } : {}),
     });
 
     // ── Subscribe to selected tracks (parallel) ──────────────────
@@ -6649,6 +7006,11 @@ export class MoqtPlayer {
       // requestId-as-alias optimistic registration) already in place. Adapters
       // that don't invoke the callback fall back to post-await registration.
       const connAtSubscribe = this.connection;
+      const wireDetail = `ns=${namespaceDisplay(this.config.namespace)}`
+        + ` nsFields=${nsBytes.length} nsHex=${nsBytes.map(hexBytes).join('/')}`
+        + ` track="${name}" trackHex=${hexBytes(nameBytes)}`
+        + ` filter=${(mediaOptions as { subscriptionFilter?: { type?: string } }).subscriptionFilter?.type ?? 'default'}`
+        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}`;
       let subRegistered = false;
       const registerMediaSub = (reqIdBigInt: bigint): void => {
         if (subRegistered) return;
@@ -6661,6 +7023,8 @@ export class MoqtPlayer {
         // different alias, the registration is updated in handleControlMessage.
         this.subscriptionManager.registerTrack(reqIdBigInt, name, mediaType, packaging);
         this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
+        this.recordMediaSubWire(reqIdBigInt, wireDetail);
+        this.log.info('SUBSCRIBE media reqId=%s %s', reqIdBigInt.toString(), wireDetail);
       };
       let registeredId: bigint | null = null;
       let reqIdBigInt: bigint;
@@ -6980,11 +7344,113 @@ export class MoqtPlayer {
     });
   }
 
+  /** Re-join at the live edge, abandoning whatever is buffered. For callers that
+   *  know playback was suspended (frozen tab, sleep) and the buffer is stale. */
+  jumpToLive(reason: string): void {
+    if (!this.connection) return;
+    this.log.info('Jump to live: %s', reason);
+    this.clearStallPark();
+    // As the stall path does: drop the backlog, refuse stale groups still in
+    // flight, and re-anchor on what arrives next.
+    for (const pipeline of [this.videoPipeline, this.audioPipeline]) {
+      pipeline?.reset(pipeline.currentGroupId + 1n);
+    }
+    this.syncController?.reset();
+    this.requestFreshSubscriptionStart('video');
+    this.requestFreshSubscriptionStart('audio');
+    this.emitter.emit('recovery_action', {
+      type: 'recovery_action',
+      action: { type: 'jump_to_live' },
+    });
+  }
+
+  private clearStallPark(): void {
+    if (this.stallParkTimer === null) return;
+    clearTimeout(this.stallParkTimer);
+    this.stallParkTimer = null;
+  }
+
+  /**
+   * Drop the video backlog and refuse stale groups still in flight (the
+   * pipeline's minAcceptGroupId), so playback resumes at the next keyframe.
+   */
+  private flushVideoForRecovery(): void {
+    const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
+    this.videoPipeline?.reset(minFreshGroup);
+    this.syncController?.reset();
+  }
+
+  /** Publish and carry out the recovery controller's answer to a video stall. */
+  private applyStallRecovery(action: RecoveryAction): void {
+    this.emitter.emit('recovery_action', { type: 'recovery_action', action });
+    doRecoveryAction(action, 'video', this.qualityController, this.log, {
+      onQualityReduced: (newTrack) => {
+        // No stats here — deferred to completePendingVideoSwitch.
+        this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
+          this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
+        });
+      },
+      onResubscribe: (mt, sg) => this.requestFreshSubscriptionStart(mt, sg),
+      onTerminate: (_reason) => {
+        if (this.stateMachine.state !== PlayerState.ERROR) {
+          this.transitionState(PlayerState.ERROR);
+        }
+        this.stopTicking();
+      },
+    });
+  }
+
+  /**
+   * Reconnect after the current session closed during playback: a migration to
+   * the configured URL on a fresh connection, retried with backoff, fatal after
+   * RECONNECT_MAX_ATTEMPTS. Each failed attempt rolls back cleanly.
+   */
+  private scheduleReconnect(closeReason: string): void {
+    if (this._destroyed || this.currentMigration) return;
+    if (!this.config.createConnection || !this.config.createTransport) return;
+    const state = this.stateMachine.state;
+    if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED) return;
+    const r = this.reconnect ??= { attempt: 0, timer: null, closeReason };
+    if (r.timer !== null) return;
+    if (r.attempt >= MoqtPlayer.RECONNECT_MAX_ATTEMPTS) {
+      this.reconnect = null;
+      this.emitError(createPlayerError(
+        'fatal', 'connection', PlayerErrorCode.CONNECTION_LOST,
+        `Session closed (${r.closeReason}); reconnect gave up after ${r.attempt} attempts`,
+      ));
+      if (this.stateMachine.state !== PlayerState.ERROR) {
+        this.transitionState(PlayerState.ERROR);
+      }
+      this.stopTicking();
+      return;
+    }
+    r.attempt++;
+    const delays = MoqtPlayer.RECONNECT_DELAYS_MS;
+    const delayMs = delays[Math.min(r.attempt, delays.length) - 1]!;
+    this.emitter.emit('session_reconnecting', { type: 'session_reconnecting', attempt: r.attempt, delayMs });
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      if (this._destroyed || this.reconnect !== r) return;
+      this.migrate(this.config.createConnection!()).then(
+        () => { if (this.reconnect === r) this.reconnect = null; },
+        (err: unknown) => {
+          this.log.warn('Reconnect attempt %d failed: %s',
+            r.attempt, err instanceof Error ? err.message : String(err));
+          if (this.reconnect === r) this.scheduleReconnect(r.closeReason);
+        },
+      );
+    }, delayMs);
+  }
+
   private requestFreshSubscriptionStart(
     mediaType: 'video' | 'audio',
     startGroup?: bigint,
   ): void {
     if (!this.connection) return;
+    // The session is gone; the reconnect re-subscribes.
+    if (this.reconnect !== null) return;
+    // Re-issuing on every failure exhausts the request-ID space.
+    if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
     const matching = [...this.activeSubscriptions.entries()]
       .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId);
@@ -6999,6 +7465,7 @@ export class MoqtPlayer {
           }
           : { type: 'NextGroupStart' },
       }).then(() => {
+        this.recoveryUpdateFailures = 0;
         this.log.info(
           'Recovery REQUEST_UPDATE %s "%s" reqId=%s filter=%s',
           mediaType,
@@ -7008,8 +7475,13 @@ export class MoqtPlayer {
         );
       }).catch((err: unknown) => {
         const cause = err instanceof Error ? err : new Error(String(err));
+        this.recoveryUpdateBlockedUntilUs =
+          this.clock.now() + MoqtPlayer.RECOVERY_UPDATE_COOLDOWN_US;
+        this.recoveryUpdateFailures++;
+        if (this.recoveryUpdateFailures > 1) return;
         this.log.warn(
-          'Recovery REQUEST_UPDATE failed for %s reqId=%s: %s',
+          'Recovery REQUEST_UPDATE failed for %s reqId=%s: %s — backing off; '
+          + 'further failures counted only',
           mediaType,
           requestId,
           cause.message,
@@ -7037,6 +7509,8 @@ export class MoqtPlayer {
     const monitor = this.livenessMonitor;
     if (!monitor) return;
     if (this.stateMachine.state !== PlayerState.PLAYING) return;
+    // Restarts cannot succeed on a closed session; the reconnect owns recovery.
+    if (this.reconnect !== null) return;
     monitor.reconcile(this.collectLivenessTracks());
     monitor.check(performance.now());
   }
@@ -7403,7 +7877,7 @@ export class MoqtPlayer {
   /** Start pipeline tick interval (~60fps). */
   private startTicking(): void {
     if (this.tickInterval) return;
-    this.tickInterval = setInterval(() => this.tick(), 16);
+    this.tickInterval = setInterval(() => this.tick(), TICK_INTERVAL_MS);
   }
 
   /** Stop pipeline tick interval. */

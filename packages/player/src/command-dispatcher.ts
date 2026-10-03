@@ -192,19 +192,19 @@ export class CommandDispatcher {
     if (this.audioDecoder && this.audioOutput) {
       const audioOutput = this.audioOutput;
       const ad = this.audioDecoder;
-      this.audioDecoder.onData = (data, renderTimeUs) => {
+      this.audioDecoder.onData = (data, renderTimeUs, captureUs) => {
         // Delay unification: audio receives THE SAME playout cushion as the
         // video render-time recompute (getPlaybackDelayUs — adaptive gap
         // timeout with a static floor), applied here so the cushion arrives
         // inside renderTimeUs. Integrated audio outputs are constructed with
         // playbackDelayMs 0 and add no delay of their own. NOTE the adoption
-        // boundary: WebAudioOutput intentionally ignores renderTimeUs while
-        // its chain is healthy, so audio adopts a changed cushion at the
-        // next anchor/underrun — video adopts per-frame. One policy source;
-        // any divergence from a changed cushion persists until the next
-        // audio anchor/underrun/reset (pinned in webaudio-output.test.ts).
+        // boundary: WebAudioOutput never retimes a healthy chain to
+        // renderTimeUs, so a grown cushion reaches audio at the next
+        // anchor/underrun — video adopts per-frame. It does bound how far
+        // the chain runs BEHIND renderTimeUs (rate chase, then a snap that
+        // drops queued audio); pinned in webaudio-output.test.ts.
         const cushionUs = this._getPlaybackDelayUs?.() ?? 0;
-        audioOutput.schedule(data, renderTimeUs + cushionUs);
+        audioOutput.schedule(data, renderTimeUs + cushionUs, captureUs);
         this.checkQueuePressure('audio', ad);
       };
     }

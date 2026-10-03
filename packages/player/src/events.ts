@@ -68,6 +68,14 @@ export interface SessionClosedEvent {
   readonly reason?: string;
 }
 
+/** The current session closed during playback; a fresh session is attempted after `delayMs`. */
+export interface SessionReconnectingEvent {
+  readonly type: 'session_reconnecting';
+  /** 1 for the first attempt after the close. */
+  readonly attempt: number;
+  readonly delayMs: number;
+}
+
 /**
  * Session error (protocol violation, transport error).
  * @deprecated Use `error` event with structured PlayerError instead.
@@ -619,6 +627,7 @@ export interface PlayerEventMap {
   session_goaway: SessionGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
+  session_reconnecting: SessionReconnectingEvent;
   session_error: SessionErrorEvent;
 
   // Errors (structured)

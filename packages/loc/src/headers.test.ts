@@ -95,6 +95,19 @@ describe('parseLocHeaders', () => {
         expect(headers.captureTimestamp).toBe(timestamp);
     });
 
+    it('parses loc-04 TIMESTAMP (0x10) and prefers it over loc-01 0x02', () => {
+        const only10 = parseLocHeaders(buildExtensionBytes([
+            { id: LocExtensionId.TIMESTAMP, value: 1746104600000000n },
+        ]));
+        expect(only10.captureTimestamp).toBe(1746104600000000n);
+
+        const both = parseLocHeaders(buildExtensionBytes([
+            { id: LocExtensionId.CAPTURE_TIMESTAMP, value: 1n },
+            { id: LocExtensionId.TIMESTAMP, value: 2n },
+        ]));
+        expect(both.captureTimestamp).toBe(2n);
+    });
+
     it('parses VideoFrameMarking — independent keyframe (§2.3.2.2)', () => {
         // S=1 E=1 I=1 D=0 B=0 TID=0 → 0xE0
         const bytes = buildExtensionBytes([
