@@ -528,6 +528,14 @@
           <option value="strict">strict</option>
         </select>
 
+        <label for="s-cc">Congestion control (hint)</label>
+        <select id="s-cc">
+          <option value="">Browser default</option>
+          <option value="low-latency">Low latency</option>
+          <option value="throughput">Throughput</option>
+        </select>
+        <div class="hint">The browser may ignore it; the log shows what it applied.</div>
+
         <label for="s-authority">Authority</label>
         <input id="s-authority" type="text" placeholder="(none)">
 

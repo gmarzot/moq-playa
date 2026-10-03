@@ -21,6 +21,13 @@ const catchUpRate: number | undefined = (() => {
   const v = Number(new URLSearchParams(location.search).get('catchUp'));
   return Number.isFinite(v) && v >= 1 ? v : undefined;
 })();
+
+/** `?congestionControl=low-latency|throughput`: a hint to the browser's QUIC
+ *  congestion controller. Unset leaves the browser default. */
+const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
+  const v = new URLSearchParams(location.search).get('congestionControl');
+  return v === 'low-latency' || v === 'throughput' ? v : undefined;
+})();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 import { copyOnClick } from '../shared/copyable.js';
 
@@ -84,7 +91,7 @@ function log(msg: string): void {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
   const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'cushion', 'cushionMax',
-    'catchUp', 'catalogBootstrap', 'authority', 'hash', 'status', 'debug'];
+    'catchUp', 'catalogBootstrap', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const backdrop = byId('settings-backdrop');
@@ -96,6 +103,7 @@ function log(msg: string): void {
   const fCushionMax = byId<HTMLInputElement>('s-cushion-max');
   const fCatchUp = byId<HTMLInputElement>('s-catchup');
   const fBootstrap = byId<HTMLSelectElement>('s-bootstrap');
+  const fCc = byId<HTMLSelectElement>('s-cc');
   const fAuthority = byId<HTMLInputElement>('s-authority');
   const fHash = byId<HTMLInputElement>('s-hash');
   const fStatus = byId<HTMLInputElement>('s-status');
@@ -114,6 +122,7 @@ function log(msg: string): void {
     fCushionMax.value = p.get('cushionMax') ?? '';
     fCatchUp.value = p.get('catchUp') ?? '';
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
+    fCc.value = p.get('congestionControl') ?? '';
     fAuthority.value = p.get('authority') ?? '';
     fHash.value = p.get('hash') ?? '';
     fStatus.checked = p.get('status') === '1';
@@ -153,6 +162,7 @@ function log(msg: string): void {
     set('cushionMax', fCushionMax.value.trim());
     set('catchUp', fCatchUp.value.trim());
     set('catalogBootstrap', fBootstrap.value);
+    set('congestionControl', fCc.value);
     set('authority', fAuthority.value.trim());
     set('hash', fHash.value.trim());
     if (fStatus.checked) next.set('status', '1');
@@ -218,6 +228,7 @@ async function main(): Promise<void> {
     autoplay: true,
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {}),
+    ...(congestionControl ? { congestionControl } : {}),
     ...(targetLatencyOverrideMs ? { targetLatencyMs: targetLatencyOverrideMs } : {}),
     moqtPlayerConfig: engineConfig,
   });
@@ -234,8 +245,12 @@ async function main(): Promise<void> {
     stateBadge.className = `state-badge ${state}`;
   });
 
+  const logCongestionControl = (): void => log(`Congestion control: requested `
+    + `${congestionControl ?? 'browser default'}, browser applied ${player.congestionControl ?? 'not reported'}`);
+
   player.on('ready', ({ levels }) => {
     log(`Ready: ${levels.length} quality level(s)`);
+    logCongestionControl();
     playBtn.disabled = false;
     muteBtn.disabled = false;
     qualitySelect.disabled = false;
@@ -325,7 +340,10 @@ async function main(): Promise<void> {
   player.on('session_reconnecting', ({ attempt, delayMs }) => {
     log(`Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`);
   });
-  player.on('session_migrated', () => log('Session re-established'));
+  player.on('session_migrated', () => {
+    log('Session re-established');
+    logCongestionControl();
+  });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
   const renderCushionMs = (): number | null =>

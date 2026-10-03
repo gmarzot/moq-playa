@@ -144,3 +144,46 @@ describe('Player — page lifecycle', () => {
     expect(jumpToLive).toHaveBeenCalledOnce();
   });
 });
+
+// ─── congestion control ──────────────────────────────────────────────
+
+describe('Player — congestion control', () => {
+  /** A WebTransport that records its options and reports `applied`. */
+  function stubWebTransport(applied: string): unknown[] {
+    const constructed: unknown[] = [];
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      closed = new Promise(() => { /* stays open */ });
+      congestionControl = applied;
+      constructor(_url: string, opts: unknown) { constructed.push(opts); }
+    });
+    return constructed;
+  }
+
+  function playerWith(extra: Record<string, unknown>): Player {
+    const container = mockElement();
+    container.parentNode = { removeChild: vi.fn() };
+    return new Player(container, { url: 'https://relay.example.com/moq', namespace: 'test', ...extra });
+  }
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('passes the hint to WebTransport and reports what the browser applied', async () => {
+    const constructed = stubWebTransport('low-latency');
+    const player = playerWith({ congestionControl: 'low-latency' });
+    expect(player.congestionControl).toBeUndefined();
+
+    await (player as any).buildMoqtPlayerConfig().createTransport('https://relay.example.com/moq');
+    expect(constructed[0]).toMatchObject({ congestionControl: 'low-latency' });
+    expect(player.congestionControl).toBe('low-latency');
+  });
+
+  it('sends no hint by default and still reports what the browser applied', async () => {
+    const constructed = stubWebTransport('default');
+    const player = playerWith({});
+
+    await (player as any).buildMoqtPlayerConfig().createTransport('https://relay.example.com/moq');
+    expect(constructed[0]).not.toHaveProperty('congestionControl');
+    expect(player.congestionControl).toBe('default');
+  });
+});

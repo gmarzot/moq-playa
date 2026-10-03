@@ -136,6 +136,8 @@ export class Player {
   private readonly audioClock = new AudioAlignedClock();
   private readonly deferredAudio = new DeferredAudioOutput();
   private renderer: CanvasRenderer | null = null;
+  /** Congestion-control class the browser reported for the latest transport. */
+  private _congestionControl: string | undefined;
   private audioOutput: WebAudioOutput | null = null;
   private audioCtx: AudioContext | null = null;
   private _prepareAudioPromise: Promise<void> | null = null;
@@ -249,6 +251,10 @@ export class Player {
 
   /** Current player state. */
   get state(): PlayerState { return this._state; }
+
+  /** Congestion-control class the browser applied to the current transport,
+   *  or undefined where it does not report one. */
+  get congestionControl(): string | undefined { return this._congestionControl; }
 
   /**
    * Which media element is currently used as the render sink.
@@ -599,6 +605,11 @@ export class Player {
   private buildMoqtPlayerConfig(): MoqtPlayerConfig {
     const opts = this.options;
     const draftVersion = opts.draftVersion ?? DEFAULTS.draftVersion;
+    const transportFactory = createWebTransport({
+      ...(opts.certHash ? { certHash: opts.certHash } : {}),
+      ...(opts.congestionControl ? { congestionControl: opts.congestionControl } : {}),
+      draftVersion,
+    });
 
     const base: MoqtPlayerConfig = {
       url: opts.url,
@@ -607,10 +618,12 @@ export class Player {
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,
-      createTransport: createWebTransport({
-        ...(opts.certHash ? { certHash: opts.certHash } : {}),
-        draftVersion,
-      }),
+      // Every transport, a reconnect's included, records what the browser applied.
+      createTransport: async (url: string) => {
+        const transport = await transportFactory(url);
+        this._congestionControl = transport.congestionControl;
+        return transport;
+      },
       createConnection: () => new MoqtConnection(draftVersion),
     };
 

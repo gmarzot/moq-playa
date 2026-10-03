@@ -32,6 +32,9 @@ export interface PlayerOptions {
   readonly draftVersion?: 14 | 16 | 18;
   /** Auth tokens for CLIENT_SETUP. */
   readonly authTokens?: Uint8Array[];
+  /** WebTransport congestion-control hint, which the browser may ignore;
+   *  `Player.congestionControl` reports what it applied. */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 
   // ── Playback ──
 
