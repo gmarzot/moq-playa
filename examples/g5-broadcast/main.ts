@@ -494,6 +494,13 @@ startCameraBtn.addEventListener('click', () => startBroadcast('camera'));
 startScreenBtn.addEventListener('click', () => startBroadcast('screen'));
 stopBtn.addEventListener('click', stopBroadcast);
 
+/** Backoff between reconnects after the session closes under a broadcast. */
+const RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+/** Attempts before giving up: about ten minutes at the longest delay. */
+const RECONNECT_MAX_ATTEMPTS = 40;
+/** A session up this long resets the backoff. */
+const RECONNECT_STABLE_MS = 30_000;
+
 async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
@@ -511,6 +518,40 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let width = 1280;
   let height = 720;
   let fps = 30;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectCount = 0;
+  let sessionUpSinceMs: number | null = null;
+
+  // The session closed under the broadcast: rebuild only the network side,
+  // with backoff, while capture and encoders keep running.
+  function scheduleReconnect(): void {
+    if (currentAttempt !== attempt || reconnectTimer !== null) return;
+    if (sessionUpSinceMs !== null && Date.now() - sessionUpSinceMs >= RECONNECT_STABLE_MS) {
+      reconnectCount = 0;
+    }
+    sessionUpSinceMs = null;
+    if (reconnectCount >= RECONNECT_MAX_ATTEMPTS) {
+      log(`Reconnect gave up after ${reconnectCount} attempts.`);
+      void stopBroadcast();
+      return;
+    }
+    reconnectCount++;
+    const delayMs = RECONNECT_DELAYS_MS[Math.min(reconnectCount, RECONNECT_DELAYS_MS.length) - 1]!;
+    setState('reconnecting', 'starting');
+    log(`Reconnecting (attempt ${reconnectCount} in ${delayMs / 1000}s)`);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (currentAttempt !== attempt) return;
+      attempt.reopen().then((result) => {
+        if (result !== 'completed' || currentAttempt !== attempt) return;
+        sessionUpSinceMs = Date.now();
+        log('Session re-established.');
+      }, (err: unknown) => {
+        log(`Reconnect failed: ${(err as Error)?.message ?? err}`);
+        scheduleReconnect();
+      });
+    }, delayMs);
+  }
 
   const attempt: BroadcastAttempt = new BroadcastAttempt({
     // 1. Start capture — audio settings are ATTEMPT-LOCAL, derived from the
@@ -522,6 +563,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // Capture retires SYNCHRONOUSLY when Stop is pressed — camera/mic tracks
       // are released immediately, not after the session's bounded shutdown.
       ctx.onCancel(() => { try { cap.stop(); } catch { /* not started */ } });
+      ctx.onCancel(() => { if (reconnectTimer !== null) clearTimeout(reconnectTimer); });
       capture = cap;
       const stream = source === 'camera'
         ? await cap.startCamera({
@@ -673,8 +715,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           setState('live', 'live');
           liveSinceMs ??= Date.now();
         },
-        // Only the CURRENT attempt's session may drive the global stop.
-        onSessionClosed: () => { if (currentAttempt === attempt) void stopBroadcast(); },
+        // Only the CURRENT attempt's session may drive a reconnect.
+        onSessionClosed: () => { if (currentAttempt === attempt) scheduleReconnect(); },
       }), (sess) => sess.shutdown());
 
       // No await between connect resolution and these assignments — nothing
@@ -771,6 +813,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   try {
     const result = await attempt.run();
     if (result === 'cancelled') return; // superseded — the UI belongs to the replacement
+    sessionUpSinceMs = Date.now();
   } catch (err) {
     // Only the CURRENT attempt's failure is the user's failure; a stale
     // attempt has already been quiet-cancelled inside run().

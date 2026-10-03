@@ -90,6 +90,12 @@ export class BroadcastAttempt<TSession extends SessionLike = SessionLike> {
   private readonly runningDisposals = new Set<Promise<void>>();
   private readonly cancelCallbacks: Array<() => void> = [];
   private readonly ctx: AttemptResources;
+  /** Kept for reopen(): the network side is rebuilt, these are not. */
+  private capture: CaptureHandle | null = null;
+  private encoders: EncoderHandle | null = null;
+  /** Adoptions and abort hooks from these indices on belong to the network side. */
+  private networkMark = 0;
+  private networkCallbackMark = 0;
 
   constructor(deps: BroadcastAttemptDeps<TSession>) {
     this.deps = deps;
@@ -136,6 +142,10 @@ export class BroadcastAttempt<TSession extends SessionLike = SessionLike> {
 
       const encoders = this.deps.createEncoders(this.ctx, capture);
       this.ctx.throwIfCancelled();
+      this.capture = capture;
+      this.encoders = encoders;
+      this.networkMark = this.adopted.length;
+      this.networkCallbackMark = this.cancelCallbacks.length;
 
       const session = await this.deps.openSession(this.ctx);
       this.ctx.throwIfCancelled();
@@ -152,6 +162,49 @@ export class BroadcastAttempt<TSession extends SessionLike = SessionLike> {
       await this.cancel();
       if (wasCancelled) return 'cancelled';
       throw err;
+    }
+  }
+
+  /**
+   * Rebuild the network side after its session closed, keeping capture and
+   * encoders: release what openSession adopted (LIFO), then open a session,
+   * publish the namespace and wire publication again. A failure leaves its
+   * partial resources for the next reopen() or cancel() to release; a
+   * cancellation is reported as `'cancelled'`.
+   */
+  async reopen(): Promise<'completed' | 'cancelled'> {
+    if (this.cancelled || this.capture === null || this.encoders === null) return 'cancelled';
+    this.session = null;
+    await this.releaseNetwork();
+    try {
+      this.ctx.throwIfCancelled();
+      const session = await this.deps.openSession(this.ctx);
+      this.ctx.throwIfCancelled();
+      await this.deps.publishNamespace(this.ctx, session);
+      this.ctx.throwIfCancelled();
+      this.deps.wirePublication(session, this.capture, this.encoders);
+      this.session = session;
+      return 'completed';
+    } catch (err) {
+      if (this.cancelled || err instanceof AttemptCancelledError) return 'cancelled';
+      throw err;
+    }
+  }
+
+  /** Dispose the network side's adoptions, newest first. Each disposal is
+   *  tracked, so a cancel() racing it still awaits the one in progress. */
+  private async releaseNetwork(): Promise<void> {
+    // The old handshake's abort hooks have nothing left to abort.
+    this.cancelCallbacks.splice(this.networkCallbackMark);
+    const network = this.adopted.splice(this.networkMark);
+    for (let i = network.length - 1; i >= 0; i--) {
+      const entry = network[i]!;
+      if (entry.disposed) continue;
+      entry.disposed = true;
+      const p = this.safeDispose(entry.resource as never, entry.dispose);
+      this.runningDisposals.add(p);
+      await p;
+      this.runningDisposals.delete(p);
     }
   }
 

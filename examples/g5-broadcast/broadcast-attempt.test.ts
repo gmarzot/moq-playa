@@ -397,3 +397,59 @@ describe('BroadcastAttempt — synchronous retire of local resources', () => {
     expect(order[order.length - 1]).toBe('session.shutdown:end');
   });
 });
+
+describe('BroadcastAttempt — reopen after the session closed', () => {
+  it('releases only the network side, newest first, then opens, publishes and wires again', async () => {
+    const a = controllableAttempt();
+    await runToCompletion(a);
+    const reopen = a.attempt.reopen();
+    await settle();
+    expect(a.disposed).toEqual(['session', 'connection', 'transport']);
+
+    a.releaseTransport(); await settle();
+    a.releaseHandshake(); await settle();
+    a.releaseNamespace();
+    await expect(reopen).resolves.toBe('completed');
+    expect(a.wirePublication).toHaveBeenCalledTimes(2);
+    expect(a.capture.stopped).toBe(0);
+    expect(a.encoders.destroyed).toBe(0);
+    expect(a.attempt.currentSession).toBe(a.session);
+  });
+
+  it('a failed reopen is reported, and Stop still releases what it adopted', async () => {
+    const a = controllableAttempt();
+    await runToCompletion(a);
+    const reopen = a.attempt.reopen();
+    await settle();
+    a.releaseTransport(); await settle();          // transport + connection adopted
+    a.failHandshake(new Error('relay down'));
+    await expect(reopen).rejects.toThrow('relay down');
+
+    a.disposed.length = 0;
+    await a.attempt.cancel();
+    expect(a.disposed).toEqual(['connection', 'transport', 'encoders', 'capture']);
+  });
+
+  it('a reopen after Stop does nothing', async () => {
+    const a = controllableAttempt();
+    await runToCompletion(a);
+    await a.attempt.cancel();
+    a.disposed.length = 0;
+    await expect(a.attempt.reopen()).resolves.toBe('cancelled');
+    expect(a.disposed).toEqual([]);
+    expect(a.wirePublication).toHaveBeenCalledTimes(1);
+  });
+
+  it('Stop during a reopen\'s handshake aborts it and reports cancelled', async () => {
+    const a = controllableAttempt();
+    await runToCompletion(a);
+    const reopen = a.attempt.reopen();
+    await settle();
+    a.releaseTransport(); await settle();
+    const stop = a.attempt.cancel();                // its abort hook fails the handshake
+    await expect(reopen).resolves.toBe('cancelled');
+    await stop;
+    expect(a.capture.stopped).toBe(1);
+    expect(a.encoders.destroyed).toBe(1);
+  });
+});
