@@ -197,14 +197,17 @@
       overflow-y: auto; white-space: pre-wrap;
     }
 
-    @media (max-width: 1120px) {
+    /* Same breakpoint as the player, so a same-size window opens with the
+       same layout. */
+    @media (max-width: 1150px) {
       .layout { grid-template-columns: 1fr; }
       .cat-col { position: static; }
       .catalog-panel { position: static; margin-top: 12px; }
       /* Stacked, the panel has no column height to fill — the JSON pane needs
-         an explicit one or it collapses to the header. */
+         an explicit one or it collapses to the header. Its flex stays 1: the
+         wrap is a row, so flex sets the pane's width. */
       .json-wrap { flex: none; }
-      .cat-json { flex: none; min-height: 220px; max-height: 45vh; }
+      .cat-json { min-height: 220px; max-height: 45vh; }
     }
 
     /* Settings / share modals */

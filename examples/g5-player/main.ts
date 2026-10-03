@@ -128,6 +128,15 @@ function log(msg: string): void {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && backdrop.classList.contains('visible')) close();
   });
+  // Enter in a field applies, as a form submit would; buttons and the
+  // Advanced toggle keep their own Enter.
+  backdrop.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.isComposing) return;
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag !== 'INPUT' && tag !== 'SELECT') return;
+    e.preventDefault();
+    byId('set-apply').click();
+  });
 
   byId('set-apply').addEventListener('click', () => {
     const next = new URLSearchParams(location.search);
