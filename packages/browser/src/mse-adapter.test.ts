@@ -3682,3 +3682,116 @@ describe('seam-overlap default visibility (non-silent accountability)', () => {
         warn.mockRestore();
     });
 });
+
+describe('stall nudge and post-stall live-edge snap', () => {
+    function stallSetup(opts: { maxAheadSec?: number } = {}) {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[5, 25]]);
+        video.currentTime = 10;
+        video.readyState = 2;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+            targetAheadSec: 0.2,
+            ...(opts.maxAheadSec !== undefined ? { maxAheadSec: opts.maxAheadSec } : {}),
+        });
+        (adapter as any).playTriggered = true;
+        const adjusts: Array<[string, number, number]> = [];
+        adapter.onPlayheadAdjust = (kind, from, to) => adjusts.push([kind, from, to]);
+        return { adapter, video, adjusts };
+    }
+
+    it('nudges a playhead frozen with media ahead once, after 500 ms', () => {
+        vi.useFakeTimers();
+        try {
+            const { adapter, video, adjusts } = stallSetup();
+            (adapter as any).handleWaiting();
+            vi.advanceTimersByTime(400);
+            expect(video.currentTime).toBe(10);
+            vi.advanceTimersByTime(200);
+            expect(video.currentTime).toBeCloseTo(10.1, 5);
+            expect(adjusts).toEqual([['nudge', 10, expect.closeTo(10.1, 5)]]);
+            // The nudge's own seek-generated waiting does not nudge again.
+            (adapter as any).handleWaiting();
+            vi.advanceTimersByTime(1_000);
+            expect(adjusts).toHaveLength(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('does not nudge without media ahead, while paused, or after the stall ended', () => {
+        vi.useFakeTimers();
+        try {
+            const thin = stallSetup();
+            thin.video.currentTime = 24.7;              // 0.3 s ahead
+            (thin.adapter as any).handleWaiting();
+            vi.advanceTimersByTime(600);
+            expect(thin.adjusts).toEqual([]);
+
+            const paused = stallSetup();
+            (paused.adapter as any).handleWaiting();
+            paused.video.paused = true;
+            vi.advanceTimersByTime(600);
+            expect(paused.adjusts).toEqual([]);
+
+            const ended = stallSetup();
+            (ended.adapter as any).handleWaiting();
+            (ended.adapter as any).handlePlaying();    // resumed before the nudge
+            vi.advanceTimersByTime(600);
+            expect(ended.adjusts).toEqual([]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('after a detected stall, snaps a live cushion more than 1 s over target to the live edge', () => {
+        vi.useFakeTimers();
+        try {
+            const { adapter, video, adjusts } = stallSetup();
+            video.currentTime = 20;                     // 5 s ahead, target 0.2 s
+            (adapter as any).handleWaiting();
+            vi.advanceTimersByTime(300);                // detected (default threshold)
+            video.currentTime = 20;                     // undo the nudge for a clean read
+            adjusts.length = 0;
+            (adapter as any).handlePlaying();
+            expect(video.currentTime).toBeCloseTo(24.8, 5);
+            expect(adjusts).toEqual([['snap', 20, expect.closeTo(24.8, 5)]]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('does not snap after an undetected wait, near target, or on a non-live stream', () => {
+        vi.useFakeTimers();
+        try {
+            const brief = stallSetup();
+            brief.video.currentTime = 20;
+            (brief.adapter as any).handleWaiting();
+            (brief.adapter as any).handlePlaying();    // below the detection threshold
+            expect(brief.adjusts).toEqual([]);
+
+            const near = stallSetup();
+            near.video.currentTime = 24;                // 1 s ahead: 0.8 s over target
+            (near.adapter as any).handleWaiting();
+            vi.advanceTimersByTime(300);
+            (near.adapter as any).handlePlaying();
+            expect(near.adjusts.filter(([k]) => k === 'snap')).toEqual([]);
+
+            const vod = stallSetup({ maxAheadSec: Infinity });
+            vod.video.currentTime = 20;
+            (vod.adapter as any).handleWaiting();
+            vi.advanceTimersByTime(300);
+            (vod.adapter as any).handlePlaying();
+            expect(vod.adjusts.filter(([k]) => k === 'snap')).toEqual([]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('describes each SourceBuffer and the frame counters', () => {
+        const { adapter } = stallSetup();
+        (adapter as any).videoBuffer = { buffered: makeTimeRanges([[5, 25]]) };
+        (adapter as any).audioBuffer = { buffered: makeTimeRanges([[5, 12], [12.04, 25]]) };
+        expect(adapter.describeBuffers())
+            .toBe('video=[5.00–25.00] audio=[5.00–12.00][12.04–25.00] frames=100 dropped=2');
+    });
+});

@@ -617,6 +617,14 @@ export class MseMediaSource implements MediaSourceLike {
   onWedge: ((info: PlayheadWedgeInfo) => void) | null = null;
 
   /**
+   * Fired when the adapter moved the playhead to end a stall: `nudge` past a
+   * point the element froze at with media buffered ahead, or `snap` to the
+   * live edge once a stall had built a backlog. INFORMATIONAL, concrete-class
+   * only, like {@link onWedge}.
+   */
+  onPlayheadAdjust: ((kind: 'nudge' | 'snap', fromSec: number, toSec: number) => void) | null = null;
+
+  /**
    * Fired after the adapter jumped the playhead across a bounded buffered
    * hole (see MseMediaSourceOptions.gapJumpMs). Wired by MoqtPlayer into
    * stats + the public `gap_jump` event; applications should subscribe to
@@ -633,6 +641,9 @@ export class MseMediaSource implements MediaSourceLike {
   private stallDetected = false;
   /** Fires detection at the explicit threshold, not on an event cadence. */
   private stallDetectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The episode's one nudge: armed on `waiting`, spent once it fires. */
+  private stallNudgeTimer: ReturnType<typeof setTimeout> | null = null;
+  private stallNudged = false;
   private readonly stallThresholdMs: number;
 
   // ── Playhead-wedge watchdog state ──
@@ -660,6 +671,14 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly GAP_MOVE_TOLERANCE_SEC = 0.05;
   /** Candidate identity comparison tolerance (never float equality). */
   private static readonly GAP_IDENTITY_TOLERANCE_SEC = 0.01;
+
+  // ── Stall nudge and post-stall live-edge snap ──
+  /** A stall still frozen this long, with media ahead, gets one +0.1 s nudge. */
+  private static readonly STALL_NUDGE_MS = 500;
+  /** Media buffered ahead of the playhead the nudge requires. */
+  private static readonly STALL_NUDGE_MIN_AHEAD_SEC = 0.5;
+  /** After a stall, a cushion this far over target is shed by one seek (live only). */
+  private static readonly STALL_SNAP_EXCESS_SEC = 1.0;
 
   // ── Soft live-edge chase (sub-seek latency debt) ──
   /** Playback rate while shedding cushion above target; inaudible. */
@@ -1360,6 +1379,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.wedgeTimer = null;
     }
     this.onWedge = null;
+    this.onPlayheadAdjust = null;
     this.onGapJump = null;
     this.video.removeEventListener('playing', this.handlePlaying);
     this.video.removeEventListener('waiting', this.handleWaiting);
@@ -2824,7 +2844,10 @@ export class MseMediaSource implements MediaSourceLike {
       this.firstFrameFired = true;
       this.onFirstFrame?.();
     }
-    if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
+    if (recoveredMs !== null) {
+      this.snapAfterStall();
+      this.onStallRecovered?.(recoveredMs);
+    }
   };
 
   private handleWaiting = (): void => {
@@ -2848,6 +2871,7 @@ export class MseMediaSource implements MediaSourceLike {
     // uninterrupted freeze, and restarting the clock would shorten the outage.
     this.stallStartTime ??= performance.now();
     this.armStallDetection();
+    this.armStallNudge();
   };
 
   /** Detect once, at an explicit threshold, independent of `timeupdate`. */
@@ -2871,9 +2895,90 @@ export class MseMediaSource implements MediaSourceLike {
       clearTimeout(this.stallDetectTimer);
       this.stallDetectTimer = null;
     }
+    if (this.stallNudgeTimer !== null) {
+      clearTimeout(this.stallNudgeTimer);
+      this.stallNudgeTimer = null;
+    }
     this.stallStartTime = null;
     this.stallDetected = false;
+    this.stallNudged = false;
   };
+
+  /**
+   * Once per stall episode: a playhead still frozen after STALL_NUDGE_MS with
+   * media buffered ahead is moved 0.1 s on. The wedge watchdog leaves these
+   * readyState-2 freezes to the stall path.
+   */
+  private armStallNudge(): void {
+    if (this.stallNudgeTimer !== null || this.stallNudged) return;
+    this.stallNudgeTimer = setTimeout(() => {
+      this.stallNudgeTimer = null;
+      if (this.destroyed || this.stallStartTime === null || !this.playbackIntent) return;
+      const v = this.video;
+      if (v.paused || v.seeking) return;
+      const ct = v.currentTime;
+      const end = this.containingRangeEnd(ct);
+      if (end === null || end - ct < MseMediaSource.STALL_NUDGE_MIN_AHEAD_SEC) return;
+      this.stallNudged = true;
+      const to = Math.min(ct + 0.1, end - 0.05);
+      v.currentTime = to;
+      this.noteSelfSeek();
+      this.logWarn('[MSE] stall nudge %s -> %s (%ss buffered ahead)',
+        ct.toFixed(2), to.toFixed(2), (end - ct).toFixed(2));
+      try { this.onPlayheadAdjust?.('nudge', ct, to); } catch { /* listener bug */ }
+    }, MseMediaSource.STALL_NUDGE_MS);
+  }
+
+  /**
+   * After a detected stall on a live stream, shed the backlog it built with
+   * one seek to the live edge rather than over a minute at CHASE_RATE.
+   */
+  private snapAfterStall(): void {
+    if (!Number.isFinite(this.maxAheadSec) || !this.playbackIntent) return;
+    const v = this.video;
+    if (v.paused || v.seeking) return;
+    const ct = v.currentTime;
+    const end = this.containingRangeEnd(ct);
+    if (end === null) return;
+    const to = end - this.targetAheadSec;
+    if (to - ct <= MseMediaSource.STALL_SNAP_EXCESS_SEC) return;
+    this.resetPlaybackRate();
+    v.currentTime = to;
+    this.noteSelfSeek();
+    this.logWarn('[MSE] post-stall snap %s -> %s', ct.toFixed(2), to.toFixed(2));
+    try { this.onPlayheadAdjust?.('snap', ct, to); } catch { /* listener bug */ }
+  }
+
+  /** End of the buffered range containing `t`, or null. */
+  private containingRangeEnd(t: number): number | null {
+    try {
+      const b = this.video.buffered;
+      for (let i = 0; i < b.length; i++) {
+        if (t >= b.start(i) && t <= b.end(i)) return b.end(i);
+      }
+    } catch { /* detached element */ }
+    return null;
+  }
+
+  /** Each SourceBuffer's ranges and the element's frame counters, for stall logs. */
+  describeBuffers(): string {
+    const fmt = (sb: SourceBuffer | null): string => {
+      if (!sb) return 'none';
+      try {
+        const r: string[] = [];
+        for (let i = 0; i < sb.buffered.length; i++) {
+          r.push(`[${sb.buffered.start(i).toFixed(2)}–${sb.buffered.end(i).toFixed(2)}]`);
+        }
+        return r.join('') || 'empty';
+      } catch {
+        return 'n/a';
+      }
+    };
+    const q = (this.video as { getVideoPlaybackQuality?: () => VideoPlaybackQuality })
+      .getVideoPlaybackQuality?.();
+    return `video=${fmt(this.videoBuffer)} audio=${fmt(this.audioBuffer)}`
+      + (q ? ` frames=${q.totalVideoFrames} dropped=${q.droppedVideoFrames}` : '');
+  }
 
   private handleTimeUpdate = (): void => {
     if (!this.firstFrameFired && this.video.currentTime > 0) {
