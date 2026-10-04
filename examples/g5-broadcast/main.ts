@@ -517,8 +517,9 @@ startCameraBtn.addEventListener('click', () => startBroadcast('camera'));
 startScreenBtn.addEventListener('click', () => startBroadcast('screen'));
 stopBtn.addEventListener('click', stopBroadcast);
 
-/** Backoff between reconnects after the session closes under a broadcast. */
-const RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+/** Backoff between reconnects after the session closes under a broadcast:
+ *  the first is immediate, later ones back off until a session stays up. */
+const RECONNECT_DELAYS_MS = [0, 1_000, 2_000, 4_000, 8_000, 15_000];
 /** Attempts before giving up: about ten minutes at the longest delay. */
 const RECONNECT_MAX_ATTEMPTS = 40;
 /** A session up this long resets the backoff. */
@@ -600,7 +601,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${reconnectCount}` };
     const delayMs = RECONNECT_DELAYS_MS[Math.min(reconnectCount, RECONNECT_DELAYS_MS.length) - 1]!;
     setState('reconnecting', 'starting');
-    log(`Reconnecting (attempt ${reconnectCount} in ${delayMs / 1000}s)`);
+    log(delayMs > 0
+      ? `Reconnecting (attempt ${reconnectCount} in ${delayMs / 1000}s)`
+      : `Reconnecting (attempt ${reconnectCount})`);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (currentAttempt !== attempt) return;
