@@ -361,17 +361,22 @@ async function main(): Promise<void> {
     return video;
   };
   // Fires at the detection threshold; the outage length comes with stall_recovered.
+  /** CMAF: each SourceBuffer's ranges, which the element's combined range can hide. */
+  const describeBuffers = (): string => {
+    const text = (player as any).engine?.mediaSource?.describeBuffers?.() as string | undefined;
+    return text ? ` · ${text}` : '';
+  };
   player.on('stall', ({ durationMs }) => {
     const video = watchVideo();
     const where = video
       ? ` start: ${stallStartSnap || '?'} · end: ${describeVideo(video)}` : '';
-    log(`Stall detected after ${durationMs.toFixed(0)}ms${where}`);
+    log(`Stall detected after ${durationMs.toFixed(0)}ms${where}${describeBuffers()}`);
     stallStartSnap = '';
     stallMarks.push(performance.now());
   });
 
   player.on('stall_recovered', ({ durationMs }) => {
-    log(`Stall recovered — outage ${(durationMs / 1000).toFixed(2)}s`);
+    log(`Stall recovered — outage ${(durationMs / 1000).toFixed(2)}s${describeBuffers()}`);
   });
 
   // Page suspensions otherwise look like network gaps in the log.
@@ -951,12 +956,19 @@ async function main(): Promise<void> {
   setInterval(() => {
     watchVideo();
     if (++advTick % 4 === 0) void renderTransport();
-    if (debug) {
-      // The MSE adapter exists only after the catalog; enable its tracing
-      // once it appears (console output).
-      const ms = (player as any).engine?.mediaSource;
-      if (ms && ms.debug === false) ms.debug = true;
+    // The MSE adapter exists only after the catalog. Its recovery reports are
+    // informational slots the engine leaves to the app.
+    const ms = (player as any).engine?.mediaSource;
+    if (ms && ms.onPlayheadAdjust === null) {
+      ms.onPlayheadAdjust = (kind: string, from: number, to: number) =>
+        log(`[MSE] ${kind === 'nudge' ? 'stall nudge' : 'post-stall snap to live edge'} `
+          + `${from.toFixed(2)} → ${to.toFixed(2)}`);
+      ms.onWedge = (info: { rung: number; currentTime: number; readyState: number; bufferedRanges: string }) =>
+        log(`[MSE] playhead wedged (rung ${info.rung}) at t=${info.currentTime.toFixed(2)} `
+          + `rs=${info.readyState} buffered=${info.bufferedRanges}${describeBuffers()}`);
+      ms.onLiveEdgeResync = (reason: string) => log(`[MSE] live-edge resync (${reason})`);
     }
+    if (debug && ms && ms.debug === false) ms.debug = true;
     // Per-track depth ahead of the playhead: MSE SourceBuffers on CMAF; on LOC
     // the render queue and the audio scheduled in WebAudio.
     const tickNowMs = performance.now();
