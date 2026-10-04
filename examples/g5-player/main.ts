@@ -30,6 +30,9 @@ const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
 })();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 import { copyOnClick } from '../shared/copyable.js';
+import { setBadge } from '../shared/status-badge.js';
+import type { BadgeTone } from '../shared/status-badge.js';
+import type { SubscriptionStatus } from '@playa/player';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 
@@ -63,6 +66,8 @@ const catSize = document.getElementById('cat-size')!;
 const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
+const setupBadge = document.getElementById('setup-badge')!;
+const catBadge = document.getElementById('cat-badge')!;
 const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
 const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
 const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
@@ -243,13 +248,45 @@ async function main(): Promise<void> {
   player.on('statechange', ({ state }) => {
     stateBadge.textContent = state;
     stateBadge.className = `state-badge ${state}`;
+    if (state === 'error') setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
   });
+
+  // ── MoQT state badges ─────────────────────────────────────────────
+  // SETUP is the session; each FWD is one SUBSCRIBE: grey none or awaiting
+  // SUBSCRIBE_OK, yellow Forward State 0, green objects arriving, red silent.
+
+  let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
+  /** Last data object per media type, for a subscription gone silent. */
+  const lastArrivalMs: { video?: number; audio?: number } = {};
+  const SILENT_MS = 1_000;
+  const subscriptionBadge = (el: HTMLElement, sub: SubscriptionStatus | undefined, nowMs: number): void => {
+    if (!sub) { setBadge(el, 'FWD --', 'idle', 'No subscription'); return; }
+    const req = `SUBSCRIBE reqId=${sub.requestId}${sub.alias !== null ? ` · alias=${sub.alias}` : ''}`;
+    if (!sub.established) { setBadge(el, 'FWD …', 'idle', `${req} sent; awaiting SUBSCRIBE_OK`); return; }
+    if (!sub.forward) { setBadge(el, 'FWD 0', 'wait', `${req} · Forward State 0: paused by this player`); return; }
+    const last = sub.kind === 'video' || sub.kind === 'audio' ? lastArrivalMs[sub.kind] : undefined;
+    if (last !== undefined && nowMs - last > SILENT_MS && player.state === 'playing') {
+      setBadge(el, 'FWD 1', 'bad',
+        `${req} · Forward State 1, but nothing has arrived for ${((nowMs - last) / 1000).toFixed(1)}s`);
+      return;
+    }
+    setBadge(el, 'FWD 1', 'ok', `${req} · Forward State 1`);
+  };
+  const renderStatusBadges = (nowMs: number): void => {
+    setBadge(setupBadge, 'SETUP', setupBadgeState.tone, setupBadgeState.detail);
+    const subs = player.subscriptions;
+    subscriptionBadge(catBadge, subs.find((s) => s.kind === 'catalog'), nowMs);
+    for (const el of catTracks.querySelectorAll<HTMLElement>('.badge[data-track]')) {
+      subscriptionBadge(el, subs.find((s) => s.kind !== 'catalog' && s.trackName === el.dataset['track']), nowMs);
+    }
+  };
 
   const logCongestionControl = (): void => log(`Congestion control: requested `
     + `${congestionControl ?? 'browser default'}, browser applied ${player.congestionControl ?? 'not reported'}`);
 
   player.on('ready', ({ levels }) => {
     log(`Ready: ${levels.length} quality level(s)`);
+    setupBadgeState = { tone: 'ok', detail: 'Session established' };
     logCongestionControl();
     playBtn.disabled = false;
     muteBtn.disabled = false;
@@ -336,12 +373,18 @@ async function main(): Promise<void> {
   });
   player.on('session_closed', ({ code, reason }) => {
     log(`Session closed${code !== undefined ? ` (code ${code})` : ''}${reason ? `: ${reason}` : ''}`);
+    setupBadgeState = {
+      tone: 'bad',
+      detail: `Session closed${code !== undefined ? ` (code ${code})` : ''}${reason ? `: ${reason}` : ''}`,
+    };
   });
   player.on('session_reconnecting', ({ attempt, delayMs }) => {
     log(`Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`);
+    setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${attempt}` };
   });
   player.on('session_migrated', () => {
     log('Session re-established');
+    setupBadgeState = { tone: 'ok', detail: 'Session re-established' };
     logCongestionControl();
   });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
@@ -696,6 +739,9 @@ async function main(): Promise<void> {
   };
 
   (player as any).on('media_object', (e: any) => {
+    if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
+      lastArrivalMs[e.mediaType as 'video' | 'audio'] = performance.now();
+    }
     noteObject(e);
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
@@ -891,6 +937,7 @@ async function main(): Promise<void> {
     // Per-track depth ahead of the playhead: MSE SourceBuffers on CMAF; on LOC
     // the render queue and the audio scheduled in WebAudio.
     const tickNowMs = performance.now();
+    renderStatusBadges(tickNowMs);
     const eng = (player as any).engine;
     const byKind = eng?.mediaSource?.getBufferAheadMsByKind?.();
     const vMs = byKind ? byKind.video
@@ -1029,7 +1076,11 @@ async function main(): Promise<void> {
         t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',
         t.initRef ? `init=${t.initRef}` : '',
       ].filter(Boolean).join(' · ');
-      row.append(name, detail);
+      const badge = document.createElement('span');
+      badge.className = 'badge idle';
+      badge.dataset['track'] = String(t.name ?? '');
+      badge.textContent = 'FWD --';
+      row.append(name, detail, badge);
       return row;
     }));
 
@@ -1105,6 +1156,7 @@ async function main(): Promise<void> {
     if (el) copyOnClick(el);
   }
   setText('conn-draft', draftVersion === undefined ? 'auto' : String(draftVersion));
+  setupBadgeState = { tone: 'wait', detail: `SETUP to ${relayUrl}; awaiting the relay` };
   player.load().catch((err) => log(`Fatal: ${(err as Error).message}`));
 }
 

@@ -280,11 +280,24 @@
       /* The seek bar takes all slack; these must not be squeezed into wrapping. */
       white-space: nowrap; flex-shrink: 0;
     }
-    .cat-head button {
-      background: #333; color: #bbb; border: 1px solid #555;
-      border-radius: 6px; padding: 3px 10px;
-      font-size: .78rem; cursor: pointer;
+    /* A quiet link after the catalog size. */
+    .cat-head .cat-hide {
+      background: none; border: none; padding: 0; cursor: pointer; font: inherit;
+      color: #8a94a6; font-weight: 400; text-transform: none; letter-spacing: 0;
     }
+    .cat-head .cat-hide:hover { color: #ddd; text-decoration: underline; }
+    /* MoQT state badges: one word; grey idle, yellow waiting or paused,
+       green flowing, red fault. Right-justified on their line. */
+    .badge {
+      border-radius: 4px; padding: 1px 6px; white-space: nowrap; flex-shrink: 0;
+      font-weight: 700; font-size: .68rem; letter-spacing: .06em;
+      border: 1px solid #3a3a52; background: #23233a; color: #8a94a6;
+    }
+    .badge.wait { color: #d9c25c; border-color: #5a532f; background: #26241a; }
+    .badge.ok { color: #4d4; border-color: #2f5a35; background: #16271a; }
+    .badge.bad { color: #e55; border-color: #5a2f2f; background: #271616; }
+    .cat-track .badge { margin-left: auto; }
+    .cat-badges { display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto; }
     .cat-tracks {
       display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
       font-size: 1rem; font-variant-numeric: tabular-nums;
@@ -438,8 +451,12 @@
     <div class="catalog-panel" id="catalog-panel">
       <div class="cat-head">
         <span class="chart-label">catalog: <b id="cat-meta">waiting…</b><span
-          class="aside" id="cat-size"></span></span>
-        <button id="cat-toggle" type="button">hide</button>
+          class="aside" id="cat-size"></span><span class="aside"> · </span><button
+          id="cat-toggle" class="cat-hide" type="button" title="Hide the catalog panel">hide</button></span>
+        <span class="cat-badges">
+          <span class="badge idle" id="setup-badge">SETUP</span>
+          <span class="badge idle" id="cat-badge">FWD --</span>
+        </span>
       </div>
       <div class="cat-tracks" id="cat-tracks"></div>
       <div class="json-wrap">
