@@ -4566,18 +4566,20 @@ export class MoqtConnection {
     this.openSubgroupsByRequest.delete(requestId);
     const aborts: Array<Promise<boolean>> = [];
     let refusal: string | null = null;
+    const reason = new Error('subscription cancelled — RESET_STREAM (§5.1.1)');
     if (open) {
       for (const sid of [...open]) {
         const st = this.outgoingStreams.get(sid);
         if (st) {
           this.outgoingStreams.delete(sid);
           // INITIATE every cancellation before awaiting any individual one.
-          // An abort proves the reset (§5.1.1) when it fulfils, or when it
-          // rejects because the transport already ended the stream.
+          // An abort proves the reset (§5.1.1) when it fulfils, when it rejects
+          // with its own reason (the stream errored with it behind an in-flight
+          // close), or when the transport already ended the stream.
           aborts.push(
-            st.writer.abort(new Error('subscription cancelled — RESET_STREAM (§5.1.1)'))
+            st.writer.abort(reason)
               .then(() => true, (err: unknown) => {
-                if (MoqtConnection.endedByTransport(err)) return true;
+                if (err === reason || MoqtConnection.endedByTransport(err)) return true;
                 refusal ??= err instanceof Error ? err.message : String(err);
                 return false;
               }),

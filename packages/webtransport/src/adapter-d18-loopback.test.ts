@@ -764,6 +764,27 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     expect(server.session.getIncomingSubscription(nextSubReqId)).toBeDefined();
   }, 15_000);
 
+  it('an abort that rejects with its own reason counts as the reset (§5.1.1)', async () => {
+    // The stream errored with our reason, as when the abort lands behind an in-flight close.
+    const { client, server, b, reqId, errors } = await activePair();
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      async () => {
+        await origCreate();
+        return new WritableStream<Uint8Array>({
+          write() { /* accept the header */ },
+          abort(reason) { throw reason; },
+        });
+      };
+    await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    await flush();
+
+    await client.unsubscribe(reqId);
+    await flush(); await flush(); await flush();
+
+    expect(errors.filter((e) => /not proven reset/.test(e.message))).toEqual([]);
+  }, 15_000);
+
   /** A subgroup stream whose FIN stays in flight until `failFin` rejects it. */
   function holdFin(b: { createUnidirectionalStream: () => Promise<unknown> }): { failFin: (err: unknown) => void } {
     const handle = { failFin: (_err: unknown) => { /* replaced once the FIN is in flight */ } };
