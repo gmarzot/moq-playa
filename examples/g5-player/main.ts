@@ -67,6 +67,7 @@ const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
 const setupBadge = document.getElementById('setup-badge')!;
+const nsBadge = document.getElementById('ns-badge')!;
 const catBadge = document.getElementById('cat-badge')!;
 const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
 const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
@@ -226,6 +227,8 @@ async function main(): Promise<void> {
     ...(renderCushionFloorMs ? { renderCushionFloorMs } : {}),
     ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),
     ...(debug ? { logLevel: 'debug' as const } : {}),
+    // SUB_NS: report the namespace and re-establish when it is published again.
+    followNamespace: true,
   };
   const player = new Player(playerContainer, {
     url: relayUrl,
@@ -256,6 +259,11 @@ async function main(): Promise<void> {
   // SUBSCRIBE_OK, yellow Forward State 0, green objects arriving, red silent.
 
   let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
+  // SUB_NS follows the namespace: yellow sent, accepted or withdrawn; green published; red refused.
+  let nsBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'SUBSCRIBE_NAMESPACE not sent' };
+  const NS_TONE: Record<string, BadgeTone> = {
+    pending: 'wait', listening: 'wait', published: 'ok', withdrawn: 'wait', refused: 'bad',
+  };
   /** Last data object per media type, for a subscription gone silent. */
   const lastArrivalMs: { video?: number; audio?: number } = {};
   const SILENT_MS = 1_000;
@@ -274,6 +282,7 @@ async function main(): Promise<void> {
   };
   const renderStatusBadges = (nowMs: number): void => {
     setBadge(setupBadge, 'SETUP', setupBadgeState.tone, setupBadgeState.detail);
+    setBadge(nsBadge, 'SUB_NS', nsBadgeState.tone, nsBadgeState.detail);
     const subs = player.subscriptions;
     subscriptionBadge(catBadge, subs.find((s) => s.kind === 'catalog'), nowMs);
     for (const el of catTracks.querySelectorAll<HTMLElement>('.badge[data-track]')) {
@@ -381,6 +390,10 @@ async function main(): Promise<void> {
   player.on('session_reconnecting', ({ attempt, delayMs }) => {
     log(`Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`);
     setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${attempt}` };
+  });
+  player.on('namespace_state', ({ state, detail }) => {
+    nsBadgeState = { tone: NS_TONE[state] ?? 'idle', detail };
+    if (state === 'published' || state === 'withdrawn' || state === 'refused') log(`SUB_NS: ${detail}`);
   });
   player.on('session_migrated', () => {
     log('Session re-established');
