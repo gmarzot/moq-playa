@@ -471,6 +471,21 @@ export interface NamespaceDoneEvent {
   readonly namespaceSuffix: Uint8Array[];
 }
 
+/** The followed namespace at the relay (config `followNamespace`). */
+export type NamespaceState = 'pending' | 'listening' | 'published' | 'withdrawn' | 'refused';
+
+/**
+ * The followed namespace changed state: SUBSCRIBE_NAMESPACE sent (`pending`),
+ * accepted (`listening`), NAMESPACE received (`published`), NAMESPACE_DONE
+ * (`withdrawn`), or REQUEST_ERROR / stream failure (`refused`).
+ * @see draft-ietf-moq-transport-18 §10.18
+ */
+export interface NamespaceStateEvent {
+  readonly type: 'namespace_state';
+  readonly state: NamespaceState;
+  readonly detail: string;
+}
+
 /**
  * The peer has announced a full Track Namespace via control-stream
  * PUBLISH_NAMESPACE. Fires for both v14 and v16 control-stream
@@ -674,6 +689,7 @@ export interface PlayerEventMap {
   // Namespace discovery
   namespace_discovered: NamespaceDiscoveredEvent;
   namespace_done: NamespaceDoneEvent;
+  namespace_state: NamespaceStateEvent;
   namespace_announced: NamespaceAnnouncedEvent;
   namespace_announcement_done: NamespaceAnnouncementDoneEvent;
 

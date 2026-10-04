@@ -43,7 +43,7 @@ import { HookChain } from './hooks.js';
 import { WatchdogController } from './watchdog.js';
 import { MediaLivenessMonitor, type LivenessTrack } from './media-liveness.js';
 import { PlayerStateMachine, PlayerState, type PlayerStateValue } from './state.js';
-import type { PlayerEventMap } from './events.js';
+import type { NamespaceState, PlayerEventMap } from './events.js';
 import {
   DEFAULT_PLAYER_CONFIG,
   validateConfig,
@@ -645,6 +645,19 @@ export class MoqtPlayer {
     timer: ReturnType<typeof setTimeout> | null;
     readonly closeReason: string;
   } | null = null;
+  /** SUBSCRIBE_NAMESPACE following config.namespace on the current session. */
+  private namespaceRequestId: bigint | null = null;
+  private _namespaceState: NamespaceState | null = null;
+  /** The namespace went away (withdrawn, or a track refused as not existing). */
+  private namespaceLost = false;
+  /** Last re-establish on the namespace's return, for its minimum spacing. */
+  private namespaceReturnAtUs = -Infinity;
+  private namespaceReturnTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Last media object: media resuming after the namespace returns needs no re-establish. */
+  private lastMediaArrivalUs = -Infinity;
+  private static readonly NAMESPACE_RETURN_MIN_SPACING_US = 10_000_000;
+  /** How long media may take to resume by itself after the namespace returns. */
+  private static readonly NAMESPACE_RETURN_SETTLE_MS = 2_000;
   /** Delay before each reconnect attempt; later attempts reuse the last. */
   private static readonly RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
   /** Attempts before giving up: about two minutes with the delays above. */
@@ -1140,6 +1153,11 @@ export class MoqtPlayer {
    */
   get seekable(): boolean {
     return this.timelineState !== null && this.timelineState.entries.length > 0;
+  }
+
+  /** The followed namespace's state, or null when not following (config `followNamespace`). */
+  get namespaceState(): NamespaceState | null {
+    return this._namespaceState;
   }
 
   /** The SUBSCRIBEs this player holds: the catalog's and each media track's. */
@@ -1934,6 +1952,7 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
+      this.lastMediaArrivalUs = this.clock.now();
       // Emit raw event (recording, analytics, custom processing)
       this.emitter.emit('media_object', {
         type: 'media_object',
@@ -1991,6 +2010,7 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
+      this.lastMediaArrivalUs = this.clock.now();
       // Emit media_object for CMAF too — arrival timing and capture
       // timestamps are packaging-independent, so latency and jitter are
       // measured the same way on both paths.
@@ -2282,6 +2302,7 @@ export class MoqtPlayer {
       type: 'session_established',
       selectedVersion: 0n,
     });
+    void this.followNamespace(conn);
 
     // Watchdog: expect catalog within 10s (unless externally injected)
     if (!this.config.catalog && !this.config.knownTracks) {
@@ -2958,6 +2979,7 @@ export class MoqtPlayer {
     this.pendingAliasBinds.add(catalogReqId);
     this.connection = newConnection;
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
+    void this.followNamespace(newConnection);
 
     // Reset catalog state for the new session
     this.catalogReceived = false;
@@ -4717,6 +4739,8 @@ export class MoqtPlayer {
     this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
     if (this.reconnect?.timer) clearTimeout(this.reconnect.timer);
     this.reconnect = null;
+    if (this.namespaceReturnTimer !== null) clearTimeout(this.namespaceReturnTimer);
+    this.namespaceReturnTimer = null;
     this.clearStallPark();
     if (this.currentMigration) {
       const txn = this.currentMigration;
@@ -5661,6 +5685,9 @@ export class MoqtPlayer {
               requestId,
               namespaceSuffix: msg.trackNamespaceSuffix,
             });
+            if (this.isFollowedNamespace(conn, requestId, msg.trackNamespaceSuffix)) {
+              this.setNamespaceState('published', 'NAMESPACE: the publisher is announcing it');
+            }
             break;
           case 'NAMESPACE_DONE':
             this.emitter.emit('namespace_done', {
@@ -5668,6 +5695,9 @@ export class MoqtPlayer {
               requestId,
               namespaceSuffix: msg.trackNamespaceSuffix,
             });
+            if (this.isFollowedNamespace(conn, requestId, msg.trackNamespaceSuffix)) {
+              this.setNamespaceState('withdrawn', 'NAMESPACE_DONE: the publisher withdrew it');
+            }
             break;
           case 'PUBLISH_NAMESPACE': {
             const ns = msg.trackNamespace;
@@ -5748,6 +5778,18 @@ export class MoqtPlayer {
       this.log.info('Ignoring control message from a superseded session: %s', msg.type);
       return;
     }
+    if (this.namespaceRequestId !== null && 'requestId' in msg
+        && BigInt((msg as { requestId: bigint | number }).requestId) === this.namespaceRequestId) {
+      if (msg.type === 'REQUEST_OK' && this._namespaceState === 'pending') {
+        this.setNamespaceState('listening', 'SUBSCRIBE_NAMESPACE accepted');
+        return;
+      }
+      if (msg.type === 'REQUEST_ERROR') {
+        const reason = (msg as { errorReason?: string }).errorReason ?? '';
+        this.setNamespaceState('refused', `SUBSCRIBE_NAMESPACE refused: ${reason}`);
+        return;
+      }
+    }
     if ((msg.type === 'SUBSCRIBE_OK' || msg.type === 'REQUEST_ERROR') && 'requestId' in msg) {
       const answeredReqId = BigInt((msg as { requestId: bigint | number }).requestId);
       const boundAlias = msg.type === 'SUBSCRIBE_OK' && 'trackAlias' in msg
@@ -5822,6 +5864,11 @@ export class MoqtPlayer {
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
         this._mediaSubsFailed++;
+        // DOES_NOT_EXIST while the namespace is not known published: its return re-establishes.
+        if (this.config.followNamespace && BigInt(errorCode) === 0x10n
+            && this._namespaceState !== 'published') {
+          this.namespaceLost = true;
+        }
         this.emitter.emit('track_subscribe_failed', {
           type: 'track_subscribe_failed', trackName, mediaType, requestId, errorCode, reason,
         });
@@ -7440,6 +7487,67 @@ export class MoqtPlayer {
         this.stopTicking();
       },
     });
+  }
+
+  /**
+   * SUBSCRIBE_NAMESPACE for config.namespace on `conn` (§10.18). Draft-18 only:
+   * on draft-16 the same request can solicit PUBLISH, which this player does not serve.
+   */
+  private async followNamespace(conn: MoqtConnection): Promise<void> {
+    if (!this.config.followNamespace || conn.draftVersion !== 18) return;
+    this.namespaceRequestId = null;
+    this.setNamespaceState('pending', 'SUBSCRIBE_NAMESPACE sent');
+    try {
+      const reqId = await conn.subscribeNamespace(encodeNamespace(this.config.namespace, this.enc));
+      if (conn === this.connection) this.namespaceRequestId = BigInt(reqId);
+    } catch (err) {
+      if (conn !== this.connection) return;
+      this.setNamespaceState('refused',
+        `SUBSCRIBE_NAMESPACE failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** A NAMESPACE / NAMESPACE_DONE for exactly the followed namespace on the current session. */
+  private isFollowedNamespace(conn: MoqtConnection, requestId: unknown, suffix: readonly Uint8Array[]): boolean {
+    return conn === this.connection && this.namespaceRequestId !== null
+      && BigInt(requestId as bigint) === this.namespaceRequestId && suffix.length === 0;
+  }
+
+  private setNamespaceState(state: NamespaceState, detail: string): void {
+    if (this._namespaceState === state) return;
+    this._namespaceState = state;
+    if (state === 'withdrawn') this.namespaceLost = true;
+    this.emitter.emit('namespace_state', { type: 'namespace_state', state, detail });
+    if (state === 'published' && this.namespaceLost) this.reestablishOnNamespaceReturn();
+  }
+
+  /**
+   * The followed namespace is published again after it went away. If media has
+   * not resumed by itself within NAMESPACE_RETURN_SETTLE_MS, rebuild the catalog
+   * and subscriptions on a fresh session, as a reconnect does — at most once
+   * per NAMESPACE_RETURN_MIN_SPACING_US.
+   */
+  private reestablishOnNamespaceReturn(): void {
+    this.namespaceLost = false;
+    if (this.namespaceReturnTimer !== null) return;
+    const returnedAtUs = this.clock.now();
+    this.namespaceReturnTimer = setTimeout(() => {
+      this.namespaceReturnTimer = null;
+      if (this._destroyed || this.currentMigration || this.reconnect !== null) return;
+      if (!this.config.createConnection || !this.config.createTransport) return;
+      const state = this.stateMachine.state;
+      if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED) return;
+      if (this.lastMediaArrivalUs > returnedAtUs) return;
+      const now = this.clock.now();
+      if (now - this.namespaceReturnAtUs < MoqtPlayer.NAMESPACE_RETURN_MIN_SPACING_US) return;
+      this.namespaceReturnAtUs = now;
+      this.log.info('Namespace published again: re-establishing the session');
+      this.migrate(this.config.createConnection()).catch((err: unknown) => {
+        this.log.warn('Re-establishing after the namespace returned failed: %s',
+          err instanceof Error ? err.message : String(err));
+        this.scheduleReconnect('namespace returned; re-establish failed');
+      });
+    }, MoqtPlayer.NAMESPACE_RETURN_SETTLE_MS);
   }
 
   /**

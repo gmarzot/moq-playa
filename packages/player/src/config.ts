@@ -230,6 +230,17 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.16.2, draft-ietf-moq-transport-18 §10.12.2
    */
   readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe';
+
+  /**
+   * Follow {@link namespace} with SUBSCRIBE_NAMESPACE on every session and
+   * report its state (`namespace_state`). When it is published again after
+   * going away — NAMESPACE_DONE, or a track refused as not existing — the
+   * player re-establishes its session, catalog and subscriptions as a
+   * reconnect does. Draft-18 sessions only. Default false.
+   *
+   * @see draft-ietf-moq-transport-18 §10.18
+   */
+  readonly followNamespace?: boolean;
 }
 
 /** Playback tuning options. */

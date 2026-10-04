@@ -53,6 +53,8 @@ export type {
   QualitySwitchedEvent,
   CatchUpChangedEvent,
   StateChangedEvent,
+  NamespaceState,
+  NamespaceStateEvent,
 } from './events.js';
 
 // ─── Errors ──────────────────────────────────────────────────────────

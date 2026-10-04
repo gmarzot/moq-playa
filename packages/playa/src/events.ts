@@ -10,6 +10,7 @@
  */
 
 import type { CatalogState } from '@moqt/msf';
+import type { NamespaceState } from '@moqt/player';
 import type { Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 
 /** Event map for Player.on() / Player.off(). */
@@ -54,6 +55,8 @@ export interface PlayerEventMap {
   'session_reconnecting': SessionReconnectingEvent;
   /** A new session took over, after a reconnect or a relay GOAWAY. */
   'session_migrated': Record<string, never>;
+  /** The followed namespace changed state at the relay (`followNamespace`). */
+  'namespace_state': NamespaceStateEvent;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -164,6 +167,12 @@ export interface SessionReconnectingEvent {
   /** 1 for the first attempt after the close. */
   readonly attempt: number;
   readonly delayMs: number;
+}
+
+export interface NamespaceStateEvent {
+  readonly state: NamespaceState;
+  /** The MoQT message behind the change. */
+  readonly detail: string;
 }
 
 export interface ErrorEvent {

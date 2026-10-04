@@ -28,9 +28,10 @@ export type {
   LifecycleEvent,
   SessionClosedEvent,
   SessionReconnectingEvent,
+  NamespaceStateEvent,
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';
-export type { SubscriptionStatus } from '@moqt/player';
+export type { SubscriptionStatus, NamespaceState } from '@moqt/player';
 export { detectStrategy } from './auto-detect.js';
 export type { DecoderStrategy } from './auto-detect.js';

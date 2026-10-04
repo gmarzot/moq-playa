@@ -36,7 +36,7 @@
 import {
   MoqtPlayer, TypedEmitter, checkSupport,
 } from '@moqt/player';
-import type { MoqtPlayerConfig, SubscriptionStatus, SupportReport } from '@moqt/player';
+import type { MoqtPlayerConfig, NamespaceState, SubscriptionStatus, SupportReport } from '@moqt/player';
 import { MoqtConnection } from '@moqt/webtransport';
 import {
   AudioAlignedClock,
@@ -258,6 +258,9 @@ export class Player {
 
   /** The SUBSCRIBEs this player holds, with their MoQT state. */
   get subscriptions(): readonly SubscriptionStatus[] { return this.engine.subscriptions; }
+
+  /** The followed namespace's state at the relay, or null when not following. */
+  get namespaceState(): NamespaceState | null { return this.engine.namespaceState; }
 
   /**
    * Which media element is currently used as the render sink.
@@ -772,6 +775,10 @@ export class Player {
 
     this.engine.on('session_migrated', () => {
       this.emitter.emit('session_migrated', {});
+    });
+
+    this.engine.on('namespace_state', (e) => {
+      this.emitter.emit('namespace_state', { state: e.state, detail: e.detail });
     });
 
     this.engine.on('state_changed', (e) => {
