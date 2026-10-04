@@ -4856,15 +4856,15 @@ describe('MoqtConnection draft-14', () => {
         await flush();
 
         const internals = adapter as unknown as {
-          abortPublisherStreamsForRequest(requestId: bigint): Promise<boolean>;
+          abortPublisherStreamsForRequest(requestId: bigint): Promise<true | string>;
           outgoingStreams: Map<bigint, unknown>;
           openSubgroupsByRequest: Map<bigint, Set<bigint>>;
         };
         const start = Date.now();
-        const allReset = await internals.abortPublisherStreamsForRequest(1n);
+        const outcome = await internals.abortPublisherStreamsForRequest(1n);
         expect(Date.now() - start).toBeLessThan(4000);
         // The reset could NOT be proven — the caller must not send PUBLISH_DONE.
-        expect(allReset).toBe(false);
+        expect(outcome).toMatch(/aborts still queued after \d+ms/);
         // Ownership transfer still happened synchronously.
         expect(internals.outgoingStreams.has(streamId)).toBe(false);
         expect(internals.openSubgroupsByRequest.has(1n)).toBe(false);

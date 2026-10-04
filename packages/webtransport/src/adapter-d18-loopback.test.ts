@@ -750,7 +750,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     await flush(); await flush(); await flush();
 
     expect(String(server.session.state).toLowerCase()).toBe('established');
-    expect(errors.some((e) => /not proven reset/.test(e.message))).toBe(true);
+    expect(errors.some((e) => /not proven reset \(an abort was refused: abort refused\)/.test(e.message))).toBe(true);
     expect(errors.filter((e) => (e as { isFatal?: boolean }).isFatal)).toEqual([]);
 
     // A later SUBSCRIBE for the track is served on the same session.
@@ -797,6 +797,24 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     await flush(); await flush(); await flush();
 
     expect(String(server.session.state).toLowerCase()).toBe('established');
+    expect(errors.filter((e) => /not proven reset/.test(e.message))).toEqual([]);
+  }, 15_000);
+
+  it('a cancellation reaches the publisher before its streams are proven reset', async () => {
+    const { client, server, b, subReqId, reqId, errors } = await activePair();
+    let closedReqId = -1n;
+    server.onSubscribeClosed = (rid) => { closedReqId = rid; };
+    const held = holdFin(b as never);
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    server.closeSubgroup(sid).catch(() => { /* the FIN fails by design */ });
+    await flush();
+
+    await client.unsubscribe(reqId);
+    await flush(); await flush();
+    // The reset still waits on the held FIN; the publisher already knows.
+    expect(closedReqId).toBe(subReqId);
+    held.failFin(stopSending());
+    await flush(); await flush(); await flush();
     expect(errors.filter((e) => /not proven reset/.test(e.message))).toEqual([]);
   }, 15_000);
 
@@ -3414,6 +3432,24 @@ describe('MoqtConnection(18) loopback — onSubscribeClosed (§3.3.2 unsubscribe
     expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined(); // session state cleaned
     expect(serverClosed).toBe(false);                                     // connection stays open
     expect(errors).toEqual([]);                                           // not surfaced as an error
+  });
+
+  it('a throwing onSubscribeClosed is reported and the teardown still completes', async () => {
+    const { client, server, errors } = await connectedPair();
+    let subReqId = -1n;
+    server.onSubscribe = (rid) => { subReqId = rid; };
+    server.onSubscribeClosed = () => { throw new Error('observer failed'); };
+
+    const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => {} });
+    await flush();
+    await server.acceptSubscribe(subReqId, 9n);
+    const sub = await subP;
+    await sub.unsubscribe();
+    for (let i = 0; i < 4; i++) await flush();
+
+    expect(errors.map((e) => e.message)).toEqual(['observer failed']);
+    expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined();
+    expect(String(server.session.state).toLowerCase()).toBe('established');
   });
 });
 

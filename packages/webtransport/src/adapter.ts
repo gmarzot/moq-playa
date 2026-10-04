@@ -752,18 +752,23 @@ export class MoqtConnection {
   }
 
   /**
-   * Await every promise in `ops`, but never longer than `ms`. Returns true only
-   * if all settled inside the window AND every one reported success. Each
-   * promise already reports its own outcome as a boolean and never rejects, so
-   * an abandoned wait surfaces nothing.
+   * Await every promise in `ops`, but never longer than `ms`: 'all' when every
+   * one settled inside the window reporting success, 'failed' when all settled
+   * but one reported failure, 'timeout' otherwise. Each promise reports its own
+   * outcome as a boolean and never rejects, so an abandoned wait surfaces nothing.
    */
-  private async allFulfilledWithin(ops: Array<Promise<boolean>>, ms: number): Promise<boolean> {
-    if (ops.length === 0) return true;
+  private async allFulfilledWithin(
+    ops: Array<Promise<boolean>>, ms: number,
+  ): Promise<'all' | 'failed' | 'timeout'> {
+    if (ops.length === 0) return 'all';
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const all = Promise.all(ops).then((results) => results.every(Boolean), () => false);
+    const all = Promise.all(ops).then(
+      (results): 'all' | 'failed' => (results.every(Boolean) ? 'all' : 'failed'),
+      (): 'failed' => 'failed',
+    );
     const outcome = await Promise.race([
       all,
-      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), ms); }),
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), ms); }),
     ]);
     clearTimeout(timer);
     return outcome;
@@ -820,14 +825,14 @@ export class MoqtConnection {
    * @returns true when every stream was proven reset.
    */
   private async resetPublisherStreamsOrFail(requestId: bigint, context: string): Promise<boolean> {
-    const allReset = await this.abortPublisherStreamsForRequest(requestId);
-    if (!allReset) {
+    const outcome = await this.abortPublisherStreamsForRequest(requestId);
+    if (outcome !== true) {
       this.closeSessionInternalError(
-        `${context}: could not prove the open streams for request ${requestId} were reset within `
-        + `${MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS}ms — closing the session so the transport resets them (§5.1.1)`,
+        `${context}: could not prove the open streams for request ${requestId} were reset (${outcome})`
+        + ' — closing the session so the transport resets them (§5.1.1)',
       );
     }
-    return allReset;
+    return outcome === true;
   }
 
   /**
@@ -837,10 +842,10 @@ export class MoqtConnection {
    * pending close or write settles.
    */
   private async resetCancelledPublisherStreams(requestId: bigint, context: string): Promise<void> {
-    if (await this.abortPublisherStreamsForRequest(requestId)) return;
+    const outcome = await this.abortPublisherStreamsForRequest(requestId);
+    if (outcome === true) return;
     this.onError?.(new MoqtConnectionError(
-      `${context}: open streams for request ${requestId} not proven reset within `
-      + `${MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS}ms; their aborts stay queued (§5.1.1)`,
+      `${context}: open streams for request ${requestId} not proven reset (${outcome}) (§5.1.1)`,
       { errorSource: 'data', isFatal: false },
     ));
   }
@@ -963,7 +968,9 @@ export class MoqtConnection {
    * or reset by the subscriber — i.e. the subscriber unsubscribed (§3.3.2; draft-18
    * removed the UNSUBSCRIBE message, so cancellation IS a request-stream teardown).
    * This is a normal lifecycle end, NOT an error: the session's per-subscription
-   * state is already cleaned and the connection stays open. A publisher (e.g. a relay)
+   * state is already cleaned and the connection stays open. It fires before the
+   * subscription's open data streams are reset (§5.1.1), so writes still in
+   * flight for it may fail afterwards. A publisher (e.g. a relay)
    * uses it to drop just that subscription — without waiting for the whole connection
    * to close — which is what ABR quality-switching needs. Mirrors
    * {@link onSubscribeNamespaceClosed} / {@link onSubscribeTracksClosed}.
@@ -1968,8 +1975,8 @@ export class MoqtConnection {
     return after !== undefined && after !== before ? after : undefined;
   }
 
-  /** Report a Forward-State observer failure without letting `onError` escape. */
-  private reportForwardObserverError(err: unknown): void {
+  /** Report an application observer failure without letting `onError` escape. */
+  private reportObserverError(err: unknown): void {
     try {
       this.onError?.(err instanceof Error ? err : new Error(String(err)));
     } catch { /* application observers cannot interrupt protocol processing */ }
@@ -1986,11 +1993,11 @@ export class MoqtConnection {
       const result = observer(requestId, forward);
       if (result) {
         void Promise.resolve(result).catch((err) => {
-          this.reportForwardObserverError(err);
+          this.reportObserverError(err);
         });
       }
     } catch (err) {
-      this.reportForwardObserverError(err);
+      this.reportObserverError(err);
     }
   }
 
@@ -4537,7 +4544,8 @@ export class MoqtConnection {
    *   PUBLISH_DONE permitted (§5.1.1). false when an abort rejected otherwise or
    *   did not settle: that writer may still be an open transport stream.
    */
-  private async abortPublisherStreamsForRequest(requestId: bigint): Promise<boolean> {
+  /** @returns true when every open stream was proven reset, else why not. */
+  private async abortPublisherStreamsForRequest(requestId: bigint): Promise<true | string> {
     // ALL ownership transfer happens SYNCHRONOUSLY, before the first await:
     //  1. the TERMINATING latch — beginPublishOp/sendObject reject from this
     //     exact instant (an interleaved open during a held writer-abort must
@@ -4557,6 +4565,7 @@ export class MoqtConnection {
     const open = this.openSubgroupsByRequest.get(requestId);
     this.openSubgroupsByRequest.delete(requestId);
     const aborts: Array<Promise<boolean>> = [];
+    let refusal: string | null = null;
     if (open) {
       for (const sid of [...open]) {
         const st = this.outgoingStreams.get(sid);
@@ -4567,7 +4576,11 @@ export class MoqtConnection {
           // rejects because the transport already ended the stream.
           aborts.push(
             st.writer.abort(new Error('subscription cancelled — RESET_STREAM (§5.1.1)'))
-              .then(() => true, (err: unknown) => MoqtConnection.endedByTransport(err)),
+              .then(() => true, (err: unknown) => {
+                if (MoqtConnection.endedByTransport(err)) return true;
+                refusal ??= err instanceof Error ? err.message : String(err);
+                return false;
+              }),
           );
         }
       }
@@ -4576,14 +4589,18 @@ export class MoqtConnection {
     // abort indefinitely; terminalization must still reach A terminal — but an
     // unproven reset forbids PUBLISH_DONE (§5.1.1), so report the outcome rather
     // than claim the streams are closed.
-    const allReset = await this.allFulfilledWithin(aborts, MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS);
+    const settled = await this.allFulfilledWithin(aborts, MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS);
     // Do NOT delete pendingPublishOps here: an openSubgroup already past its
     // beginPublishOp but still awaiting createUnidirectionalStream holds a live
     // reservation. Preserving it keeps boundPublisherGeneration from evicting the
     // just-bumped generation. The op's own endPublishOp finally releases it —
     // after it has correctly seen the stale generation and aborted itself.
     this.boundPublisherGeneration();
-    return allReset;
+    if (settled === 'all') return true;
+    // A hung FIN defers its writer's abort; that abort stays queued and runs once the FIN settles.
+    return refusal !== null
+      ? `an abort was refused: ${refusal}`
+      : `aborts still queued after ${MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS}ms`;
   }
 
   /**
@@ -5627,6 +5644,16 @@ export class MoqtConnection {
       const fetchWriters = this.detachFetchStreamsForRequest(requestId);
       await this.executeActions(this.session.handleInboundRequestClosed(requestId));
       this.inboundRequestContexts.delete(requestId);
+      // §3.3.2: a subscriber resetting its SUBSCRIBE stream IS the draft-18
+      // unsubscribe. Surfaced before the resets below, which can take up to
+      // PUBLISHER_ABORT_DEADLINE_MS, so the publisher stops writing at once.
+      if (wasSubscribe) {
+        try {
+          this.onSubscribeClosed?.(requestId);
+        } catch (observerErr) {
+          this.reportObserverError(observerErr);
+        }
+      }
       if (pubAlias !== undefined) await this.discardOpenStreamsForAlias(pubAlias);
       // §5.1.1: the subscriber cancelled — RESET every publisher data stream
       // still open for this subscription and drop its accounting, so no more
@@ -5657,9 +5684,6 @@ export class MoqtConnection {
         this.deferredUpdateResponses.delete(requestId);
         await this.settleParkedJoins(requestId, false);
       }
-      // §3.3.2: a subscriber resetting its SUBSCRIBE stream IS the draft-18
-      // unsubscribe — surface it so the publisher can drop just that subscription.
-      if (wasSubscribe) this.onSubscribeClosed?.(requestId);
       return;
     }
     // An UNBOUND inbound stream (no valid opener yet) that failed — surface it.
