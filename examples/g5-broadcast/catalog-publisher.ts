@@ -123,7 +123,7 @@ export async function acceptCatalogSubscribe(
   requestId: bigint,
   alias: bigint,
   params: BroadcastCatalogParams,
-  wire: { draft: DraftVersion; terminalCloseDeadlineMs?: number },
+  wire: { draft: DraftVersion; terminalCloseDeadlineMs?: number; groupId?: bigint },
 ): Promise<number> {
   // Build BEFORE accepting: a build failure must never leave a subscription
   // ESTABLISHED with nothing to send it. The request is still ANSWERED —
@@ -161,23 +161,22 @@ export async function acceptCatalogSubscribe(
 /**
  * Publish ONE catalog group on an established subscription.
  *
- * A relay subscribes upstream once and fans out, so a catalog sent only at
- * subscribe time never reaches a later viewer; re-emitting on an interval is
- * what lets one acquire it.
+ * A relay subscribes upstream once and fans out; a later viewer reaches the
+ * latest group by FETCH, which the relay serves from cache or forwards.
  *
- * `onStreamOpen` reports the stream id so a caller's terminal path can close
- * it when a later step throws.
+ * `wire.groupId` defaults to the wall clock in ms. `onStreamOpen` reports the
+ * stream id so a caller's terminal path can close it when a later step throws.
  */
 export async function publishCatalogGroup(
   connection: CatalogPublishConnection,
   alias: bigint,
   payload: Uint8Array,
-  wire: { draft: DraftVersion },
+  wire: { draft: DraftVersion; groupId?: bigint },
   deadlineMs: number = DEFAULT_TERMINAL_CLOSE_DEADLINE_MS,
   onStreamOpen?: (streamId: bigint) => void,
 ): Promise<void> {
   const streamId = await connection.openSubgroup(
-    varint(alias), varint(BigInt(Date.now())), varint(0),
+    varint(alias), varint(wire.groupId ?? BigInt(Date.now())), varint(0),
     {
       hasExtensions: false,
       endOfGroup: true,

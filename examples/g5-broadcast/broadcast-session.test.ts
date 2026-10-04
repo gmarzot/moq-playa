@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection } from './broadcast-session.js';
+import type { Fetch } from '@moqt/transport';
+import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 
 const wrapInt = (n: bigint) => n;
@@ -19,16 +21,53 @@ function recordingConnection() {
   const calls: string[] = [];
   const accepted: bigint[] = [];
   const sends: Uint8Array[] = [];
+  /** Group ID of every subgroup opened. */
+  const groups: bigint[] = [];
+  const fetchOk: Array<{ group: bigint; object: bigint } | undefined> = [];
+  const fetchErrors: Array<{ code: bigint; reason: string }> = [];
+  const fetchObjects: Array<{ groupId: bigint; objectId: bigint; payload: Uint8Array }> = [];
+  /** LARGEST_OBJECT of each SUBSCRIBE_OK, or undefined when it carried none. */
+  const largests: Array<{ group: bigint; object: bigint } | undefined> = [];
+  /** Joining Location per subscription request, as the adapter would have saved it. */
+  const joiningLocations = new Map<bigint, { group: bigint; object: bigint }>();
   let nextStream = 100n;
-  const conn: BroadcastSessionConnection & { calls: typeof calls; accepted: typeof accepted; sends: typeof sends } = {
-    calls, accepted, sends,
-    acceptSubscribe: async (_requestId, alias) => { calls.push('acceptSubscribe'); accepted.push(alias as bigint); },
+  const recorded = { calls, accepted, sends, groups, fetchOk, fetchErrors, fetchObjects, largests, joiningLocations };
+  const conn: BroadcastSessionConnection & typeof recorded = {
+    ...recorded,
+    acceptSubscribe: async (requestId, alias, options) => {
+      calls.push('acceptSubscribe');
+      accepted.push(alias as bigint);
+      const largest = options?.parameters?.get(0x09n)?.[0] as { group: bigint; object: bigint } | undefined;
+      largests.push(largest);
+      if (largest) joiningLocations.set(requestId as bigint, largest);
+    },
     rejectSubscribe: async () => { calls.push('rejectSubscribe'); },
-    openSubgroup: async () => { calls.push('openSubgroup'); return nextStream++; },
+    openSubgroup: async (_alias, groupId) => {
+      calls.push('openSubgroup');
+      groups.push(groupId as bigint);
+      return nextStream++;
+    },
     sendObject: async (_sid, _oid, payload) => { calls.push('sendObject'); sends.push(payload); },
     closeSubgroup: async () => { calls.push('closeSubgroup'); },
     publishDone: async () => { calls.push('publishDone'); },
     close: async () => { calls.push('close'); },
+    acceptFetch: async (_rid, options) => { calls.push('acceptFetch'); fetchOk.push(options?.endLocation); },
+    rejectFetch: async (_rid, code, reason) => { calls.push('rejectFetch'); fetchErrors.push({ code, reason }); },
+    openFetchStream: async () => { calls.push('openFetchStream'); return nextStream++; },
+    sendFetchObject: async (_sid, { groupId, objectId, payload }) => {
+      calls.push('sendFetchObject');
+      fetchObjects.push({ groupId, objectId, payload });
+    },
+    sendFetchEndOfRange: async (_sid, nonExistent, groupId, objectId) => {
+      calls.push(`endOfRange ${nonExistent ? 'none' : 'unknown'} ${groupId}/${objectId}`);
+    },
+    closeFetchStream: async () => { calls.push('closeFetchStream'); },
+    resolveJoiningFetch: (requestId) => {
+      // The fake keys the join on the FETCH's own request ID: tests use the subscription's.
+      const jl = joiningLocations.get(requestId);
+      if (!jl) throw new Error(`subscription ${requestId} has no saved Joining Location`);
+      return { startLocation: { group: jl.group, object: 0n }, endLocation: { group: jl.group, object: jl.object + 1n } };
+    },
   };
   return conn;
 }
@@ -363,8 +402,8 @@ describe('BroadcastSession — option validation', () => {
   });
 });
 
-describe('BroadcastSession — catalog re-emission (late joiners)', () => {
-  it('keeps publishing catalog groups so a viewer arriving later can acquire one', async () => {
+describe('BroadcastSession — catalog re-emission (cache refresh)', () => {
+  it('keeps publishing catalog groups on the interval', async () => {
     vi.useFakeTimers();
     try {
       const conn = recordingConnection();
@@ -375,8 +414,6 @@ describe('BroadcastSession — catalog re-emission (late joiners)', () => {
       const afterFirst = conn.sends.length;
       expect(afterFirst).toBe(1);   // the subscribe-time catalog
 
-      // A relay subscribes upstream ONCE, so without re-emission nothing more
-      // is ever sent and every later viewer waits forever.
       await vi.advanceTimersByTimeAsync(160);
       expect(conn.sends.length).toBeGreaterThan(afterFirst);
 
@@ -438,14 +475,14 @@ describe('BroadcastSession — subscription ended by the relay', () => {
     expect(session.publisher.audioAliasArmed).toBe(1n);
 
     session.handleSubscribeClosed(5n);
-    expect(lines).toContain('Relay unsubscribed from "audio" (reqId=5)');
+    expect(lines).toContain('audio: SUBSCRIBE cancelled by the relay (reqId=5)');
     expect(session.publisher.audioAliasArmed).toBeNull();
-    expect(session.publisher.retiredTracks).toEqual(['audio']);
+    expect(session.publisher.endedTracks).toEqual(['audio']);
 
     session.handleSubscribe(9n, 'audio');
     await settle();
     expect(session.publisher.audioAliasArmed).toBe(2n);
-    expect(session.publisher.retiredTracks).toEqual([]);
+    expect(session.publisher.endedTracks).toEqual([]);
   });
 
   it('a new catalog SUBSCRIBE moves re-emission to its own alias', async () => {
@@ -483,7 +520,7 @@ describe('BroadcastSession — subscription ended by the relay', () => {
       const atEnd = aliases.length;
       await vi.advanceTimersByTimeAsync(300);
       expect(aliases.length).toBe(atEnd);
-      expect(lines).toContain('Relay unsubscribed from "catalog" (reqId=1)');
+      expect(lines).toContain('catalog: SUBSCRIBE cancelled by the relay (reqId=1)');
       session.handleClose(0, 'test');
     } finally {
       vi.useRealTimers();
@@ -499,9 +536,9 @@ describe('BroadcastSession — subscription ended by the relay', () => {
     expect(session.publisher.videoAliasArmed).toBe(2n);
 
     session.handleSubscribeClosed(3n);
-    expect(lines).toContain('Relay unsubscribed from "video" (reqId=3)');
+    expect(lines).toContain('video: SUBSCRIBE cancelled by the relay (reqId=3)');
     expect(session.publisher.videoAliasArmed).toBe(2n);
-    expect(session.publisher.retiredTracks).toEqual([]);
+    expect(session.publisher.endedTracks).toEqual([]);
   });
 });
 
@@ -515,13 +552,13 @@ describe('BroadcastSession — relay Forward State changes', () => {
     await settle();
 
     session.handleForwardChange(3n, false);
-    expect(lines).toContain('Relay paused "video" (reqId=3)');
+    expect(lines).toContain('video: Forward State 0 (REQUEST_UPDATE, reqId=3)');
     session.publisher.publishVideo(...frame(1));
     await settle();
     expect(conn.sends).toHaveLength(0);
 
     session.handleForwardChange(3n, true);
-    expect(lines).toContain('Relay resumed "video" (reqId=3)');
+    expect(lines).toContain('video: Forward State 1 (REQUEST_UPDATE, reqId=3)');
     session.publisher.publishVideo(...frame(2));
     await settle();
     expect(conn.sends).toHaveLength(1);
@@ -585,5 +622,212 @@ describe('BroadcastSession — relay Forward State changes', () => {
     expect(session.largestLocation(3n)).not.toBeNull();
     expect(session.largestLocation(3n)).toEqual(session.publisher.largestLocation('video'));
     expect(session.largestLocation(1n)).toBeNull();
+  });
+});
+
+describe('BroadcastSession — per-track MoQT status', () => {
+  it('follows a subscription from none to forwarding, paused, and ended', async () => {
+    const conn = recordingConnection();
+    const { session } = loggedSession(conn);
+    expect(session.trackStatus('video')).toEqual({ state: 'none' });
+
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    expect(session.trackStatus('video')).toEqual(
+      { state: 'live', requestId: 3n, alias: 1n, forward: true, fault: false });
+
+    session.handleForwardChange(3n, false);
+    expect(session.trackStatus('video')).toMatchObject({ state: 'live', forward: false });
+
+    session.handleSubscribeClosed(3n);
+    expect(session.trackStatus('video')).toEqual(
+      { state: 'none', ended: 'relay cancelled SUBSCRIBE reqId=3' });
+  });
+
+  it('reports a fault when the track is retired under a live subscription', async () => {
+    const conn = recordingConnection();
+    const { session } = loggedSession(conn);
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    session.publisher.endTrack('video');                 // production stopped, relay still subscribed
+    expect(session.trackStatus('video')).toMatchObject({ state: 'live', fault: true });
+  });
+
+  it('a closed session serves nothing', async () => {
+    const conn = recordingConnection();
+    const { session } = loggedSession(conn);
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    expect(session.trackStatus('catalog')).toMatchObject({ state: 'live', fault: false });
+    session.handleClose(0, 'test');
+    expect(session.trackStatus('catalog')).toEqual({ state: 'none', ended: 'session closed' });
+  });
+});
+
+/** A session on the given draft with the default catalog interval. */
+function fetchSession(conn: BroadcastSessionConnection, draft: 16 | 18 = 18) {
+  const lines: string[] = [];
+  const session = new BroadcastSession(conn, {
+    catalog: CATALOG,
+    publisher: { wrapInt, draft },
+    log: (m) => lines.push(m),
+  });
+  return { session, lines };
+}
+
+function standaloneFetch(
+  trackName: string, start: [bigint, bigint], end: [bigint, bigint], descending = false,
+): Fetch {
+  return {
+    type: 'FETCH',
+    requestId: 0n,
+    fetch: {
+      fetchType: 0x1,
+      trackNamespace: [],
+      trackName: new TextEncoder().encode(trackName),
+      startLocation: { group: start[0], object: start[1] },
+      endLocation: { group: end[0], object: end[1] },
+    },
+    parameters: new Map(descending ? [[0x22n, [2n]]] : []),
+  } as never;
+}
+
+function joiningFetch(joiningRequestId: bigint): Fetch {
+  return {
+    type: 'FETCH',
+    requestId: 0n,
+    fetch: { fetchType: 0x2, joiningRequestId, joiningStart: 0n },
+    parameters: new Map(),
+  } as never;
+}
+
+describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
+  async function published() {
+    const conn = recordingConnection();
+    const { session, lines } = fetchSession(conn);
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    return { conn, session, lines, g: conn.largests[0]!.group };
+  }
+
+  it('a draft-18 catalog SUBSCRIBE_OK carries the current catalog as LARGEST_OBJECT and sends nothing', async () => {
+    const { conn, session, g } = await published();
+    expect(conn.largests).toEqual([{ group: g, object: 0n }]);
+    expect(conn.calls).not.toContain('openSubgroup');
+    expect(session.largestLocation(1n)).toEqual({ group: g, object: 0n });
+  });
+
+  it('serves the current catalog group to a FETCH that covers it', async () => {
+    const { conn, session, g } = await published();
+    session.handleFetch(9n, standaloneFetch('catalog', [g, 0n], [g, 1n]));
+    await settle();
+    expect(conn.fetchOk).toEqual([{ group: g, object: 1n }]);
+    expect(conn.fetchObjects).toEqual([{ groupId: g, objectId: 0n, payload: buildCatalogPayload(CATALOG) }]);
+    expect(conn.calls.slice(-4)).toEqual(['acceptFetch', 'openFetchStream', 'sendFetchObject', 'closeFetchStream']);
+  });
+
+  it('serves a Joining FETCH from the Joining Location its SUBSCRIBE_OK set', async () => {
+    const { conn, session, g } = await published();
+    session.handleFetch(1n, joiningFetch(1n));
+    await settle();
+    expect(conn.fetchOk).toEqual([{ group: g, object: 1n }]);
+    expect(conn.fetchObjects.map((o) => o.groupId)).toEqual([g]);
+  });
+
+  it('serves the catalog before any SUBSCRIBE, marking earlier groups unknown', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn);
+    session.handleFetch(9n, standaloneFetch('catalog', [0n, 0n], [1n << 62n, 0n]));
+    await settle();
+    const g = conn.fetchObjects[0]!.groupId;
+    expect(conn.calls.slice(-3, -1)).toEqual([`endOfRange unknown ${g - 1n}/0`, 'sendFetchObject']);
+  });
+
+  it('trims a range past the current catalog to its last object', async () => {
+    const { conn, session, g } = await published();
+    session.handleFetch(9n, standaloneFetch('catalog', [g, 0n], [g + 5n, 0n]));
+    await settle();
+    expect(conn.fetchOk).toEqual([{ group: g, object: 1n }]);
+  });
+
+  it('marks earlier groups unknown: before the object ascending, after it descending', async () => {
+    const { conn, session, g } = await published();
+    session.handleFetch(9n, standaloneFetch('catalog', [g - 10n, 0n], [g, 1n]));
+    await settle();
+    expect(conn.calls.slice(-3, -1)).toEqual([`endOfRange unknown ${g - 1n}/0`, 'sendFetchObject']);
+
+    session.handleFetch(10n, standaloneFetch('catalog', [g - 10n, 0n], [g, 1n], true));
+    await settle();
+    expect(conn.calls.slice(-3, -1)).toEqual(['sendFetchObject', `endOfRange unknown ${g - 10n}/0`]);
+  });
+
+  it('answers every other FETCH with one REQUEST_ERROR', async () => {
+    const { conn, session, g } = await published();
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    session.handleFetch(10n, standaloneFetch('catalog', [g, 1n], [g, 2n]));          // past the current
+    session.handleFetch(11n, standaloneFetch('catalog', [g - 5n, 0n], [g - 1n, 0n])); // superseded
+    session.handleFetch(12n, standaloneFetch('video', [0n, 0n], [1n, 0n]));
+    session.handleFetch(13n, standaloneFetch('nope', [0n, 0n], [1n, 0n]));
+    session.handleFetch(14n, joiningFetch(3n));                                       // a media join
+    session.handleFetch(15n, joiningFetch(99n));                                      // no Joining Location
+    await settle();
+    expect(conn.fetchErrors.map((e) => e.code)).toEqual([0x11n, 0x11n, 0x3n, 0x10n, 0x3n, 0x11n]);
+    expect(conn.fetchOk).toEqual([]);
+  });
+
+  it('draft-16 answers FETCH with NOT_SUPPORTED', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn, 16);
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    session.handleFetch(9n, standaloneFetch('catalog', [0n, 0n], [conn.groups[0]! + 1n, 0n]));
+    await settle();
+    expect(conn.fetchErrors.map((e) => e.code)).toEqual([0x3n]);
+  });
+
+  it('re-emits nothing by default, and a resume sends nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const { session } = fetchSession(conn);
+      session.handleSubscribe(1n, 'catalog');
+      await vi.advanceTimersByTimeAsync(10_000);
+      session.handleForwardChange(1n, false);
+      session.handleForwardChange(1n, true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(conn.calls).not.toContain('openSubgroup');
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('media SUBSCRIBE_OK carries LARGEST_OBJECT once the track has sent objects', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn);
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    vi.spyOn(session.publisher, 'largestLocation').mockReturnValue({ group: 7n, object: 3n });
+    session.handleSubscribe(5n, 'video');
+    session.handleSubscribe(6n, 'audio');
+    await settle();
+    expect(conn.largests).toEqual([undefined, { group: 7n, object: 3n }, { group: 7n, object: 3n }]);
+  });
+
+  it('draft-16 catalog group IDs stay strictly increasing within one millisecond', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(5_000);
+    try {
+      const conn = recordingConnection();
+      const { session } = fetchSession(conn, 16);
+      session.handleSubscribe(1n, 'catalog');
+      await settle();
+      session.handleForwardChange(1n, false);
+      session.handleForwardChange(1n, true);
+      await settle();
+      expect(conn.groups).toEqual([5_000n, 5_001n]);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
