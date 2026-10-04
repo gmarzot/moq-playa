@@ -187,6 +187,19 @@ function defined(obj: Record<string, unknown>): any {
   return result;
 }
 
+/** One SUBSCRIBE the player holds, for status displays. */
+export interface SubscriptionStatus {
+  readonly trackName: string;
+  readonly kind: 'catalog' | 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
+  readonly requestId: bigint;
+  /** Null until SUBSCRIBE_OK assigns it. */
+  readonly alias: bigint | null;
+  /** SUBSCRIBE_OK has arrived. */
+  readonly established: boolean;
+  /** The Forward State the player last asked for (pause sends 0). */
+  readonly forward: boolean;
+}
+
 // ─── Hook intent types ───────────────────────────────────────────────
 
 /** Intent to subscribe to a track — passed through beforeSubscribe hook. */
@@ -1127,6 +1140,35 @@ export class MoqtPlayer {
    */
   get seekable(): boolean {
     return this.timelineState !== null && this.timelineState.entries.length > 0;
+  }
+
+  /** The SUBSCRIBEs this player holds: the catalog's and each media track's. */
+  get subscriptions(): readonly SubscriptionStatus[] {
+    const forward = this.stateMachine.state !== PlayerState.PAUSED;
+    const out: SubscriptionStatus[] = [];
+    if (this.catalogRequestId !== null) {
+      out.push({
+        trackName: catalogTrackName(),
+        kind: 'catalog',
+        requestId: this.catalogRequestId,
+        alias: this.catalogTrackAlias,
+        established: this.catalogTrackAlias !== null,
+        // Pause updates media subscriptions only.
+        forward: true,
+      });
+    }
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      const established = !this.pendingMediaSubs.has(requestId);
+      out.push({
+        trackName: sub.trackName,
+        kind: sub.mediaType,
+        requestId,
+        alias: established ? sub.trackAlias : null,
+        established,
+        forward,
+      });
+    }
+    return out;
   }
 
   // ─── Track switching (§5.1.19 altGroup, §4.2 group boundaries) ───

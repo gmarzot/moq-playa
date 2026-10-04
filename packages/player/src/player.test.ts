@@ -9101,6 +9101,21 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it('lists its SUBSCRIBEs with their MoQT state for status displays', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadWithAbr(adapter, createMockRenderer(), createMockVideoDecoder());
+      const subs = player.subscriptions;
+      expect(subs.find((s) => s.kind === 'catalog')).toMatchObject({ established: true, forward: true });
+      const media = subs.filter((s) => s.kind === 'video' || s.kind === 'audio');
+      expect(media.length).toBeGreaterThan(0);
+      for (const s of media) {
+        expect(s.forward).toBe(true);
+        // The alias is reported only once SUBSCRIBE_OK has assigned it.
+        expect(s.alias === null).toBe(!s.established);
+      }
+      await player.destroy();
+    });
+
     it('a frame rendered while a stall waits keeps the group: no skip, no relay restart', async () => {
       const adapter = createMockAdapter();
       const renderer = createMockRenderer();

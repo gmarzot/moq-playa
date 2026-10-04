@@ -36,7 +36,7 @@
 import {
   MoqtPlayer, TypedEmitter, checkSupport,
 } from '@moqt/player';
-import type { MoqtPlayerConfig, SupportReport } from '@moqt/player';
+import type { MoqtPlayerConfig, SubscriptionStatus, SupportReport } from '@moqt/player';
 import { MoqtConnection } from '@moqt/webtransport';
 import {
   AudioAlignedClock,
@@ -255,6 +255,9 @@ export class Player {
   /** Congestion-control class the browser applied to the current transport,
    *  or undefined where it does not report one. */
   get congestionControl(): string | undefined { return this._congestionControl; }
+
+  /** The SUBSCRIBEs this player holds, with their MoQT state. */
+  get subscriptions(): readonly SubscriptionStatus[] { return this.engine.subscriptions; }
 
   /**
    * Which media element is currently used as the render sink.

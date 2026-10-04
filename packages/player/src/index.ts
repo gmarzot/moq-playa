@@ -14,7 +14,7 @@
 // ─── Player ──────────────────────────────────────────────────────────
 
 export { MoqtPlayer } from './player.js';
-export type { SubscribeIntent, QualitySwitchIntent } from './player.js';
+export type { SubscribeIntent, QualitySwitchIntent, SubscriptionStatus } from './player.js';
 
 // ─── Capability Detection ─────────────────────────────────────────────
 
