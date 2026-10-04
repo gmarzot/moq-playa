@@ -382,6 +382,31 @@ describe('CatalogBootstrap — failure ladder', () => {
         expect(h.calls.ready).toEqual([['video']]);
     });
 
+    it('INVALID_RANGE after a SUBSCRIBE_OK that reported a Largest → rung 1, not EMPTY_WAIT', () => {
+        const h = makeHarness();
+        h.coord.start();
+        h.coord.onSubscribeOk({ group: 7n, object: 0n });  // the track has content
+        h.f.err('invalid-range');
+        expect(h.coord.phase).not.toBe('empty-wait');
+        expect(h.calls.standaloneFetches).toHaveLength(1);
+    });
+
+    it('INVALID_RANGE before SUBSCRIBE_OK waits for it: a Largest → rung 1, none → EMPTY_WAIT', () => {
+        const h = makeHarness();
+        h.coord.start();
+        h.f.err('invalid-range');
+        expect(h.calls.standaloneFetches).toHaveLength(0);
+        h.coord.onSubscribeOk({ group: 7n, object: 0n });
+        expect(h.calls.standaloneFetches).toHaveLength(1);
+
+        const h2 = makeHarness();
+        h2.coord.start();
+        h2.f.err('invalid-range');
+        h2.coord.onSubscribeOk(null);
+        expect(h2.coord.phase).toBe('empty-wait');
+        expect(h2.calls.legacyResubscribes).toBe(0);
+    });
+
     it('#15: refusal with history → rung 1 standalone fetch from SUBSCRIBE_OK largest, sub retained', () => {
         const h = makeHarness();
         h.coord.start();

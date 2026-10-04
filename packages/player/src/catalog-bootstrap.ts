@@ -189,6 +189,7 @@ export class CatalogBootstrap {
   private largest: { group: bigint; object: bigint } | null | undefined = undefined;
   /** The joining fetch failed before SUBSCRIBE_OK; its Largest picks the next rung. */
   private awaitingSubscribeOk = false;
+  private deferredJoinError: 'invalid-range' | 'refused' | 'timeout' | null = null;
 
   /** The group whose independent base is currently applied, and per-group
    *  applied-head bookkeeping for the group-aware delta rule. */
@@ -281,9 +282,12 @@ export class CatalogBootstrap {
     this.largest = largest;
     if (this.awaitingSubscribeOk) {
       this.awaitingSubscribeOk = false;
+      const deferred = this.deferredJoinError;
+      this.deferredJoinError = null;
       // A live head may have made the catalog ready meanwhile.
       if (this._phase === 'joining' && !this.attempt) {
-        this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
+        if (deferred === 'invalid-range' && largest === null) this.enterEmptyWait();
+        else this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
       }
       return;
     }
@@ -354,22 +358,8 @@ export class CatalogBootstrap {
     if (this.inert()) return;
     const attempt = this.attempt;
     if (!attempt || attempt.id !== attemptId || attempt.cancelled) return;
-    if (kind === 'invalid-range') {
-      // Track empty: the FETCH ATTEMPT IS RESOLVED (there is no prefix to
-      // fetch) but the catalog is NOT ready. Hold the LargestObject
-      // subscription and wait — intentionally INDEFINITE (a viewer joining
-      // before the publisher starts is legitimate and open-ended; the player's
-      // catalog watchdog provides diagnostics, not recovery). The first live
-      // object resolves it via first-payload classification.
-      // Exception: with the subscription already DONE+drained, nothing can
-      // ever arrive — fatal.
-      this.attempt = null;
-      if (this.doneReason !== null && this.drained) {
-        this.fatal('catalog track empty and its subscription ended — nothing to play');
-        return;
-      }
-      this._phase = 'empty-wait';
-      this.disarmInactivity();
+    if (kind === 'invalid-range' && this.largest === null) {
+      this.enterEmptyWait();
       return;
     }
     if (attempt.kind === 'joining' && this.largest === undefined && !this.strict) {
@@ -380,11 +370,33 @@ export class CatalogBootstrap {
       this.cb.log('[catalog-bootstrap] joining fetch %s before SUBSCRIBE_OK; awaiting it', kind);
       this.rungTransaction();
       this.awaitingSubscribeOk = true;
+      this.deferredJoinError = kind;
       this._phase = 'joining';
       this.armInactivity();
       return;
     }
+    // INVALID_RANGE after a SUBSCRIBE_OK that reported a Largest: the track
+    // has content, so the join failed rather than found it empty.
     this.failAttempt(`fetch ${kind}`);
+  }
+
+  /**
+   * Track empty: the FETCH ATTEMPT IS RESOLVED (there is no prefix to fetch)
+   * but the catalog is NOT ready. Hold the LargestObject subscription and
+   * wait — intentionally INDEFINITE (a viewer joining before the publisher
+   * starts is legitimate and open-ended; the player's catalog watchdog
+   * provides diagnostics, not recovery). The first live object resolves it
+   * via first-payload classification. Exception: with the subscription
+   * already DONE+drained, nothing can ever arrive — fatal.
+   */
+  private enterEmptyWait(): void {
+    this.attempt = null;
+    if (this.doneReason !== null && this.drained) {
+      this.fatal('catalog track empty and its subscription ended — nothing to play');
+      return;
+    }
+    this._phase = 'empty-wait';
+    this.disarmInactivity();
   }
 
   // ─── LIVE side ────────────────────────────────────────────────────
@@ -903,6 +915,7 @@ export class CatalogBootstrap {
   /** Rung 1 when SUBSCRIBE_OK reported a Largest, else rung 2. */
   private nextRungAfterJoin(kind: Attempt['kind'], reason: string): void {
     this.awaitingSubscribeOk = false;
+    this.deferredJoinError = null;
     if (kind === 'joining' && this.largest != null) {
       // Rung 1: emulate the join with a standalone FETCH bounded by the
       // SUBSCRIBE_OK Largest — the live subscription is RETAINED (no churn).
