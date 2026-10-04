@@ -398,12 +398,38 @@ describe('CatalogBootstrap — failure ladder', () => {
         expect(h.calls.ready).toEqual([['video']]);
     });
 
-    it('refusal with NO largest available → straight to rung 2', () => {
+    it('a refusal before SUBSCRIBE_OK waits for it; its Largest anchors rung 1', () => {
         const h = makeHarness();
         h.coord.start();
         h.f.err('refused');       // SUBSCRIBE_OK not yet seen
         expect(h.calls.standaloneFetches).toHaveLength(0);
+        expect(h.calls.legacyResubscribes).toBe(0);
+        h.coord.onSubscribeOk({ group: 6n, object: 4n });
+        expect(h.calls.standaloneFetches).toHaveLength(1);
+        expect(h.calls.legacyResubscribes).toBe(0);
+    });
+
+    it('a refusal before a SUBSCRIBE_OK with no Largest → rung 2', () => {
+        const h = makeHarness();
+        h.coord.start();
+        h.f.err('refused');
+        h.coord.onSubscribeOk(null);
+        expect(h.calls.standaloneFetches).toHaveLength(0);
         expect(h.calls.legacyResubscribes).toBe(1);
+    });
+
+    it('a refusal before a SUBSCRIBE_OK that never comes → rung 2 at the inactivity deadline', () => {
+        vi.useFakeTimers();
+        try {
+            const h = makeHarness();
+            h.coord.start();
+            h.f.err('refused');
+            expect(h.calls.legacyResubscribes).toBe(0);
+            vi.advanceTimersByTime(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
+            expect(h.calls.legacyResubscribes).toBe(1);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('#20: rung 1 failure → rung 2; legacy path ready on first acceptable base', () => {

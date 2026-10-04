@@ -187,6 +187,8 @@ export class CatalogBootstrap {
   /** SUBSCRIBE_OK largest location; null = explicitly none (empty track);
    *  undefined = not yet known. */
   private largest: { group: bigint; object: bigint } | null | undefined = undefined;
+  /** The joining fetch failed before SUBSCRIBE_OK; its Largest picks the next rung. */
+  private awaitingSubscribeOk = false;
 
   /** The group whose independent base is currently applied, and per-group
    *  applied-head bookkeeping for the group-aware delta rule. */
@@ -277,6 +279,14 @@ export class CatalogBootstrap {
   onSubscribeOk(largest: { group: bigint; object: bigint } | null): void {
     if (this.inert()) return;
     this.largest = largest;
+    if (this.awaitingSubscribeOk) {
+      this.awaitingSubscribeOk = false;
+      // A live head may have made the catalog ready meanwhile.
+      if (this._phase === 'joining' && !this.attempt) {
+        this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
+      }
+      return;
+    }
     if (this.draft === 14 && this._phase === 'joining' && !this.attempt) {
       this.beginAttempt('joining');
     }
@@ -360,6 +370,18 @@ export class CatalogBootstrap {
       }
       this._phase = 'empty-wait';
       this.disarmInactivity();
+      return;
+    }
+    if (attempt.kind === 'joining' && this.largest === undefined && !this.strict) {
+      // A join sent ahead of SUBSCRIBE_OK can fail before it arrives (a relay
+      // still subscribing upstream). Wait for its Largest rather than dropping
+      // to subscription-only retrieval, which a publisher serving its catalog
+      // only by FETCH never satisfies. Bounded by the inactivity timer.
+      this.cb.log('[catalog-bootstrap] joining fetch %s before SUBSCRIBE_OK; awaiting it', kind);
+      this.rungTransaction();
+      this.awaitingSubscribeOk = true;
+      this._phase = 'joining';
+      this.armInactivity();
       return;
     }
     this.failAttempt(`fetch ${kind}`);
@@ -875,6 +897,12 @@ export class CatalogBootstrap {
       return;
     }
     this.rungTransaction();
+    this.nextRungAfterJoin(kind, reason);
+  }
+
+  /** Rung 1 when SUBSCRIBE_OK reported a Largest, else rung 2. */
+  private nextRungAfterJoin(kind: Attempt['kind'], reason: string): void {
+    this.awaitingSubscribeOk = false;
     if (kind === 'joining' && this.largest != null) {
       // Rung 1: emulate the join with a standalone FETCH bounded by the
       // SUBSCRIBE_OK Largest — the live subscription is RETAINED (no churn).

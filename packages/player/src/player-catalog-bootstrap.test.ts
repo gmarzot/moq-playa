@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { MoqtPlayer } from './player.js';
+import { CATALOG_BOOTSTRAP_INACTIVITY_MS } from './catalog-bootstrap.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, MoqtObject, DataStreamHeader } from '@moqt/transport';
@@ -282,13 +283,16 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         const adapter = createMockAdapter(16);
         await loadPlayer(adapter);
         await flush();
-        // No SUBSCRIBE_OK largest exists → rung 1 is skipped by design and the
-        // refusal falls through to rung 2. (The rung-1 wire shape with a known
-        // largest is asserted in the F5/F8 test below.)
+        // The refusal waits for SUBSCRIBE_OK; with no largest in it, rung 1 is
+        // skipped by design and the ladder falls through to rung 2. (The rung-1
+        // wire shape with a known largest is asserted in the F5/F8 test below.)
         adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x10n),
             retryInterval: varint(0n), errorReason: 'track not found',
         } as unknown as ControlMessage);
+        await flush();
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        ackCatalog(adapter);
         await flush(); await flush();
         // Rung 2: unsubscribe the LargestObject sub, fresh AbsoluteStart{0,0}.
         expect(adapter.unsubscribe).toHaveBeenCalledTimes(1);
@@ -441,6 +445,8 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x10n),
             retryInterval: varint(0n), errorReason: 'refused',
         } as unknown as ControlMessage);
+        await flush();
+        ackCatalog(adapter);                  // no largest → rung 2
         await flush(); await flush();
         expect(adapter.subscribe).toHaveBeenCalledTimes(2);
         const resubOpts = adapter.subscribe.mock.calls[1]![2];
@@ -550,10 +556,13 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         // Candidate's join AND its rung-1 fetch both refused → ladder exhausts
         // → candidate failure, NOT another resubscribe loop.
         const candJoinId = BigInt(await adapter.joiningFetch.mock.results[1]!.value);
+        const candSubReqId = BigInt(adapter.joiningFetch.mock.calls[1]![0].joiningRequestId);
         adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(candJoinId), errorCode: varint(0x10n),
             retryInterval: varint(0n), errorReason: 'refused',
         } as unknown as ControlMessage);
+        await flush();
+        ackCatalog(adapter, candSubReqId, 9n);                // no largest → ladder exhausts
         await flush(); await flush();
         expect(errors.length).toBeGreaterThan(0);             // degraded surfaced
         expect(candidateSubs()).toBe(2);                      // NO recursive candidate
@@ -2378,12 +2387,19 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         const adapter = createMockAdapter(16);
         const { player } = await loadPlayer(adapter);
         await flush();
-        // The joining fetch is REFUSED with no known largest BEFORE the
-        // catalog SUBSCRIBE_OK → rung 2 unsubscribes the pre-OK request 1.
-        adapter._triggerMessage({
-            type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
-            retryInterval: varint(0n), errorReason: 'joining fetch not supported',
-        } as unknown as ControlMessage);
+        // The joining fetch is REFUSED BEFORE the catalog SUBSCRIBE_OK, which
+        // never comes → at the inactivity deadline rung 2 unsubscribes the
+        // pre-OK request 1.
+        vi.useFakeTimers();
+        try {
+            adapter._triggerMessage({
+                type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
+                retryInterval: varint(0n), errorReason: 'joining fetch not supported',
+            } as unknown as ControlMessage);
+            await vi.advanceTimersByTimeAsync(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
+        } finally {
+            vi.useRealTimers();
+        }
         await flush(); await flush();
         const binds = (player as unknown as { pendingAliasBinds: Set<bigint> }).pendingAliasBinds;
         expect(binds.has(1n)).toBe(false);   // dead request settled, not leaked
