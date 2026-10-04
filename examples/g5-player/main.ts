@@ -499,10 +499,12 @@ async function main(): Promise<void> {
   // sample wide and reads as noise.
   const latP50Samples: number[] = [];
   const latP95Samples: number[] = [];
-  // Per-tick worst sample, not drawn: it lets the readout report the worst
-  // across the whole charted span. p95 over ~120 samples cannot be moved by a
-  // lone spike, so this is the only series here that sees one.
+  // Per-tick worst of the samples that arrived during that tick, so MAX covers
+  // exactly the charted span. p95 over ~120 samples cannot be moved by a lone
+  // spike, so this is the only series here that sees one; its peak is marked.
   const latTickMaxSamples: number[] = [];
+  /** Worst raw latency since the previous tick. */
+  let tickWorstRawMs = -Infinity;
   const jitSamples: number[] = [];
   // Per-track queued media ahead of the playhead, one sample per tick.
   const queuedASamples: number[] = [];
@@ -771,7 +773,7 @@ async function main(): Promise<void> {
       if (Math.abs(latencyMs) < 120_000) {
         const now = performance.now();
         latWindow.push([now, latencyMs]);
-        while (latWindow.length && now - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
+        if (latencyMs > tickWorstRawMs) tickWorstRawMs = latencyMs;
       }
     }
   });
@@ -841,7 +843,7 @@ async function main(): Promise<void> {
   /** Two series on one scale — only comparable on a shared axis. */
   function drawSpark2(canvas: HTMLCanvasElement, nowMs: number, a: number[], aColor: string,
                       b: number[], bColor: string, refLine = 0,
-                      marks?: number[]): void {
+                      marks?: number[], peak?: { atMs: number; value: number } | null): void {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const [w, h] = fitCanvas(canvas);
@@ -870,6 +872,14 @@ async function main(): Promise<void> {
       ctx.strokeStyle = color;
       ctx.lineWidth = devicePixelRatio;
       ctx.stroke();
+    }
+    if (peak) {
+      // Off the curves' scale, the dot is pinned to the top edge.
+      const r = 2.5 * devicePixelRatio;
+      ctx.beginPath();
+      ctx.arc(chartX(peak.atMs, nowMs, w), Math.max(r, yOf(peak.value)), r, 0, 2 * Math.PI);
+      ctx.fillStyle = '#e07a7a';
+      ctx.fill();
     }
   }
 
@@ -949,6 +959,8 @@ async function main(): Promise<void> {
     // so they leave a gap on the charts instead of a sample.
     const sampling = !document.hidden;
 
+    // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
+    while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
     const latRaw = latWindow.map(([, v]) => v);
     // Remove the clock divergence. The constant offset stays: one-way delay
     // cannot separate it from transit.
@@ -966,14 +978,19 @@ async function main(): Promise<void> {
       sampleAtMs.push(tickNowMs);
       latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
       latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
-      latTickMaxSamples.push(have ? Math.max(...latVals) : NaN);
+      latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) ? tickWorstRawMs - driftCorrectionMs : NaN);
       jitSamples.push(prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
       queuedASamples.push(active ? (aMs ?? NaN) : NaN);
       queuedVSamples.push(active ? (vMs ?? NaN) : NaN);
     }
+    // Arrivals while hidden are not charted.
+    tickWorstRawMs = -Infinity;
     trimSamples(tickNowMs);
 
-    drawSpark2(latSpark, tickNowMs, latP50Samples, '#d9c25c', latP95Samples, '#d9922e');
+    const peakMs = maxFinite(latTickMaxSamples);
+    const peakAt = peakMs === null ? -1 : latTickMaxSamples.indexOf(peakMs);
+    drawSpark2(latSpark, tickNowMs, latP50Samples, '#d9c25c', latP95Samples, '#d9922e', 0, undefined,
+      peakAt >= 0 ? { atMs: sampleAtMs[peakAt]!, value: peakMs! } : null);
     drawSpark(jitSpark, tickNowMs, jitSamples, '#d9922e');
     drawSpark2(cusSpark, tickNowMs, queuedASamples, '#6cf', queuedVSamples, '#a98cf0',
                targetLatencyMs, stallMarks);
@@ -1014,11 +1031,9 @@ async function main(): Promise<void> {
       }
     }
 
-    if (latVals.length) {
-      latVal.textContent = percentile(latVals, 0.5).toFixed(0);
-      latP95.textContent = percentile(latVals, 0.95).toFixed(0);
-      latMax.textContent = maxFinite(latTickMaxSamples)?.toFixed(0) ?? '—';
-    }
+    latVal.textContent = latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
+    latP95.textContent = latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
+    latMax.textContent = peakMs?.toFixed(0) ?? '—';
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = clockDriftMsPerMin !== null
       ? `This browser's clock and the publisher's ran ${clockDriftMsPerMin.toFixed(1)} `
