@@ -238,7 +238,11 @@ describe('MediaPublisher — Forward State 0 pause', () => {
     const conn = recordingConnection();
     forwardGated(conn);
     const errors: string[] = [];
-    const pub = makePublisher(conn, { onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`) });
+    const statuses: string[] = [];
+    const pub = makePublisher(conn, {
+      onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
+      onStatus: (track, message) => statuses.push(`${track}: ${message}`),
+    });
     pub.setVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());
@@ -250,17 +254,18 @@ describe('MediaPublisher — Forward State 0 pause', () => {
     expect(pub.pausedTracks).toEqual(['video']);
     // Retiring would clear the alias, and no new SUBSCRIBE follows a
     // Forward 0→1 resume — the track would never come back.
-    expect(pub.retiredTracks).toEqual([]);
-    expect(errors.filter((e) => e.includes('paused'))).toHaveLength(1);
+    expect(pub.endedTracks).toEqual([]);
+    expect(statuses).toEqual(['video: Forward State 0 (a send was refused)']);
+    expect(errors).toEqual([]);
   });
 
   it('resumes production when forwarding returns, with no new SUBSCRIBE', async () => {
     const conn = recordingConnection();
     const gate = forwardGated(conn);
-    const errors: string[] = [];
+    const statuses: string[] = [];
     const pub = makePublisher(conn, {
       pauseProbeMs: 1,
-      onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
+      onStatus: (track, message) => statuses.push(`${track}: ${message}`),
     });
     pub.setVideoAlias(2n);
 
@@ -275,7 +280,7 @@ describe('MediaPublisher — Forward State 0 pause', () => {
 
     expect(pub.pausedTracks).toEqual([]);
     expect(conn.sends.map((s) => s.payload[0])).toEqual([1]);
-    expect(errors.filter((e) => e.includes('resumed'))).toHaveLength(1);
+    expect(statuses).toContain('video: Forward State 1 (a send went through)');
   });
 });
 
@@ -715,7 +720,11 @@ describe('MediaPublisher — subscription ended under us', () => {
     let calls = 0;
     conn.openSubgroup = async () => { calls++; throw ended(); };
     const errors: string[] = [];
-    const pub = makePublisher(conn, { onError: (ctx) => errors.push(ctx) });
+    const statuses: string[] = [];
+    const pub = makePublisher(conn, {
+      onError: (ctx) => errors.push(ctx),
+      onStatus: (track, message) => statuses.push(`${track}: ${message}`),
+    });
     pub.setAudioAlias(3n);
     for (let i = 0; i < 40; i++) pub.publishAudio(chunk(i), { timestampUs: i * 20_000 });
     await settle();
@@ -723,9 +732,9 @@ describe('MediaPublisher — subscription ended under us', () => {
     // Bounded by the in-flight cap (8) — those were already launched when the
     // first failed. Without retiring, all forty would have failed.
     expect(calls).toBeLessThanOrEqual(8);
-    expect(errors.filter((e) => e.includes('retired'))).toHaveLength(1);
+    expect(statuses).toEqual(['audio: SUBSCRIBE terminated (a send was refused); awaiting SUBSCRIBE']);
     expect(errors.filter((e) => e === 'audio publish')).toHaveLength(0);
-    expect(pub.retiredTracks).toContain('audio');
+    expect(pub.endedTracks).toContain('audio');
   });
 
   it('resumes when a new SUBSCRIBE assigns the alias again', async () => {
@@ -740,13 +749,13 @@ describe('MediaPublisher — subscription ended under us', () => {
     pub.setAudioAlias(3n);
     pub.publishAudio(chunk(1), { timestampUs: 0 });
     await settle();
-    expect(pub.retiredTracks).toContain('audio');
+    expect(pub.endedTracks).toContain('audio');
 
     fail = false;
     pub.setAudioAlias(3n);              // the relay subscribed again
     pub.publishAudio(chunk(2), { timestampUs: 20_000 });
     await settle();
-    expect(pub.retiredTracks).not.toContain('audio');
+    expect(pub.endedTracks).not.toContain('audio');
     expect(conn.sends.length).toBeGreaterThan(0);
   });
 
@@ -764,8 +773,8 @@ describe('MediaPublisher — subscription ended under us', () => {
     pub.endTrack('video');
     pub.publishVideo(chunk(2), delta());   // nothing is produced while ended
     await settle();
-    expect(errors.filter((e) => e.includes('retired'))).toHaveLength(1);
-    expect(pub.retiredTracks).toEqual(['video']);
+    expect(errors).toEqual([]);            // the session logs the relay's cancel
+    expect(pub.endedTracks).toEqual(['video']);
     expect(conn.sends).toHaveLength(2);
 
     pub.setVideoAlias(5n);
@@ -978,5 +987,87 @@ describe('MediaPublisher — capture clock drift', () => {
       await settle();
     }
     expect(errors).toContain('drift report');
+  });
+});
+
+describe('MediaPublisher — a new subscription replacing an old one', () => {
+  const terminated = (sid: unknown) => new MoqtConnectionError(
+    `sendObject: stream ${String(sid)} belongs to a terminated subscription — no further Objects (§10.11)`,
+    { errorSource: 'data' });
+
+  it('a new video alias does not inherit the old subgroup, so its errors cannot retire video', async () => {
+    const conn = recordingConnection();
+    const realSend = conn.sendObject.bind(conn);
+    let oldStream: bigint | null = null;
+    conn.sendObject = (sid, oid, payload, ext) => (sid === oldStream
+      ? Promise.reject(terminated(sid))
+      : realSend(sid, oid, payload, ext));
+    const pub = makePublisher(conn, { onError: () => {} });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    oldStream = conn.opened[0]!.streamId;            // its subscription has since ended
+
+    pub.setVideoAlias(5n);                           // the relay subscribed again
+    pub.publishVideo(chunk(1), delta());             // no reference on the new alias
+    pub.publishVideo(chunk(2), kf());
+    await settle();
+    expect(pub.endedTracks).toEqual([]);
+    expect(pub.videoAliasArmed).toBe(5n);
+    expect(conn.opened.at(-1)!.alias).toBe(5n);
+    expect(conn.sends.at(-1)!.payload[0]).toBe(2);
+  });
+
+  it('a late video error from the previous subscription is ignored', async () => {
+    const conn = recordingConnection({ holdSends: true });
+    const pub = makePublisher(conn, { onError: () => {} });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+
+    pub.setVideoAlias(5n);
+    await conn.rejectAllPending(terminated(conn.opened[0]!.streamId));
+    expect(pub.endedTracks).toEqual([]);
+    expect(pub.videoAliasArmed).toBe(5n);
+  });
+
+  it('a late audio error from the previous subscription is ignored', async () => {
+    const conn = recordingConnection({ holdSends: true });
+    const pub = makePublisher(conn, { onError: () => {} });
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(0), { timestampUs: 0 });
+    await settle();
+
+    pub.setAudioAlias(7n);
+    await conn.rejectAllPending(terminated(conn.opened[0]!.streamId));
+    expect(pub.endedTracks).toEqual([]);
+    expect(pub.audioAliasArmed).toBe(7n);
+  });
+});
+
+describe('MediaPublisher — status reports', () => {
+  it('a send that lands while the relay holds Forward State 0 does not announce a resume', async () => {
+    const conn = recordingConnection();
+    const realSend = conn.sendObject.bind(conn);
+    let land!: () => void;
+    let sends = 0;
+    conn.sendObject = (sid, oid, payload, ext) => {
+      sends++;
+      if (sends === 1) {
+        return new Promise<void>((resolve) => { land = () => { void realSend(sid, oid, payload, ext).then(resolve); }; });
+      }
+      return Promise.reject(new Error(
+        `sendObject: stream ${String(sid)} belongs to a subscription with Forward State 0 — no Objects may be sent (§5.1)`));
+    };
+    const statuses: string[] = [];
+    const pub = makePublisher(conn, { onStatus: (track, message) => statuses.push(`${track}: ${message}`) });
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(0), { timestampUs: 0 });        // stays in flight
+    pub.publishAudio(chunk(1), { timestampUs: 20_000 });   // refused at Forward State 0
+    await settle();
+    pub.setForward('audio', false);                        // the relay's REQUEST_UPDATE
+    land();
+    await settle();
+    expect(statuses).toEqual(['audio: Forward State 0 (a send was refused)']);
   });
 });

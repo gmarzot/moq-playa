@@ -16,7 +16,7 @@
 import { MoqtConnection } from '@moqt/webtransport';
 import { varint } from '@moqt/transport';
 import { BroadcastSession } from './broadcast-session.js';
-import type { BroadcastSessionConnection } from './broadcast-session.js';
+import type { BroadcastSessionConnection, TrackStatus } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
 import { buildCatalogPayload } from './catalog-publisher.js';
@@ -26,6 +26,8 @@ import { log } from '../shared/log.js';
 import { certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import { copyOnClick } from '../shared/copyable.js';
+import { setBadge } from '../shared/status-badge.js';
+import type { BadgeTone } from '../shared/status-badge.js';
 import {
   WebCodecsVideoEncoder,
   WebCodecsAudioEncoder,
@@ -54,9 +56,13 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
 /** Published in the catalog as the viewer's playout set point. Without it the
  *  player has no target and runs with no cushion policy or chase at all. */
 const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
-/** How often the catalog is re-published so late joiners can acquire one.
- *  0 publishes it only at subscribe time. */
-const catalogIntervalMs = parseInt(params.get('catalogInterval') ?? '1000', 10);
+/** Catalog re-publication period; null takes the draft's default
+ *  ({@link catalogIntervalFor}). 0 publishes it only at subscribe time. */
+const catalogIntervalParam = params.get('catalogInterval');
+const catalogIntervalMs = catalogIntervalParam === null ? null : parseInt(catalogIntervalParam, 10);
+/** Draft-18 viewers FETCH the latest catalog; draft-14/16 viewers, which
+ *  this page cannot serve by FETCH, need it re-published. */
+const catalogIntervalFor = (draft: 14 | 16 | 18): number => catalogIntervalMs ?? (draft === 18 ? 0 : 1000);
 /** `?debug=1`: per-second ingest snapshots and catalog re-emissions. */
 const debug = params.get('debug') === '1';
 /** `?status=0` hides the state overlay, which is on by default on this page. */
@@ -155,7 +161,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     sBitrateMode.value = bitrateMode ?? '';
     sFps.value = String(captureFps);
     sTarget.value = String(targetLatencyMs);
-    sCatalogInterval.value = String(catalogIntervalMs);
+    sCatalogInterval.value = catalogIntervalMs === null ? '' : String(catalogIntervalMs);
     sStatus.checked = showStatus;
     sDebug.checked = debug;
     sAudioDatagram.checked = audioDatagrams;
@@ -192,7 +198,7 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (sBitrateMode.value) np.set('bitrateMode', sBitrateMode.value);
     if (sFps.value && sFps.value !== '60') np.set('fps', sFps.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
-    if (sCatalogInterval.value && sCatalogInterval.value !== '1000') np.set('catalogInterval', sCatalogInterval.value);
+    if (sCatalogInterval.value) np.set('catalogInterval', sCatalogInterval.value);
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked) np.set('audioDatagram', '1');
@@ -251,6 +257,12 @@ function setState(label: string, cls: BroadcastState): void {
 // replacement's UI, so resetBroadcastUi clears it.
 let currentPublisher: MediaPublisher | null = null;
 let currentConnection: MoqtConnection | null = null;
+let currentSession: BroadcastSession | null = null;
+/** The PUBLISH_NAMESPACE awaiting or holding the relay's reply, and its badge. */
+let nsRequestId: string | null = null;
+let nsBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'PUBLISH_NAMESPACE not sent' };
+/** The MoQT session itself: SETUP, established, or closed. */
+let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
 let liveSinceMs: number | null = null;
 let catalogJsonText = '';
 
@@ -310,26 +322,36 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
       ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
       : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`;
     row.innerHTML = `<span class="nm">${String(t['name'])}</span>`
-      + `<span class="sub" data-track="${String(t['name'])}" hidden></span>`
-      + `<span class="dt">${detail}</span>`;
+      + `<span class="dt">${detail}</span>`
+      + `<span class="badge idle" data-track="${String(t['name'])}">FWD --</span>`;
     return row;
   }));
 }
 
-/** Per-track relay subscription state. NOT a viewer count — the relay
- *  subscribes once per track and fans out downstream on its own. */
-function renderTrackStates(): void {
-  const paused = new Set(currentPublisher?.pausedTracks ?? []);
-  const retired = new Set(currentPublisher?.retiredTracks ?? []);
-  for (const el of catTracks.querySelectorAll<HTMLElement>('.sub')) {
-    const track = el.dataset['track'] ?? '';
-    // Shown only when a track is paused or retired.
-    let cls = '', label = '';
-    if (retired.has(track)) { cls = 'retired'; label = 'retired'; }
-    else if (paused.has(track)) { cls = 'paused'; label = 'paused'; }
-    el.className = `sub ${cls}`.trim();
-    el.textContent = label;
-    el.hidden = label === '';
+const nsBadge = document.getElementById('ns-badge')!;
+const setupBadge = document.getElementById('setup-badge')!;
+const catBadge = document.getElementById('cat-badge')!;
+
+/** A track's subscription as the relay drives it. NOT a viewer count: the
+ *  relay subscribes once per track and fans out downstream on its own. */
+function trackBadge(el: HTMLElement, status: TrackStatus | null): void {
+  if (status === null || status.state === 'none') {
+    setBadge(el, 'FWD --', 'idle', status?.ended ? `No subscription · ${status.ended}` : 'No subscription');
+    return;
+  }
+  const sub = `SUBSCRIBE reqId=${status.requestId} · alias=${status.alias}`;
+  if (status.fault) setBadge(el, 'ERR', 'bad', `${sub} · accepted, but the track is not being produced`);
+  else if (status.forward) setBadge(el, 'FWD 1', 'ok', `${sub} · Forward State 1`);
+  else setBadge(el, 'FWD 0', 'wait', `${sub} · Forward State 0: the relay paused forwarding`);
+}
+
+function renderStatusBadges(): void {
+  setBadge(setupBadge, 'SETUP', setupBadgeState.tone, setupBadgeState.detail);
+  setBadge(nsBadge, 'PUB_NS', nsBadgeState.tone, nsBadgeState.detail);
+  trackBadge(catBadge, currentSession?.trackStatus('catalog') ?? null);
+  for (const el of catTracks.querySelectorAll<HTMLElement>('.badge[data-track]')) {
+    const track = el.dataset['track'];
+    if (track === 'video' || track === 'audio') trackBadge(el, currentSession?.trackStatus(track) ?? null);
   }
 }
 
@@ -379,7 +401,7 @@ function renderMetrics(): void {
       backlog ? 'fault' : p ? 'num' : 'idle'),
     cell('uptime', up, liveSinceMs === null ? 'idle' : 'num'),
   ].join('');
-  renderTrackStates();
+  renderStatusBadges();
 }
 
 /** Transport counters, when the implementation reports them. */
@@ -423,7 +445,7 @@ function logSnapshot(): void {
     + `obj=${p.frameCount}/${p.audioChunkCount} kf=${p.keyframeCount} `
     + `queue=${p.videoQueueDepth}/${p.audioQueueDepth} of ${q.video}/${q.audio}`
     + (p.pausedTracks.length ? ` paused=[${p.pausedTracks.join(',')}]` : '')
-    + (p.retiredTracks.length ? ` retired=[${p.retiredTracks.join(',')}]` : ''));
+    + (p.endedTracks.length ? ` ended=[${p.endedTracks.join(',')}]` : ''));
 }
 
 // The namespace is minted per load, so the log is the only durable record of
@@ -445,6 +467,7 @@ log(`Draft: ${broadcastDraft} · codec ${videoCodec} · ${videoBitrate / 1000}kb
 const setCatalogHidden = (hidden: boolean): void => {
   layoutEl.classList.toggle('cat-hidden', hidden);
   catRestore.hidden = !hidden;
+  catToggle.hidden = hidden;
 };
 catToggle.addEventListener('click', () => setCatalogHidden(true));
 catRestore.addEventListener('click', () => setCatalogHidden(false));
@@ -522,6 +545,41 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let reconnectCount = 0;
   let sessionUpSinceMs: number | null = null;
 
+  // The publisher's drift report measures each chunk as it is sent, after
+  // encoding. This twin takes the same lowest wall − stamp gap as frames come
+  // off the camera and microphone, plus each encoder's peak queue, so a stamp
+  // that loses time can be told from a pipeline that falls behind.
+  const captureAnchorUs = new Map<'video' | 'audio', number>();
+  const captureMinUs = new Map<'video' | 'audio', number>();
+  const encoderQueuePeak = { video: 0, audio: 0 };
+  const noteCapture = (track: 'video' | 'audio', timestampUs: number, queueDepth: number): void => {
+    const gapUs = Date.now() * 1000 - timestampUs;
+    if (!captureAnchorUs.has(track)) captureAnchorUs.set(track, gapUs);
+    const min = captureMinUs.get(track);
+    if (min === undefined || gapUs < min) captureMinUs.set(track, gapUs);
+    if (queueDepth > encoderQueuePeak[track]) encoderQueuePeak[track] = queueDepth;
+  };
+  const driftMs = (us: number) => `${us >= 0 ? '+' : ''}${(us / 1000).toFixed(1)}ms`;
+  const describeDrift = (videoUs: number | null, audioUs: number | null): string => [
+    ...(videoUs !== null ? [`video ${driftMs(videoUs)}`] : []),
+    ...(audioUs !== null ? [`audio ${driftMs(audioUs)}`] : []),
+    ...(videoUs !== null && audioUs !== null ? [`video−audio ${driftMs(videoUs - audioUs)}`] : []),
+  ].join(', ');
+  /** This period's capture-side drift and encoder peaks; starts the next period. */
+  const takeCaptureDrift = (): string => {
+    const at = (t: 'video' | 'audio'): number | null => {
+      const min = captureMinUs.get(t);
+      const anchor = captureAnchorUs.get(t);
+      return min === undefined || anchor === undefined ? null : min - anchor;
+    };
+    const line = `captured ${describeDrift(at('video'), at('audio'))}`
+      + ` · encoder queue peak video ${encoderQueuePeak.video}, audio ${encoderQueuePeak.audio}`;
+    captureMinUs.clear();
+    encoderQueuePeak.video = 0;
+    encoderQueuePeak.audio = 0;
+    return line;
+  };
+
   // The session closed under the broadcast: rebuild only the network side,
   // with backoff, while capture and encoders keep running.
   function scheduleReconnect(): void {
@@ -531,11 +589,15 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     }
     sessionUpSinceMs = null;
     if (reconnectCount >= RECONNECT_MAX_ATTEMPTS) {
+      setupBadgeState = { tone: 'bad', detail: `Session closed; reconnect gave up after ${reconnectCount} attempts` };
       log(`Reconnect gave up after ${reconnectCount} attempts.`);
       void stopBroadcast();
       return;
     }
     reconnectCount++;
+    nsRequestId = null;
+    nsBadgeState = { tone: 'wait', detail: `Session lost; reconnect attempt ${reconnectCount}` };
+    setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${reconnectCount}` };
     const delayMs = RECONNECT_DELAYS_MS[Math.min(reconnectCount, RECONNECT_DELAYS_MS.length) - 1]!;
     setState('reconnecting', 'starting');
     log(`Reconnecting (attempt ${reconnectCount} in ${delayMs / 1000}s)`);
@@ -655,9 +717,25 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const conn = ctx.adopt(new MoqtConnection(broadcastDraft), (c) => c.close());
       connection = conn;
 
-      conn.onError = (err) => { log(`Session error: ${err.message}`); };
+      conn.onError = (err) => {
+        // A cancelled attempt's failures are its own teardown.
+        if (ctx.cancelled) return;
+        // A non-fatal note leaves the session up; its message carries its context.
+        const fatal = (err as { isFatal?: boolean }).isFatal !== false;
+        log(fatal ? `Session error: ${err.message}` : err.message);
+      };
       conn.onMessage = (msg) => {
         log(`[CTRL] ${msg.type}${('requestId' in msg) ? ` reqId=${(msg as any).requestId}` : ''}`);
+        // The relay's reply to our PUBLISH_NAMESPACE.
+        const rid = (msg as { requestId?: unknown }).requestId;
+        if (rid === undefined || nsRequestId === null || String(rid) !== nsRequestId) return;
+        if (msg.type === 'REQUEST_OK' || msg.type === 'PUBLISH_NAMESPACE_OK') {
+          nsBadgeState = { tone: 'ok', detail: `PUBLISH_NAMESPACE reqId=${nsRequestId} · ${msg.type}` };
+        } else if (msg.type === 'REQUEST_ERROR' || msg.type === 'PUBLISH_NAMESPACE_ERROR') {
+          const why = (msg as { errorReason?: string; reasonPhrase?: string }).errorReason
+            ?? (msg as { reasonPhrase?: string }).reasonPhrase ?? '';
+          nsBadgeState = { tone: 'bad', detail: `PUBLISH_NAMESPACE reqId=${nsRequestId} · ${msg.type} ${why}`.trim() };
+        }
       };
 
       // Cancellation must REACH the in-progress handshake: closing the
@@ -665,9 +743,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ctx.onCancel(() => {
         try { (transport as unknown as { close(): void }).close(); } catch { /* already closed */ }
       });
+      setupBadgeState = { tone: 'wait', detail: `SETUP sent to ${resolvedRelayUrl || relayUrl}; awaiting the relay` };
       await conn.connect(transport, { maxRequestId: varint(100) });
       ctx.throwIfCancelled();
       negotiatedDraft = conn.draftVersion;
+      setupBadgeState = { tone: 'ok', detail: `Session established, draft-${conn.draftVersion}` };
       // Show the negotiated draft.
       setText('conn-draft', String(negotiatedDraft));
       currentConnection = conn;
@@ -697,19 +777,15 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
               : `, ${(timeOriginDeltaUs / 1000).toFixed(1)}ms from timeOrigin`)),
           // Each track's capture clock against the wall clock, per minute.
           onDrift: ({ elapsedMs, videoUs, audioUs }) => {
-            const ms = (us: number) => `${us >= 0 ? '+' : ''}${(us / 1000).toFixed(1)}ms`;
-            const parts = [
-              ...(videoUs !== null ? [`video ${ms(videoUs)}`] : []),
-              ...(audioUs !== null ? [`audio ${ms(audioUs)}`] : []),
-              ...(videoUs !== null && audioUs !== null ? [`video−audio ${ms(videoUs - audioUs)}`] : []),
-            ];
-            log(`Capture drift at ${(elapsedMs / 60_000).toFixed(1)} min: ${parts.join(', ')}`);
+            log(`Capture drift at ${(elapsedMs / 60_000).toFixed(1)} min: `
+              + `sent ${describeDrift(videoUs, audioUs)} · ${takeCaptureDrift()}`);
           },
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
+          onStatus: (track, message) => log(`${track}: ${message}`),
           onKeyframeNeeded: () => videoEncoder?.requestKeyframe(),
         },
         log,
-        catalogIntervalMs,
+        catalogIntervalMs: catalogIntervalFor(negotiatedDraft),
         ...(debug ? { onCatalogReemitted: (bytes: number) => log(`Catalog re-emitted (${bytes} bytes)`) } : {}),
         onCatalogPublished: () => {
           setState('live', 'live');
@@ -723,6 +799,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // can be missed. Handlers reference only this attempt's session.
       conn.onClose = (error, reason) => {
         log(`Session closed: error=${error ?? 'none'} reason=${reason ?? 'clean'}`);
+        setupBadgeState = { tone: 'bad', detail: `Session closed: error=${error ?? 'none'} ${reason ?? ''}`.trim() };
         transport.closed.then((info: any) => {
           log(`WebTransport closed: code=${info?.closeCode ?? 'N/A'} reason=${info?.reason ?? 'N/A'}`);
         }).catch(() => {});
@@ -732,6 +809,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
       };
       conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
+      conn.onFetch = (requestId, fetch) => session.handleFetch(requestId, fetch);
       conn.onSubscribeForwardStateChange = (requestId, forward) =>
         session.handleForwardChange(requestId, forward);
       // A draft-18 resume must carry the Largest Location (§5.1).
@@ -744,7 +822,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const enc = new TextEncoder();
       const nsBytes = namespace.split('/').map(p => enc.encode(p));
       log(`Sending PUBLISH_NAMESPACE for [${namespace}]...`);
-      await connection!.publishNamespace(nsBytes);
+      const nsRid = await connection!.publishNamespace(nsBytes);
+      nsRequestId = String(nsRid);
+      nsBadgeState = { tone: 'wait', detail: `PUBLISH_NAMESPACE reqId=${nsRid} sent; awaiting the relay's reply` };
       ctx.throwIfCancelled();
       log(`PUBLISH_NAMESPACE sent, waiting for relay response...`);
     },
@@ -756,6 +836,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     wirePublication: (session) => {
       const mediaPublisher = session.publisher;
       currentPublisher = mediaPublisher;
+      currentSession = session;
       const ve = videoEncoder!;
       ve.onChunk = (data, isKeyframe, timestamp, _duration, description) => {
         const videoConfig = description ?? ve.description;
@@ -773,14 +854,19 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           mediaPublisher.publishAudio(data, { timestampUs: timestamp });
         };
         ae.onError = (err) => log(`[AudioEncoder ERROR] ${err.message}`);
+        ae.onInputDiscontinuity = (deltaUs) => {
+          log(`Audio input discontinuity: ${driftMs(deltaUs)} (capture stamp vs sample count)`);
+        };
       }
 
       // 6. Wire capture → encoder
       capture!.onVideoFrame = (frame) => {
+        noteCapture('video', frame.timestamp, ve.queueDepth);
         ve.encode(frame);
         frame.close();
       };
       capture!.onAudioData = (data) => {
+        noteCapture('audio', data.timestamp, audioEncoder?.queueDepth ?? 0);
         audioEncoder?.encode(data);
         data.close();
       };
@@ -790,10 +876,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const viewerParams = new URLSearchParams();
       viewerParams.set('url', resolvedRelayUrl);
       viewerParams.set('ns', namespace);
-      // The catalog is served only from the SUBSCRIBE handler — there is no
-      // FETCH responder here, so the player's default SUBSCRIBE + Joining
-      // FETCH path has no fallback it will accept.
-      viewerParams.set('catalogBootstrap', 'subscribe');
+      // Draft-18 viewers use the default SUBSCRIBE + Joining FETCH (MSF-01 §5);
+      // earlier drafts' FETCH is refused here, so they rely on re-publication.
+      if (negotiatedDraft !== 18) viewerParams.set('catalogBootstrap', 'subscribe');
       // A verbose broadcaster hands out a verbose viewer.
       if (debug) viewerParams.set('debug', '1');
       viewerParams.set('v', String(negotiatedDraft));
@@ -845,6 +930,10 @@ function resetBroadcastUi(): void {
   setState('idle', 'idle');
   shareBtn.hidden = true;
   currentPublisher = null;
+  currentSession = null;
+  nsRequestId = null;
+  nsBadgeState = { tone: 'idle', detail: 'PUBLISH_NAMESPACE not sent' };
+  setupBadgeState = { tone: 'idle', detail: 'No session' };
   currentConnection = null;
   setText('conn-draft', String(broadcastDraft));
   liveSinceMs = null;

@@ -145,6 +145,9 @@ export interface MediaPublisherOptions {
   /** Video needs a keyframe now: a new subscription or a resume. The page
    *  asks its encoder for one. */
   onKeyframeNeeded?: () => void;
+  /** A track's MoQT state changed in a way only a send revealed: Forward
+   *  State, or a terminated subscription. Not an error. */
+  onStatus?: (track: 'video' | 'audio', message: string) => void;
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
@@ -200,6 +203,7 @@ export class MediaPublisher {
   private readonly pauseProbeMs: number;
   private readonly audioDatagrams: boolean;
   private readonly onKeyframeNeeded: (() => void) | null;
+  private readonly onStatus: ((track: 'video' | 'audio', message: string) => void) | null;
   /** Largest (group, object) sent per track; Largest Location for a resume. */
   private videoLargest: { group: bigint; object: bigint } | null = null;
   private audioLargest: { group: bigint; object: bigint } | null = null;
@@ -210,6 +214,8 @@ export class MediaPublisher {
   private videoGroupId: bigint;
   private videoObjectId = 0n;
   private videoStreamId: bigint | null = null;
+  /** The alias the open video subgroup was opened under. */
+  private videoStreamAlias: bigint | null = null;
   private audioGroupId: bigint;
 
   private videoFrames = 0;
@@ -233,7 +239,7 @@ export class MediaPublisher {
   private audioOverflowing = false;
 
   private stopped = false;
-  private readonly retired = new Set<string>();
+  private readonly ended = new Set<string>();
   /** Tracks the relay has stopped forwarding (Forward State 0). */
   private readonly paused = new Set<string>();
   /** Tracks the relay reported paused; only its resume clears them. */
@@ -276,6 +282,7 @@ export class MediaPublisher {
     this.audioDatagrams = options.audioDatagrams === true && options.draft === 18;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.onKeyframeNeeded = options.onKeyframeNeeded ?? null;
+    this.onStatus = options.onStatus ?? null;
     this.videoGroupId = BigInt(Date.now());
     this.audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
   }
@@ -284,10 +291,10 @@ export class MediaPublisher {
    *  video subscription starts at a keyframe, requested now. */
   setVideoAlias(alias: bigint): void {
     this.videoAlias = alias;
-    this.retired.delete('video');
+    this.ended.delete('video');
     this.requestKeyframe();
   }
-  setAudioAlias(alias: bigint): void { this.audioAlias = alias; this.retired.delete('audio'); }
+  setAudioAlias(alias: bigint): void { this.audioAlias = alias; this.ended.delete('audio'); }
 
   /**
    * The relay changed a track's Forward State (§5.1). A pause drops the queue
@@ -332,8 +339,8 @@ export class MediaPublisher {
   get videoAliasArmed(): bigint | null { return this.videoAlias; }
   get audioAliasArmed(): bigint | null { return this.audioAlias; }
 
-  /** Tracks retired because their subscription ended, for the UI. */
-  get retiredTracks(): readonly string[] { return [...this.retired]; }
+  /** Tracks whose subscription ended, for the UI. */
+  get endedTracks(): readonly string[] { return [...this.ended]; }
 
   /** Tracks the relay is not currently forwarding, for the UI. */
   get pausedTracks(): readonly string[] { return [...this.paused]; }
@@ -355,10 +362,10 @@ export class MediaPublisher {
       this.audioQueue.length = 0;
     }
     this.paused.add(track);
-    if (!this.pauseReported.has(track)) {
+    // The relay's REQUEST_UPDATE, when it arrived, already announced this.
+    if (!this.pauseReported.has(track) && !this.forwardPaused.has(track)) {
       this.pauseReported.add(track);
-      this.report(`${track} paused`, new Error(
-        'relay set Forward State 0; production paused until it resumes forwarding'));
+      this.status(track, 'Forward State 0 (a send was refused)');
     }
     setTimeout(() => { this.paused.delete(track); }, this.pauseProbeMs);
     return true;
@@ -366,9 +373,11 @@ export class MediaPublisher {
 
   /** A chunk got through: the pause episode, if any, is over. */
   private noteSent(track: 'video' | 'audio'): void {
+    // A send already in flight when the relay paused proves nothing.
+    if (this.forwardPaused.has(track)) return;
     if (!this.pauseReported.delete(track)) return;
     this.paused.delete(track);
-    this.report(`${track} resumed`, new Error('relay resumed forwarding'));
+    this.status(track, 'Forward State 1 (a send went through)');
   }
 
   /**
@@ -384,6 +393,7 @@ export class MediaPublisher {
       this.videoAlias = null;
       this.videoQueue.length = 0;
       this.videoStreamId = null;
+      this.videoStreamAlias = null;
     } else {
       this.audioAlias = null;
       this.audioQueue.length = 0;
@@ -391,18 +401,26 @@ export class MediaPublisher {
     this.paused.delete(track);
     this.forwardPaused.delete(track);
     this.pauseReported.delete(track);
-    if (!this.retired.has(track)) {
-      this.retired.add(track);
-      this.report(`${track} retired`, new Error(
-        `subscription ended; ${track} production paused until a new SUBSCRIBE`));
-    }
+    this.ended.add(track);
   }
 
   /** A §10.11 publish error: the subscription ended before we were told. */
   private retireTrack(track: 'video' | 'audio', err: unknown): boolean {
     if (!String((err as Error)?.message ?? '').includes('§10.11')) return false;
+    if (!this.ended.has(track)) {
+      this.status(track, 'SUBSCRIBE terminated (a send was refused); awaiting SUBSCRIBE');
+    }
     this.endTrack(track);
     return true;
+  }
+
+  /** The status sink is application code: a throw is reported, not raised. */
+  private status(track: 'video' | 'audio', message: string): void {
+    try {
+      this.onStatus?.(track, message);
+    } catch (err) {
+      this.report('status', err);
+    }
   }
 
   get frameCount(): number { return this.videoFrames; }
@@ -538,10 +556,13 @@ export class MediaPublisher {
       try {
         while (this.videoQueue.length > 0 && !this.stopped) {
           const item = this.videoQueue.shift()!;
+          const alias = this.videoAlias;
           try {
             await this.sendVideoChunk(item.data, item.meta);
             this.noteSent('video');
           } catch (err) {
+            // An error from an earlier subscription says nothing about this one.
+            if (alias !== this.videoAlias) continue;
             if (this.pauseTrack('video', err)) break;
             if (this.retireTrack('video', err)) break;
             this.report('video publish', err);
@@ -562,11 +583,14 @@ export class MediaPublisher {
     while (this.audioQueue.length > 0 && !this.stopped && this.audioInFlight.size < this.audioMaxInFlight) {
       const item = this.audioQueue.shift()!;
       const groupId = ++this.audioGroupId;
+      const alias = this.audioAlias;
       const inFlight = (async () => {
         try {
           await this.sendAudioChunk(item.data, item.meta, groupId);
           this.noteSent('audio');
         } catch (err) {
+          // An error from an earlier subscription says nothing about this one.
+          if (alias !== this.audioAlias) return;
           if (!this.pauseTrack('audio', err) && !this.retireTrack('audio', err)) {
             this.report('audio publish', err);
           }
@@ -688,10 +712,19 @@ export class MediaPublisher {
       // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
       // Without this, receivers cannot distinguish normal group completion
       // from an incomplete group and will wait for the intra-group timeout.
+      const alias = this.videoAlias!;
       this.videoStreamId = await this.connection.openSubgroup(
-        this.wrapInt(this.videoAlias!), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
+        this.wrapInt(alias), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
         this.subgroupOptions(128),
       );
+      this.videoStreamAlias = alias;
+    }
+    // A subgroup opened under an earlier subscription's alias cannot carry
+    // this one's frames.
+    if (this.videoStreamId !== null && this.videoStreamAlias !== this.videoAlias) {
+      const stale = this.videoStreamId;
+      this.videoStreamId = null;
+      this.trackClose(stale);
     }
     // No open subgroup — either pre-first-keyframe, or the group was retired
     // by a failure. Dependent frames are dropped until the next keyframe.
