@@ -257,6 +257,7 @@ function setState(label: string, cls: BroadcastState): void {
 // replacement's UI, so resetBroadcastUi clears it.
 let currentPublisher: MediaPublisher | null = null;
 let currentConnection: MoqtConnection | null = null;
+let currentTransport: { close(): void } | null = null;
 let currentSession: BroadcastSession | null = null;
 /** The PUBLISH_NAMESPACE awaiting or holding the relay's reply, and its badge. */
 let nsRequestId: string | null = null;
@@ -517,6 +518,19 @@ startCameraBtn.addEventListener('click', () => startBroadcast('camera'));
 startScreenBtn.addEventListener('click', () => startBroadcast('screen'));
 stopBtn.addEventListener('click', stopBroadcast);
 
+/** Longest Stop waits for the namespace withdrawal before closing the session. */
+const NS_WITHDRAW_MS = 500;
+
+// A page closing or reloading mid-broadcast cannot await the shutdown: start the
+// withdrawal and close the session now, so a reload reusing ?ns= finds no stale
+// registration at the relay.
+window.addEventListener('pagehide', () => {
+  if (currentConnection && nsRequestId !== null) {
+    void currentConnection.publishNamespaceDone(BigInt(nsRequestId)).catch(() => {});
+  }
+  try { currentTransport?.close(); } catch { /* already closed */ }
+});
+
 /** Backoff between reconnects after the session closes under a broadcast:
  *  the first is immediate, later ones back off until a session stays up. */
 const RECONNECT_DELAYS_MS = [0, 1_000, 2_000, 4_000, 8_000, 15_000];
@@ -716,6 +730,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const transport = ctx.adopt(await transportFactory(relayUrl), (t) => {
         try { (t as unknown as { close(): void }).close(); } catch { /* already closed */ }
       });
+      currentTransport = transport as unknown as { close(): void };
       ctx.throwIfCancelled();
       const conn = ctx.adopt(new MoqtConnection(broadcastDraft), (c) => c.close());
       connection = conn;
@@ -826,7 +841,15 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const enc = new TextEncoder();
       const nsBytes = namespace.split('/').map(p => enc.encode(p));
       log(`Sending PUBLISH_NAMESPACE for [${namespace}]...`);
-      const nsRid = await connection!.publishNamespace(nsBytes);
+      const nsConn = connection!;
+      const nsRid = await nsConn.publishNamespace(nsBytes);
+      // Disposed before the session (LIFO): Stop and reconnect withdraw the
+      // namespace through the protocol, so the relay drops the registration
+      // instead of holding it for a timeout. Bounded: a dead session must not stall Stop.
+      ctx.adopt(nsRid, (rid) => Promise.race([
+        nsConn.publishNamespaceDone(rid).catch(() => {}),
+        new Promise<void>((resolve) => setTimeout(resolve, NS_WITHDRAW_MS)),
+      ]));
       nsRequestId = String(nsRid);
       nsBadgeState = { tone: 'wait', detail: `PUBLISH_NAMESPACE reqId=${nsRid} sent; awaiting the relay's reply` };
       ctx.throwIfCancelled();
@@ -939,6 +962,7 @@ function resetBroadcastUi(): void {
   nsBadgeState = { tone: 'idle', detail: 'PUBLISH_NAMESPACE not sent' };
   setupBadgeState = { tone: 'idle', detail: 'No session' };
   currentConnection = null;
+  currentTransport = null;
   setText('conn-draft', String(broadcastDraft));
   liveSinceMs = null;
   lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
