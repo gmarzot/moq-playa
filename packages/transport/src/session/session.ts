@@ -279,6 +279,12 @@ export interface SetupOptions {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   authTokens?: Uint8Array[];
+  /**
+   * Compat, client, draft-14/16: when SERVER_SETUP carries no MAX_REQUEST_ID,
+   * send requests uncapped until the peer sends one. §9.3.1.3 makes that a
+   * limit of 0 (no requests); some relays omit it yet accept requests.
+   */
+  requestsUncappedUntilMaxRequestId?: boolean;
 }
 
 /**
@@ -636,6 +642,8 @@ export class Session {
   private _newSessionUri: string | undefined;
   private _peerMaxRequestId: Varint = varint(0n);
   private _goawayReceived: boolean = false;
+  /** SetupOptions.requestsUncappedUntilMaxRequestId, held until SERVER_SETUP. */
+  private requestsUncappedOptIn = false;
 
   constructor(
     private readonly _role: EndpointRoleValue,
@@ -680,6 +688,17 @@ export class Session {
   }
 
   /**
+   * Compat state (SetupOptions.requestsUncappedUntilMaxRequestId): whether the
+   * peer granted no request credit so requests went uncapped, whether that is
+   * still so, and how many requests were sent beyond the peer's limit.
+   */
+  get uncappedRequestCredit(): { engaged: boolean; active: boolean; requests: number } {
+    const requests = this.requestIdAllocator.uncappedAllocations;
+    const active = this.requestIdAllocator.isUncapped;
+    return { engaged: active || requests > 0, active, requests };
+  }
+
+  /**
    * Peer's MAX_AUTH_TOKEN_CACHE_SIZE from setup.
    * Limits how many token alias bytes we can register with them.
    * @see draft-ietf-moq-transport-16 §9.3.1.4
@@ -708,6 +727,7 @@ export class Session {
     }
 
     const clientSetup = this.setupGate.createClientSetup(options);
+    this.requestsUncappedOptIn = options.requestsUncappedUntilMaxRequestId === true;
 
     // Set our MAX_REQUEST_ID so validateIncoming() knows what we advertised
     if (options.maxRequestId && options.maxRequestId > 0n) {
@@ -962,6 +982,8 @@ export class Session {
         // Only update allocator if MAX_REQUEST_ID was actually provided (> 0)
         if (result.peerMaxRequestId > 0n) {
           this.requestIdAllocator.updatePeerMaxRequestId(result.peerMaxRequestId);
+        } else if (this.requestsUncappedOptIn) {
+          this.requestIdAllocator.allowUncappedUntilMaxRequestId();
         }
         // §9.3.1.4: Store peer's cache size for our outbound alias registration
         if (result.peerMaxAuthTokenCacheSize !== undefined) {

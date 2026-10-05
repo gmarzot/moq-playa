@@ -64,6 +64,9 @@ export interface KnownTrackConfig {
 // ─── Category Interfaces (documentation grouping — type stays flat) ───
 
 /** Connection options. */
+/** Opt-in interop behaviour for a non-conformant relay ({@link ConnectionConfig.compat}). */
+export type PlayerCompat = 'request-credit' | 'empty-objects';
+
 export interface ConnectionConfig {
   /** WebTransport URL to the relay (e.g., "https://relay.example.com/moq"). */
   readonly url: string;
@@ -154,6 +157,16 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   readonly authTokens?: Uint8Array[];
+
+  /**
+   * Opt-in interop behaviours for relays that deviate from the spec; none by
+   * default. Each is logged once when it takes effect and counted.
+   * - `request-credit`: when SERVER_SETUP grants no MAX_REQUEST_ID, send
+   *   requests uncapped until the relay sends one (draft-14/16).
+   * - `empty-objects`: skip empty Normal objects on media tracks instead of
+   *   passing them to the decoder.
+   */
+  readonly compat?: readonly PlayerCompat[];
 
   /**
    * MOQT implementation identifier included in CLIENT_SETUP.

@@ -24,6 +24,7 @@ import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import type { MediaPublisher } from './media-publisher.js';
 import { log } from '../shared/log.js';
 import { parseCertHashHex } from '../shared/relay-url.js';
+import { parseCompat } from '../shared/compat.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
@@ -85,6 +86,8 @@ const certHash: ArrayBuffer | undefined = (() => {
     return undefined;
   }
 })();
+/** `?compat=`: opt-in interop for a non-conformant relay (shared/compat.ts). URL only. */
+const compatParam = parseCompat(params.get('compat'));
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
@@ -239,10 +242,15 @@ const namespace = namedNamespace ?? tabNamespace();
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked) np.set('audioDatagram', '1');
     // The dialog showed URL overrides too, so they are saved and the URL drops
-    // them; where storage is refused, the URL carries them instead.
+    // them; where storage is refused, the URL carries them instead. `compat`
+    // is URL-only and stays.
     const qs = np.toString();
     const saved = storageSet(() => localStorage, SETTINGS_KEY, qs || null);
-    window.location.assign(window.location.pathname + (!saved && qs ? '?' + qs : ''));
+    const next = new URLSearchParams(saved ? '' : qs);
+    const compat = new URLSearchParams(window.location.search).get('compat');
+    if (compat) next.set('compat', compat);
+    const query = next.toString();
+    window.location.assign(window.location.pathname + (query ? '?' + query : ''));
   });
 }
 
@@ -492,6 +500,7 @@ function logSnapshot(): void {
 // configuration before anything starts.
 log(`Namespace: ${namespace}${namedNamespace === null ? ' (this tab)' : ''}`);
 log(`Settings: ${params.toString() || 'defaults'}`);
+if (compatParam.unknown.length) log(`Ignoring unknown compat: ${compatParam.unknown.join(', ')}`);
 log(`Relay: ${params.get('url') ?? `${DEFAULT_RELAY} (default)`}`);
 setText('conn-relay', params.get('url') ?? DEFAULT_RELAY);
 setText('conn-ns', namespace);
@@ -800,8 +809,15 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         try { (transport as unknown as { close(): void }).close(); } catch { /* already closed */ }
       });
       setupBadgeState = { tone: 'wait', detail: `SETUP sent to ${resolvedRelayUrl || relayUrl}; awaiting the relay` };
-      await conn.connect(transport, { maxRequestId: varint(100) });
+      await conn.connect(transport, {
+        maxRequestId: varint(100),
+        ...(compatParam.compat.includes('request-credit') ? { requestsUncappedUntilMaxRequestId: true } : {}),
+      });
       ctx.throwIfCancelled();
+      if (conn.session?.uncappedRequestCredit.active) {
+        log('Relay granted no request credit (SERVER_SETUP without MAX_REQUEST_ID); '
+          + 'requests go uncapped until it sends one (compat request-credit)');
+      }
       negotiatedDraft = conn.draftVersion;
       setupBadgeState = { tone: 'ok', detail: `Session established, draft-${conn.draftVersion}` };
       // Show the negotiated draft.
@@ -953,6 +969,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       viewerParams.set('v', String(negotiatedDraft));
       const hashParam = params.get('hash');
       if (hashParam) viewerParams.set('hash', hashParam);
+      // Viewers of the same relay need the same compat.
+      if (compatParam.compat.length) viewerParams.set('compat', compatParam.compat.join(','));
       currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
       shareBtn.hidden = false;
       renderCatalogPanel({

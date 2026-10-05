@@ -80,6 +80,14 @@ describe('buildSetupOptions', () => {
     expect(options.authority).toBeUndefined();
   });
 
+  it('opts into uncapped requests only with compat request-credit', () => {
+    expect(buildSetupOptions(minimalConfig({})).requestsUncappedUntilMaxRequestId).toBeUndefined();
+    expect(buildSetupOptions(minimalConfig({ compat: ['empty-objects'] }))
+      .requestsUncappedUntilMaxRequestId).toBeUndefined();
+    expect(buildSetupOptions(minimalConfig({ compat: ['request-credit'] }))
+      .requestsUncappedUntilMaxRequestId).toBe(true);
+  });
+
   it('omits implementation when not configured', () => {
     const config = minimalConfig({ moqtImplementation: undefined });
     const options = buildSetupOptions(config);

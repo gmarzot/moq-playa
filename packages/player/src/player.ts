@@ -636,6 +636,8 @@ export class MoqtPlayer {
   /** Catalog objects dropped for an empty payload, and parse failures. */
   private emptyCatalogObjects = 0;
   private catalogParseFailures = 0;
+  /** Empty Normal media objects skipped under compat `empty-objects`. */
+  private _emptyMediaObjects = 0;
   /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
   private recoveryUpdateBlockedUntilUs = 0;
   private recoveryUpdateFailures = 0;
@@ -1895,6 +1897,7 @@ export class MoqtPlayer {
       // Liveness: ANY object on this track (data, gap, or staged-for-switch)
       // proves the delivery path is alive — stamp before every early return.
       this.stampMediaArrival(BigInt(obj.trackAlias));
+      if (this.skipEmptyMediaObject(mediaType, obj)) return;
 
       // Make-before-break track switch: stage new-track objects until a
       // keyframe arrives, keeping the old track playing the entire time.
@@ -1999,6 +2002,7 @@ export class MoqtPlayer {
     this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, headers) => {
       // Liveness: stamp before every early return (gates, staging, drops).
       this.stampMediaArrival(BigInt(obj.trackAlias));
+      if (this.skipEmptyMediaObject(mediaType, obj)) return;
 
       // CMAF switch completion handled at raw onObject level (above)
 
@@ -2290,6 +2294,7 @@ export class MoqtPlayer {
 
       const peerMaxReqId = conn.session?.peerMaxRequestId ?? 'unknown';
       this.log.info('Session established (peer MAX_REQUEST_ID=%s)', peerMaxReqId);
+      this.noteUncappedRequestCredit(conn);
     } else {
       // External adapter: already connected, skip handshake
       this.log.info('Using externally owned adapter (already connected)');
@@ -2762,6 +2767,7 @@ export class MoqtPlayer {
       this.assertMigrationLive(txn); // destroyed/aborted during transport creation?
       await newConnection.connect(transport, setupOptions);
       this.assertMigrationLive(txn);
+      this.noteUncappedRequestCredit(newConnection);
       const nsBytes = encodeNamespace(this.config.namespace, this.enc);
       const nameBytes = this.enc.encode(catalogTrackName());
       // Candidate ownership is TRANSACTION-LOCAL: the active session's
@@ -4542,6 +4548,32 @@ export class MoqtPlayer {
   get deliveryBreakdown(): ReadonlyArray<
     { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> {
     return this.deliverySpans;
+  }
+
+  /** Empty Normal media objects skipped under compat `empty-objects`. */
+  get emptyMediaObjectsSkipped(): number {
+    return this._emptyMediaObjects;
+  }
+
+  /** compat `empty-objects`: an empty Normal object on a media track never
+   *  reaches a decoder; the first is logged, all are counted. */
+  private skipEmptyMediaObject(mediaType: 'video' | 'audio', obj: MoqtObject): boolean {
+    if (obj.kind !== 'data' || obj.payload.byteLength > 0) return false;
+    if (!this.config.compat?.includes('empty-objects')) return false;
+    this._emptyMediaObjects++;
+    if (this._emptyMediaObjects === 1) {
+      this.log.warn('Empty Normal %s object (group=%s object=%s) skipped; further ones counted only '
+        + '(compat empty-objects)', mediaType, String(obj.groupId), String(obj.objectId));
+    }
+    return true;
+  }
+
+  /** compat `request-credit`: say once per session that the relay granted no
+   *  request credit and requests are going out uncapped. */
+  private noteUncappedRequestCredit(conn: MoqtConnection): void {
+    if (!conn.session?.uncappedRequestCredit?.active) return;
+    this.log.warn('Relay granted no request credit (SERVER_SETUP without MAX_REQUEST_ID); '
+      + 'requests go uncapped until it sends one (compat request-credit)');
   }
 
   private recordDeliverySpans(obj: MoqtObjectData): void {

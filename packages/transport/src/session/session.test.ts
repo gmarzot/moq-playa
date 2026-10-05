@@ -63,6 +63,41 @@ describe('Session', () => {
       expect(() => session.initiateSetup()).toThrow();
     });
 
+    describe('SERVER_SETUP without MAX_REQUEST_ID', () => {
+      const ns = [new TextEncoder().encode('ns')];
+      const name = new TextEncoder().encode('t');
+
+      it('grants no request credit by default (§9.3.1.3)', () => {
+        session.initiateSetup({ maxRequestId: varint(100n) });
+        session.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map() } as ServerSetup);
+        expect(() => session.subscribe(ns, name)).toThrow();
+        expect(session.uncappedRequestCredit.engaged).toBe(false);
+      });
+
+      it('opt-in: requests go uncapped and counted until a MAX_REQUEST_ID arrives', () => {
+        session.initiateSetup({ maxRequestId: varint(100n), requestsUncappedUntilMaxRequestId: true });
+        session.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map() } as ServerSetup);
+        session.subscribe(ns, name);
+        session.subscribe(ns, name);
+        expect(session.uncappedRequestCredit).toEqual({ engaged: true, active: true, requests: 2 });
+
+        session.handleControlMessage({ type: 'MAX_REQUEST_ID', maxRequestId: varint(10n) } as MaxRequestId);
+        expect(session.uncappedRequestCredit).toEqual({ engaged: true, active: false, requests: 2 });
+        expect(session.subscribe(ns, name).requestId).toBe(4n);
+      });
+
+      it('opt-in is inert when SERVER_SETUP grants credit', () => {
+        session.initiateSetup({ maxRequestId: varint(100n), requestsUncappedUntilMaxRequestId: true });
+        session.handleControlMessage({
+          type: 'SERVER_SETUP',
+          parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(2n)]]]),
+        } as ServerSetup);
+        session.subscribe(ns, name);
+        expect(() => session.subscribe(ns, name)).toThrow();
+        expect(session.uncappedRequestCredit.engaged).toBe(false);
+      });
+    });
+
     it('returns close_connection with PROTOCOL_VIOLATION on non-SERVER_SETUP before established', () => {
       session.initiateSetup();
 

@@ -104,6 +104,7 @@ export {
 export type {
   KnownTrackConfig,
   ConnectionConfig,
+  PlayerCompat,
   PlaybackTuningConfig,
   LatencyConfig,
   QualityConfig,

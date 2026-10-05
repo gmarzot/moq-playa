@@ -79,6 +79,10 @@ export function buildSetupOptions(config: MoqtPlayerConfig): SetupOptions {
     options.authTokens = config.authTokens;
   }
 
+  if (config.compat?.includes('request-credit')) {
+    options.requestsUncappedUntilMaxRequestId = true;
+  }
+
   return options;
 }
 

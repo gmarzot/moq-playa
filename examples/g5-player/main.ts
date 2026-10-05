@@ -12,9 +12,13 @@ import {
   namespace, certHash, draftVersion, catalogBootstrap, warmStart,
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
 } from '../shared/cert.js';
+import { parseCompat } from '../shared/compat.js';
 
 /** `?status=1` shows the playback state over the picture (off by default). */
 const showStatus = new URLSearchParams(location.search).get('status') === '1';
+
+/** `?compat=`: opt-in interop for a non-conformant relay (shared/compat.ts). */
+const compatParam = parseCompat(new URLSearchParams(location.search).get('compat'));
 
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
@@ -227,8 +231,22 @@ async function main(): Promise<void> {
     ...(renderCushionFloorMs ? { renderCushionFloorMs } : {}),
     ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),
     ...(debug ? { logLevel: 'debug' as const } : {}),
+    ...(compatParam.compat.length ? { compat: compatParam.compat } : {}),
     // SUB_NS: report the namespace and re-establish when it is published again.
     followNamespace: true,
+  };
+  if (compatParam.unknown.length) log(`Ignoring unknown compat: ${compatParam.unknown.join(', ')}`);
+  /** Compat activity, logged when it changes (the engine's own warnings go to the console). */
+  let compatReported = '';
+  const reportCompat = (): void => {
+    if (!compatParam.compat.length) return;
+    const credit = (player as any).engine?.connection?.session?.uncappedRequestCredit;
+    const line = `requests sent without credit ${credit?.requests ?? 0}`
+      + (credit?.active ? ' (relay has granted none)' : '')
+      + ` · empty media objects skipped ${(player as any).engine?.emptyMediaObjectsSkipped ?? 0}`;
+    if (line === compatReported) return;
+    compatReported = line;
+    log(`compat: ${line}`);
   };
   const player = new Player(playerContainer, {
     url: relayUrl,
@@ -438,6 +456,7 @@ async function main(): Promise<void> {
   });
   player.on('session_established', () => {
     setupBadgeState = { tone: 'ok', detail: 'SETUP complete: session established' };
+    reportCompat();
   });
   player.on('session_migrated', () => {
     log('Session re-established');
@@ -1117,6 +1136,7 @@ async function main(): Promise<void> {
     if (audioOut && audioOut.onUnderrun === null) audioOut.onUnderrun = noteUnderrun;
     if (tickNowMs - underrunReportAtMs >= UNDERRUN_REPORT_MS) {
       underrunReportAtMs = tickNowMs;
+      reportCompat();
       const u = underrunWindow;
       if (u.count > 0) {
         const lagNow = Math.max(0, ...lagSamples.map(([, d]) => d));
