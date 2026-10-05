@@ -396,7 +396,14 @@ async function main(): Promise<void> {
       r.push(`[${video.buffered.start(i).toFixed(2)}–${video.buffered.end(i).toFixed(2)}]`);
     }
     return `t=${video.currentTime.toFixed(2)} rs=${video.readyState} rate=${video.playbackRate} `
-      + `buffered=${r.join('') || 'none'}`;
+      + `buffered=${r.join('') || 'none'}${arrivalAges()}`;
+  };
+  /** How long ago each track's last object arrived: separates a delivery
+   *  pause from a stop with media in hand. */
+  const arrivalAges = (): string => {
+    const now = performance.now();
+    const age = (t?: number) => (t === undefined ? '—' : (now - t).toFixed(0));
+    return ` last obj v/a ${age(lastArrivalMs.video)}/${age(lastArrivalMs.audio)}ms ago`;
   };
   let watchedVideo: HTMLVideoElement | null = null;
   let stallStartSnap = '';
