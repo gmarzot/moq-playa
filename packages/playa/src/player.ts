@@ -635,7 +635,10 @@ export class Player {
         this._congestionControl = transport.congestionControl;
         return transport;
       },
-      createConnection: () => new MoqtConnection(draftVersion),
+      createConnection: () => new MoqtConnection(
+        draftVersion,
+        opts.maxPendingStreams === undefined ? {} : { maxPendingUniStreams: opts.maxPendingStreams },
+      ),
     };
 
     if (this.strategy === 'webcodecs') {

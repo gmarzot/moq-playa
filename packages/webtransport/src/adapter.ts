@@ -1209,6 +1209,10 @@ export class MoqtConnection {
    */
   private readonly terminatedAliasTtlMs: number;
 
+  /** Draft-18 bound on incoming uni streams awaiting classification or SETUP;
+   *  undefined leaves QUIC's stream limit as the only bound. */
+  private readonly maxPendingUniStreams: number | undefined;
+
   /** Subscriptions opted into terminal drain, by request ID (§ terminal drain). */
   private readonly drainConfigs = new Map<bigint, { onDrained: ((requestId: bigint) => void) | null }>();
   /** Live per-alias drain state; presence also blocks alias reuse. */
@@ -1268,6 +1272,10 @@ export class MoqtConnection {
    *   Request ID parity (client = even, server = odd, §10.1). Almost all
    *   deployments are clients; `'server'` exists so two endpoints can be paired
    *   in-process (e.g. an in-memory loopback for tests).
+   * @param options.maxPendingUniStreams Draft-18: incoming uni streams allowed
+   *   to await classification or SETUP at once. At the bound, intake waits;
+   *   before SETUP, an extra data stream is cancelled (§3.3). Never closes the
+   *   session. Default: no bound beyond QUIC's stream limit.
    */
   constructor(
     version?: DraftVersion,
@@ -1276,6 +1284,7 @@ export class MoqtConnection {
       joiningFetchTimeoutMs?: number;
       terminatedAliasTtlMs?: number;
       closeReportFallbackMs?: number;
+      maxPendingUniStreams?: number;
     },
   ) {
     this._requestedVersion = version;
@@ -1283,6 +1292,11 @@ export class MoqtConnection {
     this.joiningFetchTimeoutMs = options?.joiningFetchTimeoutMs ?? 10_000;
     this.terminatedAliasTtlMs = options?.terminatedAliasTtlMs ?? 10_000;
     this.closeReportFallbackMs = options?.closeReportFallbackMs ?? 2_000;
+    const maxPending = options?.maxPendingUniStreams;
+    if (maxPending !== undefined && (!Number.isSafeInteger(maxPending) || maxPending <= 0)) {
+      throw new RangeError('maxPendingUniStreams must be a positive safe integer');
+    }
+    this.maxPendingUniStreams = maxPending;
     // Initialize with the requested version (or default 16). May be reconfigured
     // in connect() if WT protocol negotiation selects a different draft.
     this.configureForVersion(version ?? 16);
@@ -1446,7 +1460,10 @@ export class MoqtConnection {
         },
         onViolation: (reason, error) => this.handleIncomingUniViolation(reason, error),
         onTransportError: (error) => this.handleIncomingUniTransportError(error),
-      });
+        onAbandoned: (reason) => {
+          this.onError?.(new MoqtConnectionError(reason, { errorSource: 'data', isFatal: false }));
+        },
+      }, this.maxPendingUniStreams === undefined ? {} : { maxPendingStreams: this.maxPendingUniStreams });
       this.incomingUniRouter = router;
       try {
         await Promise.all([

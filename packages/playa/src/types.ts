@@ -35,6 +35,10 @@ export interface PlayerOptions {
   /** WebTransport congestion-control hint, which the browser may ignore;
    *  `Player.congestionControl` reports what it applied. */
   readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
+  /** Draft-18: incoming streams allowed to await classification or SETUP at
+   *  once; at the bound, intake waits. Default: no bound beyond QUIC's
+   *  stream limit. */
+  readonly maxPendingStreams?: number;
 
   // ── Playback ──
 

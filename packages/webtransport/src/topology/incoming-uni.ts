@@ -38,10 +38,17 @@ export interface IncomingUniHandlers {
   onViolation(reason: string, error: Error): void;
   /** Surface failure of the transport's stream-accept channel unchanged. */
   onTransportError(error: Error): void;
+  /** A data stream that arrived before SETUP was cancelled at the bound (§3.3). */
+  onAbandoned?(reason: string): void;
 }
 
 export interface IncomingUniRouterOptions {
-  /** Maximum streams whose type or pre-release ownership is unresolved. */
+  /**
+   * Bound on streams whose type or pre-SETUP release is unresolved. At the
+   * bound, intake waits for one to resolve; before SETUP, a data stream that
+   * cannot be held is cancelled (§3.3). The session is never closed for it.
+   * Default: none; QUIC's stream limit governs.
+   */
   maxPendingStreams?: number;
 }
 
@@ -55,8 +62,6 @@ export interface RoutedIncomingUniStream {
 interface ClassifiedStream extends RoutedIncomingUniStream {
   readonly kind: StreamKind;
 }
-
-const DEFAULT_MAX_PENDING_STREAMS = 64;
 
 /**
  * Owns the transport's incoming-unidirectional-stream reader for draft 18.
@@ -75,16 +80,18 @@ export class IncomingUniRouter {
   private dataReleased = false;
   private terminal = false;
   private started = false;
+  /** Resolved when a pending stream resolves or the router stops. */
+  private slotFreed: Deferred<void> | null = null;
 
   constructor(
     private readonly handlers: IncomingUniHandlers,
     options: IncomingUniRouterOptions = {},
   ) {
-    const limit = options.maxPendingStreams ?? DEFAULT_MAX_PENDING_STREAMS;
-    if (!Number.isSafeInteger(limit) || limit <= 0) {
+    const limit = options.maxPendingStreams;
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
       throw new RangeError('maxPendingStreams must be a positive safe integer');
     }
-    this.maxPendingStreams = limit;
+    this.maxPendingStreams = limit ?? Infinity;
   }
 
   start(source: ReadableStream<ReadableStream<Uint8Array>>): Promise<void> {
@@ -108,6 +115,7 @@ export class IncomingUniRouter {
     if (this.dataReleased) return;
     this.dataReleased = true;
     const queued = this.earlyData.splice(0);
+    this.notifySlotFreed();
     for (const stream of queued) this.handlers.onData(stream);
   }
 
@@ -130,6 +138,7 @@ export class IncomingUniRouter {
     const error = reason instanceof Error ? reason : new Error(String(reason));
     this.terminal = true;
     this.setup.reject(error);
+    this.notifySlotFreed();
     this.cancelOwnedReaders(error);
     if (cancelSource) {
       try { void this.sourceReader?.cancel(error).catch(() => {}); } catch { /* transport already closed */ }
@@ -140,6 +149,12 @@ export class IncomingUniRouter {
     const reader = this.sourceReader!;
     try {
       for (;;) {
+        // At the bound, unread streams wait in the transport, where QUIC stream
+        // credit holds back the peer. Data held for a SETUP not yet read can
+        // never drain, so then the next stream is classified to look for SETUP.
+        while (!this.terminal && this.atBound() && (this.activeClassifiers > 0 || this.setupClaimed)) {
+          await this.nextSlotFreed();
+        }
         const { value: stream, done } = await reader.read();
         if (done) {
           this.sourceEnded = true;
@@ -149,11 +164,6 @@ export class IncomingUniRouter {
         if (this.terminal) {
           void stream.cancel().catch(() => {});
           continue;
-        }
-        if (this.activeClassifiers + this.earlyData.length >= this.maxPendingStreams) {
-          void stream.cancel().catch(() => {});
-          this.violate(`too many incoming streams awaiting classification or SETUP (limit ${this.maxPendingStreams})`);
-          return;
         }
         this.activeClassifiers++;
         void this.classifyAndRoute(stream);
@@ -196,7 +206,9 @@ export class IncomingUniRouter {
       if (!this.dataReleased) {
         if (this.earlyData.length >= this.maxPendingStreams) {
           cancelAndRelease(classified.reader);
-          this.violate(`too many data streams received before SETUP (limit ${this.maxPendingStreams})`);
+          this.handlers.onAbandoned?.(
+            `data stream before SETUP cancelled: ${this.maxPendingStreams} already held (§3.3)`,
+          );
           return;
         }
         this.earlyData.push(classified);
@@ -208,8 +220,24 @@ export class IncomingUniRouter {
     } finally {
       this.classifyingReaders.delete(reader);
       this.activeClassifiers--;
+      this.notifySlotFreed();
       this.failIfSetupImpossible();
     }
+  }
+
+  private atBound(): boolean {
+    return this.activeClassifiers + this.earlyData.length >= this.maxPendingStreams;
+  }
+
+  private nextSlotFreed(): Promise<void> {
+    this.slotFreed ??= deferred<void>();
+    return this.slotFreed.promise;
+  }
+
+  private notifySlotFreed(): void {
+    const waiter = this.slotFreed;
+    this.slotFreed = null;
+    waiter?.resolve();
   }
 
   private failIfSetupImpossible(): void {
