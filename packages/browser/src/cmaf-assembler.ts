@@ -74,6 +74,12 @@ export interface CmafAssemblerOptions {
    */
   readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
   /**
+   * Audio buffered ahead of the playhead (ms), or null when unknown. Held
+   * audio may wait until the playhead would reach the gap, less one frame;
+   * without it the wait is one frame.
+   */
+  readonly audioAheadMs?: () => number | null;
+  /**
    * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
    * Construction-time so it cannot change once an epoch is established.
    * Defaults to `shared` (production behavior).
@@ -97,6 +103,7 @@ export interface CmafAssemblerOptions {
 export class CmafAssembler {
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
+  private readonly audioAheadMs: CmafAssemblerOptions['audioAheadMs'];
 
   /**
    * Pending moofs keyed by "mediaType:trackName:groupId".
@@ -154,13 +161,13 @@ export class CmafAssembler {
    * each group on its own stream, so adjacent frames race; MSE in low-delay
    * mode decodes up to the newest frame, and one appended after its
    * successor is never played. A segment that starts past the emitted audio
-   * end waits for the gap to fill, for at most its own duration.
+   * end waits for the gap to fill, until the playhead would reach the gap.
    */
   private readonly heldAudio: Array<{
     segment: Uint8Array; trackName: string; groupId: bigint; start: bigint; end: bigint;
   }> = [];
   private heldAudioTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly audioOrder = { restored: 0, missing: 0, late: 0 };
+  private readonly audioOrder = { restored: 0, missing: 0, late: 0, worstLateMs: 0 };
 
   /**
    * Restart generation of the shared epoch. Bumped when a discontinuity
@@ -255,6 +262,7 @@ export class CmafAssembler {
   constructor(options: CmafAssemblerOptions) {
     this.onSegment = options.onSegment;
     this.onDiscontinuity = options.onDiscontinuity;
+    this.audioAheadMs = options.audioAheadMs;
     this.epochMode = options.epochMode ?? 'shared';
   }
 
@@ -498,10 +506,11 @@ export class CmafAssembler {
 
   /**
    * Audio decode-order repair: gaps filled by a segment that arrived late,
-   * frames given up as missing when a hold expired, and segments that
-   * arrived entirely behind the emitted audio end.
+   * frames given up as missing when a hold expired, segments that arrived
+   * entirely behind the emitted audio end, and the furthest behind one was
+   * (ms of audio already emitted past its start).
    */
-  get audioOrderStats(): { restored: number; missing: number; late: number } {
+  get audioOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
     return { ...this.audioOrder };
   }
 
@@ -523,6 +532,8 @@ export class CmafAssembler {
     }
     if (span.end <= emittedEnd) {
       this.audioOrder.late++;
+      const lateMs = (Number(emittedEnd - span.start) * 1000) / this.audioTimescale;
+      if (lateMs > this.audioOrder.worstLateMs) this.audioOrder.worstLateMs = lateMs;
       this.emitSegment('audio', segment, trackName, groupId);
       return;
     }
@@ -560,11 +571,17 @@ export class CmafAssembler {
     this.armHeldAudioTimer();
   }
 
-  /** The head of the held audio waits at most its own duration. */
+  /**
+   * The head of the held audio waits until the playhead would reach the gap,
+   * less one frame of margin; at least one frame, and one frame when the
+   * buffered depth is unknown.
+   */
   private armHeldAudioTimer(): void {
     if (this.heldAudioTimer !== null || this.heldAudio.length === 0 || !this.audioTimescale) return;
     const head = this.heldAudio[0]!;
-    const ms = (Number(head.end - head.start) * 1000) / this.audioTimescale;
+    const frameMs = (Number(head.end - head.start) * 1000) / this.audioTimescale;
+    const aheadMs = this.audioAheadMs?.() ?? null;
+    const ms = aheadMs === null ? frameMs : Math.max(frameMs, aheadMs - frameMs);
     this.heldAudioTimer = setTimeout(() => {
       this.heldAudioTimer = null;
       this.releaseHeldAudio(true);

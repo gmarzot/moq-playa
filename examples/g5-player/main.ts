@@ -431,7 +431,9 @@ async function main(): Promise<void> {
   /** CMAF audio decode-order repair so far (CmafAssembler.audioOrderStats). */
   const audioOrderNote = (): string => {
     const o = (player as any).engine?.cmafAssembler?.audioOrderStats;
-    return o ? ` · audio order restored/missing/late ${o.restored}/${o.missing}/${o.late}` : '';
+    if (!o) return '';
+    const worst = o.late > 0 && o.worstLateMs ? ` (worst ${o.worstLateMs.toFixed(0)}ms behind)` : '';
+    return ` · audio order restored/missing/late ${o.restored}/${o.missing}/${o.late}${worst}`;
   };
   player.on('stall', ({ durationMs }) => {
     const video = watchVideo();

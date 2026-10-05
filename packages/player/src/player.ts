@@ -6872,6 +6872,10 @@ export class MoqtPlayer {
           (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
         }
       },
+      // Bounds how long out-of-order audio may wait for a missing frame.
+      audioAheadMs: () => ('getBufferAheadMsByKind' in ms
+        ? (ms as { getBufferAheadMsByKind: () => { audio: number | null } }).getBufferAheadMsByKind().audio
+        : null),
     });
   }
 

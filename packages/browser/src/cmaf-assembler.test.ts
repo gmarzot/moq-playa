@@ -1372,9 +1372,9 @@ describe('CmafAssembler — audio decode order', () => {
     return concat(buildMoof(n * FRAME, n + 1, FRAME), buildMdat(new Uint8Array([n])));
   }
 
-  function setup() {
+  function setup(audioAheadMs?: () => number | null) {
     const onSegment = vi.fn();
-    const assembler = new CmafAssembler({ onSegment });
+    const assembler = new CmafAssembler({ onSegment, ...(audioAheadMs ? { audioAheadMs } : {}) });
     assembler.setInitSegment('audio', audioInit());
     const push = (n: number) => assembler.push('audio', 'audio0', BigInt(n), frame(n));
     const emitted = () => onSegment.mock.calls.map(
@@ -1386,7 +1386,7 @@ describe('CmafAssembler — audio decode order', () => {
     const { assembler, push, emitted } = setup();
     [0, 1, 3, 2].forEach(push);
     expect(emitted()).toEqual([0, 1, 2, 3]);
-    expect(assembler.audioOrderStats).toEqual({ restored: 1, missing: 0, late: 0 });
+    expect(assembler.audioOrderStats).toMatchObject({ restored: 1, missing: 0, late: 0 });
   });
 
   it('releases held audio past a gap that does not fill within one frame', () => {
@@ -1397,11 +1397,49 @@ describe('CmafAssembler — audio decode order', () => {
       expect(emitted()).toEqual([0, 1]);
       vi.advanceTimersByTime(FRAME_MS + 1);
       expect(emitted()).toEqual([0, 1, 3, 4]);
-      expect(assembler.audioOrderStats).toEqual({ restored: 0, missing: 1, late: 0 });
+      expect(assembler.audioOrderStats).toMatchObject({ restored: 0, missing: 1, late: 0 });
 
       push(2); // its slot was given up
       expect(emitted()).toEqual([0, 1, 3, 4, 2]);
       expect(assembler.audioOrderStats.late).toBe(1);
+      // Audio up to frame 5 was already emitted when frame 2 arrived: 3 frames behind.
+      expect(assembler.audioOrderStats.worstLateMs).toBeCloseTo(3 * FRAME_MS, 3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds as long as the buffered audio allows, less one frame', () => {
+    vi.useFakeTimers();
+    try {
+      const { assembler, push, emitted } = setup(() => 200);
+      [0, 1, 3].forEach(push);
+      vi.advanceTimersByTime(FRAME_MS + 1);
+      expect(emitted()).toEqual([0, 1]); // one frame is not the bound here
+      push(2);
+      expect(emitted()).toEqual([0, 1, 2, 3]);
+      expect(assembler.audioOrderStats).toMatchObject({ restored: 1, missing: 0, late: 0 });
+
+      [5].forEach(push);
+      vi.advanceTimersByTime(200 - FRAME_MS - 1);
+      expect(emitted()).toEqual([0, 1, 2, 3]);
+      vi.advanceTimersByTime(2);
+      expect(emitted()).toEqual([0, 1, 2, 3, 5]);
+      expect(assembler.audioOrderStats.missing).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits at least one frame when little audio is buffered', () => {
+    vi.useFakeTimers();
+    try {
+      const { push, emitted } = setup(() => 5);
+      [0, 2].forEach(push);
+      vi.advanceTimersByTime(FRAME_MS - 1);
+      expect(emitted()).toEqual([0]);
+      vi.advanceTimersByTime(2);
+      expect(emitted()).toEqual([0, 2]);
     } finally {
       vi.useRealTimers();
     }
@@ -1439,6 +1477,6 @@ describe('CmafAssembler — audio decode order', () => {
       assembler.push('video', 'video0', BigInt(n), concat(buildMoof(n * 3000, n + 1, 3000), buildMdat(new Uint8Array([n]))));
     }
     expect(onSegment).toHaveBeenCalledTimes(3);
-    expect(assembler.audioOrderStats).toEqual({ restored: 0, missing: 0, late: 0 });
+    expect(assembler.audioOrderStats).toMatchObject({ restored: 0, missing: 0, late: 0 });
   });
 });

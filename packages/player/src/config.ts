@@ -592,6 +592,8 @@ export interface FactoryConfig {
   readonly createCmafAssembler?: (options: {
     onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void;
     onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+    /** Audio buffered ahead of the playhead (ms), or null when unknown. */
+    audioAheadMs?: () => number | null;
   }) => CmafAssemblerLike;
 
   /**
