@@ -5390,9 +5390,15 @@ export class MoqtConnection {
           }
           // §5.1.1 (draft-14/16): an inbound UNSUBSCRIBE cancels the
           // subscription — RESET the publisher's open data streams for it.
+          // Surfaced first, as on draft-18, so the publisher stops writing at once.
           if (message.type === 'UNSUBSCRIBE') {
-            await this.resetCancelledPublisherStreams(
-              (message as { requestId: bigint }).requestId, 'inbound subscription cancellation');
+            const requestId = (message as { requestId: bigint }).requestId;
+            try {
+              this.onSubscribeClosed?.(requestId);
+            } catch (observerErr) {
+              this.reportObserverError(observerErr);
+            }
+            await this.resetCancelledPublisherStreams(requestId, 'inbound subscription cancellation');
           }
           // §9.18 (draft-14/16): an inbound FETCH_CANCEL — the fetcher stopped
           // (from PENDING or TRANSFERRING). Abort any response stream we opened for
