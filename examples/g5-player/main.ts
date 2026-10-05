@@ -523,7 +523,10 @@ async function main(): Promise<void> {
           + `/${fmtCount((player as any).audioOutput?.liveEdgeSnapCount ?? 0)}`, '',
           FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
             + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
-      ] : []),
+      ] : [
+        // The E2E chart is arrival; what is on screen sits behind the MSE buffer too.
+        cell('playout ≈', cmafPlayoutMs != null ? cmafPlayoutMs.toFixed(0) : '—', 'ms', NUM),
+      ]),
       cell('dropped', fmtCount(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.
@@ -573,6 +576,8 @@ async function main(): Promise<void> {
   const audioLatWindow: Array<[number, number]> = [];
   /** Audio arrival p50/p95/p99 over the window, drift-corrected. */
   let audioLatPct: [number, number, number] | null = null;
+  /** CMAF: estimated capture-to-screen latency, arrival p50 plus the video buffered ahead. */
+  let cmafPlayoutMs: number | null = null;
   /** Underruns since the last report: buffers late past their slot, buffers on
    *  time after missing audio, silence, and the worst lateness. */
   const UNDERRUN_REPORT_MS = 10_000;
@@ -1046,8 +1051,10 @@ async function main(): Promise<void> {
     renderStatusBadges(tickNowMs);
     const eng = (player as any).engine;
     const byKind = eng?.mediaSource?.getBufferAheadMsByKind?.();
+    const renderer = (player as any).renderer;
+    // An empty render queue is 0 ms ahead, not a missing sample.
     const vMs = byKind ? byKind.video
-      : ((player as any).renderer?.queuedAheadMs ?? null);
+      : renderer ? (renderer.queuedAheadMs ?? 0) : null;
     const aMs = byKind ? byKind.audio
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
@@ -1070,6 +1077,8 @@ async function main(): Promise<void> {
     const audioLat = audioLatWindow.map(([, v]) => v - driftCorrectionMs);
     audioLatPct = audioLat.length
       ? [percentile(audioLat, 0.5), percentile(audioLat, 0.95), percentile(audioLat, 0.99)] : null;
+    // MSE plays behind its buffered end, so on screen is roughly arrival plus that buffer.
+    cmafPlayoutMs = byKind && latVals.length ? percentile(latVals, 0.5) + byKind.video : null;
     // Every series takes a value on every sampled tick, NaN where there is
     // nothing to report, so all of them index the same sample times.
     if (sampling) {

@@ -2007,6 +2007,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
+        this.recordDeliverySpans(obj);
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
           this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
