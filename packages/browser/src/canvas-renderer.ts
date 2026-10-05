@@ -82,6 +82,12 @@ export class CanvasRenderer implements VideoRendererLike {
    * drift — it already includes the playout cushion applied to this frame.
    */
   onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null = null;
+  /**
+   * Observer for each frame drawn: its capture timestamp (µs) and the wall
+   * clock when it was drawn (ms), so capture-to-screen latency can be measured.
+   * Never used for playout.
+   */
+  onFrameDrawn: ((captureTimestampUs: number, drawnAtWallMs: number) => void) | null = null;
   onStall: ((durationMs: number) => void) | null = null;
 
   /**
@@ -196,6 +202,9 @@ export class CanvasRenderer implements VideoRendererLike {
         // Resizing clears the canvas, so only on a genuine size change.
         this.sizeCanvasTo(entry.frame);
         this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+        try {
+          this.onFrameDrawn?.(entry.frame.timestamp, Date.now());
+        } catch { /* an observer must not break rendering */ }
 
         // frame.close() is NON-NEGOTIABLE — GPU memory outside GC
         entry.frame.close();
