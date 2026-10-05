@@ -23,7 +23,7 @@ import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import type { MediaPublisher } from './media-publisher.js';
 import { log } from '../shared/log.js';
-import { certHash, draftVersion } from '../shared/cert.js';
+import { parseCertHashHex } from '../shared/relay-url.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
@@ -35,21 +35,56 @@ import {
   createWebTransport,
 } from '../shared/browser/index.js';
 
-// ─── URL params ──────────────────────────────────────────────────────
+// ─── Settings ────────────────────────────────────────────────────────
 
-const params = new URLSearchParams(window.location.search);
+/** Storage that is blocked or absent (private mode, site data off) reads as empty. */
+function storageGet(store: () => Storage, key: string): string | null {
+  try { return store().getItem(key); } catch { return null; }
+}
+/** False when the storage refused the write. */
+function storageSet(store: () => Storage, key: string, value: string | null): boolean {
+  try {
+    if (value === null) store().removeItem(key);
+    else store().setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Settings saved by the dialog, as URL parameters. */
+const SETTINGS_KEY = 'g5-broadcast.settings';
+/** Saved settings, each overridden by a URL parameter of the same name. */
+const params = (() => {
+  const merged = new URLSearchParams(storageGet(() => localStorage, SETTINGS_KEY) ?? '');
+  const url = new URLSearchParams(window.location.search);
+  for (const name of new Set(url.keys())) {
+    merged.delete(name);
+    for (const value of url.getAll(name)) merged.append(name, value);
+  }
+  return merged;
+})();
 /**
  * Our relay. Discovery probes the page's own host, which never finds this one,
- * so it is the default rather than a fallback. `?url=` and the settings dialog
- * still override, and discovery still runs when either names something else.
+ * so it is the default rather than a fallback.
  */
 const DEFAULT_RELAY = 'https://moqx-main.ci.openmoq.org:4433/moq-relay';
-/**
- * Our demos run draft 18. The shared default is moqt-16, so without this the
- * d18 wire behaviour the demos exist to exercise never gets negotiated.
- * `?v=` still overrides.
- */
-const broadcastDraft: 14 | 16 | 18 = draftVersion ?? 18;
+/** Our demos run draft 18; the shared default is draft 16. */
+const DEFAULT_DRAFT = 18;
+const broadcastDraft: 14 | 16 | 18 = (() => {
+  const v = params.get('v');
+  return v === '14' ? 14 : v === '16' ? 16 : DEFAULT_DRAFT;
+})();
+const certHash: ArrayBuffer | undefined = (() => {
+  const hex = params.get('hash');
+  if (!hex) return undefined;
+  try {
+    return parseCertHashHex(hex);
+  } catch (err) {
+    log(`Ignoring certificate hash: ${(err as Error).message}`);
+    return undefined;
+  }
+})();
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
@@ -83,30 +118,22 @@ const congestionControl: 'low-latency' | 'throughput' | undefined =
   params.get('congestionControl') === 'low-latency' ? 'low-latency'
     : params.get('congestionControl') === 'throughput' ? 'throughput' : undefined;
 /**
- * `?ns=` when given, otherwise one minted per TAB and held in sessionStorage.
- *
- * Per-tab rather than per-load: a reload (including a dev-server hot reload)
- * keeps the namespace, so viewer links already handed out stay valid, while a
- * new tab still mints a fresh one — which is what stops two broadcasters
- * claiming the same name and stops a relay holding state from a dead session
- * routing subscribers to it.
+ * The tab's automatic namespace, held in sessionStorage: reloads and
+ * Stop/Start keep it, so viewer links stay valid; a new tab, or New in the
+ * settings dialog, mints another, so two broadcasters never share one.
  */
-const NAMESPACE_KEY = 'g5-broadcast.namespace';
-function mintNamespace(): string {
-  const fresh = (): string => `g5-${crypto.randomUUID().slice(0, 8)}`;
-  try {
-    const held = sessionStorage.getItem(NAMESPACE_KEY);
-    if (held) return held;
-    const minted = fresh();
-    sessionStorage.setItem(NAMESPACE_KEY, minted);
-    return minted;
-  } catch {
-    // Private mode or blocked site data: a per-load namespace still works,
-    // it just will not survive a reload.
-    return fresh();
-  }
+const AUTO_NAMESPACE_KEY = 'g5-broadcast.namespace';
+const mintNamespace = (): string => `g5-${crypto.randomUUID().slice(0, 8)}`;
+function tabNamespace(): string {
+  const held = storageGet(() => sessionStorage, AUTO_NAMESPACE_KEY);
+  if (held) return held;
+  const minted = mintNamespace();
+  storageSet(() => sessionStorage, AUTO_NAMESPACE_KEY, minted);
+  return minted;
 }
-const namespace = params.get('ns') ?? mintNamespace();
+/** A named namespace (URL or saved), else the tab's automatic one. */
+const namedNamespace = params.get('ns') || null;
+const namespace = namedNamespace ?? tabNamespace();
 
 // ─── Settings modal ──────────────────────────────────────────────────
 
@@ -115,6 +142,7 @@ const namespace = params.get('ns') ?? mintNamespace();
   const backdrop = document.getElementById('settings-backdrop')!;
   const sUrl = document.getElementById('s-url') as HTMLInputElement;
   const sNs = document.getElementById('s-ns') as HTMLInputElement;
+  const sNsNew = document.getElementById('s-ns-new') as HTMLButtonElement;
   const sHash = document.getElementById('s-hash') as HTMLInputElement;
   const sVersion = document.getElementById('s-version') as HTMLSelectElement;
   const sCc = document.getElementById('s-cc') as HTMLSelectElement;
@@ -131,11 +159,13 @@ const namespace = params.get('ns') ?? mintNamespace();
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
 
-  // Modal-scoped lazy discovery: opening settings with no explicit ?url= and
+  // Modal-scoped lazy discovery: opening settings with no relay URL set and
   // no cached result starts its own discovery consumer, aborted on
   // close/Apply. Independent of the Go Live flow's consumer — neither can
   // block the other (Stop never waits on this, and vice versa).
   let modalDiscovery: AbortController | undefined;
+  /** The automatic namespace the field holds, if any; Apply keeps it unnamed. */
+  let autoNamespace: string | null = null;
 
   function abortModalDiscovery() {
     modalDiscovery?.abort(new Error('settings closed'));
@@ -152,6 +182,7 @@ const namespace = params.get('ns') ?? mintNamespace();
       );
     }
     sNs.value = namespace;
+    autoNamespace = namedNamespace === null ? namespace : null;
     sHash.value = params.get('hash') ?? '';
     sVersion.value = String(broadcastDraft);
     sCc.value = congestionControl ?? '';
@@ -168,6 +199,10 @@ const namespace = params.get('ns') ?? mintNamespace();
   }
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
+  sNsNew.addEventListener('click', () => {
+    autoNamespace = mintNamespace();
+    sNs.value = autoNamespace;
+  });
   cancelBtn.addEventListener('click', () => { abortModalDiscovery(); backdrop.classList.remove('visible'); });
   backdrop.addEventListener('click', (e) => {
     if (e.target === backdrop) { abortModalDiscovery(); backdrop.classList.remove('visible'); }
@@ -187,10 +222,11 @@ const namespace = params.get('ns') ?? mintNamespace();
     const np = new URLSearchParams();
     const url = sUrl.value.trim();
     const ns = sNs.value.trim();
-    if (url) np.set('url', url);
-    if (ns) np.set('ns', ns);
+    if (url && url !== DEFAULT_RELAY) np.set('url', url);
+    if (ns && ns === autoNamespace) storageSet(() => sessionStorage, AUTO_NAMESPACE_KEY, ns);
+    else if (ns) np.set('ns', ns);
     if (sHash.value.trim()) np.set('hash', sHash.value.trim());
-    if (sVersion.value) np.set('v', sVersion.value);
+    if (sVersion.value && sVersion.value !== String(DEFAULT_DRAFT)) np.set('v', sVersion.value);
     if (sCc.value) np.set('congestionControl', sCc.value);
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
@@ -202,8 +238,11 @@ const namespace = params.get('ns') ?? mintNamespace();
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked) np.set('audioDatagram', '1');
+    // The dialog showed URL overrides too, so they are saved and the URL drops
+    // them; where storage is refused, the URL carries them instead.
     const qs = np.toString();
-    window.location.href = window.location.pathname + (qs ? '?' + qs : '');
+    const saved = storageSet(() => localStorage, SETTINGS_KEY, qs || null);
+    window.location.assign(window.location.pathname + (!saved && qs ? '?' + qs : ''));
   });
 }
 
@@ -449,9 +488,10 @@ function logSnapshot(): void {
     + (p.endedTracks.length ? ` ended=[${p.endedTracks.join(',')}]` : ''));
 }
 
-// The namespace is minted per load, so the log is the only durable record of
-// which one a soak ran on. Echo the whole configuration before anything starts.
-log(`Namespace: ${namespace}`);
+// The log is the durable record of what a soak ran with: echo the whole
+// configuration before anything starts.
+log(`Namespace: ${namespace}${namedNamespace === null ? ' (this tab)' : ''}`);
+log(`Settings: ${params.toString() || 'defaults'}`);
 log(`Relay: ${params.get('url') ?? `${DEFAULT_RELAY} (default)`}`);
 setText('conn-relay', params.get('url') ?? DEFAULT_RELAY);
 setText('conn-ns', namespace);
@@ -712,8 +752,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     // behavior binds to the NEGOTIATED draft (connection.draftVersion after
     // connect), not the configured preference.
     openSession: async (ctx: AttemptResources) => {
-      // The settings dialog writes its value back to ?url=, so the param covers
-      // both ways of naming a relay; absent either, use ours.
       const relayUrl = params.get('url') ?? DEFAULT_RELAY;
       ctx.throwIfCancelled();
       resolvedRelayUrl = relayUrl;

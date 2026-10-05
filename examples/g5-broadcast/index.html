@@ -328,15 +328,18 @@
   <div id="settings-backdrop" class="modal-backdrop">
     <div class="modal">
       <h2>Broadcast settings</h2>
-      <div class="lede">Applying reloads the page with these as URL parameters.</div>
+      <div class="lede">Saved in this browser and applied on reload. A URL parameter of the same name overrides a saved value.</div>
 
       <label for="s-url">Relay URL</label>
       <input id="s-url" type="text" placeholder="default: moqx-main">
       <div class="hint">WebTransport MoQT endpoint.</div>
 
       <label for="s-ns">Namespace</label>
-      <input id="s-ns" type="text" placeholder="auto-generated">
-      <div class="hint">Auto-generated per tab; kept across reloads.</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="s-ns" type="text" placeholder="auto (one per tab)" style="flex:1;min-width:0">
+        <button id="s-ns-new" type="button" title="Mint a new automatic namespace; the viewer link changes">New</button>
+      </div>
+      <div class="hint">Blank or automatic: one per tab, kept across reloads and Stop/Start. A typed name is saved.</div>
 
       <label for="s-version">Draft version</label>
       <select id="s-version">
@@ -379,9 +382,9 @@
       <label for="s-target">Target playback latency (ms)</label>
       <input id="s-target" type="number" min="1" placeholder="200">
 
-      <label for="s-catalog-interval">catalog retransmit interval (ms)</label>
+      <label for="s-catalog-interval">Catalog refresh interval (ms)</label>
       <input id="s-catalog-interval" type="number" min="0" placeholder="draft default">
-      <div class="hint">0 = no retransmit. Default: none on draft-18, where viewers FETCH the catalog; 1000 on draft-14/16.</div>
+      <div class="hint">0 = never re-sent. Default: none on draft-18, where viewers FETCH the catalog; 1000 on draft-14/16.</div>
 
       <label for="s-hash">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)">
