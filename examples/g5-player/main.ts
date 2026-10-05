@@ -426,7 +426,12 @@ async function main(): Promise<void> {
   /** CMAF: each SourceBuffer's ranges, which the element's combined range can hide. */
   const describeBuffers = (): string => {
     const text = (player as any).engine?.mediaSource?.describeBuffers?.() as string | undefined;
-    return text ? ` · ${text}` : '';
+    return text ? ` · ${text}${audioOrderNote()}` : '';
+  };
+  /** CMAF audio decode-order repair so far (CmafAssembler.audioOrderStats). */
+  const audioOrderNote = (): string => {
+    const o = (player as any).engine?.cmafAssembler?.audioOrderStats;
+    return o ? ` · audio order restored/missing/late ${o.restored}/${o.missing}/${o.late}` : '';
   };
   player.on('stall', ({ durationMs }) => {
     const video = watchVideo();
@@ -610,6 +615,7 @@ async function main(): Promise<void> {
   const emptyUnderrunWindow = () => ({ count: 0, late: 0, onTime: 0, gapSec: 0, worstLateSec: 0 });
   let underrunWindow = emptyUnderrunWindow();
   let underrunReportAtMs = 0;
+  let audioOrderReported = '';
   const noteUnderrun = (gapSec: number, lateSec: number | null): void => {
     underrunWindow.count++;
     underrunWindow.gapSec += gapSec;
@@ -1147,6 +1153,11 @@ async function main(): Promise<void> {
     if (tickNowMs - underrunReportAtMs >= UNDERRUN_REPORT_MS) {
       underrunReportAtMs = tickNowMs;
       reportCompat();
+      const order = audioOrderNote();
+      if (order && order !== audioOrderReported && !order.endsWith(' 0/0/0')) {
+        audioOrderReported = order;
+        log(`CMAF${order}`);
+      }
       const u = underrunWindow;
       if (u.count > 0) {
         const lagNow = Math.max(0, ...lagSamples.map(([, d]) => d));
