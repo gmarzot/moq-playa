@@ -30,8 +30,12 @@ function recordingConnection() {
   const largests: Array<{ group: bigint; object: bigint } | undefined> = [];
   /** Joining Location per subscription request, as the adapter would have saved it. */
   const joiningLocations = new Map<bigint, { group: bigint; object: bigint }>();
+  /** [requestId, statusCode] of every PUBLISH_DONE. */
+  const dones: Array<[bigint, bigint]> = [];
   let nextStream = 100n;
-  const recorded = { calls, accepted, sends, groups, fetchOk, fetchErrors, fetchObjects, largests, joiningLocations };
+  const recorded = {
+    calls, accepted, sends, groups, fetchOk, fetchErrors, fetchObjects, largests, joiningLocations, dones,
+  };
   const conn: BroadcastSessionConnection & typeof recorded = {
     ...recorded,
     acceptSubscribe: async (requestId, alias, options) => {
@@ -49,7 +53,10 @@ function recordingConnection() {
     },
     sendObject: async (_sid, _oid, payload) => { calls.push('sendObject'); sends.push(payload); },
     closeSubgroup: async () => { calls.push('closeSubgroup'); },
-    publishDone: async () => { calls.push('publishDone'); },
+    publishDone: async (requestId, statusCode) => {
+      calls.push('publishDone');
+      dones.push([requestId as bigint, statusCode as bigint]);
+    },
     close: async () => { calls.push('close'); },
     acceptFetch: async (_rid, options) => { calls.push('acceptFetch'); fetchOk.push(options?.endLocation); },
     rejectFetch: async (_rid, code, reason) => { calls.push('rejectFetch'); fetchErrors.push({ code, reason }); },
@@ -828,6 +835,48 @@ describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
       expect(conn.groups).toEqual([5_000n, 5_001n]);
     } finally {
       now.mockRestore();
+    }
+  });
+});
+
+describe('BroadcastSession — ending its subscriptions (§10.11)', () => {
+  it('ends every accepted subscription with PUBLISH_DONE TRACK_ENDED and stops production', async () => {
+    const conn = recordingConnection();
+    const { session, lines } = fetchSession(conn);
+    session.handleSubscribe(1n, 'catalog');
+    session.handleSubscribe(3n, 'video');
+    session.handleSubscribe(5n, 'audio');
+    await settle();
+    expect(session.publisher.videoAliasArmed).not.toBeNull();
+
+    await session.endSubscriptions();
+    expect(conn.dones.sort((a, b) => Number(a[0] - b[0]))).toEqual([[1n, 2n], [3n, 2n], [5n, 2n]]);
+    expect(session.publisher.videoAliasArmed).toBeNull();
+    expect(session.publisher.audioAliasArmed).toBeNull();
+    expect(session.trackStatus('video')).toEqual({ state: 'none', ended: 'PUBLISH_DONE TRACK_ENDED reqId=3' });
+    expect(lines).toContain('PUBLISH_DONE TRACK_ENDED on 3 subscription(s)');
+
+    // Nothing left to end.
+    await session.endSubscriptions();
+    expect(conn.dones).toHaveLength(3);
+  });
+
+  it('a PUBLISH_DONE that never settles cannot stall the caller', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      conn.publishDone = () => new Promise<void>(() => { /* never settles */ });
+      const { session } = fetchSession(conn);
+      session.handleSubscribe(3n, 'video');
+      await vi.advanceTimersByTimeAsync(0);
+      let done = false;
+      void session.endSubscriptions(200).then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(199);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

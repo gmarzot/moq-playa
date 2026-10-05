@@ -43,6 +43,10 @@ const CATALOG_PRIORITY = 128;
 const GROUP_ORDER_PARAM = 0x22n;
 /** SUBSCRIBE_OK / REQUEST_UPDATE_OK parameter carrying the Largest Location (§10.2.11). */
 const LARGEST_OBJECT_PARAM = 0x09n;
+/** PUBLISH_DONE TRACK_ENDED, "the track is no longer being published" (§10.11);
+ *  0x2 in the draft-18 and the draft-14/16 tables alike. */
+const TRACK_ENDED = 0x2n;
+const END_SUBSCRIPTIONS_MS = 500;
 
 export interface BroadcastSessionOptions {
   catalog: BroadcastCatalogParams;
@@ -397,6 +401,39 @@ export class BroadcastSession {
       this.safeLog(`catalog: FETCH reqId=${requestId} failed: ${(err as Error)?.message ?? err}`);
     });
     this.trackWork(work);
+  }
+
+  /**
+   * End every accepted subscription with PUBLISH_DONE TRACK_ENDED (§10.11):
+   * production stops first, then the terminals go out, bounded together. A
+   * relay passes them on to its viewers and drops its upstream state, so a
+   * later broadcast under the same namespace starts clean.
+   */
+  async endSubscriptions(timeoutMs = END_SUBSCRIPTIONS_MS): Promise<void> {
+    if (this.retired) return;
+    this.stopCatalogReemission();
+    const ends: Array<Promise<unknown>> = [];
+    for (const [track, requestId] of [...this.currentRequest]) {
+      this.currentRequest.delete(track);
+      this.subscribedTrack.delete(requestId);
+      const accepted = this.aliasOf.delete(requestId);
+      this.forwardOf.delete(requestId);
+      if (track === 'video' || track === 'audio') this.publisher.endTrack(track);
+      if (track === 'catalog') this.catalogAlias = null;
+      if (!accepted) continue;
+      this.endedReason.set(track, `PUBLISH_DONE TRACK_ENDED reqId=${requestId}`);
+      ends.push(this.connection.publishDone(
+        this.wrapInt(requestId), this.wrapInt(TRACK_ENDED), 'broadcast stopped',
+      ).catch(() => {}));
+    }
+    if (ends.length === 0) return;
+    this.safeLog(`PUBLISH_DONE TRACK_ENDED on ${ends.length} subscription(s)`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all(ends),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+    clearTimeout(timer);
   }
 
   /**

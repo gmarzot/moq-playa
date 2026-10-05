@@ -837,19 +837,23 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     },
 
     // 4. Announce namespace
-    publishNamespace: async (ctx: AttemptResources) => {
+    publishNamespace: async (ctx: AttemptResources, session: BroadcastSession) => {
       const enc = new TextEncoder();
       const nsBytes = namespace.split('/').map(p => enc.encode(p));
       log(`Sending PUBLISH_NAMESPACE for [${namespace}]...`);
       const nsConn = connection!;
       const nsRid = await nsConn.publishNamespace(nsBytes);
-      // Disposed before the session (LIFO): Stop and reconnect withdraw the
-      // namespace through the protocol, so the relay drops the registration
-      // instead of holding it for a timeout. Bounded: a dead session must not stall Stop.
-      ctx.adopt(nsRid, (rid) => Promise.race([
-        nsConn.publishNamespaceDone(rid).catch(() => {}),
-        new Promise<void>((resolve) => setTimeout(resolve, NS_WITHDRAW_MS)),
-      ]));
+      // Disposed before the session (LIFO): Stop and reconnect end each
+      // subscription with PUBLISH_DONE, then withdraw the namespace, so the
+      // relay drops its state through the protocol instead of holding it for a
+      // timeout. Bounded: a dead session must not stall Stop.
+      ctx.adopt(nsRid, async (rid) => {
+        await session.endSubscriptions();
+        await Promise.race([
+          nsConn.publishNamespaceDone(rid).catch(() => {}),
+          new Promise<void>((resolve) => setTimeout(resolve, NS_WITHDRAW_MS)),
+        ]);
+      });
       nsRequestId = String(nsRid);
       nsBadgeState = { tone: 'wait', detail: `PUBLISH_NAMESPACE reqId=${nsRid} sent; awaiting the relay's reply` };
       ctx.throwIfCancelled();
