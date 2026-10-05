@@ -87,7 +87,17 @@ export class WebAudioOutput implements AudioOutputLike {
 
   /** Buffers that arrived after the chain had already run dry (silent gap). */
   private _underrunCount = 0;
+  /** Silence the underruns left (s). */
+  private _underrunGapSec = 0;
   private hasScheduled = false;
+
+  /**
+   * Each underrun: the silence it left (s), and how late the buffer that
+   * ended it was against its capture-aligned slot (s). Negative lateness
+   * means that buffer was on time and audio before it never arrived.
+   * Null lateness: no sync reference yet.
+   */
+  onUnderrun: ((gapSec: number, lateSec: number | null) => void) | null = null;
 
   private maxAheadSec: number;
   private targetAheadSec: number;
@@ -103,6 +113,11 @@ export class WebAudioOutput implements AudioOutputLike {
 
   get underrunCount(): number {
     return this._underrunCount;
+  }
+
+  /** Total silence left by underruns (s). */
+  get underrunGapSec(): number {
+    return this._underrunGapSec;
   }
 
   /** Last measured lead of the chain behind its capture-aligned schedule (s). */
@@ -282,6 +297,11 @@ export class WebAudioOutput implements AudioOutputLike {
       this._underrunCount++;
       this._chasing = false;
       startTime = alignedTime !== null ? Math.max(alignedTime, now) : now + this.playbackDelaySec;
+      const gapSec = startTime - this.nextScheduledTime;
+      this._underrunGapSec += gapSec;
+      try {
+        this.onUnderrun?.(gapSec, alignedTime !== null ? now - alignedTime : null);
+      } catch { /* an observer must not break playout */ }
     } else if (alignedTime !== null) {
       // After stall — jump to sync-aligned position + playback delay
       startTime = Math.max(alignedTime, now);

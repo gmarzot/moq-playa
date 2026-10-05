@@ -509,7 +509,14 @@ async function main(): Promise<void> {
       // Queue depths are on the queued chart; this row is facts and fault counts.
       ...(locPath ? [
         cell('resyncs', fmtCount(syncResets), '', FAULT(syncResets)),
-        cell('underruns', fmtCount(s.audioUnderruns ?? 0), '', FAULT(s.audioUnderruns ?? 0)),
+        // Count, then the silence they left.
+        cell('underruns', fmtCount(s.audioUnderruns ?? 0),
+          `${((player as any).audioOutput?.underrunGapSec ?? 0).toFixed(1)}s`,
+          FAULT(s.audioUnderruns ?? 0)),
+        // Audio's own arrival latency: its tail, not video's, sets how much
+        // audio queue a target leaves room for.
+        cell('audio p50/p99',
+          audioLatPct ? `${audioLatPct[0].toFixed(0)}/${audioLatPct[2].toFixed(0)}` : '—', 'ms', NUM),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
         cell('late/snap',
           `${fmtCount((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)}`
@@ -562,6 +569,27 @@ async function main(): Promise<void> {
   const latTickMaxSamples: number[] = [];
   /** Worst raw latency since the previous tick. */
   let tickWorstRawMs = -Infinity;
+  /** Audio arrival latency, kept like latWindow: its tail is what the audio queue must absorb. */
+  const audioLatWindow: Array<[number, number]> = [];
+  /** Audio arrival p50/p95/p99 over the window, drift-corrected. */
+  let audioLatPct: [number, number, number] | null = null;
+  /** Underruns since the last report: buffers late past their slot, buffers on
+   *  time after missing audio, silence, and the worst lateness. */
+  const UNDERRUN_REPORT_MS = 10_000;
+  const emptyUnderrunWindow = () => ({ count: 0, late: 0, onTime: 0, gapSec: 0, worstLateSec: 0 });
+  let underrunWindow = emptyUnderrunWindow();
+  let underrunReportAtMs = 0;
+  const noteUnderrun = (gapSec: number, lateSec: number | null): void => {
+    underrunWindow.count++;
+    underrunWindow.gapSec += gapSec;
+    if (lateSec === null) return;
+    if (lateSec > 0) {
+      underrunWindow.late++;
+      underrunWindow.worstLateSec = Math.max(underrunWindow.worstLateSec, lateSec);
+    } else {
+      underrunWindow.onTime++;
+    }
+  };
   const jitSamples: number[] = [];
   // Per-track queued media ahead of the playhead, one sample per tick.
   const queuedASamples: number[] = [];
@@ -802,6 +830,10 @@ async function main(): Promise<void> {
       lastArrivalMs[e.mediaType as 'video' | 'audio'] = performance.now();
     }
     noteObject(e);
+    if (e.mediaType === 'audio' && e.kind === 'data' && e.captureTimestamp && e.captureTimestamp > 0n) {
+      const audioLatencyMs = Date.now() - Number(e.captureTimestamp) / 1000;
+      if (Math.abs(audioLatencyMs) < 120_000) audioLatWindow.push([performance.now(), audioLatencyMs]);
+    }
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
     const arrivalMs = performance.now();
@@ -1034,6 +1066,10 @@ async function main(): Promise<void> {
     const driftCorrectionMs = drift?.correctionMs ?? 0;
     const latVals = driftCorrectionMs
       ? latRaw.map((v) => v - driftCorrectionMs) : latRaw;
+    while (audioLatWindow.length && tickNowMs - audioLatWindow[0]![0] > LAT_WINDOW_MS) audioLatWindow.shift();
+    const audioLat = audioLatWindow.map(([, v]) => v - driftCorrectionMs);
+    audioLatPct = audioLat.length
+      ? [percentile(audioLat, 0.5), percentile(audioLat, 0.95), percentile(audioLat, 0.99)] : null;
     // Every series takes a value on every sampled tick, NaN where there is
     // nothing to report, so all of them index the same sample times.
     if (sampling) {
@@ -1069,6 +1105,21 @@ async function main(): Promise<void> {
     // to the target anyway, so it is not shown; rate and chase state are.
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
     const audioOut = (player as any).audioOutput;
+    if (audioOut && audioOut.onUnderrun === null) audioOut.onUnderrun = noteUnderrun;
+    if (tickNowMs - underrunReportAtMs >= UNDERRUN_REPORT_MS) {
+      underrunReportAtMs = tickNowMs;
+      const u = underrunWindow;
+      if (u.count > 0) {
+        const lagNow = Math.max(0, ...lagSamples.map(([, d]) => d));
+        const pct = audioLatPct ? audioLatPct.map((v) => v.toFixed(0)).join('/') : '—';
+        log(`Audio underruns in ${UNDERRUN_REPORT_MS / 1000}s: ${u.count}, `
+          + `${(u.gapSec * 1000).toFixed(0)} ms silent · ${u.late} late `
+          + `(worst ${(u.worstLateSec * 1000).toFixed(0)} ms past its slot) · `
+          + `${u.onTime} on time after missing audio · `
+          + `audio arrival p50/p95/p99 ${pct} ms · lag ${lagNow.toFixed(0)} ms`);
+      }
+      underrunWindow = emptyUnderrunWindow();
+    }
     // Own strings only — no remote input reaches this, so markup is safe here.
     // One label for one concept: playout sped up to shed latency. CMAF does it
     // with the video element's playbackRate, LOC inside WebAudioOutput where
