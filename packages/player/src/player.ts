@@ -7746,7 +7746,8 @@ export class MoqtPlayer {
    * full resubscribe within the same attempt. Attempts ≥2: full
    * resubscribe directly. Bounded by livenessMaxRestarts with exponential
    * backoff; the budget resets after livenessHealthyResetMs of health.
-   * Exhausted → fatal MEDIA_STARVED (the application layer reconnects).
+   * Exhausted → fatal MEDIA_STARVED (the application layer reconnects), or
+   * with followNamespace a degraded MEDIA_STARVED and a wait for the publisher.
    */
   private async handleTrackStarvation(
     track: LivenessTrack,
@@ -7818,7 +7819,9 @@ export class MoqtPlayer {
         }
       }
 
-      if (this.livenessLadderMayContinue(restart)) {
+      if (this.livenessLadderMayContinue(restart) && this.config.followNamespace) {
+        await this.waitForStarvedTrack(track, restart);
+      } else if (this.livenessLadderMayContinue(restart)) {
         this.emitError(createPlayerError(
           'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
           `Media delivery starved: ${track.mediaType} "${track.trackName}" — ` +
@@ -7832,6 +7835,48 @@ export class MoqtPlayer {
       }
     } finally {
       restart.active = false;
+    }
+  }
+
+  /**
+   * followNamespace: an exhausted ladder waits for the publisher instead of
+   * failing. The track is resubscribed every 2 × livenessTimeoutMs (a wait,
+   * then a probe) until media returns; a namespace withdrawn and published
+   * again re-establishes the session meanwhile.
+   */
+  private async waitForStarvedTrack(
+    track: LivenessTrack,
+    restart: { attempts: number; cancelled: boolean },
+  ): Promise<void> {
+    const timeoutMs = this.config.livenessTimeoutMs!;
+    this.emitError(createPlayerError(
+      'degraded', 'connection', PlayerErrorCode.MEDIA_STARVED,
+      `Media delivery starved: ${track.mediaType} "${track.trackName}" — `
+      + `${this.config.livenessMaxRestarts} restart attempts failed; waiting for the publisher, `
+      + `resubscribing every ${Math.round((2 * timeoutMs) / 1000)}s`,
+      { context: { mediaType: track.mediaType, trackName: track.trackName } },
+    ));
+    while (this.livenessLadderMayContinue(restart)) {
+      await this.livenessSleep(timeoutMs, restart);
+      if (!this.livenessLadderMayContinue(restart)) return;
+      const attemptStartMs = performance.now();
+      restart.attempts++;
+      this.emitter.emit('recovery_action', {
+        type: 'recovery_action',
+        action: {
+          type: 'track_restart',
+          mediaType: track.mediaType,
+          trackName: track.trackName,
+          attempt: restart.attempts,
+        },
+      });
+      this.flushForLivenessRestart(track);
+      this.fullResubscribeForLiveness(track);
+      if (await this.waitForTrackArrival(track, attemptStartMs, timeoutMs, restart)) {
+        this.log.info('Liveness: %s "%s" recovered while waiting (attempt %d)',
+          track.mediaType, track.trackName, restart.attempts);
+        return;
+      }
     }
   }
 

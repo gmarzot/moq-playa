@@ -238,6 +238,38 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('followNamespace: an exhausted ladder waits, keeps resubscribing, and recovers when media returns', async () => {
+    const adapter = createMockAdapter();
+    adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+    const { player } = await startPlaying(adapter, { followNamespace: true });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    feedVideo(adapter); // arm, then silence
+    await vi.waitFor(() => {
+      expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true);
+    }, { timeout: 3_000 });
+    const starved = errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED);
+    expect(starved.severity).toBe('degraded');
+    expect(player.state).toBe(PlayerState.PLAYING);
+
+    // Still resubscribing after the ladder ran out.
+    const subscribesAtWait = adapter.subscribe.mock.calls.length;
+    await vi.waitFor(() => expect(adapter.subscribe.mock.calls.length).toBeGreaterThan(subscribesAtWait),
+      { timeout: 2_000 });
+
+    // Media returns on the newest subscription; no fatal follows.
+    const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: newReqId, groupId: varint(5), subgroupId: varint(0),
+      objectId: varint(0), payload: new Uint8Array([0xcc]),
+    } as MoqtObject);
+    await sleep(200);
+    expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED && e.severity === 'fatal')).toBe(false);
+    expect(player.state).toBe(PlayerState.PLAYING);
+    await player.destroy();
+  });
+
   it('a data-stream reset shortens the fuse — starvation fires long before the full timeout', async () => {
     const adapter = createMockAdapter();
     // Full timeout far away (5s): only the reset fuse (40ms) can fire below.

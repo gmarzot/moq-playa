@@ -509,7 +509,8 @@ export interface RecoveryConfig {
 
   /**
    * Maximum delivery-restart attempts per starvation incident before
-   * escalating to a fatal MEDIA_STARVED error. Default: 3.
+   * escalating to a fatal MEDIA_STARVED error; with followNamespace, to a
+   * degraded one and a slow resubscribe until media returns. Default: 3.
    */
   readonly livenessMaxRestarts?: number;
 
