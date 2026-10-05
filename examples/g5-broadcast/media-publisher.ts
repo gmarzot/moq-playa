@@ -92,9 +92,12 @@ export interface AnchorReport {
 export interface DriftReport {
   /** Wall-clock time since the first chunk was anchored. */
   readonly elapsedMs: number;
-  /** Null for a track with no chunk in the period. */
+  /** Stamp drift after the clock follow; null for a track with no chunk in the period. */
   readonly videoUs: number | null;
   readonly audioUs: number | null;
+  /** Wall-clock divergence from the monotonic clock carried into the stamps
+   *  since the anchor; null when not following. */
+  readonly followUs: number | null;
 }
 
 export interface MediaPublisherOptions {
@@ -114,6 +117,13 @@ export interface MediaPublisherOptions {
    * no performance timeline. Injectable for tests. Default `performance.timeOrigin`.
    */
   timeOriginUs?: () => number | null;
+  /**
+   * The monotonic clock the capture timestamps keep, in epoch microseconds
+   * (`performance.timeOrigin + performance.now()`). Its divergence from
+   * {@link wallClockUs} is carried into the stamps; null disables that.
+   * Default: the performance clock, or null when `wallClockUs` is injected.
+   */
+  monotonicNowUs?: () => number | null;
   /** Called once per track, after ANCHOR_SETTLE_OBSERVATIONS chunks, with the
    *  anchor measured against the best offset seen. */
   onAnchor?: (report: AnchorReport) => void;
@@ -175,15 +185,23 @@ export class MediaPublisher {
   /** Observations per track before the anchor's error is reported. */
   private static readonly ANCHOR_SETTLE_OBSERVATIONS = 60;
   private readonly timeOriginUs: () => number | null;
+  private readonly monotonicNowUs: () => number | null;
   private readonly onAnchor: ((report: AnchorReport) => void) | null;
   /**
    * Offset from each track's WebCodecs timestamp base to the wall clock, set at the
    * track's first chunk. Fixed, because the stamps' spacing is the media timeline the
    * receiver paces on; per track, because Chrome's video and audio bases are unrelated
    * (boot-relative vs context-relative). The first chunk's delay is banked; see AnchorReport.
+   * Only the wall clock's divergence from the monotonic clock is added later.
    */
   private videoTsOffsetUs: number | null = null;
   private audioTsOffsetUs: number | null = null;
+  /** Smoothed wall − monotonic clock gap, averaging out Date.now()'s 1 ms grain. */
+  private clockGapUs: number | null = null;
+  /** clockGapUs at each track's anchor. */
+  private videoGapAtAnchorUs: number | null = null;
+  private audioGapAtAnchorUs: number | null = null;
+  private static readonly CLOCK_GAP_SMOOTHING = 0.02;
   /** Lowest `now - timestamp` seen per track: the anchor we could have had. */
   private readonly minObservedUs = new Map<string, number>();
   private readonly anchorObservations = new Map<string, number>();
@@ -266,6 +284,10 @@ export class MediaPublisher {
     this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.timeOriginUs = options.timeOriginUs
       ?? (() => (typeof performance === 'undefined' ? null : performance.timeOrigin * 1000));
+    this.monotonicNowUs = options.monotonicNowUs
+      ?? (options.wallClockUs !== undefined || typeof performance === 'undefined'
+        ? () => null
+        : () => (performance.timeOrigin + performance.now()) * 1000);
     this.onAnchor = options.onAnchor ?? null;
     if (options.driftReportMs !== undefined
         && !(Number.isFinite(options.driftReportMs) && options.driftReportMs >= 0)) {
@@ -615,17 +637,39 @@ export class MediaPublisher {
    */
   private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
     const key = track === 'video' ? 'videoTsOffsetUs' : 'audioTsOffsetUs';
+    const gapKey = track === 'video' ? 'videoGapAtAnchorUs' : 'audioGapAtAnchorUs';
     const nowUs = this.wallClockUs();
+    const gapUs = this.updateClockGap(nowUs);
     const observed = nowUs - timestampUs;
-    this[key] ??= observed;
+    if (this[key] === null) {
+      this[key] = observed;
+      this[gapKey] = gapUs;
+    }
+    // Capture timestamps keep the monotonic clock; receivers compare stamps with
+    // their wall clock. Carry the clocks' divergence since this track's anchor.
+    const anchorGap = this[gapKey];
+    const followUs = gapUs !== null && anchorGap !== null ? gapUs - anchorGap : null;
     this.observeAnchor(track, observed);
-    this.observeDrift(track, observed, nowUs);
-    return BigInt(Math.round(timestampUs + this[key]));
+    this.observeDrift(track, observed - (followUs ?? 0), nowUs, followUs);
+    return BigInt(Math.round(timestampUs + this[key]! + (followUs ?? 0)));
   }
 
-  /** Keep each track's lowest `now - timestamp` per period and report it
+  /** Smoothed wall − monotonic gap, or null without a monotonic clock. */
+  private updateClockGap(nowUs: number): number | null {
+    const monoUs = this.monotonicNowUs();
+    if (monoUs === null) return null;
+    const rawUs = nowUs - monoUs;
+    this.clockGapUs = this.clockGapUs === null
+      ? rawUs
+      : this.clockGapUs + (rawUs - this.clockGapUs) * MediaPublisher.CLOCK_GAP_SMOOTHING;
+    return this.clockGapUs;
+  }
+
+  /** Keep each track's lowest `now - stamp` per period and report it
    *  against the track's anchor when the period ends. */
-  private observeDrift(track: 'video' | 'audio', observedUs: number, nowUs: number): void {
+  private observeDrift(
+    track: 'video' | 'audio', observedUs: number, nowUs: number, followUs: number | null,
+  ): void {
     if (!this.onDrift || this.driftReportMs <= 0) return;
     if (this.driftStartUs === null) {
       this.driftStartUs = nowUs;
@@ -644,6 +688,7 @@ export class MediaPublisher {
       elapsedMs: (nowUs - this.driftStartUs) / 1000,
       videoUs: drift('video'),
       audioUs: drift('audio'),
+      followUs,
     };
     this.driftPeriodMin.clear();
     this.driftPeriodStartUs = nowUs;

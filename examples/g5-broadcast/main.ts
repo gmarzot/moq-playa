@@ -779,9 +779,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
             + (timeOriginDeltaUs === undefined ? ''
               : `, ${(timeOriginDeltaUs / 1000).toFixed(1)}ms from timeOrigin`)),
           // Each track's capture clock against the wall clock, per minute.
-          onDrift: ({ elapsedMs, videoUs, audioUs }) => {
+          onDrift: ({ elapsedMs, videoUs, audioUs, followUs }) => {
             log(`Capture drift at ${(elapsedMs / 60_000).toFixed(1)} min: `
-              + `sent ${describeDrift(videoUs, audioUs)} · ${takeCaptureDrift()}`);
+              + `sent ${describeDrift(videoUs, audioUs)} · ${takeCaptureDrift()}`
+              + (followUs !== null ? ` · wall-clock follow ${driftMs(followUs)}` : ''));
           },
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
           onStatus: (track, message) => log(`${track}: ${message}`),

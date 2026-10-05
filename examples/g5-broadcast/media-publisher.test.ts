@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { AnchorReport } from './media-publisher.js';
+import type { AnchorReport, DriftReport } from './media-publisher.js';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
 import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
@@ -949,7 +949,7 @@ describe('MediaPublisher — relay Forward State changes', () => {
 describe('MediaPublisher — capture clock drift', () => {
   it('reports each track\'s drift against its anchor once per period', async () => {
     let wallUs = 1_700_000_000_000_000;
-    const reports: Array<{ elapsedMs: number; videoUs: number | null; audioUs: number | null }> = [];
+    const reports: DriftReport[] = [];
     const pub = makePublisher(recordingConnection(), {
       draft: 18,
       wallClockUs: () => wallUs,
@@ -967,7 +967,56 @@ describe('MediaPublisher — capture clock drift', () => {
     expect(reports).toHaveLength(2);
     // The first period includes the anchoring chunk; the second starts at
     // frame 11, where the stamps are 110 µs behind.
-    expect(reports[1]).toEqual({ elapsedMs: 20, videoUs: 110, audioUs: null });
+    expect(reports[1]).toEqual({ elapsedMs: 20, videoUs: 110, audioUs: null, followUs: null });
+  });
+
+  it('carries the wall clock\'s divergence from the monotonic clock into both tracks\' stamps', async () => {
+    const conn = recordingConnection();
+    const epoch = 1_700_000_000_000_000;
+    let monoUs = epoch;
+    let wallUs = epoch;
+    const pub = makePublisher(conn, {
+      draft: 18, wallClockUs: () => wallUs, monotonicNowUs: () => monoUs,
+    });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    // Both tracks keep the monotonic clock, from unrelated bases; after the
+    // anchor the wall clock runs 2 ms ahead of it.
+    for (let k = 0; k < 400; k++) {
+      monoUs = epoch + k * 20_000;
+      wallUs = monoUs + (k === 0 ? 0 : 2_000);
+      pub.publishVideo(chunk(k), { isKeyframe: k === 0, timestampUs: 500_000_000 + k * 20_000 });
+      pub.publishAudio(chunk(k), { timestampUs: 7_000_000 + k * 20_000 });
+      await settle();
+    }
+    const profile = { wireProfile: locWireProfileForDraft(18) };
+    const last = conn.sends.slice(-2).map((x) => parseLocHeaders(x.extensions!, profile).captureTimestamp!);
+    const expected = epoch + 399 * 20_000 + 2_000;
+    for (const t of last) expect(Math.abs(Number(t) - expected)).toBeLessThanOrEqual(1);
+  });
+
+  it('reports the follow it applied and the drift left after it', async () => {
+    const epoch = 1_700_000_000_000_000;
+    let monoUs = epoch;
+    let wallUs = epoch;
+    const reports: DriftReport[] = [];
+    const pub = makePublisher(recordingConnection(), {
+      draft: 18,
+      wallClockUs: () => wallUs,
+      monotonicNowUs: () => monoUs,
+      driftReportMs: 1_000,
+      onDrift: (r) => reports.push(r),
+    });
+    pub.setVideoAlias(2n);
+    for (let k = 0; k <= 200; k++) {
+      monoUs = epoch + k * 20_000;
+      wallUs = monoUs + (k === 0 ? 0 : 2_000);
+      pub.publishVideo(chunk(k), { isKeyframe: k === 0, timestampUs: k * 20_000 });
+      await settle();
+    }
+    const r = reports.at(-1)!;
+    expect(r.followUs!).toBeGreaterThan(1_900);
+    expect(Math.abs(r.videoUs!)).toBeLessThan(100);
   });
 
   it('a throwing drift sink is reported, not raised', async () => {
