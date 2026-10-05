@@ -53,6 +53,8 @@ export interface PlayerEventMap {
   'session_closed': SessionClosedEvent;
   /** A fresh session will be attempted after `delayMs`. */
   'session_reconnecting': SessionReconnectingEvent;
+  /** The relay answered SETUP: the session is established. */
+  'session_established': Record<string, never>;
   /** A new session took over, after a reconnect or a relay GOAWAY. */
   'session_migrated': Record<string, never>;
   /** The followed namespace changed state at the relay (`followNamespace`). */

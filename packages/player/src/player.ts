@@ -23,7 +23,7 @@
 import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
 import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
-import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
+import type { BootstrapPhase, CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
 import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
 import type {
@@ -1156,6 +1156,11 @@ export class MoqtPlayer {
   }
 
   /** The followed namespace's state, or null when not following (config `followNamespace`). */
+  /** The catalog retrieval step (SUBSCRIBE + Joining FETCH ladder); null in subscribe-only mode. */
+  get catalogBootstrapPhase(): BootstrapPhase | null {
+    return this.catalogBootstrapCoord?.phase ?? null;
+  }
+
   get namespaceState(): NamespaceState | null {
     return this._namespaceState;
   }

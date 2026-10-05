@@ -32,6 +32,6 @@ export type {
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';
-export type { SubscriptionStatus, NamespaceState } from '@moqt/player';
+export type { SubscriptionStatus, NamespaceState, BootstrapPhase } from '@moqt/player';
 export { detectStrategy } from './auto-detect.js';
 export type { DecoderStrategy } from './auto-detect.js';

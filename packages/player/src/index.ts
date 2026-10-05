@@ -56,6 +56,7 @@ export type {
   NamespaceState,
   NamespaceStateEvent,
 } from './events.js';
+export type { BootstrapPhase } from './catalog-bootstrap.js';
 
 // ─── Errors ──────────────────────────────────────────────────────────
 

@@ -259,6 +259,23 @@ async function main(): Promise<void> {
   // SUBSCRIBE_OK, yellow Forward State 0, green objects arriving, red silent.
 
   let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
+  /** The catalog SUBSCRIBE can be accepted long before any catalog arrives. */
+  let catalogArrived = false;
+  let catalogWaitSinceMs: number | null = null;
+  let catalogWaitLogged = false;
+  let lastCatalogPhase: string | null = null;
+  // Catalog retrieval steps worth a log line; the normal join passes through
+  // 'joining' and 'fetching' too briefly to report.
+  const CATALOG_PHASE_TEXT: Record<string, string> = {
+    joining: 'Joining FETCH sent with the SUBSCRIBE',
+    fetching: 'FETCH for the catalog in flight',
+    'empty-wait': 'the relay reported the track empty; waiting on the subscription',
+    'await-first-payload': 'FETCH completed without a catalog; waiting on the subscription',
+    'await-newer-head': 'waiting for a newer catalog group',
+    'fallback-legacy': 'falling back to subscribe-only retrieval',
+    fatal: 'catalog retrieval failed',
+  };
+  const QUIET_CATALOG_PHASES = new Set(['idle', 'joining', 'fetching', 'ready', 'live', 'aborted']);
   // SUB_NS follows the namespace: yellow sent, accepted or withdrawn; green published; red refused.
   let nsBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'SUBSCRIBE_NAMESPACE not sent' };
   const NS_TONE: Record<string, BadgeTone> = {
@@ -284,7 +301,26 @@ async function main(): Promise<void> {
     setBadge(setupBadge, 'SETUP', setupBadgeState.tone, setupBadgeState.detail);
     setBadge(nsBadge, 'SUB_NS', nsBadgeState.tone, nsBadgeState.detail);
     const subs = player.subscriptions;
-    subscriptionBadge(catBadge, subs.find((s) => s.kind === 'catalog'), nowMs);
+    const catSub = subs.find((s) => s.kind === 'catalog');
+    const phase = player.catalogBootstrapPhase;
+    if (!catalogArrived && phase !== null && phase !== lastCatalogPhase) {
+      lastCatalogPhase = phase;
+      if (!QUIET_CATALOG_PHASES.has(phase)) {
+        log(`Catalog retrieval: ${CATALOG_PHASE_TEXT[phase] ?? phase}`);
+      }
+    }
+    if (catSub?.established && catSub.forward && !catalogArrived) {
+      catalogWaitSinceMs ??= nowMs;
+      const step = phase === null ? 'subscribe-only' : (CATALOG_PHASE_TEXT[phase] ?? phase);
+      if (!catalogWaitLogged && nowMs - catalogWaitSinceMs > 5_000) {
+        catalogWaitLogged = true;
+        log(`No catalog 5s after SUBSCRIBE_OK (${step})`);
+      }
+      setBadge(catBadge, 'FWD 1', 'wait',
+        `SUBSCRIBE reqId=${catSub.requestId} · Forward State 1, but no catalog yet: ${step}`);
+    } else {
+      subscriptionBadge(catBadge, catSub, nowMs);
+    }
     for (const el of catTracks.querySelectorAll<HTMLElement>('.badge[data-track]')) {
       subscriptionBadge(el, subs.find((s) => s.kind !== 'catalog' && s.trackName === el.dataset['track']), nowMs);
     }
@@ -399,6 +435,9 @@ async function main(): Promise<void> {
   player.on('namespace_state', ({ state, detail }) => {
     nsBadgeState = { tone: NS_TONE[state] ?? 'idle', detail };
     if (state === 'published' || state === 'withdrawn' || state === 'refused') log(`SUB_NS: ${detail}`);
+  });
+  player.on('session_established', () => {
+    setupBadgeState = { tone: 'ok', detail: 'SETUP complete: session established' };
   });
   player.on('session_migrated', () => {
     log('Session re-established');
@@ -1132,6 +1171,7 @@ async function main(): Promise<void> {
   let lastCatalogKey = '';
   const catalogKey = (cat: any): string => JSON.stringify({ ...cat, generatedAt: undefined });
   player.on('catalog_received', ({ catalog }) => {
+    catalogArrived = true;
     lastCatalogKey = catalogKey(catalog);
     log(`Catalog received: ${catalog?.tracks?.length ?? 0} track(s)`);
     renderCatalog(catalog);
