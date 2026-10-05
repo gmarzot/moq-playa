@@ -1129,16 +1129,17 @@ async function main(): Promise<void> {
       ? `rate: <b${chaseRate > 1 ? '' : ' class="idle"'}>${chaseRate.toFixed(2)}x</b>`
       : '';
 
-    // A large queue with an idle chase is a contradiction: the controller acts on
-    // its own `lead`, which the panel cannot see. Log both together when they
-    // disagree — lead null means alignedTime was null, so no chase or snap could
-    // have run at all.
+    // The chase acts on `lead`, which the panel cannot see; the queue also holds
+    // the cushion and output buffering, so it alone is no contradiction. Log a
+    // lead above the target with the chase idle, or a large queue with no lead
+    // at all (alignedTime null: no chase or snap could have run).
     if (audioOut && targetLatencyMs > 0) {
       const qMs = audioOut.scheduledAheadSec * 1000;
-      if (qMs > targetLatencyMs * 2 && !audioOut.chasing
-          && tickNowMs - lastChaseNoteMs > 5_000) {
+      const leadSec = audioOut.captureLeadSec;
+      const contradiction = leadSec === null
+        ? qMs > targetLatencyMs * 2 : leadSec * 1000 > targetLatencyMs;
+      if (contradiction && !audioOut.chasing && tickNowMs - lastChaseNoteMs > 5_000) {
         lastChaseNoteMs = tickNowMs;
-        const leadSec = audioOut.captureLeadSec;
         const lagNow = Math.max(0, ...lagSamples.map(([, d]) => d));
         log(`chase idle: queued=${qMs.toFixed(0)}ms target=${targetLatencyMs}ms `
           + `lead=${leadSec == null ? 'null' : (leadSec * 1000).toFixed(0) + 'ms'} `
@@ -1174,7 +1175,8 @@ async function main(): Promise<void> {
     audioCodec = tracks.find((t) => (t.role ?? t.name) === 'audio')?.codec ?? null;
     // Absent on the --ts path: the live demuxer has no framerate to declare.
     videoFps = Number(videoTrack?.framerate) || null;
-    targetLatencyMs = Math.max(0,
+    // The engine runs at the URL override when one is given.
+    targetLatencyMs = targetLatencyOverrideMs ?? Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
     const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
     // Same header shape as the broadcaster's catalog panel.
