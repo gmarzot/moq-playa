@@ -533,10 +533,6 @@ async function main(): Promise<void> {
         cell('underruns', fmtCount(s.audioUnderruns ?? 0),
           `${((player as any).audioOutput?.underrunGapSec ?? 0).toFixed(1)}s`,
           FAULT(s.audioUnderruns ?? 0)),
-        // Audio's own arrival latency: its tail, not video's, sets how much
-        // audio queue a target leaves room for.
-        cell('audio p50/p99',
-          audioLatPct ? `${audioLatPct[0].toFixed(0)}/${audioLatPct[2].toFixed(0)}` : '—', 'ms', NUM),
         // Why audio underran: dropped late before decode / snapped by the output clamp.
         cell('late/snap',
           `${fmtCount((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)}`
