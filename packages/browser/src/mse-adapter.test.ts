@@ -22,6 +22,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { format } from 'node:util';
 import { MseMediaSource } from './mse-adapter.js';
 import type { MseStartupReport } from './mse-adapter.js';
+import type { TimelineIndex } from './timeline-index.js';
 
 // ─── Shared byte-building helpers (subset from mp4-box.test.ts) ──
 
@@ -77,7 +78,7 @@ function makeSegment(opts: {
     );
 }
 /** Minimal init segment with an mvex/trex for trex-default tests. */
-function makeInit(trackId: number, defaultDur: number): Uint8Array {
+function makeInit(trackId: number, defaultDur: number, timescale?: number): Uint8Array {
     // Wrap moov → mvex → trex. filterInitSegment won't run on a truly
     // minimal init (no trak/vide), so we build a slightly richer one.
     const trex = fullBox('trex', 0, 0, cat(
@@ -92,7 +93,10 @@ function makeInit(trackId: number, defaultDur: number): Uint8Array {
         u32(0), u32(0), u32(0),  // reserved
         new Uint8Array([0]),     // name (null terminator)
     ));
-    const mdia = box('mdia', hdlr);
+    // mdhd v0: creation, modification, timescale, duration, language + pre_defined.
+    const mdhd = timescale === undefined ? new Uint8Array(0)
+        : fullBox('mdhd', 0, 0, cat(u32(0), u32(0), u32(timescale), u32(0), u32(0)));
+    const mdia = box('mdia', cat(mdhd, hdlr));
     const tkhd = fullBox('tkhd', 0, 0, cat(
         u32(0), u32(0), u32(trackId), u32(0),
         u32(0), u32(0), new Uint8Array(52),
@@ -354,7 +358,7 @@ afterEach(() => {
 
 // ─── Test harness helper ─────────────────────────────────────────
 
-async function makeReadyAdapter(): Promise<{
+async function makeReadyAdapter(timescale?: number): Promise<{
     adapter: MseMediaSource;
     video: MockVideoElement;
     vsb: MockSourceBuffer;
@@ -362,7 +366,7 @@ async function makeReadyAdapter(): Promise<{
     const video = new MockVideoElement();
     const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
     adapter.debug = true; // Enable diagnostic logging for tests
-    const initData = makeInit(1, 100); // trex default_sample_duration=100
+    const initData = makeInit(1, 100, timescale); // trex default_sample_duration=100
     adapter.initialize({ video: { codec: 'avc1.42c01e', initData } });
     currentMs.open();
     // Wait for init-segment appendBuffer's updateend to fire.
@@ -1300,6 +1304,33 @@ describe('MseMediaSource — live-buffer management', () => {
         await flush(); // remove updateend → drain → append dispatch
         await flush();
         expect(vsb.appendedPayloads.length).toBe(appendsBefore + 1); // serialized, then appended
+    });
+
+    it('trims the timeline index along with the evicted back buffer', async () => {
+        const ctx = await makeReadyAdapter(1000); // timescale 1000: ticks are ms
+        ctx.video.buffered = makeTimeRanges([[0, 1]]);
+        ctx.vsb.buffered = makeTimeRanges([[0, 1]]);
+        ctx.adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        await flush();
+        // Gaps in decode time leave separate ranges: [0,500) [1000,1500) [20000,20500).
+        for (const bmd of [1000, 20_000]) {
+            ctx.adapter.appendChunk('video', makeSegment({ bmd, defaultDur: 100, sampleCount: 5 }), 'track1');
+            await flush();
+            await flush();
+        }
+        const index = (ctx.adapter as unknown as { videoTimelines: Map<string, TimelineIndex> })
+            .videoTimelines.get('track1')!;
+        expect(index.size).toBe(3);
+
+        // 25 s played, keepBehind 10 → evict before 15 s, tick 15000.
+        ctx.video.currentTime = 25;
+        ctx.vsb.buffered = makeTimeRanges([[0, 28]]);
+        ctx.adapter.appendChunk('video', makeSegment({ bmd: 28_000, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        await flush();
+        expect(ctx.vsb.removeCalls).toContainEqual([0, 15]);
+        expect(index.getRanges().map((r) => [r.start, r.end])).toEqual([[20_000n, 20_500n], [28_000n, 28_500n]]);
     });
 
     it('does not evict or chase before playTriggered (startup exempt)', async () => {

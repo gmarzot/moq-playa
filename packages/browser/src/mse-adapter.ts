@@ -20,6 +20,7 @@ import {
   filterInitSegment,
   describeBoxes,
   peekSegmentMetadata,
+  readMdhdTimescale,
   readSegmentTimeRanges,
   readTrexDefaults,
   type SegmentTimeRange,
@@ -781,6 +782,10 @@ export class MseMediaSource implements MediaSourceLike {
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
   private audioTrex: TrexDefaults | undefined;
+  /** Track timescales from the init segments, for converting eviction
+   *  points into the timeline indexes' tick units. */
+  private videoTimescale: number | null = null;
+  private audioTimescale: number | null = null;
 
   /**
    * Ranges for the in-flight appendBuffer, per media type, with the
@@ -986,6 +991,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(videoInit);
             const first = trexMap.values().next();
             if (!first.done) this.videoTrex = first.value;
+            this.videoTimescale = readMdhdTimescale(videoInit);
             const vb = this.videoBuffer;
             this.runMutation('video', 'init-append', () => vb.appendBuffer(videoInit.buffer as ArrayBuffer));
           }
@@ -1007,6 +1013,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(audioInit);
             const first = trexMap.values().next();
             if (!first.done) this.audioTrex = first.value;
+            this.audioTimescale = readMdhdTimescale(audioInit);
             const ab = this.audioBuffer;
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
@@ -1168,6 +1175,8 @@ export class MseMediaSource implements MediaSourceLike {
       const trex = Array.from(trexMap.values())[0];
       if (mediaType === 'video') this.videoTrex = trex;
       else this.audioTrex = trex;
+      if (mediaType === 'video') this.videoTimescale = readMdhdTimescale(filtered);
+      else this.audioTimescale = readMdhdTimescale(filtered);
 
       // Refresh init summary so failure dumps reflect the current codec.
       const boxes = describeBoxes(filtered);
@@ -1354,6 +1363,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.changingType.audio = false;
     this.videoTrex = undefined;
     this.audioTrex = undefined;
+    this.videoTimescale = null;
+    this.audioTimescale = null;
     this.seenDiagnostics.clear();
     this.quotaRetried.video = false;
     this.quotaRetried.audio = false;
@@ -1490,11 +1501,29 @@ export class MseMediaSource implements MediaSourceLike {
     try {
       this.runMutation(mediaType, 'back-buffer-remove', () => buffer.remove(start, evictBefore));
       this.logDebug('[MSE] evict %s back-buffer [%s, %s)', mediaType, start.toFixed(2), evictBefore.toFixed(2));
+      this.trimTimelines(mediaType, buffer, evictBefore);
       return true;
     } catch (err) {
       this.logWarn('[MSE] back-buffer evict failed (%s): %s', mediaType, (err as Error).message);
       return false;
     }
+  }
+
+  /**
+   * Drop timeline-index ranges for media just evicted before `beforeSec`
+   * (presentation seconds), so each index spans only what is still buffered
+   * and its per-append scan stays short. Needs the track timescale; without
+   * one the index is left as is.
+   */
+  private trimTimelines(mediaType: 'video' | 'audio', buffer: SourceBuffer, beforeSec: number): void {
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (!timescale) return;
+    let offset = 0;
+    try { offset = buffer.timestampOffset; } catch { /* detached */ }
+    const tick = Math.floor((beforeSec - offset) * timescale);
+    if (!Number.isFinite(tick) || tick <= 0) return;
+    const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
+    for (const timeline of timelines.values()) timeline.dropBefore(BigInt(tick));
   }
 
   /** Emit one append-only diagnostic record with a monotonic sequence number. */
@@ -2588,6 +2617,7 @@ export class MseMediaSource implements MediaSourceLike {
           this.logWarn('[MSE] quota exceeded (%s) — evicting [%s, %s) and retrying', mediaType, start.toFixed(2), evictBefore.toFixed(2));
           // updateend → drainQueue → retry
           this.runMutation(mediaType, 'quota-remove', () => buffer.remove(start, evictBefore));
+          this.trimTimelines(mediaType, buffer, evictBefore);
           return;
         } catch { /* fall through to flush */ }
       }
