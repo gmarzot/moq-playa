@@ -38,10 +38,10 @@ describe('MseMediaSource — soft chase', () => {
         expect(rate()).toBe(1.05);
 
         video.buffered = makeTimeRanges([[0, 10.21]]);    // low point, before an append
-        (adapter as any).releaseChaseAtTarget();
+        (adapter as any).chase.onLowPoint((adapter as any).cushionAheadSec());
         expect(rate()).toBe(1.05);
         video.buffered = makeTimeRanges([[0, 10.2]]);
-        (adapter as any).releaseChaseAtTarget();
+        (adapter as any).chase.onLowPoint((adapter as any).cushionAheadSec());
         expect(rate()).toBe(1);
 
         video.buffered = makeTimeRanges([[0, 10.25]]);    // the append's peak does not re-engage
@@ -54,7 +54,7 @@ describe('MseMediaSource — soft chase', () => {
         (video as unknown as { playbackRate: number }).playbackRate = 1;
         const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.1 });
         (adapter as any).playTriggered = true;
-        (adapter as any).videoSampleSec = 0.04;
+        (adapter as any).chase.noteSampleDuration(0.04);
         const floors: number[] = [];
         adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
         const rate = () => (video as unknown as { playbackRate: number }).playbackRate;
