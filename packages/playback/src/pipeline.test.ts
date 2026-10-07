@@ -1894,6 +1894,27 @@ describe('PlaybackPipeline', () => {
             expect(resetIdx).toBeLessThan(decodeIdx);
         });
 
+        it('per-group END_OF_GROUP state stays at the groups in flight over a long audio run', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, sync } = createPipeline({ mediaType: 'audio', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            for (let g = 0; g < 5_000; g++) {
+                pipeline.pushObject(makeData(g, 0), audioHeaders(1_000_000_000n + BigInt(g) * 21_333n));
+                pipeline.pushObject(makeGap(g, 1, ObjectStatus.END_OF_GROUP));
+                clock.advance(21_333);
+                pipeline.tick();
+            }
+            const state = pipeline as unknown as {
+                endedGroups: Set<bigint>;
+                gapDetector: { endedGroups: Set<bigint>; groupFirstSeenUs: Map<bigint, number> };
+            };
+            expect(state.endedGroups.size).toBeLessThanOrEqual(2);
+            expect(state.gapDetector.endedGroups.size).toBeLessThanOrEqual(2);
+            expect(state.gapDetector.groupFirstSeenUs.size).toBeLessThanOrEqual(2);
+        });
+
         it('END_OF_GROUP for N allows normal transition to N+1 without abandon/reset', () => {
             const clock = new MockClock();
             clock.set(5_000_000);

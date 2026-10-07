@@ -518,6 +518,11 @@ export class PlaybackPipeline {
             this.resetPending = false;
         }
 
+        // END_OF_GROUP marks below the consumed group are never read again.
+        for (const g of this.endedGroups) {
+            if (g < this.lastConsumedGroupId) this.endedGroups.delete(g);
+        }
+
         // 1. Evaluate gap state
         const availableGroupIds = [...this.bufferedGroupCounts.keys()];
         const gapDecision = this.gapDetector.evaluate(this.lastConsumedGroupId, availableGroupIds);
