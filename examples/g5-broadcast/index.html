@@ -347,6 +347,17 @@
         <option value="14">Draft 14</option>
       </select>
 
+      <label for="s-packaging">Packaging</label>
+      <select id="s-packaging">
+        <option value="loc">LOC (default)</option>
+        <option value="cmaf">CMAF (CMSF)</option>
+      </select>
+      <div class="hint">LOC: encode/decode via WebCodecs. CMAF: fMP4 fragments, render via MSE.</div>
+
+      <label for="s-catalog-interval">Catalog refresh interval (ms)</label>
+      <input id="s-catalog-interval" type="number" min="0" placeholder="0">
+      <div class="hint">0 = never re-sent.</div>
+
       <label for="s-cc">Congestion control (hint)</label>
       <select id="s-cc">
         <option value="">Browser default</option>
@@ -360,13 +371,6 @@
         <option value="avc1.640028">H.264 High</option>
         <option value="av01.0.04M.08">AV1 Main</option>
       </select>
-
-      <label for="s-packaging">Packaging</label>
-      <select id="s-packaging">
-        <option value="loc">LOC (default)</option>
-        <option value="cmaf">CMAF (CMSF)</option>
-      </select>
-      <div class="hint">LOC: encode/decode via WebCodecs. CMAF: fMP4 fragments, render via MSE.</div>
 
       <label for="s-bitrate-mode">Bitrate mode</label>
       <select id="s-bitrate-mode">
@@ -386,10 +390,6 @@
 
       <label for="s-target">Target playback latency (ms)</label>
       <input id="s-target" type="number" min="1" placeholder="200">
-
-      <label for="s-catalog-interval">Catalog refresh interval (ms)</label>
-      <input id="s-catalog-interval" type="number" min="0" placeholder="0">
-      <div class="hint">0 = never re-sent.</div>
 
       <label for="s-hash">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)">
