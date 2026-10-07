@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
-import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 
 const wrapInt = (n: bigint) => n;
 
@@ -77,6 +77,81 @@ const makePublisher = (conn: MediaPublishConnection, opts: Partial<MediaPublishe
   new MediaPublisher(conn, { wrapInt, draft: 16, ...opts });
 
 async function settle() { await new Promise((r) => setTimeout(r, 0)); }
+
+describe('MediaPublisher — cancelled subscriptions', () => {
+  it.each(['video', 'audio'] as const)('does not count a cancelled %s send that fulfills late', async (track) => {
+    const conn = recordingConnection({ holdSends: true });
+    const pub = makePublisher(conn);
+    if (track === 'video') {
+      pub.setVideoAlias(2n);
+      pub.publishVideo(chunk(1), kf());
+    } else {
+      pub.setAudioAlias(2n);
+      pub.publishAudio(chunk(1), { timestampUs: 1 });
+    }
+    await settle();
+    if (track === 'video') pub.clearVideoAlias(2n); else pub.clearAudioAlias(2n);
+    await conn.releaseAll();
+    expect(pub.frameCount).toBe(0);
+    expect(pub.audioChunkCount).toBe(0);
+  });
+
+  it.each(['video', 'audio'] as const)('drops queued %s and contains a cancelled in-flight send', async (track) => {
+    const conn = recordingConnection({ holdSends: true });
+    const errors: unknown[] = [];
+    const pub = makePublisher(conn, { audioMaxInFlight: 1, onError: (_, error) => errors.push(error) });
+    if (track === 'video') pub.setVideoAlias(2n); else pub.setAudioAlias(2n);
+    const publish = (tag: number) => track === 'video'
+      ? pub.publishVideo(chunk(tag), kf(tag)) : pub.publishAudio(chunk(tag), { timestampUs: tag });
+    publish(1);
+    await settle();
+    publish(2);
+    if (track === 'video') pub.clearVideoAlias(2n); else pub.clearAudioAlias(2n);
+    await conn.rejectAllPending(new Error('subscription cancelled'));
+    publish(3);
+    await settle();
+    expect(conn.opened).toHaveLength(1);
+    expect(errors).toEqual([]);
+    if (track === 'video') pub.setVideoAlias(4n); else pub.setAudioAlias(4n);
+    publish(4);
+    await conn.releaseAll();
+    expect(conn.opened.map((s) => s.alias)).toEqual([2n, 4n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1, 4]);
+  });
+
+  it.each(['video', 'audio'] as const)('does not send or revive a cancelled %s stream when its open resolves late', async (track) => {
+    const conn = recordingConnection();
+    let release!: (id: bigint) => void;
+    const original = conn.openSubgroup;
+    conn.openSubgroup = () => new Promise((resolve) => { release = resolve; });
+    const pub = makePublisher(conn);
+    if (track === 'video') {
+      pub.setVideoAlias(2n);
+      pub.publishVideo(chunk(1), kf());
+      pub.clearVideoAlias(2n);
+      pub.setVideoAlias(4n);
+    } else {
+      pub.setAudioAlias(2n);
+      pub.publishAudio(chunk(1), { timestampUs: 1 });
+      pub.clearAudioAlias(2n);
+      pub.setAudioAlias(4n);
+    }
+    release(99n);
+    await settle();
+    expect(conn.sends).toEqual([]);
+    expect(conn.closed).toContain(99n);
+    conn.openSubgroup = original;
+    if (track === 'video') {
+      pub.publishVideo(chunk(2), delta());
+      await settle();
+      expect(conn.sends).toEqual([]);
+      pub.publishVideo(chunk(3), kf());
+    } else pub.publishAudio(chunk(3), { timestampUs: 3 });
+    await settle();
+    expect(conn.opened.map((s) => s.alias)).toEqual([4n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([3]);
+  });
+});
 
 describe('MediaPublisher — serialized video publication', () => {
   it('back-to-back chunks with deferred sends get UNIQUE, ORDERED object IDs on one subgroup', async () => {
@@ -388,11 +463,8 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
 
   it('draft-18 LOC extensions use the vi64 profile: they parse as d18 and are NOT d16 bytes', async () => {
     const timestampUs = Date.now() * 1000; // a current capture timestamp
-    // Pin the wall clock to the chunk's own base so the per-track rebase is a
-    // no-op here: this test is about the wire profile, not about anchoring.
-    const wallClockUs = () => timestampUs;
     const conn18 = recordingConnection();
-    const pub18 = makePublisher(conn18, { draft: 18, wallClockUs });
+    const pub18 = makePublisher(conn18, { draft: 18, wallClockUs: () => timestampUs });
     pub18.setVideoAlias(2n);
     pub18.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
@@ -406,7 +478,7 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     // The same publisher under draft 16 emits DIFFERENT bytes (QUIC-varint
     // profile) — proving the profile is draft-bound, not fixed.
     const conn16 = recordingConnection();
-    const pub16 = makePublisher(conn16, { draft: 16, wallClockUs });
+    const pub16 = makePublisher(conn16, { draft: 16, wallClockUs: () => timestampUs });
     pub16.setVideoAlias(2n);
     pub16.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
@@ -414,6 +486,106 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     expect(Buffer.from(ext16!).equals(Buffer.from(ext!))).toBe(false);
     const parsed16 = parseLocHeaders(ext16, { wireProfile: locWireProfileForDraft(16) });
     expect(parsed16.captureTimestamp).toBe(BigInt(Math.round(timestampUs)));
+  });
+});
+
+describe('MediaPublisher — timestamps are rebased per track to wall-clock microseconds', () => {
+  it('anchors at capture before unequal encoder delays', async () => {
+    const captureUs = 1_800_000_000_000_000;
+    let wallUs = captureUs;
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { wallClockUs: () => wallUs });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    pub.observeCaptureTimestamp('video', 20_000_000);
+    pub.observeCaptureTimestamp('audio', 1_000_000);
+    pub.publishAudio(chunk(2), { timestampUs: 1_000_000 });
+    wallUs += 200_000;
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 20_000_000 });
+    await pub.drain();
+    expect(conn.sends.map(s => parseLocHeaders(s.extensions).captureTimestamp))
+      .toEqual([BigInt(captureUs), BigInt(captureUs)]);
+  });
+
+  it.each([1, 4] as const)('does not mark reference delta frames discardable under LOC-%s', async (locVersion) => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { locVersion });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(1), kf());
+    pub.publishVideo(chunk(2), delta());
+    await pub.drain();
+    expect(parseLocHeaders(conn.sends[1]!.extensions).videoFrameMarking?.discardable).toBe(false);
+  });
+
+  it.each([0, 600_000])('does not turn a %i us video stream-open delay into A/V timestamp skew', async (delayUs) => {
+    let wallUs = 1_800_000_000_000_000;
+    const conn = recordingConnection();
+    const originalOpen = conn.openSubgroup.bind(conn);
+    let releaseVideo!: () => void;
+    const videoGate = new Promise<void>((resolve) => { releaseVideo = resolve; });
+    conn.openSubgroup = async (...args) => {
+      if (args[0] === 2n) await videoGate;
+      return originalOpen(...args);
+    };
+    const pub = makePublisher(conn, { wallClockUs: () => wallUs });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 1_000_000 });
+    pub.publishAudio(chunk(2), { timestampUs: 1_000_000 });
+    wallUs += delayUs;
+    releaseVideo();
+    await pub.drain();
+
+    const video = conn.sends.find((s) => s.payload[0] === 1)!;
+    const audio = conn.sends.find((s) => s.payload[0] === 2)!;
+    expect(parseLocHeaders(video.extensions).captureTimestamp)
+      .toBe(parseLocHeaders(audio.extensions).captureTimestamp);
+  });
+
+  // WebCodecs chunk timestamps from getUserMedia are not Unix-epoch based, and
+  // Chrome can hand audio and video timestamps on DIFFERENT bases. LOC's
+  // Timestamp without a Timescale is microseconds since the Unix epoch
+  // (draft-ietf-moq-loc-04 §2.3.1.1), so each track is anchored to the wall
+  // clock at its first chunk and offsets are preserved after that.
+  it('anchors each track to the wall clock at its first chunk and keeps intra-track spacing', async () => {
+    const wallUs = 1_800_000_000_000_000; // a fixed "now" so the test is deterministic
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { wallClockUs: () => wallUs });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 208_027_000_000 }); // boot-relative base
+    pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 208_027_033_333 });
+    pub.publishAudio(chunk(3), { timestampUs: 107_000_000 }); // audio-context-relative base
+    pub.publishAudio(chunk(4), { timestampUs: 107_020_000 });
+    await settle();
+
+    const video = conn.sends.filter((s) => s.payload[0] === 1 || s.payload[0] === 2);
+    const audio = conn.sends.filter((s) => s.payload[0] === 3 || s.payload[0] === 4);
+    expect(video).toHaveLength(2);
+    expect(audio).toHaveLength(2);
+
+    const v0 = parseLocHeaders(video[0]!.extensions).captureTimestamp!;
+    const v1 = parseLocHeaders(video[1]!.extensions).captureTimestamp!;
+    const a0 = parseLocHeaders(audio[0]!.extensions).captureTimestamp!;
+    const a1 = parseLocHeaders(audio[1]!.extensions).captureTimestamp!;
+    expect(v0).toBe(BigInt(wallUs));
+    expect(a0).toBe(BigInt(wallUs));
+    expect(v1 - v0).toBe(33_333n);
+    expect(a1 - a0).toBe(20_000n);
+  });
+
+  it('defaults the wall clock to Date.now() in microseconds', async () => {
+    const before = Date.now() * 1000;
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(0), { timestampUs: 42 });
+    await settle();
+    const after = Date.now() * 1000;
+    const ts = parseLocHeaders(conn.sends[0]!.extensions).captureTimestamp!;
+    expect(ts >= BigInt(before)).toBe(true);
+    expect(ts <= BigInt(after)).toBe(true);
   });
 });
 
@@ -549,36 +721,23 @@ describe('MediaPublisher — audio publication concurrency', () => {
   });
 });
 
-describe('MediaPublisher — wall-clock rebase', () => {
-  it('anchors video and audio independently: a shared anchor would throw one track off', async () => {
+describe('MediaPublisher — LOC version', () => {
+  it('emits LOC-04 when explicitly selected', async () => {
     const conn = recordingConnection();
-    const wall = 1_700_000_000_000_000;
-    // Chrome hands the two tracks unrelated bases: boot-relative video,
-    // context-relative audio. This is the case that broke rendering.
-    const pub = makePublisher(conn, { draft: 18, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
+    const pub = makePublisher(conn, { locVersion: 4 });
     pub.setAudioAlias(3n);
-    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 208_027_000_000 });
-    pub.publishAudio(chunk(2), { timestampUs: 107_000_000 });
+    pub.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
     await settle();
-
-    const profile = { wireProfile: locWireProfileForDraft(18) };
-    const stamps = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).captureTimestamp!);
-    // Both land on the wall clock despite bases ~208,000 s apart.
-    for (const t of stamps) expect(t).toBe(BigInt(wall));
+    const ext = conn.sends[0]!.extensions!;
+    expect(parseLocHeaders(ext).version).toBe(4);
   });
 
-  it('keeps spacing after the anchor rather than re-anchoring every chunk', async () => {
+  it('emits LOC-01 when locVersion is 1', async () => {
     const conn = recordingConnection();
-    const wall = 1_700_000_000_000_000;
-    const pub = makePublisher(conn, { draft: 18, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
-    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 5_000_000 });
-    pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 5_040_000 });
+    const pub = makePublisher(conn, { locVersion: 1 });
+    pub.setAudioAlias(3n);
+    pub.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
     await settle();
-
-    const profile = { wireProfile: locWireProfileForDraft(18) };
-    const stamps = conn.sends.map((s) => parseLocHeaders(s.extensions!, profile).captureTimestamp!);
-    expect(stamps[1]! - stamps[0]!).toBe(40_000n);
+    expect(parseLocHeaders(conn.sends[0]!.extensions!).version).toBe(1);
   });
 });

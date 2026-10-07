@@ -12,9 +12,9 @@ import { MoqtPlayer } from './player.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { NamespaceState } from './events.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
 
 function createMockAdapter() {
   let nextRequestId = 1n;
@@ -280,6 +280,37 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
       await sleep(60);
       expect(migrate).toHaveBeenCalledTimes(1);
       expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+    });
+
+    it('a catalog SUBSCRIBE refused as not existing waits for the publisher, with no retry timer', async () => {
+      const adapter = createMockAdapter();
+      const { player, errors, nsReqId } = await startLoading(adapter);
+      requestOk(adapter, nsReqId!);
+      const migrate = vi.spyOn(player, 'migrate').mockResolvedValue();
+      const catalogReqId = await adapter.subscribe.mock.results[0]?.value;
+      adapter._triggerMessage({
+        type: 'REQUEST_ERROR', requestId: catalogReqId, errorCode: varint(0x10n),
+        retryInterval: varint(2n), errorReason: 'no such track',
+      } as unknown as ControlMessage);
+      expect(errors.some((e) => e.severity === 'degraded' && /waiting for the publisher/.test(e.message))).toBe(true);
+      expect((player as unknown as { catalogSubscribeRetryTimer: unknown }).catalogSubscribeRetryTimer).toBeNull();
+
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      await sleep(60);
+      expect(migrate).toHaveBeenCalledTimes(1);
+      expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+    });
+
+    it('a catalog SUBSCRIBE refused for any other reason is fatal', async () => {
+      const adapter = createMockAdapter();
+      const { errors, nsReqId } = await startLoading(adapter);
+      requestOk(adapter, nsReqId!);
+      const catalogReqId = await adapter.subscribe.mock.results[0]?.value;
+      adapter._triggerMessage({
+        type: 'REQUEST_ERROR', requestId: catalogReqId, errorCode: varint(0x1n),
+        retryInterval: varint(0n), errorReason: 'unauthorized',
+      } as unknown as ControlMessage);
+      expect(errors.some((e) => e.severity === 'fatal' && /catalog SUBSCRIBE refused: unauthorized/.test(e.message))).toBe(true);
     });
 
     it('is fatal without followNamespace', async () => {

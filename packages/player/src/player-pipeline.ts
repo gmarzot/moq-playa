@@ -9,7 +9,7 @@
  * @module
  */
 
-import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@moqt/playback';
+import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@openmoq/playback';
 import type {
   ClockSource,
   DecoderCommand,
@@ -18,7 +18,7 @@ import type {
   RecoveryAction,
   RecoveryController,
   DecoderFeedback,
-} from '@moqt/playback';
+} from '@openmoq/playback';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
@@ -27,6 +27,7 @@ import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
+import { usesMsePath } from './packaging.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -185,8 +186,10 @@ export function createPipelines(
   let mediaSource: MediaSourceLike | null = null;
 
   // ── Create MediaSource adapter for CMAF tracks ────────────────
-  const hasCmafVideo = trackInfo.video?.packaging === 'cmaf';
-  const hasCmafAudio = trackInfo.audio?.packaging === 'cmaf';
+  // cmaf and locmaf both play through MSE (LOCMAF §6).
+  // cmaf always; locmaf unless config.locmafDecoding selects the §16 frame path.
+  const hasCmafVideo = usesMsePath(trackInfo.video?.packaging, config.locmafDecoding);
+  const hasCmafAudio = usesMsePath(trackInfo.audio?.packaging, config.locmafDecoding);
   const hasCmaf = hasCmafVideo || hasCmafAudio;
 
   if (hasCmaf && config.createMediaSource) {

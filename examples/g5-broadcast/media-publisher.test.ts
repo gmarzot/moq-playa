@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import type { AnchorReport, DriftReport } from './media-publisher.js';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
-import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
-import { MoqtConnectionError } from '@moqt/webtransport';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
+import { MoqtConnectionError } from '@openmoq/webtransport';
 import { readBaseMediaDecodeTime, readSegmentTimeRanges } from '../../packages/browser/src/mp4-box.js';
 
 const wrapInt = (n: bigint) => n;

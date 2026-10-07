@@ -32,8 +32,8 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft } from '@moqt/loc';
-import type { DraftVersion } from '@moqt/transport';
+import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
+import type { DraftVersion } from '@openmoq/transport';
 import { buildChunk } from '../shared/browser/cmaf-mux.js';
 
 /** The subset of MoqtConnection the media publication path uses. */
@@ -750,10 +750,15 @@ export class MediaPublisher {
     });
   }
 
+  /** Draft-18 gives LOC-01's 0x02/0x04 Track scope, so it carries LOC-04's ids. */
+  private locOptions(): { wireProfile: ReturnType<typeof locWireProfileForDraft>; locVersion: 1 | 4 } {
+    return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.draft === 18 ? 4 : 1 };
+  }
+
   private videoExtensions(meta: VideoChunkMeta, captureUs: bigint): Uint8Array | undefined {
     // CMAF carries its own decode time and sync flags; only the capture time rides along.
     if (this.cmaf) {
-      return encodeLocHeaders({ captureTimestamp: captureUs }, { wireProfile: locWireProfileForDraft(this.draft) });
+      return encodeLocHeaders({ captureTimestamp: captureUs }, this.locOptions());
     }
     return encodeLocHeaders({
       captureTimestamp: captureUs,
@@ -767,7 +772,7 @@ export class MediaPublisher {
         temporalId: 0,
       },
       ...(meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
   }
 
   private async sendVideoChunk(data: Uint8Array, meta: VideoChunkMeta): Promise<void> {
@@ -830,7 +835,7 @@ export class MediaPublisher {
     const captureUs = this.toWallClockUs('audio', meta.timestampUs);
     const extensions = encodeLocHeaders({
       captureTimestamp: captureUs,
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
     const data = this.cmaf
       ? buildChunk({
         trackId: CMAF_AUDIO_TRACK_ID,

@@ -8,7 +8,7 @@
  *   counted (player only).
  */
 
-import type { PlayerCompat } from '@moqt/player';
+import type { PlayerCompat } from '@openmoq/player';
 
 const KNOWN: readonly PlayerCompat[] = ['request-credit', 'empty-objects'];
 

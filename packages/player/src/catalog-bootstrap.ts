@@ -43,8 +43,8 @@
  * @module
  */
 
-import type { DataStreamTerminal } from '@moqt/webtransport';
-import type { CatalogState } from '@moqt/msf';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
+import type { CatalogState } from '@openmoq/msf';
 
 /** Inactivity/progress deadline for an ACTIVE attempt (ms). Re-armed on every
  *  fetch object / FETCH_OK, and — in the waiting states — on live catalog
@@ -287,10 +287,15 @@ export class CatalogBootstrap {
       this.awaitingSubscribeOk = false;
       const deferred = this.deferredJoinError;
       this.deferredJoinError = null;
-      // A live head may have made the catalog ready meanwhile.
       if (this._phase === 'joining' && !this.attempt) {
-        if (deferred === 'invalid-range' && largest === null) this.enterEmptyWait();
-        else this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
+        if (deferred === 'invalid-range' && largest === null) {
+          this.enterEmptyWait();
+          this.replayHeldLive();
+        } else if (deferred === 'refused' && largest === null && !this.subscriptionOver()) {
+          this.awaitFirstLiveBase();
+        } else {
+          this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
+        }
       }
       return;
     }
@@ -378,6 +383,12 @@ export class CatalogBootstrap {
       this.armInactivity();
       return;
     }
+    if (kind === 'refused' && attempt.kind === 'joining' && this.largest === null
+        && !this.strict && !this.subscriptionOver()) {
+      this.rungTransaction();
+      this.awaitFirstLiveBase();
+      return;
+    }
     // INVALID_RANGE after a SUBSCRIBE_OK that reported a Largest: the track
     // has content, so the join failed rather than found it empty.
     this.failAttempt(`fetch ${kind}`);
@@ -408,6 +419,11 @@ export class CatalogBootstrap {
     if (this.inert()) return;
     this.bumpInactivity();
     if (event.kind === 'gap') return; // accounting only on the live side too
+    // Before SUBSCRIBE_OK's history boundary, live data is held, not classified.
+    if (this.awaitingSubscribeOk) {
+      this.bufferSuffix(event.location, event.payload!, streamId);
+      return;
+    }
 
     switch (this._phase) {
       case 'ready':
@@ -842,6 +858,7 @@ export class CatalogBootstrap {
     this._phase = 'ready';
     this.disarmInactivity();
     this.cb.onReady(state);
+    if (this.inert()) return;
     this._phase = 'live';
     // Release the held suffix in ascending location order through the dedup.
     const held = this.suffix.sort((a, b) => locCmp(a.location, b.location));
@@ -859,7 +876,7 @@ export class CatalogBootstrap {
     // examined. A staged-recovery candidate must adopt here, not at onReady: a
     // malformed suffix delta between the two must abort the transaction, never
     // degrade an already-adopted snapshot.
-    this.cb.onReadySettled?.();
+    if (!this.inert()) this.cb.onReadySettled?.();
   }
 
   private bufferSuffix(location: { group: bigint; object: bigint }, payload: Uint8Array, streamId: bigint): void {
@@ -913,6 +930,33 @@ export class CatalogBootstrap {
     }
     this.rungTransaction();
     this.nextRungAfterJoin(kind, reason);
+  }
+
+  /** The subscription ended and drained: nothing further can arrive on it. */
+  private subscriptionOver(): boolean {
+    return this.doneReason !== null && this.drained;
+  }
+
+  /**
+   * A refused join on an empty track does not prove the live subscription
+   * failed: the first live base resolves it. Replays what was held meanwhile;
+   * silence still advances the bounded failure ladder.
+   */
+  private awaitFirstLiveBase(): void {
+    this._phase = 'await-first-payload';
+    this.armInactivity();
+    this.replayHeldLive();
+  }
+
+  /** Live objects held for the history boundary, applied in order to the waiting phase. */
+  private replayHeldLive(): void {
+    const waiting = this._phase;
+    // The suffix stays owned until reachReady() drains it before settlement.
+    const held = [...this.suffix].sort((a, b) => locCmp(a.location, b.location));
+    for (const entry of held) {
+      if (this.inert() || this._phase !== waiting) break;
+      this.onLiveCatalogObject({ location: entry.location, kind: 'payload', payload: entry.payload }, entry.streamId);
+    }
   }
 
   /** Rung 1 when SUBSCRIBE_OK reported a Largest, else rung 2. */

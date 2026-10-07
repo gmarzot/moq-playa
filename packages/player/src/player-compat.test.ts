@@ -7,9 +7,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import type { MoqtPlayerConfig, PlayerCompat } from './config.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
 
 function createMockAdapter() {
   let nextRequestId = 1n;

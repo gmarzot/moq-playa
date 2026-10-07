@@ -7,7 +7,7 @@
  * theirs, the instrument is not.
  */
 
-import { Player } from '@playa/player';
+import { Player } from '@openmoq/playa';
 import {
   namespace, certHash, draftVersion, catalogBootstrap, warmStart,
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
@@ -36,7 +36,7 @@ import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoi
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
-import type { SubscriptionStatus } from '@playa/player';
+import type { SubscriptionStatus } from '@openmoq/playa';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 

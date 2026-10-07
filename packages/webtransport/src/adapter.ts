@@ -36,7 +36,8 @@ import {
   RequestError18,
   SubscriptionState,
   ForwardState,
-} from '@moqt/transport';
+  MessageParam,
+} from '@openmoq/transport';
 import type {
   EndpointRoleValue,
   ControlMessage,
@@ -74,8 +75,9 @@ import type {
   Parameters,
   TrackProperties,
   SubscriptionStateMachine,
-} from '@moqt/transport';
-import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { SetupOptions, AuthorizationOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@openmoq/transport';
+import { AuthorizationSession, AuthorizationError, type ConnectionAuthorization, type AuthorizationContext } from './authorization.js';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
 import { createUniPairTopology, PeerSetupRejectedError, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
@@ -106,6 +108,11 @@ export type DataStreamTerminal =
   | 'local-discard'
   | 'error';
 
+export interface ConnectOptions extends SetupOptions {
+  /** Per-connection credential provider. Mutually exclusive with raw authTokens. */
+  authorization?: ConnectionAuthorization;
+}
+
 /**
  * How a data-stream read loop ended, as seen from inside the loop. A protocol
  * violation throws instead, so no terminal is published for it.
@@ -118,7 +125,7 @@ function terminalKind(terminal: DataStreamReadTerminal): DataStreamTerminal {
 }
 
 /** Options for connection.subscribeTrack(). */
-export interface TrackSubscribeOptions {
+export interface TrackSubscribeOptions extends AuthorizationOptions {
   /** Subscription filter (LargestObject, NextGroupStart, AbsoluteStart, etc.). */
   readonly filter?: SubscribeOptions['subscriptionFilter'];
   /**
@@ -359,6 +366,9 @@ export class MoqtConnection {
   private framer!: ControlStreamFramer;
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private transport: WebTransportLike | null = null;
+  private authorization: AuthorizationSession | null = null;
+  private readonly authorizationUpdateTails = new Map<bigint, Promise<void>>();
+  private pendingAuthorizationUpdates = 0;
   /** Omitted `kind` remains WebTransport for API compatibility. */
   private transportKind: 'webtransport' | 'quic' = 'webtransport';
   private nextStreamId = 0n;
@@ -677,6 +687,8 @@ export class MoqtConnection {
    * owned by the connection outlives the terminal shutdown.
    */
   private clearTerminalState(): void {
+    this.authorization?.close();
+    this.authorizationUpdateTails.clear();
     const incomingUniRouter = this.incomingUniRouter;
     this.incomingUniRouter = null;
     // The transport owns the aggregate incoming-stream readable's terminal
@@ -1359,22 +1371,45 @@ export class MoqtConnection {
     }
   }
 
+  private async authorize<T extends AuthorizationOptions>(
+    context: Omit<AuthorizationContext, 'relayUrl' | 'signal' | 'draftVersion'>,
+    options?: T,
+  ): Promise<T & AuthorizationOptions> {
+    const snapshot = { ...options } as T;
+    const parameters = (snapshot as T & { parameters?: Parameters }).parameters;
+    if (snapshot.authTokens !== undefined || parameters?.has(MessageParam.AUTHORIZATION_TOKEN)) {
+      throw new AuthorizationError('Specify a credential provider or explicit authorization tokens, not both');
+    }
+    const authorization = this.authorization!;
+    const authTokens = await authorization.resolve({ ...context, draftVersion: this.session.draftVersion });
+    if (this._terminated || this.authorization !== authorization) throw new AuthorizationError('Authorization connection closed');
+    return { ...snapshot, authTokens };
+  }
+
+  private authorizationTarget(requestId: bigint): { owner: object; namespace: Uint8Array[]; trackName?: Uint8Array } {
+    const outbound = this.session.getSubscription(requestId);
+    const inbound = this.session.getIncomingSubscription(requestId);
+    const sub = outbound ?? (inbound?.isPublishInitiated ? inbound : undefined);
+    if (sub && !sub.isTerminated && sub.trackNamespace && sub.trackName) {
+      return { owner: sub, namespace: sub.trackNamespace, trackName: sub.trackName };
+    }
+    const ns = this.session.getNamespaceSubscription(requestId);
+    if (ns && !ns.isTerminated) return { owner: ns, namespace: ns.namespacePrefix };
+    const tracks = this.session.getTrackSubscription(requestId);
+    if (tracks && tracks.state !== 'terminated') return { owner: tracks, namespace: tracks.trackNamespacePrefix };
+    throw new AuthorizationError('Authorization target no longer exists');
+  }
+
   /**
-   * Connect to a MOQT server over WebTransport or native QUIC.
-   *
-   * Opens the control topology for the selected draft and transport binding,
-   * exchanges SETUP, then starts background loops for:
-   * - Control stream reading
-   * - Incoming unidirectional data streams
-   * - Incoming datagrams
-   *
+   * Connect over WebTransport or native QUIC. Acquires optional SETUP
+   * credentials, exchanges SETUP, then starts the control and data readers.
    * @param transport WebTransport session, native QUIC facade, or mock
-   * @param options Setup parameters (path, maxRequestId, etc.)
+   * @param options Setup parameters and optional credential provider
    * @see draft-ietf-moq-transport-16 §3.3
    */
   async connect(
     transport: WebTransportLike,
-    options: SetupOptions = {},
+    options: ConnectOptions = {},
   ): Promise<void> {
     // connect() owns the supplied transport from entry, including preflight
     // failures. A caller can always tear it down through close().
@@ -1422,11 +1457,22 @@ export class MoqtConnection {
       this.configureForVersion(selectedVersion, transportKind);
     }
 
-    // Observe the transport session lifetime: a remote close settles this
-    // promise with the real code/reason (preserved into onClose), a transport
-    // failure rejects it (surfaced as a fatal error). Runs through the one-shot
-    // terminal coordinator, ignores a stale transport after migration.
+    // Observe peer closure while credential acquisition is pending as well as
+    // during setup and playback. Otherwise a dead connection could retain a
+    // provider until its acquisition deadline.
     void this.watchTransportClosed(transport);
+
+    const { authorization, ...setup } = options;
+    options = setup;
+    if (authorization !== undefined) {
+      if (!authorization || typeof authorization !== 'object') throw new AuthorizationError('Invalid authorization configuration');
+      if (this._role !== EndpointRole.CLIENT) throw new AuthorizationError('Credential providers are client-only');
+      if (setup.authTokens !== undefined) throw new AuthorizationError('Specify authorization or authTokens, not both');
+      this.authorization = new AuthorizationSession(authorization);
+      const authTokens = await this.authorization.resolve({ operation: 'SETUP', draftVersion: selectedVersion });
+      if (this._terminated || this.transport !== transport) throw new AuthorizationError('Authorization connection closed');
+      options = { ...setup, authTokens };
+    }
 
     if (this.session.draftVersion === 18) {
       // draft-18: open the uni control-stream pair and exchange SETUP. Request
@@ -1568,6 +1614,11 @@ export class MoqtConnection {
     if (options?.onDrained && options.terminalDelivery !== 'drain') {
       throw new Error("onDrained requires terminalDelivery: 'drain'");
     }
+    if (this.authorization) {
+      namespace = namespace.map(field => Uint8Array.from(field));
+      name = Uint8Array.from(name);
+      options = await this.authorize({ operation: 'SUBSCRIBE', namespace, trackName: name }, options);
+    }
     const { sessionOptions, onRequestId } = splitOwnership(options);
     const { terminalDelivery, onDrained, ...restSession } =
       (sessionOptions ?? {}) as SubscribeOptions & TerminalDeliveryOptions;
@@ -1599,7 +1650,9 @@ export class MoqtConnection {
       onRequestId(requestId);
     } catch (err) {
       // No bytes were sent — ordinary rollback, no provenance needed.
-      this.session.rollbackRequest(requestId);
+      if (!this.session.rollbackUnsentRequest(requestId) && this.session.draftVersion !== 18) {
+        this.closeSessionInternalError('Unsent request ID cannot be reclaimed after reentrant allocation');
+      }
       throw err;
     }
   }
@@ -1742,8 +1795,13 @@ export class MoqtConnection {
     namespace: Uint8Array[],
     name: Uint8Array,
     trackAlias: bigint,
-    options?: { parameters?: Parameters; trackProperties?: TrackProperties },
+    options?: AuthorizationOptions & { parameters?: Parameters; trackProperties?: TrackProperties },
   ): Promise<bigint> {
+    if (this.authorization) {
+      namespace = namespace.map(field => Uint8Array.from(field));
+      name = Uint8Array.from(name);
+      options = await this.authorize({ operation: 'PUBLISH', namespace, trackName: name }, options);
+    }
     const { requestId, actions } = this.session.publish(namespace, name, trackAlias, options);
     // Associate the advertised alias with this publish for §10.11 Stream Count
     // accounting and terminal enforcement on the data-plane APIs.
@@ -2446,7 +2504,13 @@ export class MoqtConnection {
     name: Uint8Array,
     options?: TrackSubscribeOptions,
   ): Promise<TrackSubscription> {
+    if (this.authorization) {
+      namespace = namespace.map(field => Uint8Array.from(field));
+      name = Uint8Array.from(name);
+      options = await this.authorize({ operation: 'SUBSCRIBE', namespace, trackName: name }, options);
+    }
     const subscribeOpts: SubscribeOptions = {};
+    if (options?.authTokens !== undefined) subscribeOpts.authTokens = options.authTokens;
     if (options?.filter) {
       subscribeOpts.subscriptionFilter = options.filter;
     }
@@ -3125,6 +3189,47 @@ export class MoqtConnection {
     existingRequestId: bigint,
     options?: RequestUpdateOptions,
   ): Promise<bigint> {
+    if (this.authorization) return this.authorizedRequestUpdate(existingRequestId, options);
+    return this.sendRequestUpdate(existingRequestId, options);
+  }
+
+  private async authorizedRequestUpdate(existingRequestId: bigint, options?: RequestUpdateOptions): Promise<bigint> {
+    if (this.pendingAuthorizationUpdates >= 64) throw new AuthorizationError('Too many pending authorized updates');
+    const authorization = this.authorization!;
+    const target = this.authorizationTarget(existingRequestId);
+    const prefix = options?.trackNamespacePrefix?.map(field => Uint8Array.from(field));
+    const previous = this.authorizationUpdateTails.get(existingRequestId);
+    let release!: () => void;
+    const turn = new Promise<void>(resolve => { release = resolve; });
+    this.authorizationUpdateTails.set(existingRequestId, turn);
+    this.pendingAuthorizationUpdates++;
+    // Acquire concurrently, but consume failures immediately and wait for the
+    // preceding invocation before either sending or releasing this turn.
+    const credentials = this.authorize({ operation: 'REQUEST_UPDATE', existingRequestId,
+      namespace: prefix ?? target.namespace, ...(target.trackName ? { trackName: target.trackName } : {}) },
+    { ...options, ...(prefix ? { trackNamespacePrefix: prefix } : {}) }).then(
+      value => ({ ok: true as const, value }),
+      error => ({ ok: false as const, error }),
+    );
+    try {
+      await previous;
+      const acquired = await credentials;
+      if (!acquired.ok) throw acquired.error;
+      if (this._terminated || this.authorization !== authorization) throw new AuthorizationError('Authorization connection closed');
+      if (this.authorizationTarget(existingRequestId).owner !== target.owner) {
+        throw new AuthorizationError('Authorization target no longer exists');
+      }
+      // sendRequestUpdate synchronously queues the write before its first await.
+      // Release the turn there, not when the peer acknowledges the update.
+      return this.sendRequestUpdate(existingRequestId, acquired.value);
+    } finally {
+      this.pendingAuthorizationUpdates--;
+      release();
+      if (this.authorizationUpdateTails.get(existingRequestId) === turn) this.authorizationUpdateTails.delete(existingRequestId);
+    }
+  }
+
+  private async sendRequestUpdate(existingRequestId: bigint, options?: RequestUpdateOptions): Promise<bigint> {
     if (this.session.draftVersion === 18) {
       // Local REQUEST_UPDATE is only valid for an inbound PUBLISH (we are the
       // subscriber there). For an inbound SUBSCRIBE we are the publisher — the
@@ -3348,10 +3453,16 @@ export class MoqtConnection {
   async subscribeNamespace(
     namespacePrefix: Uint8Array[],
     subscribeOptions?: Varint,
+    options?: AuthorizationOptions,
   ): Promise<bigint> {
+    if (this.authorization) {
+      namespacePrefix = namespacePrefix.map(field => Uint8Array.from(field));
+      options = await this.authorize({ operation: 'SUBSCRIBE_NAMESPACE', namespace: namespacePrefix }, options);
+    }
     const { requestId, actions } = this.session.subscribeNamespace(
       namespacePrefix,
       subscribeOptions,
+      options,
     );
     if (this.session.draftVersion === 18) {
       // draft-18 §10.18: SUBSCRIBE_NAMESPACE opens a CONTINUING request stream.
@@ -3416,8 +3527,12 @@ export class MoqtConnection {
    * @param namespacePrefix The namespace prefix to match.
    * @returns The request ID for this track subscription.
    */
-  async subscribeTracks(namespacePrefix: Uint8Array[]): Promise<bigint> {
-    const { requestId, actions } = this.session.subscribeTracks(namespacePrefix);
+  async subscribeTracks(namespacePrefix: Uint8Array[], options?: AuthorizationOptions): Promise<bigint> {
+    if (this.authorization) {
+      namespacePrefix = namespacePrefix.map(field => Uint8Array.from(field));
+      options = await this.authorize({ operation: 'SUBSCRIBE_TRACKS', namespace: namespacePrefix }, options);
+    }
+    const { requestId, actions } = this.session.subscribeTracks(namespacePrefix, options);
     const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
     let closed: Promise<void>;
     try {
@@ -3525,6 +3640,11 @@ export class MoqtConnection {
     name: Uint8Array,
     options: FetchOptions & RequestOwnershipOptions,
   ): Promise<bigint> {
+    if (this.authorization) {
+      namespace = namespace.map(field => Uint8Array.from(field));
+      name = Uint8Array.from(name);
+      options = await this.authorize({ operation: 'FETCH', namespace, trackName: name }, options);
+    }
     const { sessionOptions, onRequestId } = splitOwnership(options);
     const { requestId, actions } = this.session.fetch(namespace, name, sessionOptions as FetchOptions);
     this.invokeOwnershipCallback(requestId, onRequestId);
@@ -3557,6 +3677,14 @@ export class MoqtConnection {
    *   our PENDING/ESTABLISHED subscriptions — nothing is emitted on the wire.
    */
   async joiningFetch(options: JoiningFetchOptions & RequestOwnershipOptions): Promise<bigint> {
+    if (this.authorization) {
+      const target = this.authorizationTarget(options.joiningRequestId);
+      options = await this.authorize({ operation: 'FETCH', existingRequestId: options.joiningRequestId,
+        namespace: target.namespace, ...(target.trackName ? { trackName: target.trackName } : {}) }, options);
+      if (this.authorizationTarget(options.joiningRequestId).owner !== target.owner) {
+        throw new AuthorizationError('Authorization target no longer exists');
+      }
+    }
     const { sessionOptions, onRequestId } = splitOwnership(options);
     const { requestId, actions } = this.session.joiningFetch(sessionOptions as JoiningFetchOptions);
     this.invokeOwnershipCallback(requestId, onRequestId);
@@ -3677,8 +3805,14 @@ export class MoqtConnection {
   async trackStatus(
     namespace: Uint8Array[],
     name: Uint8Array,
+    options?: AuthorizationOptions,
   ): Promise<bigint> {
-    const { requestId, actions } = this.session.trackStatus(namespace, name);
+    if (this.authorization) {
+      namespace = namespace.map(field => Uint8Array.from(field));
+      name = Uint8Array.from(name);
+      options = await this.authorize({ operation: 'TRACK_STATUS', namespace, trackName: name }, options);
+    }
+    const { requestId, actions } = this.session.trackStatus(namespace, name, options);
     if (this.session.draftVersion === 18) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       await this.openD18Request(requestId, msg);
@@ -3721,8 +3855,12 @@ export class MoqtConnection {
    * @returns The request ID for this namespace publication
    * @see draft-ietf-moq-transport-16 §6.2, draft-ietf-moq-transport-18 §10.15
    */
-  async publishNamespace(namespace: Uint8Array[]): Promise<bigint> {
-    const { requestId, actions } = this.session.publishNamespace(namespace);
+  async publishNamespace(namespace: Uint8Array[], options?: AuthorizationOptions): Promise<bigint> {
+    if (this.authorization) {
+      namespace = namespace.map(field => Uint8Array.from(field));
+      options = await this.authorize({ operation: 'PUBLISH_NAMESPACE', namespace }, options);
+    }
+    const { requestId, actions } = this.session.publishNamespace(namespace, options);
     if (this.session.draftVersion === 18) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       await this.openD18Request(requestId, msg);
@@ -4550,18 +4688,11 @@ export class MoqtConnection {
    * publisher subgroup stream still open for it and drop the stream accounting.
    * The alias→request association is retained so a subsequent openSubgroup /
    * sendDatagram is refused (terminated), never silently accepted.
-   */
-  /**
-   * Reset every open publisher stream for `requestId` (§5.1.1) and report
-   * whether ALL of them were proven reset within
-   * {@link PUBLISHER_ABORT_DEADLINE_MS}.
    *
-   * @returns true when every stream was proven reset: its abort fulfilled, or
-   *   rejected because the transport had already ended the stream. Only then is
-   *   PUBLISH_DONE permitted (§5.1.1). false when an abort rejected otherwise or
-   *   did not settle: that writer may still be an open transport stream.
+   * @returns true when every stream was proven reset within
+   *   {@link PUBLISHER_ABORT_DEADLINE_MS}; only then is PUBLISH_DONE permitted
+   *   (§5.1.1). Otherwise why not: a writer may still be an open transport stream.
    */
-  /** @returns true when every open stream was proven reset, else why not. */
   private async abortPublisherStreamsForRequest(requestId: bigint): Promise<true | string> {
     // ALL ownership transfer happens SYNCHRONOUSLY, before the first await:
     //  1. the TERMINATING latch — beginPublishOp/sendObject reject from this
@@ -4590,17 +4721,25 @@ export class MoqtConnection {
         if (st) {
           this.outgoingStreams.delete(sid);
           // INITIATE every cancellation before awaiting any individual one.
-          // An abort proves the reset (§5.1.1) when it fulfils, when it rejects
-          // with its own reason (the stream errored with it behind an in-flight
-          // close), or when the transport already ended the stream.
-          aborts.push(
-            st.writer.abort(reason)
-              .then(() => true, (err: unknown) => {
-                if (err === reason || MoqtConnection.endedByTransport(err)) return true;
-                refusal ??= err instanceof Error ? err.message : String(err);
-                return false;
-              }),
-          );
+          // INITIATE every cancellation before awaiting any individual one.
+          // A reset is proven (§5.1.1) when the abort fulfils, when the transport
+          // already ended the stream, or, with a FIN in flight, when the abort
+          // rejects with its own reason. A transport may supply that proof itself.
+          try {
+            aborts.push(
+              (this.transport?.resetSendStream
+                ? this.transport.resetSendStream(st.writer, reason, st.closing)
+                : st.writer.abort(reason))
+                .then(() => true, (err: unknown) => {
+                  if ((err === reason && st.closing) || MoqtConnection.endedByTransport(err)) return true;
+                  refusal ??= err instanceof Error ? err.message : String(err);
+                  return false;
+                }),
+            );
+          } catch (err) {
+            refusal ??= err instanceof Error ? err.message : String(err);
+            aborts.push(Promise.resolve(false));
+          }
         }
       }
     }
@@ -5667,8 +5806,7 @@ export class MoqtConnection {
       // fetch fail immediately rather than continuing to write during the teardown
       // awaits below. The writers are aborted afterward.
       const fetchWriters = this.detachFetchStreamsForRequest(requestId);
-      await this.executeActions(this.session.handleInboundRequestClosed(requestId));
-      this.inboundRequestContexts.delete(requestId);
+      const actions = this.session.handleInboundRequestClosed(requestId);
       // §3.3.2: a subscriber resetting its SUBSCRIBE stream IS the draft-18
       // unsubscribe. Surfaced before the resets below, which can take up to
       // PUBLISHER_ABORT_DEADLINE_MS, so the publisher stops writing at once.
@@ -5679,6 +5817,8 @@ export class MoqtConnection {
           this.reportObserverError(observerErr);
         }
       }
+      await this.executeActions(actions);
+      this.inboundRequestContexts.delete(requestId);
       if (pubAlias !== undefined) await this.discardOpenStreamsForAlias(pubAlias);
       // §5.1.1: the subscriber cancelled — RESET every publisher data stream
       // still open for this subscription and drop its accounting, so no more

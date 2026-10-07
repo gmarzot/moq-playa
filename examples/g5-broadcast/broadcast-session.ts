@@ -9,8 +9,8 @@
  * subscriptions or consume aliases, and a delayed `onClose` can no longer
  * stop or mutate the replacement generation.
  */
-import { RequestError, RequestError18 } from '@moqt/transport';
-import type { Fetch } from '@moqt/transport';
+import { RequestError, RequestError18 } from '@openmoq/transport';
+import type { Fetch } from '@openmoq/transport';
 import { acceptCatalogSubscribe, buildCatalogPayload, publishCatalogGroup } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import { MediaPublisher } from './media-publisher.js';

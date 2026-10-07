@@ -9,10 +9,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { createLoopback, flush } from './testkit/loopback.js';
 import { connectedPair, withProtocol, ns, nm } from './testkit/pair.js';
-import { SessionState, ForwardState, varint, SessionError, RequestError18, decodeSubgroupHeader18, createControlCodec, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18, writeLocation, locationEncodingLength } from '@moqt/transport';
+import { SessionState, ForwardState, varint, SessionError, RequestError18, decodeSubgroupHeader18, createControlCodec, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18, writeLocation, locationEncodingLength } from '@openmoq/transport';
 
 const codec18 = createControlCodec(18);
-import type { MoqtObject, ControlMessage, Goaway, RequestErrorMsg } from '@moqt/transport';
+import type { MoqtObject, ControlMessage, Goaway, RequestErrorMsg } from '@openmoq/transport';
 
 describe('MoqtConnection(18) loopback — SETUP handshake', () => {
   it('client and server both reach ESTABLISHED via the uni SETUP pair', async () => {
@@ -632,17 +632,17 @@ describe('MoqtConnection loopback — failed subscription REQUEST_UPDATE termina
 
 describe('MoqtConnection(18) loopback — deterministic failed-update termination', () => {
   /** Establish an active subscription on a provider-less server. */
-  async function activePair() {
-    const pair = await connectedPair();
+  async function activePair(version: 14 | 16 | 18 = 18) {
+    const pair = await connectedPair(version);
     let subReqId = -1n;
     pair.server.onSubscribe = (rid) => { subReqId = rid; };
     const clientMsgs: ControlMessage[] = [];
     pair.client.onMessage = (m) => clientMsgs.push(m);
     const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 1 } as never);
     await flush();
-    await pair.server.acceptSubscribe(subReqId, 7n, {
+    await pair.server.acceptSubscribe(subReqId, 7n, version === 18 ? {
       parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
-    });
+    } : undefined);
     await flush();
     return { ...pair, subReqId, reqId, clientMsgs };
   }
@@ -730,6 +730,68 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     expect(String(server.session.state).toLowerCase()).not.toBe('established');
   }, 15_000);
 
+  it.each([
+    [14, true, 'unsubscribe'], [14, false, 'unsubscribe'],
+    [16, true, 'unsubscribe'], [16, false, 'unsubscribe'],
+    [18, true, 'unsubscribe'], [18, false, 'unsubscribe'],
+    [18, true, 'failed update'], [18, false, 'failed update'],
+  ] as const)('draft-%s pending-FIN cancellation is proven reset (transport proof=%s, %s)', async (version, provided, path) => {
+    // With the FIN in flight, an abort rejecting with its own reason proves the
+    // reset, so the hook and the fallback agree.
+    const pair = await activePair(version);
+    const { client, server, b, reqId, clientMsgs } = pair;
+    let rejectFin!: (error: unknown) => void;
+    let reset = false;
+    b.createUnidirectionalStream = async () => new WritableStream<Uint8Array>({
+      start(controller) {
+        controller.signal.addEventListener('abort', () => {
+          reset = true;
+          rejectFin(controller.signal.reason);
+        });
+      },
+      close: () => new Promise<void>((_, reject) => { rejectFin = reject; }),
+    });
+    const resetSendStream = vi.fn(async (writer: WritableStreamDefaultWriter<Uint8Array>, reason: unknown, fin?: Promise<void>) => {
+      try { await writer.abort(reason); }
+      catch (error) {
+        if (error !== reason || !fin) throw error;
+        if (!await fin.then(() => false, (finError) => finError === reason)) throw error;
+      }
+    });
+    if (provided) Object.assign(b, { resetSendStream });
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    const fin = server.closeSubgroup(sid);
+    const finOutcome = fin.catch((error) => error);
+    await flush();
+    if (path === 'unsubscribe') await client.unsubscribe(reqId);
+    else {
+      await pausePair(pair);
+      await client.requestUpdate(reqId, { forward: 1 });
+    }
+    for (let i = 0; i < 8; i++) await flush();
+    expect(reset).toBe(true);
+    expect(String(server.session.state).toLowerCase()).toBe('established');
+    expect(resetSendStream).toHaveBeenCalledTimes(provided ? 1 : 0);
+    expect(await finOutcome).toBeInstanceOf(Error);
+    if (path === 'failed update') expect(doneMsgs(clientMsgs)).toHaveLength(1);
+  });
+
+  it.each(['reject', 'throw', 'hang'])('an unproven transport-specific reset on cancellation is reported, not fatal (%s)', async (mode) => {
+    const { client, server, b, reqId, errors } = await activePair();
+    await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    const resetSendStream = vi.fn(() => {
+      if (mode === 'throw') throw new Error('reset failed');
+      return mode === 'reject' ? Promise.reject(new Error('reset failed')) : new Promise<void>(() => {});
+    });
+    Object.assign(b, { resetSendStream });
+    await client.unsubscribe(reqId);
+    if (mode === 'hang') await new Promise((resolve) => setTimeout(resolve, 1200));
+    await flush(); await flush(); await flush();
+    expect(resetSendStream).toHaveBeenCalledTimes(1);
+    expect(String(server.session.state).toLowerCase()).toBe('established');
+    expect(errors.some((e) => /not proven reset/.test(e.message))).toBe(true);
+  });
+
   it('an ordinary cancellation whose reset is unproven keeps the session and reports it (§5.1.1)', async () => {
     // Nothing is announced after a subscriber's cancellation, so there is no
     // terminal to protect: the failure is reported and the session serves on.
@@ -764,8 +826,8 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     expect(server.session.getIncomingSubscription(nextSubReqId)).toBeDefined();
   }, 15_000);
 
-  it('an abort that rejects with its own reason counts as the reset (§5.1.1)', async () => {
-    // The stream errored with our reason, as when the abort lands behind an in-flight close.
+  it('without a FIN in flight, an abort rejecting with its own reason does not prove the reset (§5.1.1)', async () => {
+    // The pending-FIN case, where it does, is covered by the it.each above.
     const { client, server, b, reqId, errors } = await activePair();
     const origCreate = b.createUnidirectionalStream.bind(b);
     (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
@@ -782,7 +844,8 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     await client.unsubscribe(reqId);
     await flush(); await flush(); await flush();
 
-    expect(errors.filter((e) => /not proven reset/.test(e.message))).toEqual([]);
+    expect(errors.some((e) => /not proven reset/.test(e.message))).toBe(true);
+    expect(String(server.session.state).toLowerCase()).toBe('established');
   }, 15_000);
 
   /** A subgroup stream whose FIN stays in flight until `failFin` rejects it. */
@@ -3429,6 +3492,37 @@ describe('MoqtConnection(18) loopback — openSubgroup FIRST_OBJECT (§9.4.2)', 
 });
 
 describe('MoqtConnection(18) loopback — onSubscribeClosed (§3.3.2 unsubscribe)', () => {
+  it.each([false, true])('notifies before waiting for resets and preserves cleanup if the callback throws (%s)', async (throws) => {
+    const { client, server, b, errors } = await connectedPair();
+    let requestId = -1n;
+    server.onSubscribe = (rid) => { requestId = rid; };
+    const pending = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => {} });
+    await flush();
+    await server.acceptSubscribe(requestId, 9n);
+    const sub = await pending;
+    await server.openSubgroup(9n, 1n, 0n);
+    let release!: () => void;
+    const resetting = new Promise<void>((resolve) => { release = resolve; });
+    const reset = vi.fn(() => resetting);
+    Object.assign(b, { resetSendStream: reset });
+    const notified: bigint[] = [];
+    server.onSubscribeClosed = (rid) => {
+      expect(server.session.getIncomingSubscription(rid)).toBeUndefined();
+      notified.push(rid);
+      if (throws) throw new Error('application callback failed');
+    };
+    await sub.unsubscribe();
+    await flush(); await flush();
+    expect(notified).toEqual([requestId]);
+    expect(reset).toHaveBeenCalledTimes(1);
+    release();
+    await flush(); await flush();
+    expect(server.session.state).toBe(SessionState.ESTABLISHED);
+    // A throwing observer is reported, never fatal.
+    expect(errors.map((e) => e.message)).toEqual(throws ? ['application callback failed'] : []);
+    expect(errors.filter((e) => (e as { isFatal?: boolean }).isFatal)).toEqual([]);
+  });
+
   it('fires onSubscribeClosed when the subscriber resets its SUBSCRIBE stream; cleans state, no error/close', async () => {
     const { client, server, errors } = await connectedPair();
 

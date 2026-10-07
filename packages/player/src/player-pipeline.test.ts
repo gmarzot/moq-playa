@@ -19,7 +19,7 @@ import {
   type TrackInfo,
 } from './player-pipeline.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@moqt/playback';
+import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@openmoq/playback';
 import type { CommandDispatcher } from './command-dispatcher.js';
 import type { MediaSourceLike } from './interfaces.js';
 import type { LoggerLike } from './logger.js';
@@ -133,6 +133,29 @@ describe('createPipelines', () => {
     const result = createPipelines(config, mockClock, trackInfo, mockCallbacks());
     expect(result.videoPipeline).toBeNull();
     expect(result.mediaSource).not.toBeNull();
+  });
+
+  it('locmaf tracks go through MSE like CMAF — no WebCodecs decoder/renderer, no LOC pipeline (LOCMAF §6)', () => {
+    const createVideoDecoder = vi.fn();
+    const createRenderer = vi.fn();
+    const config = minimalConfig({
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onStall: null, onError: null,
+      }) as any,
+      createVideoDecoder,
+      createRenderer,
+    });
+    const trackInfo: TrackInfo = {
+      video: { codec: 'avc1.640028', packaging: 'locmaf', initData: btoa('ftyp') },
+      audio: undefined,
+    };
+    const result = createPipelines(config, mockClock, trackInfo, mockCallbacks());
+    expect(result.mediaSource).not.toBeNull();
+    expect(result.videoPipeline).toBeNull();
+    expect(createVideoDecoder).not.toHaveBeenCalled();
+    expect(createRenderer).not.toHaveBeenCalled();
+    expect(result.getRenderCushionUs).toBeUndefined();
   });
 
   it('returns null CommandDispatcher when no decoder factories', () => {

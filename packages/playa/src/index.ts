@@ -1,8 +1,8 @@
 /**
- * @playa/player — Batteries-included MoQ media player.
+ * @openmoq/playa — Batteries-included MoQ media player.
  *
  * ```ts
- * import { Player } from '@playa/player';
+ * import { Player } from '@openmoq/playa';
  * const player = new Player(container, { url, namespace });
  * await player.load();
  * player.play();
@@ -12,6 +12,8 @@
  */
 
 export { Player } from './player.js';
+export { catToken, AuthorizationError } from '@openmoq/player';
+export type { PlayerAuthorization, AuthorizationToken, AuthorizationProvider, AuthorizationContext, AuthorizationOperation } from '@openmoq/player';
 export type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 export type {
   PlayerEventMap,
@@ -32,6 +34,6 @@ export type {
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';
-export type { SubscriptionStatus, NamespaceState, BootstrapPhase } from '@moqt/player';
+export type { SubscriptionStatus, NamespaceState, BootstrapPhase } from '@openmoq/player';
 export { detectStrategy } from './auto-detect.js';
 export type { DecoderStrategy } from './auto-detect.js';

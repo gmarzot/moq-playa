@@ -34,12 +34,11 @@
  */
 
 import {
-  MoqtPlayer, TypedEmitter, checkSupport,
-} from '@moqt/player';
-import type {
-  BootstrapPhase, MoqtPlayerConfig, NamespaceState, SubscriptionStatus, SupportReport,
-} from '@moqt/player';
-import { MoqtConnection } from '@moqt/webtransport';
+  MoqtPlayer, TypedEmitter, checkSupport, usesMsePath,
+} from '@openmoq/player';
+import type { LocmafDecoding, MoqtPlayerConfig, SupportReport } from '@openmoq/player';
+import type { BootstrapPhase, NamespaceState, SubscriptionStatus } from '@openmoq/player';
+import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
   WebCodecsVideoDecoder,
@@ -50,7 +49,7 @@ import {
   MseMediaSource,
   CmafAssembler,
   createWebTransport,
-} from '@moqt/browser';
+} from '@openmoq/browser';
 
 import { detectStrategy } from './auto-detect.js';
 import type { DecoderStrategy } from './auto-detect.js';
@@ -73,7 +72,7 @@ const DEFAULTS = {
 /**
  * Batteries-included MoQ media player.
  *
- * Wraps MoqtPlayer (@moqt/player) with browser adapters (@moqt/browser)
+ * Wraps MoqtPlayer (@openmoq/player) with browser adapters (@openmoq/browser)
  * and a UI-friendly API. Handles DOM element creation, adapter wiring,
  * volume control, time tracking, and event bridging automatically.
  */
@@ -100,6 +99,8 @@ export class Player {
   private readonly container: HTMLElement | null;
   private readonly options: PlayerOptions;
   private readonly strategy: DecoderStrategy;
+  /** How the engine consumes LOCMAF tracks; decides the render sink for them. */
+  private readonly locmafDecoding: LocmafDecoding | undefined;
 
   // DOM elements — may be user-provided (borrowed) or created by Player (owned).
   private canvas: HTMLCanvasElement | null = null;
@@ -222,6 +223,7 @@ export class Player {
 
     // Build MoqtPlayer config and create MoqtPlayer
     const moqtPlayerConfig = this.buildMoqtPlayerConfig();
+    this.locmafDecoding = moqtPlayerConfig.locmafDecoding;
     this.engine = new MoqtPlayer(moqtPlayerConfig);
 
     // Wire MoqtPlayer events → Player events
@@ -647,7 +649,7 @@ export class Player {
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
           this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock });
-          // play() may have run before the pipelines existed (autoplay on ready).
+          // Catalog discovery can create the pipeline after play() has returned.
           if (this._state === 'playing') this.renderer.start();
           return this.renderer;
         },
@@ -686,6 +688,9 @@ export class Player {
     }
     if (opts.authTokens) {
       (base as unknown as Record<string, unknown>).authTokens = opts.authTokens;
+    }
+    if (opts.authorization !== undefined) {
+      Object.assign(base, { authorization: opts.authorization });
     }
 
     // Power-user escape hatch: merge moqtPlayerConfig overrides last
@@ -730,7 +735,9 @@ export class Player {
       this.emitter.emit('catalog_received', { catalog: e.catalog });
       this._levels = mapLevels(e.catalog);
       this._audioTracks = mapAudioTracks(e.catalog);
-      const hasCmaf = e.catalog.tracks.some(track => track.packaging === 'cmaf');
+      // cmaf renders through MSE into the <video> element, as does locmaf
+      // unless the engine decodes it frame by frame onto the canvas.
+      const hasCmaf = e.catalog.tracks.some(track => usesMsePath(track.packaging, this.locmafDecoding));
 
       // Aim the live edge at the declared target. The audio output is built
       // later, at pipeline creation, so the aim is stored for it too.

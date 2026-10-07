@@ -255,6 +255,29 @@ describe('applyMsf01Delta — reference integrity is re-validated against the re
     });
 });
 
+describe('applyMsf01Delta — LOCMAF locmafVersion (draft-einarsson-moq-locmaf-01 §5)', () => {
+    it('an add op carries locmafVersion through to the applied locmaf track', () => {
+        const st = apply(cmsfState(), { deltaUpdate: [{ op: 'add', tracks: [{ name: 'vl', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, codec: 'avc1.640028', initRef: 'i1' }] }] });
+        const t = st.tracks.find((x) => x.name === 'vl')!;
+        expect(t.packaging).toBe('locmaf');
+        expect(t.locmafVersion).toBe('0.3');
+    });
+
+    it('rejects a delta that adds a locmaf track without locmafVersion', () => {
+        expect(() => apply(cmsfState(), { deltaUpdate: [{ op: 'add', tracks: [{ name: 'vl', packaging: 'locmaf', isLive: true, initRef: 'i1' }] }] }))
+            .toThrow(/locmafVersion/);
+    });
+
+    it('rejects a clone that switches packaging away from locmaf but inherits locmafVersion', () => {
+        const base: CatalogState = {
+            ...cmsfState(),
+            tracks: [{ name: 'vl', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', initRef: 'i1' }],
+        };
+        expect(() => apply(base, { deltaUpdate: [{ op: 'clone', tracks: [{ parentName: 'vl', name: 'vc', packaging: 'cmaf' }] }] }))
+            .toThrow(/locmafVersion/);
+    });
+});
+
 describe('applyMsf01Delta — an MSF-00 base state stays clean', () => {
     it('an MSF-00 base (no root lists) applies an add with no injected root fields', () => {
         const st = apply({ version: 1, tracks: [{ name: 'v', packaging: 'loc', isLive: true }] },
@@ -267,13 +290,13 @@ describe('applyMsf01Delta — an MSF-00 base state stays clean', () => {
 
 // ─── Publisher round-trip: build CMSF-01 catalog → op-array clone delta ───
 // Models the node-publisher example (--catalog-format cmsf-01 --emit-delta):
-// the emitted catalog + delta bytes must parse and apply through @moqt/msf.
+// the emitted catalog + delta bytes must parse and apply through @openmoq/msf.
 
 import { buildCatalog } from './catalog-builder.js';
 import { parseCatalogAuto } from './catalog-detect.js';
 import type { Catalog } from './types.js';
 
-describe('publisher CMSF-01 catalog + op-array clone delta round-trips through @moqt/msf', () => {
+describe('publisher CMSF-01 catalog + op-array clone delta round-trips through @openmoq/msf', () => {
     it('parses the built catalog and applies the emitted clone delta (clone inherits initRef)', () => {
         // 1. buildCatalog cmsf-01 shape (what buildFixtureCatalog emits).
         const catalogBytes = buildCatalog({

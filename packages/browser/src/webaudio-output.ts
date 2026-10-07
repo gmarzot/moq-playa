@@ -9,8 +9,8 @@
  * @module
  */
 
-import type { AudioOutputLike } from '@moqt/player';
-import type { ClockSource } from '@moqt/playback';
+import type { AudioOutputLike } from '@openmoq/player';
+import type { ClockSource } from '@openmoq/playback';
 
 /** Live-edge bounds on the audio lead (seconds behind the capture-aligned schedule). */
 export interface WebAudioOutputOptions {

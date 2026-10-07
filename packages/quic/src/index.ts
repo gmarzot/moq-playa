@@ -3,7 +3,7 @@
  *
  * This package requires Node's experimental `node:quic` module and currently
  * supports MOQT draft 18 only. Browser applications should continue to use
- * `@moqt/webtransport` with a WebTransport implementation.
+ * `@openmoq/webtransport` with a WebTransport implementation.
  *
  * @module
  */

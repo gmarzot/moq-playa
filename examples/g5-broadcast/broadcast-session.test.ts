@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection, CarriedCatalog } from './broadcast-session.js';
-import type { Fetch } from '@moqt/transport';
+import type { Fetch } from '@openmoq/transport';
 import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 

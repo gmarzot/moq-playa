@@ -7,7 +7,7 @@ import {
   routeNativeStream,
   type MoqtQuicTransport,
 } from './transport.js';
-import type { WebTransportBidirectionalStream } from '@moqt/webtransport';
+import type { WebTransportBidirectionalStream } from '@openmoq/webtransport';
 
 const ALPN = 'moqt-18';
 const DEFAULT_PORT = '443';

@@ -20,23 +20,25 @@
  * @module
  */
 
-import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
-import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
+import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
-import type { BootstrapPhase, CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
-import type {
-  MoqtObject, MoqtObjectData, ObjectDatagram, SubgroupHeader,
-} from '@moqt/transport';
-import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
-import { BufferBasedController } from '@moqt/playback';
-import type { AbrTrack } from '@moqt/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
-import type { CatalogState, CatalogTrack } from '@moqt/msf';
-import type { LocHeaders } from '@moqt/loc';
-import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE } from '@moqt/msf';
+import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
+import type { BootstrapPhase } from './catalog-bootstrap.js';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
+import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
+import type { MoqtObjectData } from '@openmoq/transport';
+import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
+import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { BufferBasedController } from '@openmoq/playback';
+import type { AbrTrack } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
+import type { LocHeaders } from '@openmoq/loc';
+import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
+import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
+import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
@@ -56,6 +58,16 @@ import type { SupportReport } from './support.js';
 import { CatalogManager } from './catalog-manager.js';
 import { QualityController } from './quality-controller.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
+import { isMsePackaging, mediaTrackPackaging, usesMsePath } from './packaging.js';
+
+/** What a reconstructed LOCMAF chunk exposes beyond its CMAF bytes (frame path, event-only tracks). */
+interface LocmafChunkDetails {
+  readonly effective: LocmafEffectiveSamples;
+  readonly mdat: Uint8Array;
+  readonly genBoxes: readonly GenBox[];
+  readonly timescale: number;
+  readonly baseMediaDecodeTime: bigint;
+}
 import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
@@ -72,6 +84,7 @@ import { computePlaybackDelayUs,
 } from './player-pipeline.js';
 import {
   handleControlMessage as doControlMessage,
+  removeSubscription,
   validateKnownTracks as doValidateKnownTracks,
 } from './player-message.js';
 import { wireConnectionCallbacks } from './player-wiring.js';
@@ -361,6 +374,33 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
    */
   private mediaSource: MediaSourceLike | null = null;
+  /**
+   * Per-track LOCMAF reconstruction state, keyed by track name: each decoder is
+   * seeded from that track's CMAF Header and turns LOCMAF Objects back into
+   * canonical CMAF chunks for the assembler.
+   * @see draft-einarsson-moq-locmaf-01 §6, §15
+   */
+  private locmafDecoders = new Map<string, LocmafTrackDecoder>();
+  /**
+   * Malformed-track bookkeeping per LOCMAF track: for each recent group, whether it
+   * decoded a chunk and whether it was already counted as failed. Keyed by group
+   * because groups interleave (each rides its own stream).
+   */
+  private locmafHealth = new Map<string, { groups: Map<bigint, { decoded: boolean; counted: boolean }>; failedGroups: number }>();
+  /** The CMAF Header each LOCMAF decoder was built from (a repeated in-band header is not a re-seed). */
+  private locmafDecoderInit = new Map<string, Uint8Array>();
+  /** LOCMAF tracks whose CMAF Header cannot seed reconstruction (not re-parsed for every object). */
+  private locmafBadInit = new Set<string>();
+  /** Once-per-track warning keys for LOCMAF rejections and missing CMAF Headers. */
+  private locmafWarned = new Set<string>();
+  /**
+   * Frame path (§16) bookkeeping per LOCMAF track: the next synthetic object id
+   * for each recent group, so every coded sample becomes one pipeline object in
+   * decode order, and the codec description read from the CMAF Header the
+   * track's decoder was seeded from.
+   */
+  private locmafFrameIds = new Map<string, Map<bigint, bigint>>();
+  private locmafDescriptions = new Map<string, { init: Uint8Array; description: Uint8Array | null }>();
   /**
    * Playback intent as declared through play()/pause()/destroy(), or `null`
    * when the embedder has never declared one. A media source created later
@@ -705,6 +745,12 @@ export class MoqtPlayer {
   /** Whether the first catalog object has been received. */
   private catalogReceived = false;
 
+  /** Pending catalog-subscribe retry timer; null when none is pending. */
+  private catalogSubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Delay before re-issuing a catalog SUBSCRIBE refused with DOES_NOT_EXIST. */
+  private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
+
   /** Stored catalog state for track switching. */
   private _catalogState: CatalogState | null = null;
 
@@ -726,7 +772,7 @@ export class MoqtPlayer {
     oldRequestId: bigint;
     oldTrackName: string;
     newTrackName: string;
-    newTrackAlias: bigint;
+    newRequestId: bigint;
     newTrackPackaging: TrackPackaging;
     /** Carried from `selectVideoTrack` so commit/abort events report it. */
     reason: string;
@@ -793,7 +839,7 @@ export class MoqtPlayer {
    */
   private readonly activeSubscriptions = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint }
+    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint | null }
   >();
 
   /**
@@ -858,7 +904,7 @@ export class MoqtPlayer {
    */
   private readonly activeFetches = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean }
+    { trackName: string; mediaType: 'video' | 'audio'; subscriptionRequestId: bigint | null; trackAlias: bigint | null; warmStart?: boolean }
   >();
 
   /**
@@ -900,10 +946,8 @@ export class MoqtPlayer {
   private readonly catalogFetchStreams = new Map<bigint, bigint>();
 
   /**
-   * Fetch stream → track alias mapping for object routing.
-   * When a FETCH data stream arrives (§10.4.4), we map the stream ID
-   * to the correct track alias so fetch objects can be routed through
-   * the subscription manager.
+   * Confirmed FETCH stream -> alias routing. Streams waiting for their
+   * subscription's SUBSCRIBE_OK stay in pendingFetchStreams instead.
    * @see draft-ietf-moq-transport-16 §10.4.4 (FETCH_HEADER)
    */
   private readonly fetchStreamAliases = new Map<bigint, bigint>();
@@ -916,8 +960,8 @@ export class MoqtPlayer {
   private readonly fetchStreamRequestIds = new Map<bigint, bigint>();
 
   /**
-   * FETCH data streams whose request ID is not (yet) registered in
-   * {@link activeFetches}. §9.16.3 allows fetch data at any time relative to
+   * FETCH data streams whose request or subscription alias is not yet known.
+   * §9.16.3 allows fetch data at any time relative to
    * FETCH_OK — which can beat the joiningFetch()/fetch() promise continuation
    * that registers the fetch. Objects buffer here (bounded) and replay
    * through the normal alias remap once the fetch is registered; they are
@@ -925,7 +969,7 @@ export class MoqtPlayer {
    */
   private readonly pendingFetchStreams = new Map<
     bigint,
-    { requestId: bigint; objects: MoqtObject[]; terminal?: DataStreamTerminal }
+    { requestId: bigint; objects: MoqtObject[]; bytes: number; terminal?: DataStreamTerminal }
   >();
 
   /**
@@ -945,6 +989,13 @@ export class MoqtPlayer {
   private static readonly MAX_QUARANTINED_FETCHES = 16;
 
   private quarantineFetchRequest(reqId: bigint): void {
+    this.activeFetches.delete(reqId);
+    for (const [streamId, requestId] of this.fetchStreamRequestIds) {
+      if (requestId !== reqId) continue;
+      this.fetchStreamRequestIds.delete(streamId);
+      this.fetchStreamAliases.delete(streamId);
+      this.droppedFetchStreams.add(streamId);
+    }
     if (this.quarantinedFetchRequests.size >= MoqtPlayer.MAX_QUARANTINED_FETCHES) {
       const oldest = this.quarantinedFetchRequests.values().next().value;
       if (oldest !== undefined) this.quarantinedFetchRequests.delete(oldest);
@@ -960,9 +1011,28 @@ export class MoqtPlayer {
   }
   /** Entry-count bound for pendingFetchStreams (FIFO eviction of the oldest). */
   private static readonly MAX_PENDING_FETCH_STREAMS = 8;
+  private static readonly MAX_PENDING_FETCH_BYTES = 4 * 1024 * 1024;
+
+  /** Release a request's routing only on the session that created it. */
+  private retireMediaSubscription(requestId: bigint, conn: MoqtConnection) {
+    if (conn !== this.connection) return undefined;
+    this.settleParkedOwnership(requestId, null, conn);
+    const sub = removeSubscription(requestId, {
+      activeSubscriptions: this.activeSubscriptions,
+      pendingMediaSubs: this.pendingMediaSubs,
+      subscriptionManager: this.subscriptionManager,
+    });
+    if (sub?.trackAlias != null && this.subscriptionManager?.getMediaType(sub.trackAlias) === undefined) {
+      this.pendingObjectsByAlias.delete(sub.trackAlias);
+    }
+    for (const [fetchId, info] of this.activeFetches) {
+      if (info.subscriptionRequestId === requestId) this.quarantineFetchRequest(fetchId);
+    }
+    return sub;
+  }
 
   /**
-   * Tombstones for OVERFLOWED unregistered fetch streams: their later objects
+   * Tombstones for discarded fetch streams: their later objects
    * must be swallowed (a fetch stream's wire trackAlias is 0, which can
    * collide with a real alias-0 subscription). Entries clear on FIN/reset,
    * so the set is bounded by the peer's concurrently-open streams.
@@ -1254,6 +1324,528 @@ export class MoqtPlayer {
     return undefined;
   }
 
+  /** Consecutive groups with no reconstructable chunk before a LOCMAF track is malformed (§2.4.2). */
+  private static readonly LOCMAF_MAX_FAILED_GROUPS = 3;
+  /** Recent groups kept in a LOCMAF track's malformed-track bookkeeping. */
+  private static readonly LOCMAF_TRACKED_GROUPS = 8;
+
+  /**
+   * A LOCMAF media object: reconstruct the canonical CMAF chunk it carries and
+   * feed it through the same gates and assembler as a CMAF object.
+   *
+   * The track's decoder sees every object that passes the init and attach
+   * gates, in order, so its in-group delta reference stays exact. Objects
+   * dropped before it leave a gap, which it rejects until the next full header
+   * (§3): the same "resume at the next group" behaviour the CMAF gates have.
+   * Video is spliced only on a chunk whose first sample is a sync sample (§10.1
+   * sample flags), never on object ids.
+   * @see draft-einarsson-moq-locmaf-01 §3, §9, §15, §16
+   */
+  private onLocmafMediaObject(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, obj: MoqtObject): void {
+    if (mediaType === 'eventtimeline') {
+      this.onLocmafEventObject(trackName, obj);
+      return;
+    }
+    // Liveness: stamp before every early return (gates, staging, drops).
+    this.stampMediaArrival(BigInt(obj.trackAlias));
+
+    this._stats.recordFirstObjectReceived();
+    if (obj.kind === 'data') {
+      const bytes = obj.payload ? obj.payload.byteLength : 0;
+      this._stats.recordMediaObject(bytes);
+      if (mediaType === 'video' && bytes > 0) {
+        this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
+      }
+    } else {
+      this._stats.recordGapObject();
+    }
+    this.emitter.emit('media_object', {
+      type: 'media_object',
+      mediaType,
+      trackName,
+      groupId: BigInt(obj.groupId),
+      objectId: BigInt(obj.objectId),
+      kind: obj.kind,
+      ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
+      ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+    });
+
+    if (this.stateMachine.state === PlayerState.PAUSED) return;
+    if (obj.kind === 'gap') {
+      // §16: END_OF_GROUP / END_OF_TRACK markers let the LOC pipeline advance
+      // to the next group at once instead of waiting out the gap timeout.
+      if (this.locmafFramePath) this.routeLocmafFrame(mediaType, trackName, obj, {});
+      return;
+    }
+    if (!obj.payload) return;
+
+    // §9: a rawBoxes Object carries complete ISO boxes, possibly a CMAF Header.
+    const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
+
+    // §16 frame interface: no MSE gates apply; the LOC pipeline takes the samples.
+    if (this.locmafFramePath) {
+      this.onLocmafFrameObject(mediaType, trackName, obj, rawBoxes);
+      return;
+    }
+
+    // Gate: nothing reaches MSE before initialization. An in-band CMAF Header
+    // (as rawBoxes) is an init source, exactly like a CMAF in-band ftyp+moov.
+    if (!this.cmafInitialized) {
+      this.handlePreInitCmafObject(mediaType, trackName, rawBoxes ?? obj.payload);
+      return;
+    }
+
+    // Gate: hold media while the MediaSource is not attached (see onCmafObject).
+    if (this.mediaSource?.attached === false) {
+      if (!this.cmafHoldingForAttach) {
+        this.cmafHoldingForAttach = true;
+        this.log.info('[LOCMAF] MediaSource not attached yet (sourceopen pending — hidden tab?); holding media until attached');
+      }
+      return;
+    }
+
+    // A later in-band CMAF Header re-seeds this track's reconstruction (§6, §9.3).
+    if (rawBoxes && MoqtPlayer.looksLikeCmafInitSegment(rawBoxes)) {
+      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      return;
+    }
+
+    const groupId = BigInt(obj.groupId);
+    const decoded = this.decodeLocmafObject(mediaType, trackName, BigInt(obj.trackAlias), groupId,
+      BigInt(obj.objectId), obj.payload);
+    if (!decoded) return;
+
+    // Gate: video starts on a sync sample (the chunk's own sample flags).
+    if (mediaType === 'video' && !this.cmafVideoSynced) {
+      if (!decoded.sync) return;
+      this.cmafVideoSynced = true;
+      this.log.debug('[LOCMAF] video synced at g=%s o=%s', String(obj.groupId), String(obj.objectId));
+    }
+
+    // Make-before-break: stage the new track's chunks until a sync chunk, as for CMAF.
+    if (this.pendingVideoSwitch && mediaType === 'video'
+        && trackName === this.pendingVideoSwitch.newTrackName) {
+      this.cmafSwitchStagingBuffer.push({ trackName, mediaType, groupId, payload: decoded.bytes });
+      if (this.switchStagingTimeout === null) {
+        this.switchStagingTimeout = setTimeout(() => {
+          this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
+          this.completePendingVideoSwitch();
+        }, SWITCH_STAGING_TIMEOUT_MS);
+      }
+      if (decoded.sync) {
+        this.completePendingVideoSwitch();
+      } else if (this.cmafSwitchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
+        this.log.warn('[SWITCH] LOCMAF staging overflow (%d objects) — force-completing', SWITCH_STAGING_MAX_OBJECTS);
+        this.completePendingVideoSwitch();
+      }
+      return;
+    }
+
+    // Early stale-group drop, as for CMAF: video only, the previous group tolerated.
+    if (mediaType === 'video' && this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
+      const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
+        .getCommittedGroupFloor(mediaType, trackName);
+      if (floor !== undefined && groupId + 1n < floor) return;
+    }
+
+    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes);
+  }
+
+  /**
+   * Reconstruct one LOCMAF Object. Returns the CMAF bytes and whether they start
+   * on a sync sample, or null when the object is rejected (counted, warned once
+   * per track). A track whose last {@link LOCMAF_MAX_FAILED_GROUPS} groups each
+   * produced nothing is malformed: a gap legitimately rejects the rest of its
+   * group, but whole groups failing in a row means the stream cannot be decoded.
+   */
+  private decodeLocmafObject(
+    mediaType: 'video' | 'audio' | 'eventtimeline',
+    trackName: string,
+    trackAlias: bigint,
+    groupId: bigint,
+    objectId: bigint,
+    payload: Uint8Array,
+  ): { bytes: Uint8Array; sync: boolean; chunk?: LocmafChunkDetails; rawError?: string } | null {
+    const decoder = this.locmafDecoderFor(mediaType, trackName, trackAlias);
+    if (!decoder) return null;
+    const result = decoder.push(groupId, objectId, payload);
+
+    let health = this.locmafHealth.get(trackName);
+    if (!health) {
+      health = { groups: new Map(), failedGroups: 0 };
+      this.locmafHealth.set(trackName, health);
+    }
+    let group = health.groups.get(groupId);
+    if (!group) {
+      group = { decoded: false, counted: false };
+      health.groups.set(groupId, group);
+      if (health.groups.size > MoqtPlayer.LOCMAF_TRACKED_GROUPS) {
+        const oldest = health.groups.keys().next().value;
+        if (oldest !== undefined) health.groups.delete(oldest);
+      }
+    }
+
+    if (result.kind === 'rejected') {
+      this._stats.recordLocmafObjectRejected();
+      if (!this.locmafWarned.has(`rejected:${trackName}`)) {
+        this.locmafWarned.add(`rejected:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s rejected: %s',
+          trackName, mediaType, String(groupId), String(objectId), result.error.message);
+      }
+      if (!group.decoded && !group.counted) {
+        group.counted = true;
+        health.failedGroups++;
+        if (health.failedGroups >= MoqtPlayer.LOCMAF_MAX_FAILED_GROUPS) {
+          this.locmafDecoders.delete(trackName);
+          this.locmafDecoderInit.delete(trackName);
+          this.locmafHealth.delete(trackName);
+          this.handleMalformedTrack(trackAlias, trackName, result.error);
+        }
+      }
+      return null;
+    }
+
+    group.decoded = true;
+    health.failedGroups = 0;
+    if (result.kind === 'raw') {
+      // rawBoxes media (§9): the chunk is carried verbatim, often because its
+      // moof falls outside the LOCMAF field model. Read its samples leniently
+      // (any decodable moof+mdat, not only what the encoder could have carried
+      // as a header). A chunk whose samples cannot be placed has no header to
+      // read sync from: fall back to the CMAF object-id rule and report why.
+      try {
+        const read = readCmafChunkSamples(result.bytes, decoder.context);
+        const first = read.effective.flags[0];
+        return {
+          bytes: result.bytes,
+          sync: first !== undefined && isSyncSampleFlags(first),
+          chunk: {
+            effective: read.effective,
+            mdat: read.mdat,
+            genBoxes: read.genBoxes,
+            timescale: decoder.context.timescale,
+            baseMediaDecodeTime: read.effective.baseMediaDecodeTime,
+          },
+        };
+      } catch (err) {
+        if (!(err instanceof LocmafFormatError)) throw err;
+        return { bytes: result.bytes, sync: objectId <= 1n, rawError: err.message };
+      }
+    }
+    return {
+      bytes: result.bytes,
+      sync: result.startsWithSync,
+      chunk: {
+        effective: result.effective,
+        mdat: result.mdat,
+        genBoxes: result.genBoxes,
+        timescale: result.timescale,
+        baseMediaDecodeTime: result.baseMediaDecodeTime,
+      },
+    };
+  }
+
+  /** Whether a track of this packaging plays through MSE in this player (LOCMAF may take the frame path). */
+  private usesMse(packaging: string | undefined): boolean {
+    return usesMsePath(packaging, this.config.locmafDecoding);
+  }
+
+  /** LOCMAF tracks are consumed through the §16 frame interface (LOC WebCodecs pipeline). */
+  private get locmafFramePath(): boolean {
+    return this.config.locmafDecoding === 'frame';
+  }
+
+  /**
+   * The base64 init the pipelines are configured with: the catalog's inline init
+   * as-is, except that a LOCMAF track on the frame path gets the codec
+   * description read from its CMAF Header (§16) -- what a frame decoder takes as
+   * `description`, not the whole ftyp+moov. Undefined when the Header has no
+   * known codec configuration; the per-frame VideoConfig then configures video on
+   * its first keyframe.
+   */
+  private pipelineInitData(track: CatalogTrack): string | undefined {
+    if (track.packaging !== 'locmaf' || !this.locmafFramePath) return this.resolveInlineInitData(track);
+    try {
+      const init = this.decodeResolvedInlineInitData(track);
+      const description = init ? codecDescriptionFromInit(init) : null;
+      return description ? btoa(String.fromCharCode(...description)) : undefined;
+    } catch {
+      return undefined; // an invalid inline init was already surfaced at selection time
+    }
+  }
+
+  /** The codec description of a LOCMAF track's current CMAF Header, cached per Header. */
+  private locmafDescription(trackName: string): Uint8Array | null {
+    const init = this.locmafDecoderInit.get(trackName);
+    if (!init) return null;
+    const cached = this.locmafDescriptions.get(trackName);
+    if (cached && cached.init === init) return cached.description;
+    let description: Uint8Array | null = null;
+    try {
+      description = codecDescriptionFromInit(init);
+    } catch {
+      description = null;
+    }
+    this.locmafDescriptions.set(trackName, { init, description });
+    return description;
+  }
+
+  /** Next synthetic pipeline object id for `count` frames of a LOCMAF track's group. */
+  private nextLocmafFrameId(trackName: string, groupId: bigint, count: number): bigint {
+    let groups = this.locmafFrameIds.get(trackName);
+    if (!groups) {
+      groups = new Map();
+      this.locmafFrameIds.set(trackName, groups);
+    }
+    const next = groups.get(groupId) ?? 0n;
+    groups.set(groupId, next + BigInt(count));
+    if (groups.size > MoqtPlayer.LOCMAF_TRACKED_GROUPS) {
+      const oldest = groups.keys().next().value;
+      if (oldest !== undefined) groups.delete(oldest);
+    }
+    return next;
+  }
+
+  /**
+   * An in-band CMAF Header on a LOCMAF track (rawBoxes, §9): remember it and
+   * re-seed the decoder if it changed. A different header re-seeds
+   * reconstruction; repeating the same one must not discard the in-flight
+   * groups' references.
+   */
+  private noteLocmafInBandHeader(trackName: string, header: Uint8Array): void {
+    this.initSegmentByTrack.set(trackName, header);
+    const current = this.locmafDecoderInit.get(trackName);
+    if (!current || !MoqtPlayer.sameBytes(current, header)) {
+      this.locmafDecoders.delete(trackName);
+      this.locmafDecoderInit.delete(trackName);
+      this.locmafBadInit.delete(trackName);
+      this.locmafFrameIds.delete(trackName);
+    }
+  }
+
+  /**
+   * A LOCMAF media object on the frame path (§16): reconstruct it, slice the
+   * mdat payload into coded samples and push each one into the LOC pipeline as
+   * its own object, in decode order, with LOC-shaped headers -- the presentation
+   * time as CaptureTimestamp, the sync flag as the independent frame marking and
+   * the CMAF Header's codec configuration as VideoConfig on keyframes. Protected
+   * tracks are dropped: a frame decoder has no way to decrypt them.
+   */
+  private onLocmafFrameObject(
+    mediaType: 'video' | 'audio',
+    trackName: string,
+    obj: MoqtObject & { kind: 'data' },
+    rawBoxes: Uint8Array | null,
+  ): void {
+    if (rawBoxes && isCmafHeader(rawBoxes)) {
+      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      return;
+    }
+    const groupId = BigInt(obj.groupId);
+    const decoded = this.decodeLocmafObject(mediaType, trackName, BigInt(obj.trackAlias), groupId,
+      BigInt(obj.objectId), obj.payload);
+    if (!decoded) return;
+    if (!decoded.chunk) {
+      this._stats.recordLocmafObjectRejected();
+      if (!this.locmafWarned.has(`raw:${trackName}`)) {
+        this.locmafWarned.add(`raw:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): rawBoxes object g=%s o=%s carries no decodable chunk; dropped on the frame path: %s',
+          trackName, mediaType, String(groupId), String(obj.objectId), decoded.rawError ?? 'unknown');
+      }
+      return;
+    }
+    const decoder = this.locmafDecoders.get(trackName);
+    if (decoder?.context.isProtected) {
+      if (!this.locmafWarned.has(`protected:${trackName}`)) {
+        this.locmafWarned.add(`protected:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): protected track (%s) cannot be decrypted on the frame path — dropping objects; use locmafDecoding "mse"',
+          trackName, mediaType, decoder.context.schemeType ?? 'cenc');
+      }
+      return;
+    }
+    let frames;
+    try {
+      frames = sliceFrames(decoded.chunk.effective, decoded.chunk.mdat);
+    } catch (err) {
+      this._stats.recordLocmafObjectRejected();
+      if (!this.locmafWarned.has(`frames:${trackName}`)) {
+        this.locmafWarned.add(`frames:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s cannot be sliced into frames: %s',
+          trackName, mediaType, String(groupId), String(obj.objectId), err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+    if (frames.length === 0) return;
+    const description = mediaType === 'video' ? this.locmafDescription(trackName) : null;
+    const timescale = decoded.chunk.timescale;
+    const firstId = this.nextLocmafFrameId(trackName, groupId, frames.length);
+    for (const frame of frames) {
+      const synthetic: MoqtObject = {
+        kind: 'data',
+        trackAlias: obj.trackAlias,
+        groupId: obj.groupId,
+        subgroupId: obj.subgroupId,
+        objectId: varint(firstId + BigInt(frame.index)),
+        publisherPriority: obj.publisherPriority,
+        payload: frame.data,
+      };
+      const headers: LocHeaders = {
+        // CMAF presentation time is media time, never wall clock, so
+        // wall-clock latency features must stay off for this path.
+        captureTimestamp: ticksToMicros(frame.presentationTime, timescale),
+        timestampIsWallClock: false,
+        ...(mediaType === 'video'
+          ? {
+              videoFrameMarking: {
+                startOfFrame: true,
+                endOfFrame: true,
+                independent: frame.isSync,
+                // sample_is_depended_on == 2: no other sample depends on this one.
+                discardable: !frame.isSync && ((frame.flags >>> 22) & 0x3) === 2,
+                baseLayerSync: false,
+                temporalId: 0,
+              },
+              ...(frame.isSync && description ? { videoConfig: description } : {}),
+            }
+          : {}),
+      };
+      this.routeLocmafFrame(mediaType, trackName, synthetic, headers);
+    }
+  }
+
+  /** Route one frame-path object like a LOC object: switch staging, old-track drop, pipeline push. */
+  private routeLocmafFrame(mediaType: 'video' | 'audio', trackName: string, frame: MoqtObject, headers: LocHeaders): void {
+    if (this.pendingVideoSwitch && mediaType === 'video'
+        && trackName === this.pendingVideoSwitch.newTrackName) {
+      this.switchStagingBuffer.push({ obj: frame, headers });
+      if (this.switchStagingBuffer.length === 1) {
+        this.switchStagingTimeout = setTimeout(() => {
+          this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
+          this.completePendingVideoSwitch();
+        }, SWITCH_STAGING_TIMEOUT_MS);
+      }
+      if (headers.videoFrameMarking?.independent) {
+        this.completePendingVideoSwitch();
+      } else if (this.switchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
+        this.log.warn('[SWITCH] LOCMAF staging overflow (%d objects) — force-completing', SWITCH_STAGING_MAX_OBJECTS);
+        this.completePendingVideoSwitch();
+      }
+      return;
+    }
+    if (this.switchInProgress && this.pendingVideoSwitch
+        && mediaType === 'video'
+        && trackName === this.pendingVideoSwitch.oldTrackName) {
+      return;
+    }
+    const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+    pipeline?.pushObject(frame, headers);
+  }
+
+  /**
+   * A chunk of a LOCMAF event-only track (§14): reconstruct it for its genBoxes
+   * and emit the parsed emsg boxes. The chunk carries no samples, so nothing
+   * reaches a media sink; a version-0 emsg's presentation time is relative to
+   * the chunk's base media decode time, which the event carries.
+   */
+  private onLocmafEventObject(trackName: string, obj: MoqtObject): void {
+    if (obj.kind !== 'data' || !obj.payload) return;
+    const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
+    if (rawBoxes && isCmafHeader(rawBoxes)) {
+      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      return;
+    }
+    const groupId = BigInt(obj.groupId);
+    const objectId = BigInt(obj.objectId);
+    const decoded = this.decodeLocmafObject('eventtimeline', trackName, BigInt(obj.trackAlias), groupId, objectId, obj.payload);
+    if (!decoded?.chunk) return;
+    let events: EmsgEvent[];
+    try {
+      events = parseEmsgBoxes(decoded.chunk.genBoxes);
+    } catch (err) {
+      this.log.warn('[LOCMAF] "%s": emsg in g=%s o=%s does not parse: %s',
+        trackName, String(groupId), String(objectId), err instanceof Error ? err.message : String(err));
+      return;
+    }
+    this.emitter.emit('locmaf_event', {
+      type: 'locmaf_event',
+      trackName,
+      groupId,
+      objectId,
+      timescale: decoded.chunk.timescale,
+      baseMediaDecodeTime: decoded.chunk.baseMediaDecodeTime,
+      events,
+    });
+  }
+
+  /** The track's LOCMAF decoder, created from its CMAF Header on first use. */
+  private locmafDecoderFor(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, trackAlias: bigint): LocmafTrackDecoder | null {
+    const existing = this.locmafDecoders.get(trackName);
+    if (existing) return existing;
+    if (this.locmafBadInit.has(trackName)) return null;
+    const init = this.locmafInitBytes(trackName);
+    if (!init) {
+      if (!this.locmafWarned.has(`noinit:${trackName}`)) {
+        this.locmafWarned.add(`noinit:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): no CMAF Header to reconstruct against — dropping objects', trackName, mediaType);
+      }
+      return null;
+    }
+    try {
+      const decoder = new LocmafTrackDecoder(init);
+      this.locmafDecoders.set(trackName, decoder);
+      this.locmafDecoderInit.set(trackName, init);
+      return decoder;
+    } catch (err) {
+      if (err instanceof LocmafFormatError) {
+        this.locmafBadInit.add(trackName);
+        this.handleMalformedTrack(trackAlias, trackName, err);
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * CMAF Header bytes for a LOCMAF track: an in-band header seen on the track,
+   * then the catalog's inline init (initData / initRef), then its init track.
+   * Never another rendition's header: its timescale and trex defaults would
+   * silently skew this track's durations and decode times.
+   */
+  private locmafInitBytes(trackName: string): Uint8Array | undefined {
+    const inBand = this.initSegmentByTrack.get(trackName);
+    if (inBand) return inBand;
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === trackName);
+    if (track) {
+      try {
+        const inline = this.decodeResolvedInlineInitData(track);
+        if (inline) return inline;
+      } catch {
+        // Invalid inline init was already surfaced at selection time.
+      }
+      if (track.initTrack) {
+        const fromInitTrack = this.initSegmentByTrack.get(track.initTrack);
+        if (fromInitTrack) return fromInitTrack;
+      }
+    }
+    return undefined;
+  }
+
+  private static sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.byteLength !== b.byteLength) return false;
+    for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  /** The ISO boxes of a rawBoxes Object (element_type 4 as its first vi64), or null. §9.1 */
+  private static locmafRawBoxes(payload: Uint8Array): Uint8Array | null {
+    try {
+      const { value, bytesRead } = readVi64(payload, 0);
+      return value === 4n ? payload.subarray(bytesRead) : null;
+    } catch {
+      return null;
+    }
+  }
+
   private decodeResolvedInlineInitData(track: CatalogTrack): Uint8Array | undefined {
     const initB64 = this.resolveInlineInitData(track);
     if (initB64 === undefined) return undefined;
@@ -1366,6 +1958,12 @@ export class MoqtPlayer {
     if (!targetTrack) {
       throw new Error(`Unknown video track: "${trackName}"`);
     }
+    // LOCMAF §5: a receiver MUST NOT subscribe to a locmafVersion it does not support.
+    if (!isTrackPackagingSupported(targetTrack)) {
+      throw new Error(
+        `Cannot switch to "${trackName}": unsupported locmafVersion "${targetTrack.locmafVersion ?? ''}" (LOCMAF §5)`,
+      );
+    }
 
     // Find the current video subscription
     let currentVideoRequestId: bigint | null = null;
@@ -1398,7 +1996,7 @@ export class MoqtPlayer {
     // switch can't proceed. Reject now so the existing subscription
     // stays intact — better than racing the rejection mid-async, where
     // the abort path would have to undo a partial commit.
-    const needsCodecChange = targetTrack.packaging === 'cmaf'
+    const needsCodecChange = this.usesMse(targetTrack.packaging)
         && targetTrack.codec !== undefined
         && (this.currentVideoCodec === null
             || !codecsCompatible(targetTrack.codec, this.currentVideoCodec));
@@ -1431,6 +2029,22 @@ export class MoqtPlayer {
         }
       }
       // Inline init bytes — nothing to await.
+    } else if (targetTrack.packaging === 'locmaf' && targetTrack.initTrack) {
+      // LOCMAF reconstructs against the target's OWN CMAF Header (track_ID,
+      // timescale, trex defaults feed durations and decode times), so even a
+      // same-codec switch needs that header in hand before its objects arrive.
+      // @see draft-einarsson-moq-locmaf-01 §6, §15.1
+      let inlineInit: Uint8Array | undefined;
+      try {
+        inlineInit = this.decodeResolvedInlineInitData(targetTrack);
+      } catch (err) {
+        throw new Error(`Cannot switch to "${trackName}": ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!inlineInit) {
+        this.log.info('[SWITCH] locmaf "%s" → "%s": prefetching CMAF Header from init track "%s"',
+          currentVideoTrackName, trackName, targetTrack.initTrack);
+        await this.ensureInitTrack(targetTrack.initTrack);
+      }
     }
 
     // Subscribe to new track starting from the NEXT group boundary.
@@ -1454,13 +2068,11 @@ export class MoqtPlayer {
       : (buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(isLive));
     this.log.info('[SWITCH] subscribing at group=%s (current=%s)', nextGroup ?? 'latest', currentGroup);
     // Determine packaging from catalog
-    const packaging: TrackPackaging = (targetTrack.packaging === 'cmaf') ? 'cmaf' : 'loc';
+    const packaging: TrackPackaging = mediaTrackPackaging(targetTrack.packaging);
     // Pre-send ownership (§9.10): the pending entry (alias remap) and the
     // activeSubscriptions record are installed inside onRequestId so a
-    // same-tick SUBSCRIBE_OK cannot miss them. DON'T register with the
-    // subscription manager yet — new-track objects would feed the pipeline
-    // while the old track is still playing; they buffer in
-    // pendingObjectsByAlias until the switch completes.
+    // same-tick SUBSCRIBE_OK cannot miss them. Only SUBSCRIBE_OK binds
+    // routing; objects arriving before it remain parked by their wire alias.
     const switchConn = this.connection;
     let switchRegisteredId: bigint | null = null;
     const registerSwitchSub = (id: bigint): void => {
@@ -1468,7 +2080,7 @@ export class MoqtPlayer {
       switchRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== switchConn) return;
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: id });
+      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null });
       this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging });
     };
     let reqIdBigInt: bigint;
@@ -1479,9 +2091,7 @@ export class MoqtPlayer {
       registerSwitchSub(reqIdBigInt);
     } catch (err) {
       if (switchRegisteredId !== null) {
-        this.settleParkedOwnership(switchRegisteredId, null, switchConn);
-        this.activeSubscriptions.delete(switchRegisteredId);
-        this.pendingMediaSubs.delete(switchRegisteredId);
+        this.retireMediaSubscription(switchRegisteredId, switchConn);
       }
       throw err;
     }
@@ -1500,7 +2110,7 @@ export class MoqtPlayer {
         oldRequestId: currentVideoRequestId,
         oldTrackName: currentVideoTrackName ?? '',
         newTrackName: trackName,
-        newTrackAlias: reqIdBigInt,
+        newRequestId: reqIdBigInt,
         newTrackPackaging: packaging,
         reason,
         ...(abrAction ? { abrAction } : {}),
@@ -1565,7 +2175,7 @@ export class MoqtPlayer {
     // bytes are dropped — and the user sees an error event. Without
     // this, a failed pivot tears down the only known-good subscription
     // and strands playback in an unrecoverable state.
-    const needsChangeType = newTrack?.packaging === 'cmaf'
+    const needsChangeType = newTrack !== undefined && this.usesMse(newTrack.packaging)
       && newTrack.codec !== undefined
       && (this.currentVideoCodec === null
           || !codecsCompatible(newTrack.codec, this.currentVideoCodec));
@@ -1645,7 +2255,7 @@ export class MoqtPlayer {
       const trackInfo: TrackInfo = {
         video: defined({
           codec: newTrack.codec ?? '',
-          initData: this.resolveInlineInitData(newTrack),
+          initData: this.pipelineInitData(newTrack),
           width: newTrack.width,
           height: newTrack.height,
         }),
@@ -1696,14 +2306,8 @@ export class MoqtPlayer {
    */
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     if (!this.connection || !this.subscriptionManager) return;
-    const oldAlias =
-      this.activeSubscriptions.get(sw.oldRequestId)?.trackAlias ?? sw.oldRequestId;
-    this.subscriptionManager.unregisterTrack(oldAlias);
-    this.settleParkedOwnership(sw.oldRequestId, null, this.connection);
+    this.retireMediaSubscription(sw.oldRequestId, this.connection);
     this.connection.unsubscribe(varint(sw.oldRequestId));
-    this.activeSubscriptions.delete(sw.oldRequestId);
-    this.pendingMediaSubs.delete(sw.oldRequestId);
-    this.pendingObjectsByAlias.delete(oldAlias);
   }
 
   /**
@@ -1718,6 +2322,9 @@ export class MoqtPlayer {
     // bytes so a late object from the retired stream cannot switch the
     // assembler back after this commit.
     this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
+    this.locmafDecoders.delete(sw.oldTrackName);
+    this.locmafDecoderInit.delete(sw.oldTrackName);
+    this.locmafHealth.delete(sw.oldTrackName);
     const cmafStaged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
     for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload } of cmafStaged) {
@@ -1772,17 +2379,14 @@ export class MoqtPlayer {
     cause: Error,
   ): void {
     if (this.connection && this.subscriptionManager) {
-      const newAlias =
-        this.activeSubscriptions.get(sw.newTrackAlias)?.trackAlias ?? sw.newTrackAlias;
-      this.subscriptionManager.unregisterTrack(newAlias);
-      this.settleParkedOwnership(sw.newTrackAlias, null, this.connection);
-      try { this.connection.unsubscribe(varint(sw.newTrackAlias)); } catch { /* ignore */ }
-      this.activeSubscriptions.delete(sw.newTrackAlias);
-      this.pendingMediaSubs.delete(sw.newTrackAlias);
-      this.pendingObjectsByAlias.delete(newAlias);
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
     }
     this.cmafSwitchStagingBuffer = [];
     this.switchStagingBuffer = [];
+    this.locmafDecoders.delete(sw.newTrackName);
+    this.locmafDecoderInit.delete(sw.newTrackName);
+    this.locmafHealth.delete(sw.newTrackName);
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
     this.emitter.emit('quality_switch_failed', {
@@ -1995,6 +2599,12 @@ export class MoqtPlayer {
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
       pipeline?.pushObject(obj, headers);
       this.pumpDrain();
+    };
+
+    // Wire LOCMAF object delivery → reconstruction into CMAF chunks → assembler.
+    // @see draft-einarsson-moq-locmaf-01 §15, §16
+    this.subscriptionManager.onLocmafObject = (mediaType, trackName, obj) => {
+      this.onLocmafMediaObject(mediaType, trackName, obj);
     };
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
@@ -2210,7 +2820,6 @@ export class MoqtPlayer {
         trackName, obj.kind, obj.kind === 'data' && obj.payload ? obj.payload.byteLength : 0,
         this.mediaSource ? 'exists' : 'null');
       if (obj.kind !== 'data' || !obj.payload) return;
-      if (!this.mediaSource) return;
 
       // Find which catalog tracks reference this initTrack
       const catalog = this.catalogManager?.currentState;
@@ -2239,18 +2848,14 @@ export class MoqtPlayer {
       const initReqId = this.initTrackRequestIds.get(trackName);
       if (initReqId !== undefined) {
         this.initTrackRequestIds.delete(trackName);
-        const active = this.activeSubscriptions.get(initReqId);
-        const alias = active?.trackAlias ?? initReqId;
-        this.activeSubscriptions.delete(initReqId);
-        this.pendingMediaSubs.delete(initReqId);
-        this.subscriptionManager?.unregisterTrack(alias);
-        if (this.connection) this.settleParkedOwnership(initReqId, null, this.connection);
+        if (this.connection) this.retireMediaSubscription(initReqId, this.connection);
         this.connection?.unsubscribe(varint(initReqId)).catch(() => {});
       }
 
       // Already initialized → this delivery is cache-warming for a future
-      // codec switch only (the cache write above did the work).
-      if (this.cmafInitialized) return;
+      // codec switch only (the cache write above did the work). Without a
+      // MediaSource (LOCMAF frame path) the cache is all the delivery feeds.
+      if (this.cmafInitialized || !this.mediaSource) return;
 
       // Supply the bytes to the init state machine for every selected CMAF
       // track referencing this init track. initialize() fires once ALL
@@ -2394,30 +2999,7 @@ export class MoqtPlayer {
       const subscribeOptions = buildSubscribeOptions(this.config);
       const promises: Promise<void>[] = [];
 
-      // Catalog subscription (always required — MSF §9.1). Under the
-      // bootstrap mode the filter is LargestObject and a relative Joining
-      // FETCH (offset 0) supplies the prefix (MSF-01 §5); the legacy mode
-      // keeps AbsoluteStart{0,0} byte-identical.
-      const catalogFilter = this.catalogSubscribeOptions(conn);
-      const bootstrapMode = this.resolvedCatalogMode(conn) === 'joining-fetch';
-      // Coordinator installed BEFORE the subscribe: a fast SUBSCRIBE_OK or
-      // first object must reach it, not the legacy path.
-      const knownTracksCoord = bootstrapMode ? this.createCatalogBootstrap(conn) : null;
-      promises.push((async () => {
-        let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
-        try {
-          reqId = await conn.subscribe(nsBytes, this.enc.encode(catalogTrackName()), catalogFilter as never);
-        } catch (err) {
-          // The pre-send callback may have registered the bind — settle it.
-          if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
-          throw err;
-        }
-        this.catalogRequestId = BigInt(reqId);
-        // catalogTrackAlias set by SUBSCRIBE_OK — never assume alias=requestId.
-        // Callback-less adapter fallback: the subscribe is awaiting its OK.
-        if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
-        knownTracksCoord?.start();
-      })());
+      promises.push(this.subscribeCatalog(conn));
 
       // Pre-known media tracks (respecting disable flags)
       this._mediaSubsExpected = 0;
@@ -2443,9 +3025,8 @@ export class MoqtPlayer {
             if (!this.subscriptionManager || this.connection !== conn) return;
             this.pendingAliasBinds.add(reqIdBigInt);
             this.activeSubscriptions.set(reqIdBigInt, {
-              trackName: track.name, mediaType, trackAlias: reqIdBigInt,
+              trackName: track.name, mediaType, trackAlias: null,
             });
-            this.subscriptionManager.registerTrack(reqIdBigInt, track.name, mediaType);
             this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType });
             this.log.info('Subscribe %s "%s" requestId=%s (pre-known)', mediaType, track.name, reqIdBigInt);
           };
@@ -2467,10 +3048,7 @@ export class MoqtPlayer {
             });
           } catch (err) {
             if (knownRegisteredId !== null) {
-              this.settleParkedOwnership(knownRegisteredId, null, conn);
-              this.activeSubscriptions.delete(knownRegisteredId);
-              this.subscriptionManager?.unregisterTrack(knownRegisteredId);
-              this.pendingMediaSubs.delete(knownRegisteredId);
+              this.retireMediaSubscription(knownRegisteredId, conn);
             }
             throw err;
           }
@@ -2480,27 +3058,102 @@ export class MoqtPlayer {
       await Promise.all(promises);
     } else {
       // ── Standard path: catalog-first ───────────────────────────────
-      // Subscribe to the catalog track (MSF §9.1, §5.1.10; name is always
-      // "catalog" on every draft). Bootstrap mode pairs a LargestObject
-      // filter with a relative Joining FETCH (MSF-01 §5); legacy mode keeps
-      // AbsoluteStart{0,0} byte-identical.
-      const nameBytes = this.enc.encode(catalogTrackName());
-      const standardCoord = this.resolvedCatalogMode(conn) === 'joining-fetch'
-        ? this.createCatalogBootstrap(conn) : null;
-      let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
-      try {
-        reqId = await conn.subscribe(nsBytes, nameBytes, this.catalogSubscribeOptions(conn) as never);
-      } catch (err) {
-        // The pre-send callback may have registered the bind — settle it.
-        if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
-        throw err;
-      }
-      this.catalogRequestId = BigInt(reqId);
-      // catalogTrackAlias set by SUBSCRIBE_OK — never assume alias=requestId.
-      // Callback-less adapter fallback: the subscribe is awaiting its OK.
-      if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
-      standardCoord?.start();
+      await this.subscribeCatalog(conn);
     }
+  }
+
+  /**
+   * Issue the catalog SUBSCRIBE (MSF §9.1, §5.1.10). Bootstrap mode pairs a
+   * LargestObject filter with a Joining FETCH (MSF-01 §5); legacy mode keeps
+   * AbsoluteStart{0,0}. Shared by the initial subscribe and by
+   * {@link scheduleCatalogSubscribeRetry}.
+   */
+  private async subscribeCatalog(conn: MoqtConnection): Promise<void> {
+    const gen = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && this.connection === conn
+      && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
+    if (!live()) return;
+    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nameBytes = this.enc.encode(catalogTrackName());
+    const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
+      ? this.createCatalogBootstrap(conn) : null;
+    const options = this.catalogSubscribeOptions(conn);
+    const register = options.onRequestId as (id: bigint) => void;
+    let allocatedId: bigint | null = null;
+    let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
+    try {
+      reqId = await conn.subscribe(nsBytes, nameBytes, {
+        ...options,
+        onRequestId: (id: bigint) => {
+          if (!live()) return;
+          allocatedId = id;
+          register(id);
+        },
+      } as never);
+    } catch (err) {
+      if (live()) {
+        // The pre-send callback may have registered the bind — settle it.
+        if (allocatedId !== null) this.settleParkedOwnership(allocatedId, null, conn);
+        this.cancelCatalogBootstrap();
+      }
+      throw err;
+    }
+    if (!live()) return;
+    // A response can precede send completion. Only callback-less adapters
+    // still need registration here; never restore an already-retired request.
+    if (allocatedId === null) {
+      this.catalogRequestId = BigInt(reqId);
+      if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
+    }
+    coord?.start();
+  }
+
+  /**
+   * Honor the peer's retry guidance for DOES_NOT_EXIST. Draft-16 9.8 and
+   * draft-18 10.6.2 encode the minimum delay plus one; zero means no retry.
+   */
+  private scheduleCatalogSubscribeRetry(conn: MoqtConnection, retryInterval: bigint): void {
+    if (retryInterval <= 0n) return;
+    const gen = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && this.connection === conn
+      && gen === this.bootstrapGeneration && !this.catalogReceived
+      && !this.catalogQuarantinedConns.has(conn);
+    if (!live()) return;
+    if (this.catalogSubscribeRetryTimer !== null) return;
+    let remaining = retryInterval - 1n;
+    const backoff = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
+    if (remaining < backoff) remaining = backoff;
+    const arm = (): void => {
+      // Wire intervals can be uint64; platform timers are signed 32-bit.
+      const delay = Number(remaining > 0x7fffffffn ? 0x7fffffffn : remaining);
+      const timer = setTimeout(() => {
+        if (this.catalogSubscribeRetryTimer !== timer) return;
+        this.catalogSubscribeRetryTimer = null;
+        if (!live()) return;
+        remaining -= BigInt(delay);
+        if (remaining > 0n) { arm(); return; }
+        this.log.info('Retrying catalog subscription for namespace "%s" (no publisher yet)',
+          this.config.namespace);
+        if (!live()) return;
+        this.subscribeCatalog(conn).catch((err) => {
+          this.log.warn('Catalog subscribe retry failed to send: %s',
+            err instanceof Error ? err.message : String(err));
+        });
+      }, delay);
+      this.catalogSubscribeRetryTimer = timer;
+    };
+    arm();
+  }
+
+  /** Retire bootstrap work and invalidate its outstanding async callbacks. */
+  private cancelCatalogBootstrap(): void {
+    this.bootstrapGeneration += 1;
+    if (this.catalogSubscribeRetryTimer !== null) {
+      clearTimeout(this.catalogSubscribeRetryTimer);
+      this.catalogSubscribeRetryTimer = null;
+    }
+    this.catalogBootstrapCoord?.abort();
+    this.catalogBootstrapCoord = null;
   }
 
   /**
@@ -3002,12 +3655,10 @@ export class MoqtPlayer {
     // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
     // one (new generation) binds to the committed session. Its joining fetch
     // fires immediately (Pending/Established association both legal on 16/18).
-    this.catalogBootstrapCoord?.abort();
-    this.catalogBootstrapCoord = null;
+    this.cancelCatalogBootstrap();
     this.catalogRecovery?.coord.abort();
     this.catalogRecovery = null;
     this.recoveryAttempted = false; // new session, fresh recovery budget
-    this.bootstrapGeneration += 1;
     this.bootstrapFetch = null;
     this.bootstrapFetchStreams.clear();
     this.catalogManager?.reset();
@@ -3112,7 +3763,7 @@ export class MoqtPlayer {
 
   private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
     const createTransport = this.config.createTransport!;
-    const setupOptions = buildSetupOptions(this.config);
+    const setupOptions = buildSetupOptions(this.config, url);
     await this.runMigrationTransaction(newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions);
 
     this._stats.recordReconnect();
@@ -3150,20 +3801,16 @@ export class MoqtPlayer {
       endObject: varint(BigInt(options.endObject)),
     };
 
-    // Find the media type and track alias for this track name from the
-    // active subscriptions (catalog-selected tracks) BEFORE issuing the
-    // request, so pre-send ownership can register inside onRequestId — a
-    // zero-latency data stream or response never beats the registration.
-    // (registerMediaFetch re-resolves the alias against the CURRENT
-    // subscription state anyway, covering a remap during the await.)
+    // Capture the owning subscription before sending. Its confirmed alias
+    // may arrive later, but a replacement subscription must not inherit this FETCH.
     let mediaType: 'video' | 'audio' = 'video';
-    let knownAlias: bigint | null = null;
-    for (const [, sub] of this.activeSubscriptions) {
+    let subscriptionRequestId: bigint | null = null;
+    for (const [requestId, sub] of this.activeSubscriptions) {
       if (sub.trackName === trackName &&
           sub.mediaType !== 'mediatimeline' &&
           sub.mediaType !== 'eventtimeline') {
         mediaType = sub.mediaType;
-        knownAlias = sub.trackAlias;
+        subscriptionRequestId = requestId;
         break;
       }
     }
@@ -3172,15 +3819,14 @@ export class MoqtPlayer {
       if (fetchRegisteredId !== null) return;
       fetchRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== connAtCall) return;
-      this.registerMediaFetch(id, { trackName, mediaType, trackAlias: knownAlias ?? id });
+      this.registerMediaFetch(id, { trackName, mediaType, subscriptionRequestId, trackAlias: null });
     };
     let reqId: Awaited<ReturnType<MoqtConnection['fetch']>>;
     try {
       reqId = await connAtCall.fetch(nsBytes, nameBytes,
         { ...fetchOptions, onRequestId: (id: bigint) => registerPublicFetch(BigInt(id)) } as never);
     } catch (err) {
-      if (fetchRegisteredId !== null) {
-        this.activeFetches.delete(fetchRegisteredId);
+      if (fetchRegisteredId !== null && this.connection === connAtCall) {
         this.quarantineFetchRequest(fetchRegisteredId);
       }
       throw err;
@@ -3192,7 +3838,6 @@ export class MoqtPlayer {
     // (fetchCancel would target the NEW connection). Best-effort cancel on
     // the captured old connection and reject loudly.
     if (!this.subscriptionManager || this.connection !== connAtCall) {
-      if (fetchRegisteredId !== null) this.activeFetches.delete(fetchRegisteredId);
       try { await connAtCall.fetchCancel(reqId); } catch { /* old session gone */ }
       throw new Error('fetch() aborted: player destroyed or session migrated while the FETCH was in flight');
     }
@@ -3209,7 +3854,7 @@ export class MoqtPlayer {
    */
   private registerMediaFetch(
     fetchReqId: bigint,
-    info: { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean },
+    info: { trackName: string; mediaType: 'video' | 'audio'; subscriptionRequestId: bigint | null; trackAlias: bigint | null; warmStart?: boolean },
   ): void {
     // A REQUEST_ERROR that raced the fetch()/joiningFetch() continuation
     // already refused this request — honor it instead of resurrecting a
@@ -3217,42 +3862,51 @@ export class MoqtPlayer {
     const refused = this.refusedFetchRequests.get(fetchReqId);
     if (refused) {
       this.refusedFetchRequests.delete(fetchReqId);
-      for (const [streamId, pending] of this.pendingFetchStreams) {
-        if (pending.requestId === fetchReqId) this.pendingFetchStreams.delete(streamId);
-      }
+      this.quarantineFetchRequest(fetchReqId);
       this.log.warn('[%s] media FETCH %s for "%s" was refused before registration: %s (code=0x%s) — continuing live-only',
         info.warmStart ? 'warm-start' : 'fetch',
         fetchReqId, info.trackName, refused.reason, refused.code.toString(16));
       return;
     }
 
-    // An alias remap (SUBSCRIBE_OK with a server-assigned alias) may have
-    // landed during the same await window — always register against the
-    // track's CURRENT alias, not the one captured before the await.
-    for (const sub of this.activeSubscriptions.values()) {
-      if (sub.trackName === info.trackName && sub.mediaType === info.mediaType) {
-        info = { ...info, trackAlias: sub.trackAlias };
-        break;
-      }
+    if (this.quarantinedFetchRequests.has(fetchReqId)) return;
+
+    // Resolve only against the subscription that owned this FETCH when sent.
+    // A replacement request for the same track must not inherit its data.
+    const subscription = info.subscriptionRequestId === null
+      ? undefined : this.activeSubscriptions.get(info.subscriptionRequestId);
+    if (!subscription) {
+      this.quarantineFetchRequest(fetchReqId);
+      return;
     }
+    info = { ...info, trackAlias: subscription.trackAlias };
 
     this.activeFetches.set(fetchReqId, info);
+    if (info.trackAlias === null) return;
+    this.drainMediaFetch(fetchReqId);
+  }
+
+  private drainMediaFetch(fetchReqId: bigint): void {
+    const info = this.activeFetches.get(fetchReqId);
+    if (!info || info.trackAlias === null) return;
+    const conn = this.connection;
     for (const [streamId, pending] of this.pendingFetchStreams) {
       if (pending.requestId !== fetchReqId) continue;
       this.pendingFetchStreams.delete(streamId);
-      for (const obj of pending.objects) {
-        // Fetch state is per-session (cleared on migrate), so the current
-        // connection is the source session here.
-        this.routeFetchObject(streamId, info.trackAlias, obj, this.connection?.draftVersion, this.connection ?? undefined);
+      if (pending.terminal === undefined) {
+        this.fetchStreamAliases.set(streamId, info.trackAlias);
+        this.fetchStreamRequestIds.set(streamId, fetchReqId);
       }
-      if (pending.terminal !== undefined) {
+      for (const obj of pending.objects) {
+        if (this.connection !== conn || this.activeFetches.get(fetchReqId) !== info) break;
+        this.routeFetchObject(streamId, info.trackAlias, obj, conn?.draftVersion, conn ?? undefined);
+      }
+      if (this.connection !== conn) return;
+      if (pending.terminal !== undefined && this.activeFetches.get(fetchReqId) === info) {
         // The stream already ended — however it ended, no live routing maps
         // are needed and the fetch bookkeeping ends with it. Only the
         // BOOTSTRAP path below needs the terminal to be a peer FIN.
         this.activeFetches.delete(fetchReqId);
-      } else {
-        this.fetchStreamAliases.set(streamId, info.trackAlias);
-        this.fetchStreamRequestIds.set(streamId, fetchReqId);
       }
     }
   }
@@ -3277,8 +3931,8 @@ export class MoqtPlayer {
    */
   async fetchCancel(requestId: bigint): Promise<void> {
     if (!this.connection) throw new Error('Player not loaded');
+    this.quarantineFetchRequest(BigInt(requestId));
     await this.connection.fetchCancel(varint(requestId));
-    this.activeFetches.delete(BigInt(requestId));
   }
 
   /**
@@ -3531,12 +4185,14 @@ export class MoqtPlayer {
     const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
+    let pendingAttempt: number | null = null;
 
     const coord = new CatalogBootstrap({
       applyAt: (loc, payload, opts) => this.catalogManager!.processCatalogObjectAt(loc, payload, opts),
       resetManager: () => this.catalogManager?.reset(),
       currentState: () => this.catalogManager?.currentState ?? null,
       issueJoiningFetch: (attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -3546,7 +4202,11 @@ export class MoqtPlayer {
               joiningRequestId: this.catalogRequestId,
               joiningStart: 0n,
               groupOrder: varint(0x1n), // ascending — explicit on every bootstrap fetch
-              onRequestId: (id: bigint) => { myFetchReqId = id; this.registerBootstrapFetch(conn, id, attempt, gen); },
+              onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
+                myFetchReqId = id;
+                this.registerBootstrapFetch(conn, id, attempt, gen);
+              },
             } as never);
           } catch (err) {
             if (!live()) return;
@@ -3565,6 +4225,7 @@ export class MoqtPlayer {
         })();
       },
       issueStandaloneFetch: (range, attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -3579,7 +4240,11 @@ export class MoqtPlayer {
               endGroup: range.endGroupWholeOf,
               endObject: 0n,
               groupOrder: varint(0x1n),
-              onRequestId: (id: bigint) => { myFetchReqId = id; this.registerBootstrapFetch(conn, id, attempt, gen); },
+              onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
+                myFetchReqId = id;
+                this.registerBootstrapFetch(conn, id, attempt, gen);
+              },
             } as never);
           } catch (err) {
             if (!live()) return;
@@ -3597,6 +4262,7 @@ export class MoqtPlayer {
         })();
       },
       cancelFetch: () => {
+        pendingAttempt = null;
         const fetch = this.bootstrapFetch;
         this.bootstrapFetch = null;
         if (fetch) this.retireBootstrapFetch(fetch.conn, fetch.reqId, { attempt: fetch.attempt });
@@ -3885,6 +4551,7 @@ export class MoqtPlayer {
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     const manager = new CatalogManager(namespaceDisplay(this.config.namespace));
+    let pendingAttempt: number | null = null;
 
     const failCandidate = (reason: string): void => {
       if (!ownedAsCandidate()) return; // post-adoption failures follow main-role paths
@@ -3896,6 +4563,7 @@ export class MoqtPlayer {
       resetManager: () => manager.reset(),
       currentState: () => manager.currentState,
       issueJoiningFetch: (attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -3907,6 +4575,7 @@ export class MoqtPlayer {
               joiningStart: 0n,
               groupOrder: varint(0x1n),
               onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
                   this.catalogRecovery!.fetch = { reqId: id, attempt };
@@ -3941,6 +4610,7 @@ export class MoqtPlayer {
         })();
       },
       issueStandaloneFetch: (range, attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -3951,6 +4621,7 @@ export class MoqtPlayer {
               endGroup: range.endGroupWholeOf, endObject: 0n,
               groupOrder: varint(0x1n),
               onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
                   this.catalogRecovery!.fetch = { reqId: id, attempt };
@@ -3985,6 +4656,7 @@ export class MoqtPlayer {
         })();
       },
       cancelFetch: () => {
+        pendingAttempt = null;
         if (ownedAsCandidate()) {
           const r = this.catalogRecovery!;
           if (r.fetch) {
@@ -4829,11 +5501,9 @@ export class MoqtPlayer {
       pending.reject(new Error('Player destroyed'));
     }
     this.pendingTrackStatuses.clear();
-    this.catalogBootstrapCoord?.abort();
-    this.catalogBootstrapCoord = null;
+    this.cancelCatalogBootstrap();
     this.catalogRecovery?.coord.abort();
     this.catalogRecovery = null;
-    this.bootstrapGeneration += 1;
     this.bootstrapFetch = null;
     this.bootstrapFetchStreams.clear();
     this.rejectPendingCatalogFetches('Player destroyed');
@@ -4846,6 +5516,13 @@ export class MoqtPlayer {
     this.commandDispatcher = null;
     this.cmafPendingInit = null;
     this.cmafPreInitDropWarned.clear();
+    this.locmafDecoders.clear();
+    this.locmafDecoderInit.clear();
+    this.locmafHealth.clear();
+    this.locmafFrameIds.clear();
+    this.locmafDescriptions.clear();
+    this.locmafWarned.clear();
+    this.locmafBadInit.clear();
     this.cmafInitDeadlineArmed = false;
     this.cmafFirstFrameDeadlineStartedAt = undefined;
     this.cmafFirstFrameHiddenAt = undefined;
@@ -5212,6 +5889,7 @@ export class MoqtPlayer {
           this.log.info('[SESSION] superseded session closed — not affecting the current session');
           return;
         }
+        this.cancelCatalogBootstrap();
         // Reject in-flight fetchCatalog promises — their stream IDs
         // belong to the closed session, so the FETCH response can't
         // arrive and the timeout would fire against a dead adapter.
@@ -5265,6 +5943,7 @@ export class MoqtPlayer {
           this.log.info('[SESSION] error on a superseded session — ignored: %s', error.message);
           return;
         }
+        if (classified.severity === 'fatal') this.cancelCatalogBootstrap();
         this.emitError(createPlayerError(
           classified.severity, 'connection', classified.code, error.message,
           defined({ cause: error, context: classified.context }),
@@ -5337,8 +6016,14 @@ export class MoqtPlayer {
         // stream and replay on registration. Never route as wire alias 0.
         const pendingFetch = fetchMapsAuthoritative ? this.pendingFetchStreams.get(streamId) : undefined;
         if (pendingFetch) {
-          if (pendingFetch.objects.length < MoqtPlayer.MAX_PENDING_PER_ALIAS) {
+          const bytes = obj.kind === 'data' ? obj.payload.byteLength + (obj.extensions?.byteLength ?? 0) : 0;
+          if (pendingFetch.objects.length < MoqtPlayer.MAX_PENDING_PER_ALIAS
+              && pendingFetch.bytes + bytes <= MoqtPlayer.MAX_PENDING_FETCH_BYTES) {
             pendingFetch.objects.push(obj);
+            pendingFetch.bytes += bytes;
+          } else {
+            this.quarantineFetchRequest(pendingFetch.requestId);
+            this.log.warn('Pending FETCH %s exceeded its buffer limit; continuing live-only', pendingFetch.requestId);
           }
           return;
         }
@@ -5631,19 +6316,10 @@ export class MoqtPlayer {
           const mode = getSubgroupIdMode(sub.typeByte);
           // Track a stream only when its alias is a CONFIRMED video track.
           //
-          // A subscription is registered optimistically under its request ID
-          // before SUBSCRIBE_OK, because many relays echo the request ID as the
-          // track alias — but the two are separate spaces. Trusting that guess
-          // could label an audio subgroup, whose real alias happens to equal a
-          // pending video request ID, as video. This record exists to settle a
-          // root-cause dispute, so it must never classify from a guess.
-          //
           // Classification is made once and never revised: a stream opened
           // against an unconfirmed alias is simply never reported, which also
           // means no state is retained for it.
-          const confirmed = this.pendingMediaSubs.has(alias)
-            ? undefined
-            : this.subscriptionManager?.getMediaType(alias);
+          const confirmed = this.subscriptionManager?.getMediaType(alias);
           if (confirmed !== 'video') return;
           subgroupLifecycle.set(streamId, {
             groupId: sub.groupId,
@@ -5685,38 +6361,29 @@ export class MoqtPlayer {
             this.bootstrapFetchStreams.set(streamId, { attempt: bootstrap.attempt, conn });
             return;
           }
-          // A QUARANTINED request (ownership rolled back after an ambiguous
-          // send failure): its late streams are tombstoned, never parked as
+          // A cancelled, refused, or discarded request's late streams are
+          // tombstoned, never parked as
           // unowned pending streams awaiting an owner that will never come.
           if (this.quarantinedFetchRequests.has(reqId)) {
             this.droppedFetchStreams.add(streamId);
             return;
           }
           const fetchInfo = this.activeFetches.get(reqId);
-          if (fetchInfo) {
+          if (fetchInfo?.trackAlias != null) {
             this.fetchStreamAliases.set(streamId, fetchInfo.trackAlias);
             this.fetchStreamRequestIds.set(streamId, reqId);
           } else {
-            // §9.16.3 defensive fallback: a stream whose request has no owner
-            // yet. Registration is pre-send and synchronous today, so this
-            // should not happen — park the stream rather than drop it, and
-            // registerMediaFetch() replays the buffered objects if it does.
+            // Data can beat request registration or its subscription's alias
+            // binding. Keep it FETCH-owned until both are known.
             // BOUNDED: a peer cycling unknown fetch streams must not grow
             // this for the session lifetime — evict the oldest entry.
             if (this.pendingFetchStreams.size >= MoqtPlayer.MAX_PENDING_FETCH_STREAMS) {
-              const oldest = this.pendingFetchStreams.keys().next().value;
+              const oldest = this.pendingFetchStreams.values().next().value;
               if (oldest !== undefined) {
-                const evicted = this.pendingFetchStreams.get(oldest);
-                this.pendingFetchStreams.delete(oldest);
-                // Keep the CLASSIFICATION for a still-open stream: its later
-                // objects are dropped, never alias-routed. A stream that has
-                // ALREADY ENDED gets NO tombstone — no close event will ever
-                // clear it, and repeated header→terminal→overflow cycles
-                // would grow the set forever.
-                if (evicted?.terminal === undefined) this.droppedFetchStreams.add(oldest);
+                this.quarantineFetchRequest(oldest.requestId);
               }
             }
-            this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [] });
+            this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [], bytes: 0 });
           }
         }
       }, 'data'),
@@ -5846,6 +6513,7 @@ export class MoqtPlayer {
       adapter: this.connection,
       activeSubscriptions: this.activeSubscriptions,
       pendingMediaSubs: this.pendingMediaSubs,
+      removeSubscription: (requestId) => this.retireMediaSubscription(requestId, conn),
       pendingTrackStatuses: this.pendingTrackStatuses,
       catalogRequestId: this.catalogRequestId,
       catalogTrackAlias: this.catalogTrackAlias,
@@ -5939,6 +6607,27 @@ export class MoqtPlayer {
       },
       onCatalogSubscribeOk: (largest) => {
         this.catalogBootstrapCoord?.onSubscribeOk(largest);
+      },
+      onCatalogSubscribeError: (errorCode, reason, retryInterval) => {
+        if (conn !== this.connection) return;
+        this.cancelCatalogBootstrap();
+        // Only "not published yet" is retriable; other codes are real refusals.
+        if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) {
+          this.emitError(createPlayerError(
+            'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)})`,
+          ));
+          return;
+        }
+        // followNamespace: the namespace's publication re-establishes the session.
+        if (this.awaitPublisherForCatalog(conn)) {
+          this.emitError(createPlayerError(
+            'degraded', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)}); waiting for the publisher`,
+          ));
+          return;
+        }
+        this.scheduleCatalogSubscribeRetry(conn, retryInterval);
       },
       onRecoveryCatalogSubscribeOk: (reqId, alias, largest) => {
         const r = this.catalogRecovery;
@@ -6103,12 +6792,10 @@ export class MoqtPlayer {
             if (oldest !== undefined) this.refusedFetchRequests.delete(oldest);
           }
           this.refusedFetchRequests.set(requestId, { reason: errorReason, code: errorCode });
-          for (const [streamId, pending] of this.pendingFetchStreams) {
-            if (pending.requestId === requestId) this.pendingFetchStreams.delete(streamId);
-          }
+          this.quarantineFetchRequest(requestId);
           return;
         }
-        this.activeFetches.delete(requestId);
+        this.quarantineFetchRequest(requestId);
         // Non-fatal by design: a refused warm-start (or manual) media fetch
         // just means no pre-roll — the live subscription is untouched and
         // playback starts at the next group boundary.
@@ -6116,16 +6803,13 @@ export class MoqtPlayer {
           fetchInfo.warmStart ? 'warm-start' : 'fetch',
           requestId, fetchInfo.trackName, errorReason, errorCode.toString(16));
       },
-      onMediaAliasRemapped: (_requestId, oldAlias, newAlias) => {
-        // §9.10: the server assigned a different track alias — fetch
-        // bookkeeping registered under the optimistic alias must follow, or
-        // a warm-start fetch's objects orphan on relays that don't echo the
-        // request ID as the alias.
-        for (const info of this.activeFetches.values()) {
-          if (info.trackAlias === oldAlias) info.trackAlias = newAlias;
-        }
-        for (const [streamId, alias] of this.fetchStreamAliases) {
-          if (alias === oldAlias) this.fetchStreamAliases.set(streamId, newAlias);
+      onMediaAliasBound: (requestId, alias) => {
+        // FETCH ownership follows the associated subscription, never a
+        // coincidentally equal Request ID or another track's numeric alias.
+        for (const [fetchId, info] of this.activeFetches) {
+          if (info.subscriptionRequestId !== requestId) continue;
+          info.trackAlias = alias;
+          this.drainMediaFetch(fetchId);
         }
       },
     });
@@ -6657,13 +7341,13 @@ export class MoqtPlayer {
       const decodeBase64 = (b64: string): Uint8Array =>
         Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       this.cmafPendingInit = {};
-      if (trackInfo.video?.packaging === 'cmaf' && trackInfo.video.codec) {
+      if (trackInfo.video && this.usesMse(trackInfo.video.packaging) && trackInfo.video.codec) {
         this.cmafPendingInit.video = {
           codec: trackInfo.video.codec,
           bytes: trackInfo.video.initData ? decodeBase64(trackInfo.video.initData) : null,
         };
       }
-      if (trackInfo.audio?.packaging === 'cmaf' && trackInfo.audio.codec) {
+      if (trackInfo.audio && this.usesMse(trackInfo.audio.packaging) && trackInfo.audio.codec) {
         this.cmafPendingInit.audio = {
           codec: trackInfo.audio.codec,
           bytes: trackInfo.audio.initData ? decodeBase64(trackInfo.audio.initData) : null,
@@ -6767,6 +7451,8 @@ export class MoqtPlayer {
       }
     }
     this.cmafVideoSynced = false;
+    // Held LOCMAF objects never reached their decoders: restart each group reference.
+    for (const decoder of this.locmafDecoders.values()) decoder.reset();
     this.log.info('[CMAF] MediaSource attached — resuming at the next group start (live edge)');
   }
 
@@ -7014,7 +7700,7 @@ export class MoqtPlayer {
     const cmafSelections: Array<['video' | 'audio', CatalogTrack | undefined]> =
       [['video', selected.video], ['audio', selected.audio]];
     for (const [mediaType, track] of cmafSelections) {
-      if (!track || track.packaging !== 'cmaf') continue;
+      if (!track || !isMsePackaging(track.packaging)) continue;
       let reason: string | null = null;
       if (!track.codec) {
         reason = 'no codec string';
@@ -7077,15 +7763,15 @@ export class MoqtPlayer {
     // Use the quality controller's selected tracks (not the first
     // catalog tracks) — codec / resolution / initData must match the
     // subscription or the decoder will be mis-configured.
-    const videoPackaging: TrackPackaging = (selected.video?.packaging === 'cmaf') ? 'cmaf' : 'loc';
-    const audioPackaging: TrackPackaging = (selected.audio?.packaging === 'cmaf') ? 'cmaf' : 'loc';
+    const videoPackaging: TrackPackaging = mediaTrackPackaging(selected.video?.packaging);
+    const audioPackaging: TrackPackaging = mediaTrackPackaging(selected.audio?.packaging);
 
     this.createPipelinesFromTrackInfo({
       video: selected.video ? defined({
         codec: selected.video.codec,
         width: selected.video.width,
         height: selected.video.height,
-        initData: this.resolveInlineInitData(selected.video),
+        initData: this.pipelineInitData(selected.video),
         initTrack: selected.video.initTrack,
         packaging: videoPackaging,
       }) : undefined,
@@ -7093,7 +7779,7 @@ export class MoqtPlayer {
         codec: selected.audio.codec,
         samplerate: selected.audio.samplerate,
         channels: selected.audio.channelConfig ? Number(selected.audio.channelConfig) : undefined,
-        initData: this.resolveInlineInitData(selected.audio),
+        initData: this.pipelineInitData(selected.audio),
         initTrack: selected.audio.initTrack,
         packaging: audioPackaging,
       }) : undefined,
@@ -7131,8 +7817,8 @@ export class MoqtPlayer {
       // explicit subscriptionFilter is LargestObject when warm start is on.
       const warmStart = this.config.warmStartCurrentGroup === true
         && track?.isLive === true
-        && packaging !== 'cmaf';
-      if (this.config.warmStartCurrentGroup === true && packaging === 'cmaf') {
+        && !isMsePackaging(packaging);
+      if (this.config.warmStartCurrentGroup === true && isMsePackaging(packaging)) {
         this.log.warn('[warm-start] CMAF track "%s" skipped — LOC only in this slice', name);
       }
       // Warm start overrides ONLY the filter — configured subscribe options
@@ -7141,8 +7827,7 @@ export class MoqtPlayer {
         ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }
         : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
       // Pre-send ownership (§9.10): register inside onRequestId — a
-      // zero-latency SUBSCRIBE_OK must find the pending entry (and the
-      // requestId-as-alias optimistic registration) already in place. Adapters
+      // zero-latency SUBSCRIBE_OK must find the pending entry already in place. Adapters
       // that don't invoke the callback fall back to post-await registration.
       const connAtSubscribe = this.connection;
       const wireDetail = `ns=${namespaceDisplay(this.config.namespace)}`
@@ -7156,11 +7841,7 @@ export class MoqtPlayer {
         subRegistered = true;
         if (!this.subscriptionManager || this.connection !== connAtSubscribe) return;
         this.pendingAliasBinds.add(reqIdBigInt);
-        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: reqIdBigInt });
-        // Register immediately using requestId as alias — many relays
-        // echo requestId as trackAlias. If SUBSCRIBE_OK provides a
-        // different alias, the registration is updated in handleControlMessage.
-        this.subscriptionManager.registerTrack(reqIdBigInt, name, mediaType, packaging);
+        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null });
         this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
         this.recordMediaSubWire(reqIdBigInt, wireDetail);
         this.log.info('SUBSCRIBE media reqId=%s %s', reqIdBigInt.toString(), wireDetail);
@@ -7174,13 +7855,10 @@ export class MoqtPlayer {
         registerMediaSub(reqIdBigInt);
       } catch (err) {
         // The send failed AFTER pre-send registration: undo the ownership so
-        // no phantom pending/optimistic-alias entry survives a request the
+        // no pending ownership survives a request the
         // peer never (usably) received.
         if (registeredId !== null) {
-          this.settleParkedOwnership(registeredId, null, connAtSubscribe);
-          this.activeSubscriptions.delete(registeredId);
-          this.subscriptionManager?.unregisterTrack(registeredId);
-          this.pendingMediaSubs.delete(registeredId);
+          this.retireMediaSubscription(registeredId, connAtSubscribe);
         }
         throw err;
       }
@@ -7216,7 +7894,7 @@ export class MoqtPlayer {
             registered = true;
             warmFetchId = id;
             this.registerMediaFetch(id, {
-              trackName: name, mediaType, trackAlias: reqIdBigInt, warmStart: true,
+              trackName: name, mediaType, subscriptionRequestId: reqIdBigInt, trackAlias: null, warmStart: true,
             });
           };
           try {
@@ -7233,15 +7911,7 @@ export class MoqtPlayer {
             // The send failed AFTER pre-send registration: reclaim the fetch
             // ownership, or a phantom activeFetches entry could alias-route
             // raced traffic for a request that was reported as failed.
-            if (warmFetchId !== null) {
-              this.activeFetches.delete(warmFetchId);
-              for (const [sid, mappedReq] of this.fetchStreamRequestIds) {
-                if (mappedReq === warmFetchId) {
-                  this.fetchStreamRequestIds.delete(sid);
-                  this.fetchStreamAliases.delete(sid);
-                  this.droppedFetchStreams.add(sid);
-                }
-              }
+            if (warmFetchId !== null && this.connection === connAtCall) {
               // Tombstone the request: late traffic quarantines (dropped, not
               // parked unowned) until the session boundary reclaims it.
               this.quarantineFetchRequest(warmFetchId);
@@ -7343,12 +8013,35 @@ export class MoqtPlayer {
       this.log.info('Subscribe eventtimeline "%s" (eventType=%s) requestId=%s',
         evtTrack.name, evtTrack.eventType ?? '(none)', reqIdBigInt);
     }
+
+    // LOCMAF event-only tracks (draft-einarsson-moq-locmaf-01 §14): a locmaf track
+    // of a non-media role whose chunks carry emsg genBoxes and no samples. Selected
+    // like eventtimeline tracks -- by dependence on a selected media track -- and
+    // delivered as `locmaf_event` player events rather than media.
+    const locmafEventTracks = catalog.tracks.filter(
+      (t: CatalogTrack) =>
+        t.packaging === 'locmaf' &&
+        t.role !== 'video' && t.role !== 'audio' &&
+        isTrackPackagingSupported(t) &&
+        Array.isArray(t.depends) &&
+        t.depends.some((dep: string) => selectedNames.has(dep)),
+    );
+    for (const evtTrack of locmafEventTracks) {
+      if (!this.connection || !this.subscriptionManager) break;
+      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nameBytes = this.enc.encode(evtTrack.name);
+      const eventOptions = subscribeOptions ?? { subscriptionFilter: { type: 'LargestObject' as const } };
+      const reqIdBigInt = await this.subscribeAuxTrackOwned(nsBytes, nameBytes, eventOptions, {
+        trackName: evtTrack.name, mediaType: 'eventtimeline', packaging: 'locmaf',
+      });
+      this.log.info('Subscribe LOCMAF event-only track "%s" (role=%s) requestId=%s',
+        evtTrack.name, evtTrack.role ?? '(none)', reqIdBigInt);
+    }
   }
 
   /**
    * Subscribe an auxiliary track (mediatimeline / init / eventtimeline) with
-   * PRE-SEND ownership: registration in activeSubscriptions / the
-   * SubscriptionManager / pendingMediaSubs happens inside `onRequestId`
+   * PRE-SEND ownership: pending subscription registration happens inside `onRequestId`
    * (post-allocation, pre-emission), so a zero-latency SUBSCRIBE_OK can never
    * beat it (§9.10 alias remap included). Adapters that don't invoke the
    * callback fall back to post-await registration; a send failure AFTER
@@ -7371,9 +8064,8 @@ export class MoqtPlayer {
       if (!this.subscriptionManager || this.connection !== conn) return;
       this.pendingAliasBinds.add(reqId);
       this.activeSubscriptions.set(reqId, {
-        trackName: info.trackName, mediaType: info.mediaType, trackAlias: reqId,
+        trackName: info.trackName, mediaType: info.mediaType, trackAlias: null,
       });
-      this.subscriptionManager.registerTrack(reqId, info.trackName, info.mediaType, info.packaging);
       this.pendingMediaSubs.set(reqId, {
         trackName: info.trackName, mediaType: info.mediaType, packaging: info.packaging,
       });
@@ -7386,10 +8078,7 @@ export class MoqtPlayer {
       return BigInt(reqId);
     } catch (err) {
       if (registered !== null) {
-        this.settleParkedOwnership(registered, null, conn);
-        this.activeSubscriptions.delete(registered);
-        this.subscriptionManager?.unregisterTrack(registered);
-        this.pendingMediaSubs.delete(registered);
+        this.retireMediaSubscription(registered, conn);
         onRolledBack?.(registered);
       }
       throw err;
@@ -7753,6 +8442,7 @@ export class MoqtPlayer {
     const out: LivenessTrack[] = [];
     for (const [requestId, sub] of this.activeSubscriptions) {
       if (sub.mediaType !== 'video' && sub.mediaType !== 'audio') continue;
+      if (sub.trackAlias === null) continue;
       if (requestId === this.catalogRequestId || requestId === this.timelineRequestId) continue;
       if (initRequestIds.has(requestId)) continue;
       out.push({
@@ -7952,7 +8642,12 @@ export class MoqtPlayer {
    */
   private flushForLivenessRestart(track: LivenessTrack): void {
     const catalogTrack = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === track.trackName);
-    if (catalogTrack?.packaging === 'cmaf') {
+    // LOCMAF on either path: drop the in-group reference; the restarted delivery begins at a full header.
+    if (catalogTrack?.packaging === 'locmaf') {
+      this.locmafDecoders.get(track.trackName)?.reset();
+      this.locmafFrameIds.delete(track.trackName);
+    }
+    if (this.usesMse(catalogTrack?.packaging)) {
       // CMAF bypasses the LOC pipelines: re-arm the wait-for-keyframe gate
       // (post-restart mid-group deltas must be dropped, as on init) and drop
       // any stranded moof half-pair so it can't mispair after the restart.
@@ -8008,14 +8703,10 @@ export class MoqtPlayer {
     if (!this.connection || !this.subscriptionManager) return;
     for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
       if (sub.trackName !== track.trackName || sub.mediaType !== track.mediaType) continue;
-      this.subscriptionManager.unregisterTrack(sub.trackAlias);
-      this.settleParkedOwnership(requestId, null, this.connection);
+      this.retireMediaSubscription(requestId, this.connection);
       // Async — a sync try/catch would let the rejection escape. Best-effort:
       // the request stream may have died with the delivery path.
       void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
-      this.activeSubscriptions.delete(requestId);
-      this.pendingMediaSubs.delete(requestId);
-      this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
     this.replaceSubscription(track.trackName, 'liveness');
   }
@@ -8054,7 +8745,7 @@ export class MoqtPlayer {
     }
 
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
-    const packaging = (track.packaging === 'cmaf') ? 'cmaf' : 'loc';
+    const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
 
     // Reset pipeline + sync to prepare for fresh data.
@@ -8081,8 +8772,7 @@ export class MoqtPlayer {
       resubRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== resubConn) return;
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: id });
-      this.subscriptionManager.registerTrack(id, trackName, mediaType, packaging);
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
     };
     // Start through the CAPTURED connection and attach both observers before
@@ -8106,10 +8796,7 @@ export class MoqtPlayer {
       });
     }).catch((err: unknown) => {
       if (resubRegisteredId !== null) {
-        this.settleParkedOwnership(resubRegisteredId, null, resubConn);
-        this.activeSubscriptions.delete(resubRegisteredId);
-        this.subscriptionManager?.unregisterTrack(resubRegisteredId);
-        this.pendingMediaSubs.delete(resubRegisteredId);
+        this.retireMediaSubscription(resubRegisteredId, resubConn);
       }
       const failure = err instanceof Error ? err : new Error(String(err));
       this.log.warn('Resubscribe "%s" failed: %s', trackName, failure.message);
@@ -8172,6 +8859,14 @@ export class MoqtPlayer {
       return;
     }
 
+    // A malformed switch TARGET must abort the pending switch: otherwise its
+    // staging timeout later "completes" the switch and unsubscribes the old,
+    // working track, or the switch stays pending forever.
+    const pendingSwitch = this.pendingVideoSwitch;
+    if (pendingSwitch && pendingSwitch.newTrackName === trackName) {
+      this.abortPendingVideoSwitch(pendingSwitch, error);
+    }
+
     // Find the requestId for this track alias in activeSubscriptions
     let matchedRequestId: bigint | undefined;
     for (const [requestId, sub] of this.activeSubscriptions) {
@@ -8183,12 +8878,8 @@ export class MoqtPlayer {
 
     if (matchedRequestId !== undefined) {
       // §2.4.2 MUST: UNSUBSCRIBE
-      if (this.connection) this.settleParkedOwnership(matchedRequestId, null, this.connection);
+      if (this.connection) this.retireMediaSubscription(matchedRequestId, this.connection);
       this.connection?.unsubscribe(varint(matchedRequestId));
-
-      // Clean up local state
-      this.activeSubscriptions.delete(matchedRequestId);
-      this.subscriptionManager?.unregisterTrack(trackAlias);
 
       // §2.4.2 SHOULD: deliver error to application
       this.emitter.emit('track_unsubscribed', {

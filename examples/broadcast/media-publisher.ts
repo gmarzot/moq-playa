@@ -32,8 +32,8 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft } from '@moqt/loc';
-import type { DraftVersion } from '@moqt/transport';
+import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@openmoq/loc';
+import type { DraftVersion } from '@openmoq/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {
@@ -49,14 +49,20 @@ export interface MediaPublishConnection {
 
 export interface VideoChunkMeta {
   isKeyframe: boolean;
-  /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
+  /**
+   * WebCodecs chunk timestamp in microseconds. Its base is browser-defined
+   * (and may differ between the audio and video tracks), so the publisher
+   * rebases it per track using the capture-time anchor. Without a capture
+   * observation, the first enqueue supplies the anchor.
+   * @see draft-ietf-moq-loc-04 §2.3.1.1
+   */
   timestampUs: number;
   /** Codec description (decoder config) to ride as the LOC videoConfig. */
   videoConfig?: Uint8Array;
 }
 
 export interface AudioChunkMeta {
-  /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
+  /** WebCodecs chunk timestamp in microseconds; rebased like {@link VideoChunkMeta.timestampUs}. */
   timestampUs: number;
 }
 
@@ -67,9 +73,12 @@ export interface MediaPublisherOptions {
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
+  /** LOC draft to emit: 1 (default) or 4. */
+  locVersion?: LocVersion;
   /**
-   * Wall clock in microseconds since the Unix epoch, anchoring each track's
-   * first chunk timestamp. Injectable for tests. Default `Date.now() * 1000`.
+   * Wall clock in microseconds since the Unix epoch, used to anchor each
+   * track's capture timestamp. Injectable for tests. Default:
+   * `() => Date.now() * 1000`.
    */
   wallClockUs?: () => number;
   /** Failure sink — publication errors are contained, never unhandled. */
@@ -107,10 +116,9 @@ export class MediaPublisher {
   private readonly connection: MediaPublishConnection;
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
+  private readonly locVersion: LocVersion;
   private readonly wallClockUs: () => number;
-  // Offset from each track's WebCodecs timestamp base to the wall clock, fixed
-  // at that track's first chunk. Separate per track: the browser may hand audio
-  // and video timestamps on different bases.
+  /** Per-track WebCodecs-to-wall-clock offset, fixed at the first capture observation. */
   private videoTsOffsetUs: number | null = null;
   private audioTsOffsetUs: number | null = null;
   private readonly onError: (context: string, err: unknown) => void;
@@ -121,6 +129,8 @@ export class MediaPublisher {
 
   private videoAlias: bigint | null = null;
   private audioAlias: bigint | null = null;
+  private videoEpoch = 0;
+  private audioEpoch = 0;
 
   private videoGroupId: bigint;
   private videoObjectId = 0n;
@@ -161,6 +171,8 @@ export class MediaPublisher {
     this.connection = connection;
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
+    this.locVersion = options.locVersion ?? 1;
+    if (this.locVersion !== 1 && this.locVersion !== 4) throw new Error('Unsupported LOC version');
     this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
@@ -172,8 +184,29 @@ export class MediaPublisher {
   }
 
   /** Bind the relay-subscribed aliases (from the accepted SUBSCRIBEs). */
-  setVideoAlias(alias: bigint): void { this.videoAlias = alias; }
-  setAudioAlias(alias: bigint): void { this.audioAlias = alias; }
+  setVideoAlias(alias: bigint | null): void {
+    if (this.videoAlias === alias) return;
+    this.videoEpoch++;
+    this.videoAlias = alias;
+    this.videoQueue.length = 0;
+    this.videoContinuityLost = false;
+    const streamId = this.videoStreamId;
+    this.videoStreamId = null;
+    if (streamId !== null) this.trackClose(streamId);
+  }
+  setAudioAlias(alias: bigint | null): void {
+    if (this.audioAlias === alias) return;
+    this.audioEpoch++;
+    this.audioAlias = alias;
+    this.audioQueue.length = 0;
+    this.audioOverflowing = false;
+  }
+  clearVideoAlias(alias: bigint): void {
+    if (this.videoAlias === alias) this.setVideoAlias(null);
+  }
+  clearAudioAlias(alias: bigint): void {
+    if (this.audioAlias === alias) this.setAudioAlias(null);
+  }
 
   get frameCount(): number { return this.videoFrames; }
   get audioChunkCount(): number { return this.audioChunks; }
@@ -185,6 +218,7 @@ export class MediaPublisher {
    */
   publishVideo(data: Uint8Array, meta: VideoChunkMeta): void {
     if (this.stopped || this.videoAlias === null) return;
+    this.observeCaptureTimestamp('video', meta.timestampUs);
     if (this.videoQueue.length >= this.videoQueueMax) {
       // Overflow: the queued dependents can never all be delivered in time —
       // continuity is lost. Invalidate the whole backlog and recover at the
@@ -207,6 +241,7 @@ export class MediaPublisher {
   /** Enqueue one encoded audio chunk (same contract as {@link publishVideo}). */
   publishAudio(data: Uint8Array, meta: AudioChunkMeta): void {
     if (this.stopped || this.audioAlias === null) return;
+    this.observeCaptureTimestamp('audio', meta.timestampUs);
     if (this.audioQueue.length >= this.audioQueueMax) {
       // Audio chunks are independently decodable — drop the OLDEST to keep
       // the live edge. Report once per overflow episode.
@@ -297,10 +332,11 @@ export class MediaPublisher {
       try {
         while (this.videoQueue.length > 0 && !this.stopped) {
           const item = this.videoQueue.shift()!;
+          const epoch = this.videoEpoch;
           try {
             await this.sendVideoChunk(item.data, item.meta);
           } catch (err) {
-            this.report('video publish', err);
+            if (epoch === this.videoEpoch) this.report('video publish', err);
           }
         }
       } finally {
@@ -318,11 +354,12 @@ export class MediaPublisher {
     while (this.audioQueue.length > 0 && !this.stopped && this.audioInFlight.size < this.audioMaxInFlight) {
       const item = this.audioQueue.shift()!;
       const groupId = ++this.audioGroupId;
+      const epoch = this.audioEpoch;
       const inFlight = (async () => {
         try {
           await this.sendAudioChunk(item.data, item.meta, groupId);
         } catch (err) {
-          this.report('audio publish', err);
+          if (epoch === this.audioEpoch) this.report('audio publish', err);
         }
       })();
       this.audioInFlight.add(inFlight);
@@ -334,12 +371,20 @@ export class MediaPublisher {
     }
   }
 
+  /** Observe raw capture before encoding so encoder and network waits cannot shift A/V time. */
+  observeCaptureTimestamp(track: 'video' | 'audio', timestampUs: number): void {
+    if (!this.stopped) this.toWallClockUs(track, timestampUs);
+  }
+
+  private locOptions() {
+    return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.locVersion };
+  }
+
   /**
-   * Rebase a WebCodecs chunk timestamp to Unix-epoch microseconds. The first
-   * chunk of each track anchors to the wall clock; later chunks keep their
-   * spacing relative to it. Without this the stamp carries a browser-defined
-   * base, and a receiver using audio as its sync master computes video render
-   * times against an unrelated origin.
+   * Rebase a WebCodecs timestamp to Unix-epoch microseconds. Each track's
+   * first capture observation anchors it; later chunks keep their spacing
+   * relative to that observation. Audio and video get independent anchors
+   * because the browser may hand them timestamps on different bases.
    * @see draft-ietf-moq-loc-04 §2.3.1.1 (Timestamp without Timescale = µs since epoch)
    */
   private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
@@ -357,17 +402,21 @@ export class MediaPublisher {
       captureTimestamp: this.toWallClockUs('video', meta.timestampUs),
       videoFrameMarking: {
         independent: meta.isKeyframe,
-        discardable: !meta.isKeyframe,
+        // WebCodecs key/delta classification does not identify non-reference frames.
+        discardable: false,
         baseLayerSync: false,
         startOfFrame: true,
         endOfFrame: true,
         temporalId: 0,
       },
       ...(meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
   }
 
   private async sendVideoChunk(data: Uint8Array, meta: VideoChunkMeta): Promise<void> {
+    const alias = this.videoAlias;
+    const epoch = this.videoEpoch;
+    if (alias === null) return;
     if (meta.isKeyframe) {
       // New group per keyframe. The previous subgroup has no further writers
       // (the pump is the only one), so its close needs no await — but it
@@ -383,10 +432,15 @@ export class MediaPublisher {
       // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
       // Without this, receivers cannot distinguish normal group completion
       // from an incomplete group and will wait for the intra-group timeout.
-      this.videoStreamId = await this.connection.openSubgroup(
-        this.wrapInt(this.videoAlias!), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
+      const streamId = await this.connection.openSubgroup(
+        this.wrapInt(alias), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
         this.subgroupOptions(128),
       );
+      if (epoch !== this.videoEpoch) {
+        this.trackClose(streamId);
+        return;
+      }
+      this.videoStreamId = streamId;
     }
     // No open subgroup — either pre-first-keyframe, or the group was retired
     // by a failure. Dependent frames are dropped until the next keyframe.
@@ -396,6 +450,7 @@ export class MediaPublisher {
       await this.connection.sendObject(
         this.videoStreamId, this.wrapInt(this.videoObjectId), data, this.videoExtensions(meta));
     } catch (err) {
+      if (epoch !== this.videoEpoch) return;
       // LOC: Object 0 of a subgroup must be the independent frame. After a
       // failed (or ambiguous) send the group is unusable — retire it, so
       // deltas drop until the next keyframe opens a fresh group at Object 0.
@@ -404,21 +459,29 @@ export class MediaPublisher {
       this.trackClose(broken);
       throw err;
     }
+    if (epoch !== this.videoEpoch) return;
     this.videoObjectId++;
     this.videoFrames++;
     this.onCounts?.(this.videoFrames, this.audioChunks);
   }
 
   private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
+    const alias = this.audioAlias;
+    const epoch = this.audioEpoch;
+    if (alias === null) return;
     const extensions = encodeLocHeaders({
       captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     const streamId = await this.connection.openSubgroup(
-      this.wrapInt(this.audioAlias!), this.wrapInt(groupId), this.wrapInt(0n),
+      this.wrapInt(alias), this.wrapInt(groupId), this.wrapInt(0n),
       this.subgroupOptions(64),
     );
+    if (epoch !== this.audioEpoch) {
+      this.trackClose(streamId);
+      return;
+    }
     try {
       await this.connection.sendObject(streamId, this.wrapInt(0n), data, extensions);
     } catch (err) {
@@ -426,6 +489,7 @@ export class MediaPublisher {
       throw err;
     }
     await this.trackClose(streamId);
+    if (epoch !== this.audioEpoch) return;
     this.audioChunks++;
     this.onCounts?.(this.videoFrames, this.audioChunks);
     if (this.audioQueue.length < this.audioQueueMax) this.audioOverflowing = false;
