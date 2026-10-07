@@ -2433,6 +2433,14 @@ export class MseMediaSource implements MediaSourceLike {
     }
   }
 
+  /** End a soft chase once the cushion, measured before new media lands, is down to target. */
+  private releaseChaseAtTarget(): void {
+    if (this.video.playbackRate === 1) return;
+    const ct = this.video.currentTime;
+    const end = this.containingRangeEnd(ct);
+    if (end !== null && end - ct <= this.targetAheadSec) this.resetPlaybackRate();
+  }
+
   /** End a soft chase; a seek, pause or reset must not carry the rate over. */
   private resetPlaybackRate(): void {
     if (this.video.playbackRate !== 1) this.video.playbackRate = 1;
@@ -2553,6 +2561,9 @@ export class MseMediaSource implements MediaSourceLike {
         .join(' ');
       this.logDebug('[MSE] appendBuffer %s: %dB head=[%s]', mediaType, data.byteLength, hex);
     }
+
+    // The cushion is at its low point just before new media lands.
+    this.releaseChaseAtTarget();
 
     // ── Step 3: mark pending + call appendBuffer ─────────────────
     this.appendErrored[mediaType] = false;
