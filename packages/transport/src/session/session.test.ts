@@ -2552,7 +2552,7 @@ describe('Session', () => {
         expect(ns?.discoveredNamespaces[0]).toEqual(suffix);
       });
 
-      it('terminates namespace SM on NAMESPACE_DONE', () => {
+      it('NAMESPACE_DONE withdraws the suffix and keeps the subscription ACTIVE (§10.17)', () => {
         const prefix = [new Uint8Array([0x6c])];
         const { requestId } = session.subscribeNamespace(prefix);
 
@@ -2568,13 +2568,42 @@ describe('Session', () => {
           trackNamespaceSuffix: [],
         });
 
-        session.handleNamespaceStreamMessage(requestId, {
+        const actions = session.handleNamespaceStreamMessage(requestId, {
           type: 'NAMESPACE_DONE',
           trackNamespaceSuffix: [],
         });
 
+        expect(actions).toEqual([]);
         const ns = session.getNamespaceSubscription(requestId);
-        expect(ns?.state).toBe(NamespaceState.TERMINATED);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
+        expect(ns?.discoveredNamespaces.length).toBe(0);
+      });
+
+      it('accepts NAMESPACE again after NAMESPACE_DONE (publisher restart)', () => {
+        const prefix = [new Uint8Array([0x6c])];
+        const { requestId } = session.subscribeNamespace(prefix);
+        session.handleNamespaceStreamMessage(requestId, {
+          type: 'REQUEST_OK',
+          requestId,
+          parameters: new Map(),
+        });
+
+        session.handleNamespaceStreamMessage(requestId, { type: 'NAMESPACE', trackNamespaceSuffix: [] });
+        session.handleNamespaceStreamMessage(requestId, { type: 'NAMESPACE_DONE', trackNamespaceSuffix: [] });
+        expect(() => session.handleNamespaceStreamMessage(requestId, {
+          type: 'NAMESPACE',
+          trackNamespaceSuffix: [],
+        })).not.toThrow();
+
+        const ns = session.getNamespaceSubscription(requestId);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
+        expect(ns?.hasDiscoveredSuffix([])).toBe(true);
+        // A second withdrawal is legal again once re-announced.
+        const actions = session.handleNamespaceStreamMessage(requestId, {
+          type: 'NAMESPACE_DONE',
+          trackNamespaceSuffix: [],
+        });
+        expect(actions).toEqual([]);
       });
 
       it('terminates namespace SM on REQUEST_ERROR', () => {
@@ -2636,8 +2665,9 @@ describe('Session', () => {
         });
 
         const ns = session.getNamespaceSubscription(requestId);
-        expect(ns?.discoveredNamespaces.length).toBe(2);
-        expect(ns?.state).toBe(NamespaceState.TERMINATED);
+        expect(ns?.discoveredNamespaces.length).toBe(1);
+        expect(ns?.hasDiscoveredSuffix(videoSuffix)).toBe(false);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
       });
 
       // ─── Combined Namespace Validation (§2.4.1) ────────────────────────
@@ -2787,9 +2817,8 @@ describe('Session', () => {
           });
 
           expect(actions.length).toBe(0);
-          // SM transitions to TERMINATED (current behavior)
           const ns = session.getNamespaceSubscription(requestId);
-          expect(ns?.state).toBe(NamespaceState.TERMINATED);
+          expect(ns?.state).toBe(NamespaceState.ACTIVE);
         });
 
         it('validates combined namespace on NAMESPACE_DONE too', () => {

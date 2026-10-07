@@ -1,6 +1,6 @@
 /**
  * Namespace discovery state machine tests.
- * @see draft-ietf-moq-transport-16 §6.1
+ * @see draft-ietf-moq-transport-18 §10.17, §10.18
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -40,9 +40,9 @@ describe('NamespaceStateMachine', () => {
       expect(ns.errorReason).toBe('Namespace not found');
     });
 
-    it('transitions to TERMINATED on NAMESPACE_DONE', () => {
+    it('transitions to TERMINATED on terminate()', () => {
       ns.handleRequestOk();
-      ns.handleNamespaceDone();
+      ns.terminate();
 
       expect(ns.state).toBe(NamespaceState.TERMINATED);
     });
@@ -73,8 +73,8 @@ describe('NamespaceStateMachine', () => {
       expect(() => ns.handleNamespace(suffix)).toThrow();
     });
 
-    it('cannot receive NAMESPACE_DONE in PENDING state', () => {
-      expect(() => ns.handleNamespaceDone()).toThrow();
+    it('cannot terminate in PENDING state', () => {
+      expect(() => ns.terminate()).toThrow();
     });
   });
 
@@ -109,21 +109,20 @@ describe('NamespaceStateMachine', () => {
       expect(() => ns.sendNamespace(suffix)).not.toThrow();
     });
 
-    it('transitions to TERMINATED on sending NAMESPACE_DONE', () => {
+    it('stays ACTIVE after withdrawing a sent namespace (NAMESPACE_DONE)', () => {
       ns.sendRequestOk();
-      ns.sendNamespaceDone();
+      const suffix = [new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f])];
+      ns.sendNamespace(suffix);
+      ns.withdrawNamespace(suffix);
 
-      expect(ns.state).toBe(NamespaceState.TERMINATED);
+      expect(ns.state).toBe(NamespaceState.ACTIVE);
+      expect(ns.discoveredNamespaces.length).toBe(0);
     });
 
     it('cannot send NAMESPACE in PENDING state', () => {
       const suffix = [new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f])];
 
       expect(() => ns.sendNamespace(suffix)).toThrow();
-    });
-
-    it('cannot send NAMESPACE_DONE in PENDING state', () => {
-      expect(() => ns.sendNamespaceDone()).toThrow();
     });
   });
 
@@ -144,12 +143,6 @@ describe('NamespaceStateMachine', () => {
       expect(() => ns.sendNamespace([])).toThrow();
     });
 
-    it('subscriber cannot send NAMESPACE_DONE', () => {
-      const ns = NamespaceStateMachine.createAsSubscriber(varint(0n), []);
-      ns.handleRequestOk();
-      expect(() => ns.sendNamespaceDone()).toThrow();
-    });
-
     it('publisher cannot handle REQUEST_OK', () => {
       const ns = NamespaceStateMachine.createAsPublisher(varint(1n), []);
       expect(() => ns.handleRequestOk()).toThrow();
@@ -166,10 +159,10 @@ describe('NamespaceStateMachine', () => {
       expect(() => ns.handleNamespace([])).toThrow();
     });
 
-    it('publisher cannot handle NAMESPACE_DONE', () => {
+    it('publisher cannot terminate', () => {
       const ns = NamespaceStateMachine.createAsPublisher(varint(1n), []);
       ns.sendRequestOk();
-      expect(() => ns.handleNamespaceDone()).toThrow();
+      expect(() => ns.terminate()).toThrow();
     });
   });
 
@@ -191,7 +184,7 @@ describe('NamespaceStateMachine', () => {
       ns.handleRequestOk();
       expect(ns.isActive).toBe(true);
 
-      ns.handleNamespaceDone();
+      ns.terminate();
       expect(ns.isActive).toBe(false);
     });
 
@@ -229,12 +222,22 @@ describe('NamespaceStateMachine', () => {
     });
   });
 
-  describe('withdrawNamespace (draft-14 per-namespace withdrawal)', () => {
+  describe('withdrawNamespace (per-namespace withdrawal)', () => {
     /**
-     * draft-ietf-moq-transport-14 §9.26: PUBLISH_NAMESPACE_DONE "withdraws a
-     * previous PUBLISH_NAMESPACE" but does NOT terminate the subscription.
-     * The subscription stays ACTIVE — new PUBLISH_NAMESPACE messages can arrive.
+     * draft-18 §10.17 NAMESPACE_DONE and draft-14 §9.26 PUBLISH_NAMESPACE_DONE
+     * withdraw one namespace; the subscription stays ACTIVE.
      */
+
+    it('accepts the same suffix announced again after its withdrawal', () => {
+      const ns = NamespaceStateMachine.createAsSubscriber(varint(0n), []);
+      ns.handleRequestOk();
+      const suffix: Uint8Array[] = [];
+      ns.handleNamespace(suffix);
+      ns.withdrawNamespace(suffix);
+
+      expect(() => ns.handleNamespace(suffix)).not.toThrow();
+      expect(ns.hasDiscoveredSuffix(suffix)).toBe(true);
+    });
 
     it('removes a previously discovered namespace, stays ACTIVE', () => {
       const ns = NamespaceStateMachine.createAsSubscriber(varint(0n), []);

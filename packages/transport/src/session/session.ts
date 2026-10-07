@@ -3827,9 +3827,7 @@ export class Session {
   handleNamespaceStreamClosed(requestId: bigint): SessionOutboundAction[] {
     const nsSm = this.namespaceSubscriptions.get(requestId as bigint);
     if (!nsSm) return [];
-    if (nsSm.isActive) {
-      nsSm.handleNamespaceDone(); // ACTIVE → TERMINATED (treat actives as done)
-    }
+    if (nsSm.isActive) nsSm.terminate();
     this.namespaceSubscriptions.delete(requestId as bigint);
     return [];
   }
@@ -3884,7 +3882,8 @@ export class Session {
             `NAMESPACE_DONE for suffix not previously announced via NAMESPACE (§6.1)`,
           );
         }
-        nsSm.handleNamespaceDone();
+        // §10.17: withdraws this suffix only; the subscription continues.
+        nsSm.withdrawNamespace(ndMsg.trackNamespaceSuffix);
         return [];
       }
 
@@ -4114,12 +4113,8 @@ export class Session {
 
   /**
    * Publisher-side: emit NAMESPACE_DONE for a previously announced suffix on an
-   * accepted incoming SUBSCRIBE_NAMESPACE stream (§10.18). Locally this is a
-   * PER-SUFFIX withdrawal from our publisher bookkeeping (via `withdrawNamespace`,
-   * NOT the terminal `NamespaceStateMachine.sendNamespaceDone()`), so our incoming
-   * machine stays ACTIVE and may emit further NAMESPACE / NAMESPACE_DONE. The
-   * RECEIVING subscriber, however, treats NAMESPACE_DONE as TERMINATING its
-   * namespace subscription (§6.1, `handleNamespaceDone`).
+   * accepted incoming SUBSCRIBE_NAMESPACE stream (§10.17). A per-suffix
+   * withdrawal on both sides; the stream stays ACTIVE for further updates.
    */
   sendNamespaceDone(requestId: bigint, suffix: Uint8Array[]): SessionOutboundAction[] {
     const nsSm = this.requireActiveIncomingNamespaceSub(requestId, 'sendNamespaceDone');
@@ -4562,8 +4557,7 @@ export class Session {
       trackNamespacePrefix: nsSm.namespacePrefix,
     };
 
-    // Terminate the state machine
-    nsSm.handleNamespaceDone();
+    nsSm.terminate();
 
     return [this.sendControl(unsubMsg)];
   }
