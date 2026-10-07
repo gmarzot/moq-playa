@@ -803,7 +803,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           // ideal only: a min is mandatory and hides devices that cannot meet it.
           frameRate: { ideal: captureFps },
         })
-        : await cap.startScreen({ video: true, audio: false });
+        : await cap.startScreen({ video: { frameRate: { ideal: captureFps } }, audio: false });
       // The tracks only become real HERE — MediaCapture.stop() before this
       // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
       // capture so a permission prompt that resolved AFTER Stop still has its
