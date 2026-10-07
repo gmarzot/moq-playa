@@ -71,6 +71,14 @@ export interface BroadcastSessionOptions {
    * REQUEST_ERROR. Absent: always ready.
    */
   catalogReady?: () => Promise<void>;
+  /**
+   * Draft-18: the catalog group an earlier session of this broadcast published,
+   * with its bytes. A catalog that builds to the same bytes keeps that group,
+   * so a relay's cached copy stays the current catalog.
+   */
+  carriedCatalog?: CarriedCatalog;
+  /** Draft-18: the current catalog group and its bytes, whenever they change. */
+  onCatalogGroup?: (catalog: CarriedCatalog) => void;
   /** THIS generation's session closed while it was still current (UI hook).
    *  Never invoked for a retired generation — a superseded session must not
    *  stop its replacement. */
@@ -85,6 +93,12 @@ const CLOSE_DEADLINE_MS = 1000;
  *  have rejected any held write. If it did not, the work is ABANDONED
  *  (it never rejects, so abandoning it surfaces nothing). */
 const POST_CLOSE_DEADLINE_MS = 250;
+
+/** A published catalog group and the bytes of its Object 0. */
+export interface CarriedCatalog {
+  readonly group: bigint;
+  readonly payload: Uint8Array;
+}
 
 /** A track's MoQT subscription as the broadcaster serves it. */
 export type TrackStatus =
@@ -117,6 +131,8 @@ export class BroadcastSession {
   /** Last catalog group ID issued, and the current one: its Object 0 is the catalog. */
   private catalogGroupIssued: bigint | null = null;
   private catalogGroup: bigint | null = null;
+  /** Draft-18: the current group's bytes, once built. */
+  private catalogPayload: Uint8Array | null = null;
   /** The track each accepted SUBSCRIBE serves, by request ID. */
   private readonly subscribedTrack = new Map<bigint, string>();
   /** The request currently served for each track. */
@@ -141,6 +157,8 @@ export class BroadcastSession {
     this.opts = opts;
     this.wrapInt = opts.publisher.wrapInt;
     this.publisher = new MediaPublisher(connection, opts.publisher);
+    // Group IDs keep increasing across this broadcast's sessions.
+    if (opts.carriedCatalog) this.catalogGroupIssued = opts.carriedCatalog.group;
     // Draft-18: the catalog exists from the start; SUBSCRIBE_OK reports it and FETCH serves it.
     if (opts.publisher.draft === 18) this.catalogGroup = this.nextCatalogGroup();
   }
@@ -163,6 +181,25 @@ export class BroadcastSession {
 
   private noteCatalogGroup(group: bigint): void {
     if (this.catalogGroup === null || group > this.catalogGroup) this.catalogGroup = group;
+  }
+
+  /** Draft-18 catalog bytes. The first build keeps the carried group when the bytes match. */
+  private currentCatalogPayload(): Uint8Array {
+    const payload = buildCatalogPayload(this.opts.catalog);
+    if (this.catalogPayload === null) {
+      const carried = this.opts.carriedCatalog;
+      if (carried && bytesEqual(carried.payload, payload)) {
+        this.catalogGroup = carried.group;
+        this.safeLog(`catalog: unchanged, keeping group ${carried.group}`);
+      }
+      this.noteCatalogPayload(payload);
+    }
+    return payload;
+  }
+
+  private noteCatalogPayload(payload: Uint8Array): void {
+    this.catalogPayload = payload;
+    if (!this.retired) this.opts.onCatalogGroup?.({ group: this.catalogGroup!, payload });
   }
 
   /**
@@ -190,6 +227,7 @@ export class BroadcastSession {
         this.connection as never, alias, payload, { draft: this.opts.publisher.draft, groupId },
       ).then(() => {
         this.noteCatalogGroup(groupId);
+        if (this.opts.publisher.draft === 18 && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
         if (!this.retired) this.opts.onCatalogReemitted?.(payload.byteLength);
       }).catch((err: unknown) => {
         if (reportedFailure) return;
@@ -326,7 +364,7 @@ export class BroadcastSession {
   private acceptCatalogAtLargest(requestId: bigint, alias: bigint, report: (err: unknown) => void): void {
     let bytes: number;
     try {
-      bytes = buildCatalogPayload(this.opts.catalog).byteLength;
+      bytes = this.currentCatalogPayload().byteLength;
     } catch (err) {
       report(err);
       this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n), 'catalog build failed')
@@ -399,6 +437,13 @@ export class BroadcastSession {
         return;
       }
     }
+    let payload: Uint8Array;
+    try {
+      payload = this.currentCatalogPayload();
+    } catch (err) {
+      reject(RequestError18.INTERNAL_ERROR, `catalog build failed: ${(err as Error)?.message ?? err}`);
+      return;
+    }
     const g = this.catalogGroup!;
     const start = range.startLocation;
     if (start.group > g || (start.group === g && start.object > 0n)) {
@@ -408,13 +453,6 @@ export class BroadcastSession {
     // End is exclusive, and Object 0 means the whole End group: {g,0} is inside iff g <= end.group.
     if (range.endLocation.group < g) {
       reject(RequestError18.INVALID_RANGE, 'only the current catalog group is retained');
-      return;
-    }
-    let payload: Uint8Array;
-    try {
-      payload = buildCatalogPayload(this.opts.catalog);
-    } catch (err) {
-      reject(RequestError18.INTERNAL_ERROR, `catalog build failed: ${(err as Error)?.message ?? err}`);
       return;
     }
     const descending = fetch.parameters.get(GROUP_ORDER_PARAM)?.[0] === 2n;
@@ -665,4 +703,10 @@ function assertPositiveFinite(value: number, name: string): void {
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive finite number of milliseconds, got ${value}`);
   }
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

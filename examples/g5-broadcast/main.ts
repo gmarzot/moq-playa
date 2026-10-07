@@ -16,7 +16,7 @@
 import { MoqtConnection } from '@moqt/webtransport';
 import { varint } from '@moqt/transport';
 import { BroadcastSession } from './broadcast-session.js';
-import type { BroadcastSessionConnection, TrackStatus } from './broadcast-session.js';
+import type { BroadcastSessionConnection, CarriedCatalog, TrackStatus } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
 import { buildCatalogPayload } from './catalog-publisher.js';
@@ -125,11 +125,14 @@ const congestionControl: 'low-latency' | 'throughput' | undefined =
   params.get('congestionControl') === 'low-latency' ? 'low-latency'
     : params.get('congestionControl') === 'throughput' ? 'throughput' : undefined;
 /**
- * The tab's automatic namespace, held in sessionStorage: reloads and
- * Stop/Start keep it, so viewer links stay valid; a new tab, or New in the
- * settings dialog, mints another, so two broadcasters never share one.
+ * The tab's automatic namespace, held in sessionStorage. Each broadcast after
+ * the first under it mints another, so a relay never answers a new catalog
+ * from an earlier broadcast's cache; reconnects within a broadcast keep it.
+ * A new tab, or New in the settings dialog, also mints one.
  */
 const AUTO_NAMESPACE_KEY = 'g5-broadcast.namespace';
+/** The automatic namespace a broadcast has already used. */
+const AUTO_NAMESPACE_USED_KEY = 'g5-broadcast.namespace-used';
 const mintNamespace = (): string => `g5-${crypto.randomUUID().slice(0, 8)}`;
 function tabNamespace(): string {
   const held = storageGet(() => sessionStorage, AUTO_NAMESPACE_KEY);
@@ -140,7 +143,20 @@ function tabNamespace(): string {
 }
 /** A named namespace (URL or saved), else the tab's automatic one. */
 const namedNamespace = params.get('ns') || null;
-const namespace = namedNamespace ?? tabNamespace();
+let namespace = namedNamespace ?? tabNamespace();
+let usedNamespace = storageGet(() => sessionStorage, AUTO_NAMESPACE_USED_KEY);
+
+/** The namespace for a new broadcast: an automatic one already broadcast under is replaced. */
+function claimNamespace(): void {
+  if (namedNamespace === null && usedNamespace === namespace) {
+    namespace = mintNamespace();
+    storageSet(() => sessionStorage, AUTO_NAMESPACE_KEY, namespace);
+    setText('conn-ns', namespace);
+    log(`Namespace: ${namespace} (new broadcast)`);
+  }
+  usedNamespace = namespace;
+  storageSet(() => sessionStorage, AUTO_NAMESPACE_USED_KEY, namespace);
+}
 
 // ─── Settings modal ──────────────────────────────────────────────────
 
@@ -596,6 +612,7 @@ const RECONNECT_MAX_ATTEMPTS = 40;
 const RECONNECT_STABLE_MS = 30_000;
 
 async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
+  claimNamespace();
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
   stopBtn.disabled = false;
@@ -617,6 +634,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let sessionUpSinceMs: number | null = null;
   /** The catalog the current session serves; CMAF attaches its init segments later. */
   let sessionCatalog: BroadcastCatalogParams | null = null;
+  /** The catalog group this broadcast last published; a reconnect keeps it when unchanged. */
+  let carriedCatalog: CarriedCatalog | null = null;
   /** The video encoder's decoder description, from its first keyframe: CMAF's video init needs it. */
   let videoDescription: Uint8Array | null = null;
   const descriptionWaiters = new Set<(description: Uint8Array) => void>();
@@ -891,6 +910,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
         catalog,
         ...(packaging === 'cmaf' ? { catalogReady: () => attachCmafInit(catalog) } : {}),
+        ...(carriedCatalog ? { carriedCatalog } : {}),
+        onCatalogGroup: (published) => { carriedCatalog = published; },
         publisher: {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,

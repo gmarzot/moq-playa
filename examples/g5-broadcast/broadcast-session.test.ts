@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { BroadcastSession } from './broadcast-session.js';
-import type { BroadcastSessionConnection } from './broadcast-session.js';
+import type { BroadcastSessionConnection, CarriedCatalog } from './broadcast-session.js';
 import type { Fetch } from '@moqt/transport';
 import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
@@ -859,6 +859,59 @@ describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
       session.handleForwardChange(1n, true);
       await settle();
       expect(conn.groups).toEqual([5_000n, 5_001n]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+});
+
+describe('BroadcastSession — catalog group across sessions of one broadcast', () => {
+  function d18Session(conn: BroadcastSessionConnection, opts: {
+    catalog?: BroadcastCatalogParams;
+    carriedCatalog?: CarriedCatalog;
+    onCatalogGroup?: (c: CarriedCatalog) => void;
+  } = {}) {
+    return new BroadcastSession(conn, {
+      catalog: opts.catalog ?? CATALOG,
+      publisher: { wrapInt, draft: 18 },
+      log: () => {},
+      ...(opts.carriedCatalog ? { carriedCatalog: opts.carriedCatalog } : {}),
+      ...(opts.onCatalogGroup ? { onCatalogGroup: opts.onCatalogGroup } : {}),
+    });
+  }
+
+  it('an unchanged catalog keeps the group the previous session published', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(5_000);
+    try {
+      let carried: CarriedCatalog | null = null;
+      const first = recordingConnection();
+      d18Session(first, { onCatalogGroup: (c) => { carried = c; } }).handleSubscribe(1n, 'catalog');
+      await settle();
+      expect(carried).toEqual({ group: 5_000n, payload: buildCatalogPayload(CATALOG) });
+
+      now.mockReturnValue(9_000);
+      const second = recordingConnection();
+      const session = d18Session(second, { carriedCatalog: carried! });
+      session.handleSubscribe(1n, 'catalog');
+      await settle();
+      expect(second.largests).toEqual([{ group: 5_000n, object: 0n }]);
+      session.handleFetch(1n, joiningFetch(1n));
+      await settle();
+      expect(second.fetchObjects.map((o) => o.groupId)).toEqual([5_000n]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('a changed catalog takes a new group above the carried one', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(5_000);
+    try {
+      const carried = { group: 5_000n, payload: buildCatalogPayload(CATALOG) };
+      const conn = recordingConnection();
+      d18Session(conn, { catalog: { ...CATALOG, width: 640, height: 360 }, carriedCatalog: carried })
+        .handleSubscribe(1n, 'catalog');
+      await settle();
+      expect(conn.largests).toEqual([{ group: 5_001n, object: 0n }]);
     } finally {
       now.mockRestore();
     }
