@@ -303,12 +303,16 @@ async function main(): Promise<void> {
   /** Last data object per media type, for a subscription gone silent. */
   const lastArrivalMs: { video?: number; audio?: number } = {};
   const SILENT_MS = 1_000;
+  /** Silence is counted from the resume, not across the pause. */
+  let resumedAtMs = -Infinity;
+  player.on('play', () => { resumedAtMs = performance.now(); });
   const subscriptionBadge = (el: HTMLElement, sub: SubscriptionStatus | undefined, nowMs: number): void => {
     if (!sub) { setBadge(el, 'FWD --', 'idle', 'No subscription'); return; }
     const req = `SUBSCRIBE reqId=${sub.requestId}${sub.alias !== null ? ` · alias=${sub.alias}` : ''}`;
     if (!sub.established) { setBadge(el, 'FWD …', 'idle', `${req} sent; awaiting SUBSCRIBE_OK`); return; }
     if (!sub.forward) { setBadge(el, 'FWD 0', 'wait', `${req} · Forward State 0: paused by this player`); return; }
-    const last = sub.kind === 'video' || sub.kind === 'audio' ? lastArrivalMs[sub.kind] : undefined;
+    const arrived = sub.kind === 'video' || sub.kind === 'audio' ? lastArrivalMs[sub.kind] : undefined;
+    const last = arrived === undefined ? undefined : Math.max(arrived, resumedAtMs);
     if (last !== undefined && nowMs - last > SILENT_MS && player.state === 'playing') {
       setBadge(el, 'FWD 1', 'bad',
         `${req} · Forward State 1, but nothing has arrived for ${((nowMs - last) / 1000).toFixed(1)}s`);
