@@ -618,6 +618,8 @@ export class MseMediaSource implements MediaSourceLike {
    *  consume it to request fresh keyframe-led media when the publisher doesn't
    *  keyframe-align chunks. */
   onLiveEdgeResync: ((reason: 'quota' | 'behind-live') => void) | null = null;
+  /** Informational: a stall during a soft chase raised the cushion the chase stops at (s). */
+  onChaseFloor: ((floorSec: number, aheadAtStallSec: number) => void) | null = null;
 
   /**
    * Fired when the playhead-wedge watchdog detects or escalates a wedge
@@ -652,6 +654,10 @@ export class MseMediaSource implements MediaSourceLike {
   private playTriggered = false;
   /** Set by a resume: startup re-enters on media buffered after this time (s). */
   private reentryAfterSec: number | null = null;
+  /** Cushion (s) at which a stall began during a soft chase, plus one frame; the chase stops above it. */
+  private chaseFloorSec = 0;
+  /** Duration (s) of the latest appended video sample. */
+  private videoSampleSec: number | null = null;
   private stallStartTime: number | null = null;
   /** True once this episode has been reported as detected. */
   private stallDetected = false;
@@ -1348,6 +1354,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.startupFacts = { session: this.bufferGen, startPosition: null, seekOutcome: null, playTimeSec: null };
     this.startupReported = false;
     this.reentryAfterSec = null;
+    this.chaseFloorSec = 0;
+    this.videoSampleSec = null;
     this.cancelBufferOps('reset');
     try {
       if (this.videoBuffer && !this.videoBuffer.updating) {
@@ -2421,24 +2429,42 @@ export class MseMediaSource implements MediaSourceLike {
           this.noteSelfSeek();
           this.onLiveEdgeResync?.('behind-live');
         }
-      } else if (ahead > this.targetAheadSec
+      } else if (ahead > this.chaseReleaseSec()
           + Math.max(MseMediaSource.CHASE_ON_MIN_SEC, this.targetAheadSec * MseMediaSource.CHASE_ON_RATIO)) {
         // Soft chase: shed sub-seek latency debt by playing slightly fast
         // until the cushion is back at target.
         if (v.playbackRate === 1) v.playbackRate = MseMediaSource.CHASE_RATE;
-      } else if (ahead <= this.targetAheadSec) {
+      } else if (ahead <= this.chaseReleaseSec()) {
         this.resetPlaybackRate();
       }
       return; // containing range handled (or within cap) — done either way
     }
   }
 
-  /** End a soft chase once the cushion, measured before new media lands, is down to target. */
+  /** The cushion a soft chase stops at: the target, or above a level a chase has stalled at. */
+  private chaseReleaseSec(): number {
+    return Math.max(this.targetAheadSec, this.chaseFloorSec);
+  }
+
+  /** End a soft chase once the cushion, measured before new media lands, is down to its release. */
   private releaseChaseAtTarget(): void {
     if (this.video.playbackRate === 1) return;
     const ct = this.video.currentTime;
     const end = this.containingRangeEnd(ct);
-    if (end !== null && end - ct <= this.targetAheadSec) this.resetPlaybackRate();
+    if (end !== null && end - ct <= this.chaseReleaseSec()) this.resetPlaybackRate();
+  }
+
+  /** A stall began during a soft chase: the chase never again drains the cushion to that level. */
+  private noteChaseStall(): void {
+    const ct = this.video.currentTime;
+    const end = this.containingRangeEnd(ct);
+    if (end === null) return;
+    const ahead = end - ct;
+    const floor = ahead + (this.videoSampleSec ?? 0);
+    if (floor <= this.chaseFloorSec) return;
+    this.chaseFloorSec = floor;
+    this.resetPlaybackRate();
+    try { this.onChaseFloor?.(floor, ahead); } catch { /* contained */ }
   }
 
   /** End a soft chase; a seek, pause or reset must not carry the rate over. */
@@ -2548,6 +2574,13 @@ export class MseMediaSource implements MediaSourceLike {
             mediaType, trackName, String(groupId ?? 'n/a'), String(seam.startTime), String(seam.endTime),
           );
         }
+      }
+    }
+
+    if (mediaType === 'video' && ranges !== null && ranges.length > 0 && this.videoTimescale) {
+      const last = ranges[ranges.length - 1]!;
+      if (last.sampleCount > 0) {
+        this.videoSampleSec = Number(last.endTime - last.startTime) / last.sampleCount / this.videoTimescale;
       }
     }
 
@@ -2927,6 +2960,7 @@ export class MseMediaSource implements MediaSourceLike {
     // playback, not a stall.
     if (!this.playbackIntent) return;
     this.gapStallFromLanding = false;   // fresh evidence, not landing-owned
+    if (this.stallStartTime === null && this.video.playbackRate !== 1) this.noteChaseStall();
     // First `waiting` owns the episode: a browser may re-emit it during one
     // uninterrupted freeze, and restarting the clock would shorten the outage.
     this.stallStartTime ??= performance.now();

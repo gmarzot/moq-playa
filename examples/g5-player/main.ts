@@ -1082,6 +1082,9 @@ async function main(): Promise<void> {
         log(`[MSE] playhead wedged (rung ${info.rung}) at t=${info.currentTime.toFixed(2)} `
           + `rs=${info.readyState} buffered=${info.bufferedRanges}${describeBuffers()}`);
       ms.onLiveEdgeResync = (reason: string) => log(`[MSE] live-edge resync (${reason})`);
+      ms.onChaseFloor = (floorSec: number, aheadSec: number) =>
+        log(`[MSE] stalled with ${Math.round(aheadSec * 1000)}ms buffered while catching up; `
+          + `catch-up now stops at ${Math.round(floorSec * 1000)}ms`);
     }
     if (debug && ms && ms.debug === false) ms.debug = true;
     // Per-track depth ahead of the playhead: MSE SourceBuffers on CMAF; on LOC

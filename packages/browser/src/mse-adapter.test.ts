@@ -1643,6 +1643,48 @@ describe('playhead-wedge watchdog', () => {
         expect(rate()).toBe(1);
     });
 
+    it('a stall during a chase raises the cushion the chase stops at', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.1 });
+        (adapter as any).playTriggered = true;
+        (adapter as any).videoSampleSec = 0.04;
+        const floors: number[] = [];
+        adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
+        const rate = () => (video as unknown as { playbackRate: number }).playbackRate;
+        const chaseAt = (aheadSec: number) => {
+            video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            (adapter as any).maybeChaseLiveEdge();
+            return rate();
+        };
+        video.currentTime = 10;
+        expect(chaseAt(0.4)).toBe(1.05);
+
+        video.buffered = makeTimeRanges([[0, 10.13]]);
+        (adapter as any).handleWaiting();                  // stalled with 130 ms still buffered
+        expect(floors).toHaveLength(1);
+        expect(floors[0]).toBeCloseTo(0.17, 5);
+        expect(rate()).toBe(1);
+        (adapter as any).cancelStallEpisode();
+
+        expect(chaseAt(0.4)).toBe(1.05);                   // past 0.17 + 0.066
+        expect(chaseAt(0.18)).toBe(1.05);
+        expect(chaseAt(0.17)).toBe(1);                     // released at the floor, not the target
+    });
+
+    it('a stall outside a chase leaves the chase floor alone', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.1 });
+        (adapter as any).playTriggered = true;
+        const floors: number[] = [];
+        adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
+        video.currentTime = 10;
+        video.buffered = makeTimeRanges([[0, 10.13]]);
+        (adapter as any).handleWaiting();
+        expect(floors).toEqual([]);
+    });
+
     it('the watchdog tick chases live with no further appends', () => {
         // Field case: an occluded tab's element is paused by the UA while
         // appends keep landing, then the publisher ends. On resume there is
