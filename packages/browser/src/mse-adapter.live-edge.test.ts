@@ -78,6 +78,23 @@ describe('MseMediaSource — soft chase', () => {
         expect(chaseAt(0.17)).toBe(1);                     // released at the floor, not the target
     });
 
+    it('a stall during a chase but above its band leaves the floor alone', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2 });
+        (adapter as any).playTriggered = true;
+        const floors: number[] = [];
+        adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
+        video.currentTime = 10;
+        video.buffered = makeTimeRanges([[0, 10.6]]);
+        (adapter as any).maybeChaseLiveEdge();
+        expect((video as unknown as { playbackRate: number }).playbackRate).toBe(1.05);
+
+        video.buffered = makeTimeRanges([[0, 10.55]]);    // 550 ms: above 0.2 + 0.132
+        (adapter as any).handleWaiting();
+        expect(floors).toEqual([]);
+    });
+
     it('a stall outside a chase leaves the chase floor alone', () => {
         const video = new MockVideoElement();
         (video as unknown as { playbackRate: number }).playbackRate = 1;

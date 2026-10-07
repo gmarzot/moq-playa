@@ -39,10 +39,14 @@ export class SoftChase {
     return Math.max(this.targetSec(), this.floorSec);
   }
 
+  /** The cushion above which a chase engages. */
+  private get engageSec(): number {
+    return this.releaseSec + Math.max(SoftChase.ON_MIN_SEC, this.targetSec() * SoftChase.ON_RATIO);
+  }
+
   /** Cushion measured after new media lands: engage above the band, release at the release point. */
   onCushion(aheadSec: number): void {
-    const margin = Math.max(SoftChase.ON_MIN_SEC, this.targetSec() * SoftChase.ON_RATIO);
-    if (aheadSec > this.releaseSec + margin) {
+    if (aheadSec > this.engageSec) {
       if (this.element.playbackRate === 1) this.element.playbackRate = SoftChase.RATE;
     } else if (aheadSec <= this.releaseSec) {
       this.stop();
@@ -54,9 +58,12 @@ export class SoftChase {
     if (this.chasing && aheadSec <= this.releaseSec) this.stop();
   }
 
-  /** A stall began with `aheadSec` buffered. During a chase, returns the raised floor; else null. */
+  /**
+   * A stall began with `aheadSec` buffered. Only a stall inside the chase band
+   * is the chase's doing: returns the raised floor, else null.
+   */
   onStall(aheadSec: number): number | null {
-    if (!this.chasing) return null;
+    if (!this.chasing || aheadSec > this.engageSec) return null;
     const floor = aheadSec + (this.sampleSec ?? 0);
     if (floor <= this.floorSec) return null;
     this.floorSec = floor;
