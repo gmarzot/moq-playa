@@ -684,10 +684,10 @@ export class MseMediaSource implements MediaSourceLike {
   // ── Soft live-edge chase (sub-seek latency debt) ──
   /** Playback rate while shedding cushion above target; inaudible. */
   private static readonly CHASE_RATE = 1.05;
-  /** Engage when the cushion exceeds target by this much… */
-  private static readonly CHASE_RATE_ON_SEC = 0.5;
-  /** …and release once it is back within this of target. */
-  private static readonly CHASE_RATE_OFF_SEC = 0.1;
+  /** Engage once the cushion exceeds target by this share of it (at least
+   *  CHASE_ON_MIN_SEC); release back at target. Same band as the WebAudio chase. */
+  private static readonly CHASE_ON_RATIO = 0.66;
+  private static readonly CHASE_ON_MIN_SEC = 0.02;
   /** Per-attempt wait before jumping; 0 disables. */
   private readonly gapJumpMs: number;
   /** Armed hole candidate; identity is {curEnd, nextStart} ONLY (the next
@@ -2403,11 +2403,12 @@ export class MseMediaSource implements MediaSourceLike {
           this.noteSelfSeek();
           this.onLiveEdgeResync?.('behind-live');
         }
-      } else if (ahead > this.targetAheadSec + MseMediaSource.CHASE_RATE_ON_SEC) {
+      } else if (ahead > this.targetAheadSec
+          + Math.max(MseMediaSource.CHASE_ON_MIN_SEC, this.targetAheadSec * MseMediaSource.CHASE_ON_RATIO)) {
         // Soft chase: shed sub-seek latency debt by playing slightly fast
         // until the cushion is back at target.
         if (v.playbackRate === 1) v.playbackRate = MseMediaSource.CHASE_RATE;
-      } else if (ahead <= this.targetAheadSec + MseMediaSource.CHASE_RATE_OFF_SEC) {
+      } else if (ahead <= this.targetAheadSec) {
         this.resetPlaybackRate();
       }
       return; // containing range handled (or within cap) — done either way

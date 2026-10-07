@@ -1603,6 +1603,23 @@ describe('playhead-wedge watchdog', () => {
         expect(video.currentTime).toBeCloseTo(38, 5); // resumes → chase works again
     });
 
+    it('soft chase engages two-thirds of the target above it and releases at the target', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2 });
+        (adapter as any).playTriggered = true;
+        const rateAt = (aheadSec: number): number => {
+            video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            video.currentTime = 10;
+            (adapter as any).maybeChaseLiveEdge();
+            return (video as unknown as { playbackRate: number }).playbackRate;
+        };
+        expect(rateAt(0.30)).toBe(1);     // inside the band
+        expect(rateAt(0.35)).toBe(1.05);  // past 0.2 + 0.132
+        expect(rateAt(0.25)).toBe(1.05);  // still above target: keeps chasing
+        expect(rateAt(0.20)).toBe(1);     // back at target: released
+    });
+
     it('the watchdog tick chases live with no further appends', () => {
         // Field case: an occluded tab's element is paused by the UA while
         // appends keep landing, then the publisher ends. On resume there is
