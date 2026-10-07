@@ -85,6 +85,7 @@ function makeSession(conn: BroadcastSessionConnection, hooks: {
   catalog?: BroadcastCatalogParams;
   shutdownGraceMs?: number;
   catalogIntervalMs?: number;
+  catalogReady?: () => Promise<void>;
 } = {}) {
   const { catalog, shutdownGraceMs, catalogIntervalMs, ...rest } = hooks;
   return new BroadcastSession(conn, {
@@ -122,6 +123,31 @@ describe('BroadcastSession — subscription routing', () => {
     session.publisher.publishAudio(new Uint8Array([2]), { timestampUs: 2 });
     await settle();
     expect(conn.sends.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('BroadcastSession — catalog readiness', () => {
+  it('a catalog SUBSCRIBE waits until the catalog is ready, then is served', async () => {
+    const conn = recordingConnection();
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { ready = resolve; });
+    const session = makeSession(conn, { catalogReady: () => gate });
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    expect(conn.calls).not.toContain('acceptSubscribe');
+
+    ready();
+    await settle();
+    expect(conn.accepted).toEqual([1n]);
+    expect(conn.sends).toHaveLength(1);
+  });
+
+  it('a catalog that never becomes ready answers the SUBSCRIBE with REQUEST_ERROR', async () => {
+    const conn = recordingConnection();
+    const session = makeSession(conn, { catalogReady: () => Promise.reject(new Error('no keyframe yet')) });
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    expect(conn.calls).toEqual(['rejectSubscribe']);
   });
 });
 

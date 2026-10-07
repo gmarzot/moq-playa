@@ -4,6 +4,7 @@ import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
 import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
 import { MoqtConnectionError } from '@moqt/webtransport';
+import { readBaseMediaDecodeTime, readSegmentTimeRanges } from '../../packages/browser/src/mp4-box.js';
 
 const wrapInt = (n: bigint) => n;
 
@@ -316,6 +317,52 @@ describe('MediaPublisher — audio publication', () => {
     expect(conn.opened[1]!.groupId).toBe(conn.opened[0]!.groupId + 1n);
     expect(conn.sends.map((s) => s.objectId)).toEqual([0n, 0n]);
     expect(conn.closed).toEqual([conn.opened[0]!.streamId, conn.opened[1]!.streamId]);
+  });
+});
+
+describe('MediaPublisher — CMAF packaging', () => {
+  const wall = 1_759_000_000_000_000;
+  const profile = { wireProfile: locWireProfileForDraft(16) };
+
+  it('wraps a video frame in a CMAF chunk whose decode time is the capture timestamp', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(7), { isKeyframe: true, timestampUs: 1_000, durationUs: 41_708 });
+    await settle();
+
+    const sent = conn.sends[0]!;
+    const headers = parseLocHeaders(sent.extensions!, profile);
+    expect(headers.videoFrameMarking).toBeUndefined(); // CMAF carries its own sync flags
+    expect(readBaseMediaDecodeTime(sent.payload)).toBe(headers.captureTimestamp);
+    expect(readSegmentTimeRanges(sent.payload)).toEqual([{
+      startTime: headers.captureTimestamp!, endTime: headers.captureTimestamp! + 41_708n, sampleCount: 1,
+    }]);
+    expect(sent.payload[sent.payload.length - 1]).toBe(7);
+  });
+
+  it('wraps an audio chunk the same way, one per group', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(9), { timestampUs: 500, durationUs: 20_000 });
+    await settle();
+
+    const sent = conn.sends[0]!;
+    const capture = parseLocHeaders(sent.extensions!, profile).captureTimestamp!;
+    expect(readSegmentTimeRanges(sent.payload)).toEqual([
+      { startTime: capture, endTime: capture + 20_000n, sampleCount: 1 },
+    ]);
+    expect(sent.payload[sent.payload.length - 1]).toBe(9);
+  });
+
+  it('leaves LOC payloads as the encoded frame', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(9), { timestampUs: 500 });
+    await settle();
+    expect(conn.sends[0]!.payload).toEqual(chunk(9));
   });
 });
 

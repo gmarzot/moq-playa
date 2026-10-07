@@ -34,6 +34,7 @@
  */
 import { encodeLocHeaders, locWireProfileForDraft } from '@moqt/loc';
 import type { DraftVersion } from '@moqt/transport';
+import { buildChunk } from '../shared/browser/cmaf-mux.js';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {
@@ -61,12 +62,23 @@ export interface VideoChunkMeta {
   timestampUs: number;
   /** Codec description (decoder config) to ride as the LOC videoConfig. */
   videoConfig?: Uint8Array;
+  /** Frame duration in microseconds, when the encoder reports one. */
+  durationUs?: number;
 }
 
 export interface AudioChunkMeta {
   /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
   timestampUs: number;
+  /** Chunk duration in microseconds, when the encoder reports one. */
+  durationUs?: number;
 }
+
+/** CMAF track IDs; they match the init segments the catalog carries. */
+export const CMAF_VIDEO_TRACK_ID = 1;
+export const CMAF_AUDIO_TRACK_ID = 2;
+/** Fallbacks when the encoder reports no duration: 30 fps, a 20 ms Opus frame. */
+const DEFAULT_VIDEO_FRAME_US = 33_333;
+const DEFAULT_AUDIO_FRAME_US = 20_000;
 
 /** The capture-clock anchor in use, measured against the best offset observed. */
 export interface AnchorReport {
@@ -152,6 +164,12 @@ export interface MediaPublisherOptions {
   /** Publish audio as OBJECT_DATAGRAMs rather than a subgroup stream per
    *  chunk: no retransmission, no per-chunk stream churn. draft-18 only. */
   audioDatagrams?: boolean;
+  /**
+   * Object payload format. `loc` (default): the encoded frame. `cmaf`: one
+   * CMAF chunk (moof + mdat) per frame, decode time in microseconds so it
+   * matches the capture timestamp property (CMSF-01 §3.3).
+   */
+  packaging?: 'loc' | 'cmaf';
   /** Video needs a keyframe now: a new subscription or a resume. The page
    *  asks its encoder for one. */
   onKeyframeNeeded?: () => void;
@@ -220,6 +238,12 @@ export class MediaPublisher {
   private readonly audioMaxInFlight: number;
   private readonly pauseProbeMs: number;
   private readonly audioDatagrams: boolean;
+  private readonly cmaf: boolean;
+  /** mfhd sequence numbers, per CMAF track. */
+  private cmafVideoSequence = 0;
+  private cmafAudioSequence = 0;
+  /** Previous video decode time, for a duration when the encoder gives none. */
+  private lastVideoCaptureUs: bigint | null = null;
   private readonly onKeyframeNeeded: (() => void) | null;
   private readonly onStatus: ((track: 'video' | 'audio', message: string) => void) | null;
   /** Largest (group, object) sent per track; Largest Location for a resume. */
@@ -302,6 +326,7 @@ export class MediaPublisher {
     this.pauseProbeMs = options.pauseProbeMs ?? PAUSE_PROBE_MS;
     // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
     this.audioDatagrams = options.audioDatagrams === true && options.draft === 18;
+    this.cmaf = options.packaging === 'cmaf';
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.onKeyframeNeeded = options.onKeyframeNeeded ?? null;
     this.onStatus = options.onStatus ?? null;
@@ -725,9 +750,13 @@ export class MediaPublisher {
     });
   }
 
-  private videoExtensions(meta: VideoChunkMeta): Uint8Array | undefined {
+  private videoExtensions(meta: VideoChunkMeta, captureUs: bigint): Uint8Array | undefined {
+    // CMAF carries its own decode time and sync flags; only the capture time rides along.
+    if (this.cmaf) {
+      return encodeLocHeaders({ captureTimestamp: captureUs }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }
     return encodeLocHeaders({
-      captureTimestamp: this.toWallClockUs('video', meta.timestampUs),
+      captureTimestamp: captureUs,
       videoFrameMarking: {
         independent: meta.isKeyframe,
         // No temporal layers, so every P-frame is a reference for the next.
@@ -775,9 +804,11 @@ export class MediaPublisher {
     // by a failure. Dependent frames are dropped until the next keyframe.
     if (this.videoStreamId === null) return;
 
+    const captureUs = this.toWallClockUs('video', meta.timestampUs);
+    const payload = this.cmaf ? this.cmafVideoChunk(data, meta, captureUs) : data;
     try {
       await this.connection.sendObject(
-        this.videoStreamId, this.wrapInt(this.videoObjectId), data, this.videoExtensions(meta));
+        this.videoStreamId, this.wrapInt(this.videoObjectId), payload, this.videoExtensions(meta, captureUs));
     } catch (err) {
       // LOC: Object 0 of a subgroup must be the independent frame. After a
       // failed (or ambiguous) send the group is unusable — retire it, so
@@ -795,10 +826,21 @@ export class MediaPublisher {
     this.onCounts?.(this.videoFrames, this.audioChunks);
   }
 
-  private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
+  private async sendAudioChunk(chunk: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
+    const captureUs = this.toWallClockUs('audio', meta.timestampUs);
     const extensions = encodeLocHeaders({
-      captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
+      captureTimestamp: captureUs,
     }, { wireProfile: locWireProfileForDraft(this.draft) });
+    const data = this.cmaf
+      ? buildChunk({
+        trackId: CMAF_AUDIO_TRACK_ID,
+        sequence: ++this.cmafAudioSequence,
+        baseDecodeTime: captureUs,
+        duration: meta.durationUs && meta.durationUs > 0 ? meta.durationUs : DEFAULT_AUDIO_FRAME_US,
+        keyframe: true,
+        data: chunk,
+      })
+      : chunk;
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     if (this.audioDatagrams && this.connection.sendDatagram) {
@@ -806,7 +848,7 @@ export class MediaPublisher {
         this.audioAlias!, groupId, 0n, data,
         { publisherPriority: 64, ...(extensions ? { extensions } : {}) },
       );
-      this.noteAudioSent(data.byteLength, groupId);
+      this.noteAudioSent(chunk.byteLength, groupId);
       return;
     }
     const streamId = await this.connection.openSubgroup(
@@ -820,7 +862,24 @@ export class MediaPublisher {
       throw err;
     }
     await this.trackClose(streamId);
-    this.noteAudioSent(data.byteLength, groupId);
+    this.noteAudioSent(chunk.byteLength, groupId);
+  }
+
+  /** One CMAF chunk around an encoded video frame, decode time = capture time. */
+  private cmafVideoChunk(data: Uint8Array, meta: VideoChunkMeta, captureUs: bigint): Uint8Array {
+    const last = this.lastVideoCaptureUs;
+    this.lastVideoCaptureUs = captureUs;
+    const sinceLast = last === null ? 0 : Number(captureUs - last);
+    const duration = meta.durationUs && meta.durationUs > 0 ? meta.durationUs
+      : sinceLast > 0 && sinceLast < 1_000_000 ? sinceLast : DEFAULT_VIDEO_FRAME_US;
+    return buildChunk({
+      trackId: CMAF_VIDEO_TRACK_ID,
+      sequence: ++this.cmafVideoSequence,
+      baseDecodeTime: captureUs,
+      duration,
+      keyframe: meta.isKeyframe,
+      data,
+    });
   }
 
   /** Accounting shared by the stream and datagram audio paths. Concurrent

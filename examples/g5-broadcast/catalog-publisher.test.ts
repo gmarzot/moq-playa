@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { acceptCatalogSubscribe } from './catalog-publisher.js';
+import { acceptCatalogSubscribe, buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import { parseCatalog } from '@moqt/msf';
 
@@ -160,6 +160,25 @@ describe('broadcast catalog subscription lifecycle', () => {
     // Last resort: an established subscription we cannot terminate means the
     // session itself must go — never an established, silent catalog.
     expect(conn.calls).toContain('close');
+  });
+
+  it('CMAF: tracks reference their init segments in the root initDataList (CMSF-01 §3.1)', () => {
+    const catalog = parseCatalog(buildCatalogPayload({
+      ...PARAMS, packaging: 'cmaf', cmaf: { videoInit: new Uint8Array([1, 2, 3]), audioInit: new Uint8Array([4, 5]) },
+    }));
+    expect(catalog.tracks.map((t) => [t.name, t.packaging, t.initRef]))
+      .toEqual([['video', 'cmaf', 'v0'], ['audio', 'cmaf', 'a0']]);
+    expect(catalog.initDataList?.map((e) => [e.id, e.type, e.data]))
+      .toEqual([['v0', 'inline', 'AQID'], ['a0', 'inline', 'BAU=']]);
+  });
+
+  it('CMAF: an audio track without an init segment is refused', () => {
+    expect(() => buildCatalogPayload({ ...PARAMS, packaging: 'cmaf', cmaf: { videoInit: new Uint8Array([1]) } }))
+      .toThrow(/audio track without an init/);
+  });
+
+  it('CMAF: never falls back to a LOC catalog before the init segments exist', () => {
+    expect(() => buildCatalogPayload({ ...PARAMS, packaging: 'cmaf' })).toThrow(/not ready/);
   });
 
   it('omits the audio track when the capture has none', async () => {

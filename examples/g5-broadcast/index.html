@@ -362,6 +362,13 @@
         <option value="av01.0.04M.08">AV1 Main</option>
       </select>
 
+      <label for="s-packaging">Packaging</label>
+      <select id="s-packaging">
+        <option value="loc">LOC (default)</option>
+        <option value="cmaf">CMAF (CMSF)</option>
+      </select>
+      <div class="hint">CMAF wraps each frame in a fragment for CMAF-only players; viewers play it through MSE.</div>
+
       <label for="s-bitrate-mode">Bitrate mode</label>
       <select id="s-bitrate-mode">
         <option value="">Encoder default</option>

@@ -104,6 +104,14 @@ export interface BroadcastCatalogParams {
     sampleRate: number;
     channels: number;
   };
+  /** Object packaging. Default `loc`. */
+  packaging?: 'loc' | 'cmaf';
+  /** CMAF (CMSF-01): each track's init segment, carried in the catalog's
+   *  initDataList. Required to build a CMAF catalog. */
+  cmaf?: {
+    videoInit: Uint8Array;
+    audioInit?: Uint8Array;
+  };
 }
 
 /**
@@ -229,11 +237,26 @@ async function terminateFailedCatalog(
 /** Assemble the catalog payload. Pure: no wire effects, so a failure here is
  *  safely recoverable by answering the request with a rejection. */
 export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
+  const packaging = params.packaging ?? 'loc';
+  const cmaf = packaging === 'cmaf' ? params.cmaf : undefined;
+  if (packaging === 'cmaf' && !cmaf) throw new Error('CMAF init segments are not ready yet');
+  if (cmaf && params.audio && !cmaf.audioInit) {
+    throw new Error('CMAF catalog has an audio track without an init segment');
+  }
   return buildCatalog({
+    // CMSF-01 §3.1: init segments go in the root initDataList, referenced by initRef.
+    ...(cmaf ? {
+      version: '1' as const,
+      initDataList: [
+        { id: 'v0', type: 'inline', data: toBase64(cmaf.videoInit) },
+        ...(cmaf.audioInit ? [{ id: 'a0', type: 'inline', data: toBase64(cmaf.audioInit) }] : []),
+      ],
+    } : {}),
     tracks: [
       {
         name: 'video',
-        packaging: 'loc',
+        packaging,
+        ...(cmaf ? { initRef: 'v0' } : {}),
         isLive: true,
         role: 'video',
         codec: params.videoCodec,
@@ -246,7 +269,8 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
       },
       ...(params.audio ? [{
         name: 'audio',
-        packaging: 'loc' as const,
+        packaging,
+        ...(cmaf ? { initRef: 'a0' } : {}),
         isLive: true as const,
         role: 'audio' as const,
         codec: 'opus',
@@ -258,6 +282,12 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
       }] : []),
     ],
   });
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
 }
 
 /** Answer a request we never accepted. If even the rejection cannot be sent,

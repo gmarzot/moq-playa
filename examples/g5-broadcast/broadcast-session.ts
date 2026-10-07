@@ -65,6 +65,12 @@ export interface BroadcastSessionOptions {
   /** Each successful re-emission, for a verbose UI. Not called for the first
    *  catalog, which reports through onCatalogPublished. */
   onCatalogReemitted?: (bytes: number) => void;
+  /**
+   * Resolves once the catalog can be built (CMAF: its init segments exist).
+   * A catalog SUBSCRIBE waits for it; a rejection answers the request with
+   * REQUEST_ERROR. Absent: always ready.
+   */
+  catalogReady?: () => Promise<void>;
   /** THIS generation's session closed while it was still current (UI hook).
    *  Never invoked for a retired generation — a superseded session must not
    *  stop its replacement. */
@@ -224,27 +230,11 @@ export class BroadcastSession {
       this.currentRequest.set(trackName, requestId);
     }
 
-    if (trackName === 'catalog' && this.opts.publisher.draft === 18) {
-      this.acceptCatalogAtLargest(requestId, alias, report);
-    } else if (trackName === 'catalog') {
-      // Catalog publication is SESSION-OWNED work: tracked so shutdown()
-      // accounts for it; the retired-guard keeps a stale completion from
-      // touching a replacement generation's UI.
-      const groupId = this.nextCatalogGroup();
-      const work = acceptCatalogSubscribe(
-        this.connection as never, requestId, alias, this.opts.catalog,
-        { draft: this.opts.publisher.draft, groupId })
-        .then((bytes) => {
-          this.noteCatalogGroup(groupId);
-          this.safeLog(`Catalog published (${bytes} bytes)`);
-          this.noteAccepted(requestId, alias);
-          if (!this.retired) {
-            this.opts.onCatalogPublished?.(bytes);
-            this.startCatalogReemission(alias);
-          }
-        })
-        .catch(report);
-      this.trackWork(work);
+    if (trackName === 'catalog') {
+      this.whenCatalogReady(requestId, report, () => {
+        if (this.opts.publisher.draft === 18) this.acceptCatalogAtLargest(requestId, alias, report);
+        else this.acceptCatalogWithObject(requestId, alias, report);
+      });
     } else if (trackName === 'video') {
       this.connection.acceptSubscribe(
         this.wrapInt(requestId), this.wrapInt(alias),
@@ -280,6 +270,52 @@ export class BroadcastSession {
       this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n), `Unknown track: ${trackName}`)
         .catch(report);
     }
+  }
+
+  /** Run `serve` once the catalog can be built; if it cannot, answer with REQUEST_ERROR. */
+  private whenCatalogReady(requestId: bigint, report: (err: unknown) => void, serve: () => void): void {
+    const ready = this.opts.catalogReady;
+    if (!ready) {
+      serve();
+      return;
+    }
+    const work = ready().then(
+      () => {
+        // Still ours and still wanted: the relay may have cancelled meanwhile.
+        if (!this.retired && this.subscribedTrack.has(requestId)) serve();
+      },
+      (err: unknown) => {
+        report(err);
+        if (this.retired) return;
+        this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(0n),
+          `catalog unavailable: ${(err as Error)?.message ?? err}`).catch(report);
+      },
+    );
+    this.trackWork(work);
+  }
+
+  /**
+   * Draft-14/16 catalog SUBSCRIBE: accept and publish the catalog on the
+   * subscription. Session-owned work, tracked so shutdown() accounts for it;
+   * the retired-guard keeps a stale completion from touching a replacement
+   * generation's UI.
+   */
+  private acceptCatalogWithObject(requestId: bigint, alias: bigint, report: (err: unknown) => void): void {
+    const groupId = this.nextCatalogGroup();
+    const work = acceptCatalogSubscribe(
+      this.connection as never, requestId, alias, this.opts.catalog,
+      { draft: this.opts.publisher.draft, groupId })
+      .then((bytes) => {
+        this.noteCatalogGroup(groupId);
+        this.safeLog(`Catalog published (${bytes} bytes)`);
+        this.noteAccepted(requestId, alias);
+        if (!this.retired) {
+          this.opts.onCatalogPublished?.(bytes);
+          this.startCatalogReemission(alias);
+        }
+      })
+      .catch(report);
+    this.trackWork(work);
   }
 
   /**

@@ -22,6 +22,8 @@ import type { AttemptResources } from './broadcast-attempt.js';
 import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import type { MediaPublisher } from './media-publisher.js';
+import { CMAF_AUDIO_TRACK_ID, CMAF_VIDEO_TRACK_ID } from './media-publisher.js';
+import { buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE } from '../shared/browser/cmaf-mux.js';
 import { log } from '../shared/log.js';
 import { parseCertHashHex } from '../shared/relay-url.js';
 import { parseCompat } from '../shared/compat.js';
@@ -110,6 +112,8 @@ const showStatus = params.get('status') !== '0';
 const captureFps = parseInt(params.get('fps') ?? '60', 10);
 /** `?audioDatagram=1`: audio as OBJECT_DATAGRAMs. draft-18 only. */
 const audioDatagrams = params.get('audioDatagram') === '1';
+/** `?packaging=cmaf`: objects as CMAF chunks (CMSF-01) instead of LOC. */
+const packaging: 'loc' | 'cmaf' = params.get('packaging') === 'cmaf' ? 'cmaf' : 'loc';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
 const bitrateMode: 'constant' | 'variable' | undefined =
@@ -159,6 +163,7 @@ const namespace = namedNamespace ?? tabNamespace();
   const sStatus = document.getElementById('s-status') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
   const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
+  const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
 
@@ -199,6 +204,7 @@ const namespace = namedNamespace ?? tabNamespace();
     sStatus.checked = showStatus;
     sDebug.checked = debug;
     sAudioDatagram.checked = audioDatagrams;
+    sPackaging.value = packaging;
   }
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
@@ -241,6 +247,7 @@ const namespace = namedNamespace ?? tabNamespace();
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked) np.set('audioDatagram', '1');
+    if (sPackaging.value === 'cmaf') np.set('packaging', 'cmaf');
     // The dialog showed URL overrides too, so they are saved and the URL drops
     // them; where storage is refused, the URL carries them instead. `compat`
     // is URL-only and stays.
@@ -608,6 +615,48 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectCount = 0;
   let sessionUpSinceMs: number | null = null;
+  /** The catalog the current session serves; CMAF attaches its init segments later. */
+  let sessionCatalog: BroadcastCatalogParams | null = null;
+  /** The video encoder's decoder description, from its first keyframe: CMAF's video init needs it. */
+  let videoDescription: Uint8Array | null = null;
+  const descriptionWaiters = new Set<(description: Uint8Array) => void>();
+  const noteVideoDescription = (description: Uint8Array): void => {
+    if (videoDescription) return;
+    videoDescription = description;
+    for (const wake of descriptionWaiters) wake(description);
+    descriptionWaiters.clear();
+  };
+  /** Bounds the wait for the first keyframe; encoding starts right after the namespace is announced. */
+  const CMAF_INIT_WAIT_MS = 5_000;
+  const videoDescriptionReady = (): Promise<Uint8Array> => {
+    if (videoDescription) return Promise.resolve(videoDescription);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        descriptionWaiters.delete(wake);
+        reject(new Error(`no keyframe from the video encoder within ${CMAF_INIT_WAIT_MS / 1000}s`));
+      }, CMAF_INIT_WAIT_MS);
+      const wake = (description: Uint8Array): void => { clearTimeout(timer); resolve(description); };
+      descriptionWaiters.add(wake);
+    });
+  };
+  /** CMAF: build both init segments once the video description exists. */
+  const attachCmafInit = async (catalog: BroadcastCatalogParams): Promise<void> => {
+    if (catalog.cmaf) return;
+    const description = await videoDescriptionReady();
+    catalog.cmaf = {
+      videoInit: buildVideoInit({
+        trackId: CMAF_VIDEO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, codec: catalog.videoCodec,
+        width: catalog.width, height: catalog.height, description,
+      }),
+      ...(catalog.audio ? {
+        audioInit: buildAudioInit({
+          trackId: CMAF_AUDIO_TRACK_ID, timescale: MICROSECOND_TIMESCALE,
+          sampleRate: catalog.audio.sampleRate, channels: catalog.audio.channels,
+        }),
+      } : {}),
+    };
+    if (catalog === sessionCatalog) renderCatalogPanel(catalog);
+  };
 
   // The publisher's drift report measures each chunk as it is sent, after
   // encoding. This twin takes the same lowest wall − stamp gap as frames come
@@ -733,6 +782,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // Each encoder is adopted at construction, so a throw while configuring
       // the SECOND one still destroys the first.
       const ve = ctx.adopt(new WebCodecsVideoEncoder(), (e) => { e.destroy(); });
+      videoDescription = null;
       // Encoders also retire synchronously at Stop: no further frames are
       // encoded while the session drains.
       ctx.onCancel(() => { try { ve.destroy(); } catch { /* already destroyed */ } });
@@ -827,20 +877,25 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
+      const catalog: BroadcastCatalogParams = {
+        videoCodec,
+        width,
+        height,
+        fps,
+        videoBitrate,
+        targetLatencyMs,
+        packaging,
+        ...(audio ? { audio } : {}),
+      };
+      sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
-        catalog: {
-          videoCodec,
-          width,
-          height,
-          fps,
-          videoBitrate,
-          targetLatencyMs,
-          ...(audio ? { audio } : {}),
-        },
+        catalog,
+        ...(packaging === 'cmaf' ? { catalogReady: () => attachCmafInit(catalog) } : {}),
         publisher: {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,
           audioDatagrams,
+          packaging,
           // The anchor's measured error, once per track.
           onAnchor: ({ track, excessUs, timeOriginDeltaUs }) => log(
             `Capture anchor ${track}: first chunk cost `
@@ -923,12 +978,14 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       currentPublisher = mediaPublisher;
       currentSession = session;
       const ve = videoEncoder!;
-      ve.onChunk = (data, isKeyframe, timestamp, _duration, description) => {
+      ve.onChunk = (data, isKeyframe, timestamp, duration, description) => {
         const videoConfig = description ?? ve.description;
+        if (videoConfig) noteVideoDescription(videoConfig);
         mediaPublisher.publishVideo(data, {
           isKeyframe,
           timestampUs: timestamp,
           ...(videoConfig ? { videoConfig } : {}),
+          ...(duration > 0 ? { durationUs: duration } : {}),
         });
       };
       ve.onError = (err) => log(`[VideoEncoder ERROR] ${err.message}`);
@@ -973,10 +1030,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       if (compatParam.compat.length) viewerParams.set('compat', compatParam.compat.join(','));
       currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
       shareBtn.hidden = false;
-      renderCatalogPanel({
-        videoCodec, width, height, fps, videoBitrate, targetLatencyMs,
-        ...(audio ? { audio } : {}),
-      });
+      // A CMAF catalog appears once its init segments exist (attachCmafInit).
+      if (sessionCatalog && (packaging === 'loc' || sessionCatalog.cmaf)) renderCatalogPanel(sessionCatalog);
+      if (sessionCatalog && packaging === 'cmaf') {
+        void attachCmafInit(sessionCatalog).catch((err: unknown) => log(`CMAF init: ${(err as Error)?.message ?? err}`));
+      }
       setState('awaiting subscribe', 'starting');
     },
   });
