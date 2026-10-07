@@ -111,8 +111,11 @@ export interface CatalogBootstrapCallbacks {
   onUpdated(state: CatalogState): void;
   /** Rung 2: unsubscribe + fresh AbsoluteStart{0,0} subscribe. */
   requestLegacyResubscribe(): void;
-  /** Terminal failure (pre-first-catalog severity model: fatal). */
-  onFatal(reason: string): void;
+  /**
+   * Terminal failure (pre-first-catalog severity model: fatal).
+   * `subscriptionEnded`: the catalog subscription ended before a base arrived.
+   */
+  onFatal(reason: string, subscriptionEnded?: boolean): void;
   /** Post-readiness catalog fault (degraded, matching the legacy model). */
   onDegraded(reason: string): void;
   /**
@@ -392,7 +395,7 @@ export class CatalogBootstrap {
   private enterEmptyWait(): void {
     this.attempt = null;
     if (this.doneReason !== null && this.drained) {
-      this.fatal('catalog track empty and its subscription ended — nothing to play');
+      this.fatal('catalog track empty and its subscription ended — nothing to play', true);
       return;
     }
     this._phase = 'empty-wait';
@@ -522,7 +525,7 @@ export class CatalogBootstrap {
         return;
       case 'empty-wait':
         // No history (INVALID_RANGE proved it), no future (DONE proved it).
-        this.fatal('catalog track empty and its subscription ended');
+        this.fatal('catalog track empty and its subscription ended', true);
         return;
       case 'await-first-payload':
       case 'await-newer-head':
@@ -535,7 +538,7 @@ export class CatalogBootstrap {
         // arrived: nothing further can come — the rung has failed. (For a
         // legacy-mode recovery CANDIDATE, onFatal fails the transaction and
         // the active snapshot is retained.)
-        this.fatal('catalog subscription ended before a base was received');
+        this.fatal('catalog subscription ended before a base was received', true);
         return;
       case 'joining':
       case 'fetching':
@@ -975,7 +978,7 @@ export class CatalogBootstrap {
     }
   }
 
-  private fatal(reason: string): void {
+  private fatal(reason: string, subscriptionEnded = false): void {
     if (this._phase === 'fatal') return;
     this._phase = 'fatal';
     this.disarmInactivity();
@@ -984,7 +987,7 @@ export class CatalogBootstrap {
       this.cb.cancelFetch();
     }
     this.attempt = null;
-    this.cb.onFatal(reason);
+    this.cb.onFatal(reason, subscriptionEnded);
   }
 
   // ─── Inactivity (progress) timer ──────────────────────────────────

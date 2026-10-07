@@ -1,6 +1,7 @@
 /**
  * followNamespace: SUBSCRIBE_NAMESPACE state reporting, and re-establishing the
- * session when the namespace is published again after going away.
+ * session when the namespace is published again after going away, including
+ * before the first catalog.
  *
  * @see draft-ietf-moq-transport-18 §10.18
  * @module
@@ -116,6 +117,38 @@ async function startFollowing(
   return { player, states, nsReqId };
 }
 
+/** Load with followNamespace and the default catalog bootstrap; no catalog is delivered. */
+async function startLoading(
+  adapter: ReturnType<typeof createMockAdapter>,
+  opts: { followNamespace?: boolean } = {},
+) {
+  const config: MoqtPlayerConfig = {
+    url: 'https://relay.example.com/moq',
+    namespace: 'live/broadcast',
+    createTransport: vi.fn(async () => ({}) as any),
+    createConnection: () => adapter as unknown as MoqtConnection,
+    ...(opts.followNamespace === false ? {} : { followNamespace: true }),
+  };
+  const player = new MoqtPlayer(config);
+  const errors: { severity: string; message: string }[] = [];
+  player.on('error', (e) => errors.push({ severity: e.error.severity, message: e.error.message }));
+  const loadPromise = player.load();
+  await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
+  adapter._connectResolve?.();
+  await loadPromise;
+  await sleep(0);
+  const sent = adapter.subscribeNamespace.mock.results[0];
+  const nsReqId = sent ? BigInt(await sent.value) : null;
+  return { player, errors, nsReqId };
+}
+
+/** The bootstrap coordinator's subscription-ended failure. */
+function catalogSubscriptionEnded(player: MoqtPlayer): void {
+  const coord = (player as unknown as { catalogBootstrapCoord: { fatal(r: string, ended: boolean): void } })
+    .catalogBootstrapCoord;
+  coord.fatal('catalog subscription ended before a base was received', true);
+}
+
 function requestOk(adapter: ReturnType<typeof createMockAdapter>, requestId: bigint): void {
   adapter._triggerMessage({
     type: 'REQUEST_OK', requestId: varint(requestId), parameters: new Map(),
@@ -211,5 +244,52 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
     namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
     await sleep(60);
     expect(migrate).toHaveBeenCalledTimes(1);
+  });
+
+  describe('the publisher restarting during catalog bootstrap', () => {
+    it('waits instead of failing and re-establishes after the namespace returned', async () => {
+      const adapter = createMockAdapter();
+      const { player, errors, nsReqId } = await startLoading(adapter);
+      requestOk(adapter, nsReqId!);
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      const migrate = vi.spyOn(player, 'migrate').mockResolvedValue();
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE_DONE');
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      catalogSubscriptionEnded(player);
+
+      expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+      expect(errors.some((e) => e.severity === 'degraded' && /waiting for the publisher/.test(e.message)))
+        .toBe(true);
+      await sleep(60);
+      expect(player.state).toBe(PlayerState.LOADING);
+      expect(migrate).toHaveBeenCalledTimes(1);
+    });
+
+    it('ending while the namespace is withdrawn re-establishes on its return', async () => {
+      const adapter = createMockAdapter();
+      const { player, errors, nsReqId } = await startLoading(adapter);
+      requestOk(adapter, nsReqId!);
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      const migrate = vi.spyOn(player, 'migrate').mockResolvedValue();
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE_DONE');
+      catalogSubscriptionEnded(player);
+      await sleep(60);
+      expect(migrate).not.toHaveBeenCalled();
+
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      await sleep(60);
+      expect(migrate).toHaveBeenCalledTimes(1);
+      expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+    });
+
+    it('is fatal without followNamespace', async () => {
+      const adapter = createMockAdapter();
+      const { player, errors } = await startLoading(adapter, { followNamespace: false });
+      const migrate = vi.spyOn(player, 'migrate').mockResolvedValue();
+      catalogSubscriptionEnded(player);
+      expect(errors.some((e) => e.severity === 'fatal' && /catalog bootstrap failed/.test(e.message))).toBe(true);
+      await sleep(60);
+      expect(migrate).not.toHaveBeenCalled();
+    });
   });
 });

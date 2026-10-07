@@ -3659,8 +3659,15 @@ export class MoqtPlayer {
           }
         })();
       },
-      onFatal: (reason) => {
+      onFatal: (reason, subscriptionEnded) => {
         if (!live()) return;
+        if (subscriptionEnded && this.awaitPublisherForCatalog(conn)) {
+          this.emitError(createPlayerError(
+            'degraded', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+            `catalog bootstrap: ${reason}; waiting for the publisher`,
+          ));
+          return;
+        }
         this.emitError(createPlayerError(
           'fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
           `catalog bootstrap failed: ${reason}`,
@@ -7564,10 +7571,25 @@ export class MoqtPlayer {
   }
 
   /**
+   * followNamespace: the catalog subscription ended before the first catalog.
+   * Re-establish once the namespace is published (now, if it already is).
+   * False when not following; the caller then reports the failure.
+   */
+  private awaitPublisherForCatalog(conn: MoqtConnection): boolean {
+    if (!this.config.followNamespace || conn !== this.connection || this.namespaceRequestId === null) {
+      return false;
+    }
+    if (this._namespaceState === 'published') this.reestablishOnNamespaceReturn();
+    else this.namespaceLost = true;
+    return true;
+  }
+
+  /**
    * The followed namespace is published again after it went away. If media has
    * not resumed by itself within NAMESPACE_RETURN_SETTLE_MS, rebuild the catalog
    * and subscriptions on a fresh session, as a reconnect does — at most once
-   * per NAMESPACE_RETURN_MIN_SPACING_US.
+   * per NAMESPACE_RETURN_MIN_SPACING_US. Also applies while still loading
+   * without a catalog.
    */
   private reestablishOnNamespaceReturn(): void {
     this.namespaceLost = false;
@@ -7578,7 +7600,8 @@ export class MoqtPlayer {
       if (this._destroyed || this.currentMigration || this.reconnect !== null) return;
       if (!this.config.createConnection || !this.config.createTransport) return;
       const state = this.stateMachine.state;
-      if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED) return;
+      const awaitingCatalog = state === PlayerState.LOADING && !this.catalogReceived;
+      if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED && !awaitingCatalog) return;
       if (this.lastMediaArrivalUs > returnedAtUs) return;
       const now = this.clock.now();
       if (now - this.namespaceReturnAtUs < MoqtPlayer.NAMESPACE_RETURN_MIN_SPACING_US) return;
