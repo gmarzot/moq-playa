@@ -158,6 +158,29 @@ function claimNamespace(): void {
   storageSet(() => sessionStorage, AUTO_NAMESPACE_USED_KEY, namespace);
 }
 
+/**
+ * The last catalog this browser published: its namespace, group and bytes. A
+ * later broadcast under that namespace with the same catalog keeps the group,
+ * so a relay's cached copy stays the current catalog.
+ */
+const LAST_CATALOG_KEY = 'g5-broadcast.last-catalog';
+function loadLastCatalog(ns: string): CarriedCatalog | null {
+  try {
+    const saved = JSON.parse(storageGet(() => localStorage, LAST_CATALOG_KEY) ?? 'null');
+    if (saved?.namespace !== ns) return null;
+    return { group: BigInt(saved.group), payload: Uint8Array.from(atob(saved.payload), (c) => c.charCodeAt(0)) };
+  } catch {
+    return null;
+  }
+}
+function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
+  storageSet(() => localStorage, LAST_CATALOG_KEY, JSON.stringify({
+    namespace: ns,
+    group: catalog.group.toString(),
+    payload: btoa(String.fromCharCode(...catalog.payload)),
+  }));
+}
+
 // ─── Settings modal ──────────────────────────────────────────────────
 
 {
@@ -634,8 +657,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let sessionUpSinceMs: number | null = null;
   /** The catalog the current session serves; CMAF attaches its init segments later. */
   let sessionCatalog: BroadcastCatalogParams | null = null;
-  /** The catalog group this broadcast last published; a reconnect keeps it when unchanged. */
-  let carriedCatalog: CarriedCatalog | null = null;
+  /** The catalog group last published under this namespace; kept when the catalog is unchanged. */
+  let carriedCatalog: CarriedCatalog | null = loadLastCatalog(namespace);
   /** The video encoder's decoder description, from its first keyframe: CMAF's video init needs it. */
   let videoDescription: Uint8Array | null = null;
   const descriptionWaiters = new Set<(description: Uint8Array) => void>();
@@ -911,7 +934,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         catalog,
         ...(packaging === 'cmaf' ? { catalogReady: () => attachCmafInit(catalog) } : {}),
         ...(carriedCatalog ? { carriedCatalog } : {}),
-        onCatalogGroup: (published) => { carriedCatalog = published; },
+        onCatalogGroup: (published) => {
+          carriedCatalog = published;
+          saveLastCatalog(namespace, published);
+        },
         publisher: {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,
