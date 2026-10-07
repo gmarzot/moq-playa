@@ -339,7 +339,7 @@
         <input id="s-ns" type="text" placeholder="auto (new per broadcast)" style="flex:1;min-width:0">
         <button id="s-ns-new" type="button" title="Mint a new automatic namespace; the viewer link changes">New</button>
       </div>
-      <div class="hint">Blank or automatic: one per tab, kept across reloads and Stop/Start. A typed name is saved.</div>
+      <div class="hint">Blank or automatic: a new one each broadcast. A typed name is kept.</div>
 
       <label for="s-version">Draft version</label>
       <select id="s-version">
@@ -367,7 +367,7 @@
         <option value="loc">LOC (default)</option>
         <option value="cmaf">CMAF (CMSF)</option>
       </select>
-      <div class="hint">CMAF wraps each frame in a fragment for CMAF-only players; viewers play it through MSE.</div>
+      <div class="hint">LOC: frames as encoded, played with WebCodecs. CMAF: frames in fragments, played with MSE.</div>
 
       <label for="s-bitrate-mode">Bitrate mode</label>
       <select id="s-bitrate-mode">
@@ -381,7 +381,6 @@
 
       <label for="s-fps">Capture frame rate</label>
       <input id="s-fps" type="number" min="1" placeholder="60">
-      <div class="hint">42ms of latency at 24fps, 17ms at 60.</div>
 
       <label for="s-keyframe">Keyframe interval (frames)</label>
       <input id="s-keyframe" type="number" min="1" value="60">
@@ -390,8 +389,8 @@
       <input id="s-target" type="number" min="1" placeholder="200">
 
       <label for="s-catalog-interval">Catalog refresh interval (ms)</label>
-      <input id="s-catalog-interval" type="number" min="0" placeholder="draft default">
-      <div class="hint">0 = never re-sent. Default: none on draft-18, where viewers FETCH the catalog; 1000 on draft-14/16.</div>
+      <input id="s-catalog-interval" type="number" min="0" placeholder="0">
+      <div class="hint">0 = never re-sent.</div>
 
       <label for="s-hash">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)">

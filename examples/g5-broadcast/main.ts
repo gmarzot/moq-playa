@@ -240,11 +240,18 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sFps.value = String(captureFps);
     sTarget.value = String(targetLatencyMs);
     sCatalogInterval.value = catalogIntervalMs === null ? '' : String(catalogIntervalMs);
+    showCatalogIntervalDefault();
     sStatus.checked = showStatus;
     sDebug.checked = debug;
     sAudioDatagram.checked = audioDatagrams;
     sPackaging.value = packaging;
   }
+
+  /** The blank interval's value: the selected draft's default. */
+  function showCatalogIntervalDefault() {
+    sCatalogInterval.placeholder = String(catalogIntervalFor(Number(sVersion.value) as 14 | 16 | 18));
+  }
+  sVersion.addEventListener('change', showCatalogIntervalDefault);
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
   sNsNew.addEventListener('click', () => {
