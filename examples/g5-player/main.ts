@@ -477,6 +477,11 @@ async function main(): Promise<void> {
     log('Session re-established');
     setupBadgeState = { tone: 'ok', detail: 'Session re-established' };
     logCongestionControl();
+    // The new session retrieves the catalog again: report its progress too.
+    catalogArrived = false;
+    lastCatalogPhase = null;
+    catalogWaitSinceMs = null;
+    catalogWaitLogged = false;
   });
   player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
