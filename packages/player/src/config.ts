@@ -614,6 +614,8 @@ export interface FactoryConfig {
     onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
     /** Audio buffered ahead of the playhead (ms), or null when unknown. */
     audioAheadMs?: () => number | null;
+    /** Video buffered ahead of the playhead (ms), or null when unknown. */
+    videoAheadMs?: () => number | null;
   }) => CmafAssemblerLike;
 
   /**

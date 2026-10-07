@@ -79,6 +79,8 @@ export interface CmafAssemblerOptions {
    * without it the wait is one frame.
    */
   readonly audioAheadMs?: () => number | null;
+  /** Video buffered ahead of the playhead (ms), or null when unknown; as for audio. */
+  readonly videoAheadMs?: () => number | null;
   /**
    * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
    * Construction-time so it cannot change once an epoch is established.
@@ -86,6 +88,28 @@ export interface CmafAssemblerOptions {
    */
   readonly epochMode?: 'shared' | 'legacy';
 }
+
+interface HeldSegment {
+  segment: Uint8Array;
+  trackName: string;
+  groupId: bigint;
+  start: bigint;
+  end: bigint;
+}
+
+interface DecodeOrder {
+  readonly held: HeldSegment[];
+  timer: ReturnType<typeof setTimeout> | null;
+  readonly stats: { restored: number; missing: number; late: number; worstLateMs: number };
+  /** The next segment follows a deliberate pause: its gap is not missing media. */
+  resumed: boolean;
+  /** Group of the newest segment emitted. */
+  lastGroup: bigint | null;
+}
+
+const newDecodeOrder = (): DecodeOrder => ({
+  held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0 }, resumed: false, lastGroup: null,
+});
 
 /**
  * Pairs moof+mdat MoQ objects into complete CMAF segments.
@@ -104,6 +128,7 @@ export class CmafAssembler {
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
   private readonly audioAheadMs: CmafAssemblerOptions['audioAheadMs'];
+  private readonly videoAheadMs: CmafAssemblerOptions['videoAheadMs'];
 
   /**
    * Pending moofs keyed by "mediaType:trackName:groupId".
@@ -157,19 +182,18 @@ export class CmafAssembler {
   private lastAudioOutputEnd: bigint | null = null;
 
   /**
-   * Audio held for decode order. Audio usually travels one frame per group,
-   * each group on its own stream, so adjacent frames race; MSE in low-delay
-   * mode decodes up to the newest frame, and one appended after its
-   * successor is never played. A segment that starts past the emitted audio
-   * end waits for the gap to fill, until the playhead would reach the gap.
+   * Segments held for decode order, per media type. Audio usually travels one
+   * frame per group and a group's video tail can trail the next group's
+   * keyframe, each group on its own stream, so adjacent frames race. MSE never
+   * plays audio appended after its successor, and after a video append that
+   * goes back in decode time it drops video until the next keyframe. A segment
+   * that starts past the emitted end waits for the gap to fill, until the
+   * playhead would reach the gap.
    */
-  private readonly heldAudio: Array<{
-    segment: Uint8Array; trackName: string; groupId: bigint; start: bigint; end: bigint;
-  }> = [];
-  private heldAudioTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly audioOrder = { restored: 0, missing: 0, late: 0, worstLateMs: 0 };
-  /** The next audio segment follows a deliberate pause: its gap is not missing audio. */
-  private audioResumed = false;
+  private readonly order: Record<'video' | 'audio', DecodeOrder> = {
+    video: newDecodeOrder(),
+    audio: newDecodeOrder(),
+  };
 
   /**
    * Restart generation of the shared epoch. Bumped when a discontinuity
@@ -265,6 +289,7 @@ export class CmafAssembler {
     this.onSegment = options.onSegment;
     this.onDiscontinuity = options.onDiscontinuity;
     this.audioAheadMs = options.audioAheadMs;
+    this.videoAheadMs = options.videoAheadMs;
     this.epochMode = options.epochMode ?? 'shared';
   }
 
@@ -513,7 +538,12 @@ export class CmafAssembler {
    * (ms of audio already emitted past its start).
    */
   get audioOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
-    return { ...this.audioOrder };
+    return { ...this.order.audio.stats };
+  }
+
+  /** Video decode-order repair, as for audio; late video is dropped, not appended. */
+  get videoOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
+    return { ...this.order.video.stats };
   }
 
   private emitInOrder(
@@ -522,85 +552,100 @@ export class CmafAssembler {
     trackName: string,
     groupId: bigint,
   ): void {
-    if (mediaType === 'video') {
+    const o = this.order[mediaType];
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    const span = this.segmentSpan(mediaType, segment);
+    const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+    if (span === null || emittedEnd === null || !timescale || o.resumed) {
+      o.resumed = false;
       this.emitSegment(mediaType, segment, trackName, groupId);
       return;
     }
-    const span = this.audioSpan(segment);
-    const emittedEnd = this.lastAudioOutputEnd;
-    if (span === null || emittedEnd === null || !this.audioTimescale || this.audioResumed) {
-      this.audioResumed = false;
-      this.emitSegment('audio', segment, trackName, groupId);
-      return;
-    }
     if (span.end <= emittedEnd) {
-      this.audioOrder.late++;
-      const lateMs = (Number(emittedEnd - span.start) * 1000) / this.audioTimescale;
-      if (lateMs > this.audioOrder.worstLateMs) this.audioOrder.worstLateMs = lateMs;
-      this.emitSegment('audio', segment, trackName, groupId);
+      o.stats.late++;
+      const lateMs = (Number(emittedEnd - span.start) * 1000) / timescale;
+      if (lateMs > o.stats.worstLateMs) o.stats.worstLateMs = lateMs;
+      // Video appended behind the emitted end makes MSE drop video until the next keyframe.
+      if (mediaType === 'audio') this.emitSegment(mediaType, segment, trackName, groupId);
       return;
     }
-    // Half a segment of slack: timestamp rounding is not a missing frame.
-    if (span.start - emittedEnd > (span.end - span.start) / 2n) {
-      this.heldAudio.push({ segment, trackName, groupId, ...span });
-      this.heldAudio.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
-      this.armHeldAudioTimer();
+    // Half a segment of slack: timestamp rounding is not a missing frame. A
+    // group's video arrives in order on one stream, so a gap inside the group
+    // is a skipped frame; only a newer group can be ahead of a late tail.
+    const gap = span.start - emittedEnd > (span.end - span.start) / 2n;
+    const mayFill = mediaType === 'audio' || o.lastGroup === null || groupId > o.lastGroup;
+    if (gap && mayFill) {
+      o.held.push({ segment, trackName, groupId, ...span });
+      o.held.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+      this.armHeldTimer(mediaType);
       return;
     }
-    if (this.heldAudio.length > 0) this.audioOrder.restored++;
-    this.emitSegment('audio', segment, trackName, groupId);
-    this.releaseHeldAudio(false);
+    if (o.held.length > 0) o.stats.restored++;
+    this.emitSegment(mediaType, segment, trackName, groupId);
+    this.releaseHeld(mediaType, false);
   }
 
-  /** Emit held audio that is now contiguous; on expiry, skip the gap ahead of the first. */
-  private releaseHeldAudio(expired: boolean): void {
+  /** Emit held segments that are now contiguous; on expiry, skip the gap ahead of the first. */
+  private releaseHeld(mediaType: 'video' | 'audio', expired: boolean): void {
+    const o = this.order[mediaType];
     let skipGap = expired;
-    while (this.heldAudio.length > 0) {
-      const head = this.heldAudio[0]!;
+    while (o.held.length > 0) {
+      const head = o.held[0]!;
+      const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
       const duration = head.end - head.start;
-      const gap = this.lastAudioOutputEnd === null ? 0n : head.start - this.lastAudioOutputEnd;
+      const gap = emittedEnd === null ? 0n : head.start - emittedEnd;
       if (gap > duration / 2n) {
         if (!skipGap) break;
         skipGap = false;
-        this.audioOrder.missing += duration > 0n ? Math.max(1, Math.round(Number(gap) / Number(duration))) : 1;
+        o.stats.missing += duration > 0n ? Math.max(1, Math.round(Number(gap) / Number(duration))) : 1;
       }
-      this.heldAudio.shift();
-      this.emitSegment('audio', head.segment, head.trackName, head.groupId);
+      o.held.shift();
+      this.emitSegment(mediaType, head.segment, head.trackName, head.groupId);
     }
-    if (this.heldAudioTimer !== null) {
-      clearTimeout(this.heldAudioTimer);
-      this.heldAudioTimer = null;
+    if (o.timer !== null) {
+      clearTimeout(o.timer);
+      o.timer = null;
     }
-    this.armHeldAudioTimer();
+    this.armHeldTimer(mediaType);
   }
 
   /**
-   * The head of the held audio waits until the playhead would reach the gap,
-   * less one frame of margin; at least one frame, and one frame when the
+   * The head of the held segments waits until the playhead would reach the
+   * gap, less one frame of margin; at least one frame, and one frame when the
    * buffered depth is unknown.
    */
-  private armHeldAudioTimer(): void {
-    if (this.heldAudioTimer !== null || this.heldAudio.length === 0 || !this.audioTimescale) return;
-    const head = this.heldAudio[0]!;
-    const frameMs = (Number(head.end - head.start) * 1000) / this.audioTimescale;
-    const aheadMs = this.audioAheadMs?.() ?? null;
+  private armHeldTimer(mediaType: 'video' | 'audio'): void {
+    const o = this.order[mediaType];
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (o.timer !== null || o.held.length === 0 || !timescale) return;
+    const head = o.held[0]!;
+    const frameMs = (Number(head.end - head.start) * 1000) / timescale;
+    const aheadMs = (mediaType === 'video' ? this.videoAheadMs : this.audioAheadMs)?.() ?? null;
     const ms = aheadMs === null ? frameMs : Math.max(frameMs, aheadMs - frameMs);
-    this.heldAudioTimer = setTimeout(() => {
-      this.heldAudioTimer = null;
-      this.releaseHeldAudio(true);
+    o.timer = setTimeout(() => {
+      o.timer = null;
+      this.releaseHeld(mediaType, true);
     }, ms);
   }
 
-  /** Drop held audio and its timer (state reset). */
-  private dropHeldAudio(): void {
-    if (this.heldAudioTimer !== null) clearTimeout(this.heldAudioTimer);
-    this.heldAudioTimer = null;
-    this.heldAudio.length = 0;
+  /** Emit everything held for one media type, skipping its gaps. */
+  private flushHeld(mediaType: 'video' | 'audio'): void {
+    while (this.order[mediaType].held.length > 0) this.releaseHeld(mediaType, true);
   }
 
-  /** Decode-time extent of an audio segment, in track ticks. */
-  private audioSpan(segment: Uint8Array): { start: bigint; end: bigint } | null {
-    const ranges = readSegmentTimeRanges(segment, this.audioTrex ?? undefined);
+  /** Drop held segments and their timers (state reset). */
+  private dropHeld(): void {
+    for (const o of Object.values(this.order)) {
+      if (o.timer !== null) clearTimeout(o.timer);
+      o.timer = null;
+      o.held.length = 0;
+    }
+  }
+
+  /** Decode-time extent of a segment, in track ticks. */
+  private segmentSpan(mediaType: 'video' | 'audio', segment: Uint8Array): { start: bigint; end: bigint } | null {
+    const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
+    const ranges = readSegmentTimeRanges(segment, trex ?? undefined);
     if (ranges === null || ranges.length === 0) return null;
     let start = ranges[0]!.startTime;
     let end = ranges[0]!.endTime;
@@ -619,6 +664,8 @@ export class CmafAssembler {
     groupId: bigint,
   ): void {
     const output = this.maybeStripRaslSamples(mediaType, segment);
+    const o = this.order[mediaType];
+    if (o.lastGroup === null || groupId > o.lastGroup) o.lastGroup = groupId;
     const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
     const ranges = readSegmentTimeRanges(output, trex ?? undefined);
     this.onSegment(mediaType, output, trackName, groupId);
@@ -650,27 +697,29 @@ export class CmafAssembler {
     for (const key of [...this.pendingMoofs.keys()]) {
       if (key.startsWith(`${mediaType}:`)) this.pendingMoofs.delete(key);
     }
-    // Held audio is complete media: deliver it rather than wait across the boundary.
-    if (mediaType === 'audio') {
-      while (this.heldAudio.length > 0) this.releaseHeldAudio(true);
-    }
+    // Held segments are complete media: deliver them rather than wait across the boundary.
+    this.flushHeld(mediaType);
   }
 
   /**
    * Delivery is resuming after a deliberate pause: drop pending half-pairs and
-   * held audio, and emit the next audio segment without waiting on its gap.
+   * held segments, and emit the next of each without waiting on its gap.
    */
   resumeAfterPause(): void {
     this.pendingMoofs.clear();
-    this.dropHeldAudio();
-    this.audioResumed = true;
+    this.dropHeld();
+    this.order.video.resumed = true;
+    this.order.audio.resumed = true;
   }
 
   /** Clear all pending moofs, epoch state, and parsed init defaults. */
   reset(): void {
     this.pendingMoofs.clear();
-    this.dropHeldAudio();
-    this.audioResumed = false;
+    this.dropHeld();
+    for (const o of Object.values(this.order)) {
+      o.resumed = false;
+      o.lastGroup = null;
+    }
     this.videoEpoch = null;
     this.audioEpoch = null;
     this.lastVideoBmd = null;
@@ -904,6 +953,7 @@ export class CmafAssembler {
       // Track switch (ABR splice): variants in a switching set are media-time
       // aligned. Keep the shared raw/output epochs so a switch cannot jump
       // back to presentation time zero after a source restart.
+      this.flushHeld(mediaType);
       const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;
@@ -953,6 +1003,9 @@ export class CmafAssembler {
       if (!isSmallAudioReorder && !isOutOfOrderGroup) {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
+        // Both tracks re-base from what they emitted: held segments go out first.
+        this.flushHeld('video');
+        this.flushHeld('audio');
         // A restart affects both tracks. The first track to detect it
         // re-establishes the shared epoch (generation bump); the second
         // track sees its generation is behind and adopts the new epoch

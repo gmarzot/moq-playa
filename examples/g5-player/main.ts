@@ -432,13 +432,18 @@ async function main(): Promise<void> {
     const text = (player as any).engine?.mediaSource?.describeBuffers?.() as string | undefined;
     return text ? ` · ${text}${audioOrderNote()}` : '';
   };
-  /** CMAF audio decode-order repair so far (CmafAssembler.audioOrderStats). */
-  const audioOrderNote = (): string => {
-    const o = (player as any).engine?.cmafAssembler?.audioOrderStats;
-    if (!o) return '';
-    const worst = o.late > 0 && o.worstLateMs ? ` (worst ${o.worstLateMs.toFixed(0)}ms behind)` : '';
-    return ` · audio order restored/missing/late ${o.restored}/${o.missing}/${o.late}${worst}`;
+  type OrderStats = { restored: number; missing: number; late: number; worstLateMs: number };
+  /** CMAF decode-order repair so far (CmafAssembler audio/videoOrderStats). */
+  const orderStats = (): Array<[string, OrderStats]> => {
+    const asm = (player as any).engine?.cmafAssembler;
+    return (['audio', 'video'] as const)
+      .map((kind): [string, OrderStats | undefined] => [kind, asm?.[`${kind}OrderStats`]])
+      .filter((e): e is [string, OrderStats] => e[1] !== undefined);
   };
+  const audioOrderNote = (): string => orderStats().map(([kind, o]) => {
+    const worst = o.late > 0 && o.worstLateMs ? ` (worst ${o.worstLateMs.toFixed(0)}ms behind)` : '';
+    return ` · ${kind} order restored/missing/late ${o.restored}/${o.missing}/${o.late}${worst}`;
+  }).join('');
   player.on('stall', ({ durationMs }) => {
     const video = watchVideo();
     const where = video
@@ -1177,7 +1182,8 @@ async function main(): Promise<void> {
       underrunReportAtMs = tickNowMs;
       reportCompat();
       const order = audioOrderNote();
-      if (order && order !== audioOrderReported && !order.endsWith(' 0/0/0')) {
+      const anyRepair = orderStats().some(([, o]) => o.restored + o.missing + o.late > 0);
+      if (order && order !== audioOrderReported && anyRepair) {
         audioOrderReported = order;
         log(`CMAF${order}`);
       }
