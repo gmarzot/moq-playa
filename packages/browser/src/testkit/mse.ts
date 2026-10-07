@@ -1,7 +1,7 @@
 /**
  * MSE test doubles: ISOBMFF builders and mock MediaSource / SourceBuffer /
- * video element shaped as MseMediaSource consumes them. Copied from
- * mse-adapter.test.ts so tests outside it share one harness.
+ * video element shaped as MseMediaSource consumes them; the same doubles as
+ * mse-adapter.test.ts, for tests outside it.
  */
 import { vi, beforeEach, afterEach } from 'vitest';
 
