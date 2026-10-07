@@ -430,9 +430,10 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     if (this.destroyed) return;
-    // Already started: this is a resume, not a new startup transaction.
-    if (this.playTriggered) {
-      this.resumeElement();
+    // A resume of live media: what was buffered before the pause is behind the
+    // live edge, so start again on what arrives after it.
+    if (this.playTriggered || this.reentryAfterSec !== null) {
+      this.reenterAfterPause();
       return;
     }
     // Intent arrived after media: start now if a common range already exists.
@@ -452,6 +453,18 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     this.resumeElement();
+  }
+
+  /** Restart startup on media buffered after everything held at the pause. */
+  private reenterAfterPause(): void {
+    const buffered = this.video.buffered;
+    let end = this.video.currentTime;
+    for (let i = 0; i < buffered.length; i++) end = Math.max(end, buffered.end(i));
+    this.reentryAfterSec = Math.max(end, this.reentryAfterSec ?? end);
+    this.cancelStartup();
+    this.playTriggered = false;
+    this.diag('resume: re-entering after t=%s', this.reentryAfterSec.toFixed(3));
+    void this.requestStartup().catch(() => { /* contained */ });
   }
 
   /**
@@ -637,6 +650,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** One-shot guard for the "no SourceBuffer yet" drop diagnostic in appendChunk(). */
   private preInitDropLogged = false;
   private playTriggered = false;
+  /** Set by a resume: startup re-enters on media buffered after this time (s). */
+  private reentryAfterSec: number | null = null;
   private stallStartTime: number | null = null;
   /** True once this episode has been reported as detected. */
   private stallDetected = false;
@@ -1332,6 +1347,7 @@ export class MseMediaSource implements MediaSourceLike {
     // New session: stale facts must never join a later summary.
     this.startupFacts = { session: this.bufferGen, startPosition: null, seekOutcome: null, playTimeSec: null };
     this.startupReported = false;
+    this.reentryAfterSec = null;
     this.cancelBufferOps('reset');
     try {
       if (this.videoBuffer && !this.videoBuffer.updating) {
@@ -1714,15 +1730,16 @@ export class MseMediaSource implements MediaSourceLike {
    */
   private selectStartPosition(): { start: number; duration: number } | null {
     const buffered = this.video.buffered;
-    if (buffered.length === 0) return null;
-    let start = buffered.start(0);
-    let duration = buffered.end(0) - start;
-    for (let i = 1; i < buffered.length; i++) {
-      const s = buffered.start(i);
+    // After a pause only media past the re-entry point counts.
+    const after = this.reentryAfterSec;
+    let best: { start: number; duration: number } | null = null;
+    for (let i = 0; i < buffered.length; i++) {
+      const s = after === null ? buffered.start(i) : Math.max(buffered.start(i), after);
       const d = buffered.end(i) - s;
-      if (d > duration) { start = s; duration = d; }
+      if (after !== null && d <= MseMediaSource.GAP_MOVE_TOLERANCE_SEC) continue;
+      if (best === null || d > best.duration) best = { start: s, duration: d };
     }
-    return { start, duration };
+    return best;
   }
 
   /**
@@ -1961,6 +1978,7 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
     this.playTriggered = true;
+    this.reentryAfterSec = null;
     this.startupPhase = 'started';
     this.recordStartupFact(facts, { playTimeSec: this.video.currentTime });
     this.logDebug('[MSE] startup: play() started at %s', this.video.currentTime.toFixed(3));

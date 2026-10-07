@@ -1470,6 +1470,21 @@ describe('CmafAssembler — audio decode order', () => {
     }
   });
 
+  it('a resume after a pause emits the next audio at once and counts no missing frames', () => {
+    vi.useFakeTimers();
+    try {
+      const { assembler, push, emitted } = setup(() => 200);
+      [0, 1].forEach(push);
+      assembler.resumeAfterPause();
+      [150, 151].forEach(push);
+      expect(emitted()).toEqual([0, 1, 150, 151]);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(assembler.audioOrderStats).toMatchObject({ restored: 0, missing: 0, late: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('leaves video in arrival order', () => {
     const onSegment = vi.fn();
     const assembler = new CmafAssembler({ onSegment });

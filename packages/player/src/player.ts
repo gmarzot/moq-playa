@@ -2535,6 +2535,7 @@ export class MoqtPlayer {
       this.audioPipeline?.reset();
       this.syncController?.reset();
       this.recoveryController?.reset?.();
+      this.cmafAssembler?.resumeAfterPause?.();
     }
 
     // Liveness: drop stale arrival stamps — a pause (no delivery, no ticks)

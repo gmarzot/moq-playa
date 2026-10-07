@@ -2859,13 +2859,30 @@ describe('MseMediaSource — intent pauses and resumes established playback', ()
         expect(video.paused).toBe(true);
     });
 
-    it('re-granting intent resumes established playback', async () => {
+    it('re-granting intent re-enters on media buffered after the pause, never the old tail', async () => {
         const { adapter, video } = await startedHarness();
         adapter.setPlaybackIntent(false);
         const playsBefore = video.playCalls;
         adapter.setPlaybackIntent(true);
         await settle();
-        expect(video.playCalls).toBe(playsBefore + 1);
+        expect(video.playCalls).toBe(playsBefore);   // nothing past the pause yet
+        expect(video.paused).toBe(true);
+
+        video.buffered = makeTimeRanges([[2.73, 12.73], [15.0, 15.4]]);
+        adapter.appendChunk('video', makeSegment({ bmd: 1500, defaultDur: 100, sampleCount: 1 }), 'track1');
+        await settle();
+        expect(video.currentTime).toBeCloseTo(15.0);
+        expect(video.paused).toBe(false);
+    });
+
+    it('media contiguous with the old tail re-enters where the pause left off', async () => {
+        const { adapter, video } = await startedHarness();
+        adapter.setPlaybackIntent(false);
+        adapter.setPlaybackIntent(true);
+        video.buffered = makeTimeRanges([[2.73, 15.4]]);
+        adapter.appendChunk('video', makeSegment({ bmd: 1300, defaultDur: 100, sampleCount: 1 }), 'track1');
+        await settle();
+        expect(video.currentTime).toBeCloseTo(12.73);
         expect(video.paused).toBe(false);
     });
 

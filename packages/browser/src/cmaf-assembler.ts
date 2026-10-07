@@ -168,6 +168,8 @@ export class CmafAssembler {
   }> = [];
   private heldAudioTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly audioOrder = { restored: 0, missing: 0, late: 0, worstLateMs: 0 };
+  /** The next audio segment follows a deliberate pause: its gap is not missing audio. */
+  private audioResumed = false;
 
   /**
    * Restart generation of the shared epoch. Bumped when a discontinuity
@@ -526,7 +528,8 @@ export class CmafAssembler {
     }
     const span = this.audioSpan(segment);
     const emittedEnd = this.lastAudioOutputEnd;
-    if (span === null || emittedEnd === null || !this.audioTimescale) {
+    if (span === null || emittedEnd === null || !this.audioTimescale || this.audioResumed) {
+      this.audioResumed = false;
       this.emitSegment('audio', segment, trackName, groupId);
       return;
     }
@@ -653,10 +656,21 @@ export class CmafAssembler {
     }
   }
 
+  /**
+   * Delivery is resuming after a deliberate pause: drop pending half-pairs and
+   * held audio, and emit the next audio segment without waiting on its gap.
+   */
+  resumeAfterPause(): void {
+    this.pendingMoofs.clear();
+    this.dropHeldAudio();
+    this.audioResumed = true;
+  }
+
   /** Clear all pending moofs, epoch state, and parsed init defaults. */
   reset(): void {
     this.pendingMoofs.clear();
     this.dropHeldAudio();
+    this.audioResumed = false;
     this.videoEpoch = null;
     this.audioEpoch = null;
     this.lastVideoBmd = null;

@@ -437,6 +437,11 @@ export interface CmafAssemblerLike {
    * state may ignore the call.
    */
   clearPending?(mediaType: 'video' | 'audio'): void;
+  /**
+   * Delivery resumes after a pause: the paused interval is not missing media.
+   * Optional; assemblers without ordering state may ignore it.
+   */
+  resumeAfterPause?(): void;
   reset(): void;
   destroy(): void;
 }
