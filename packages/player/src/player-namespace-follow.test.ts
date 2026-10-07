@@ -9,6 +9,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
+import { NamespaceFollower } from './namespace-follow.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { NamespaceState } from './events.js';
@@ -57,8 +58,7 @@ const CATALOG_JSON = JSON.stringify({
 const VIDEO_ALIAS = 50n;
 const AUDIO_ALIAS = 51n;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const statics = MoqtPlayer as unknown as { NAMESPACE_RETURN_SETTLE_MS: number };
-const SETTLE_MS = statics.NAMESPACE_RETURN_SETTLE_MS;
+const SETTLE_MS = NamespaceFollower.RETURN_SETTLE_MS;
 
 /**
  * Load and play with followNamespace on, recording namespace states from the
@@ -169,8 +169,8 @@ function feedVideo(adapter: ReturnType<typeof createMockAdapter>): void {
 }
 
 describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
-  beforeEach(() => { statics.NAMESPACE_RETURN_SETTLE_MS = 20; });
-  afterEach(() => { statics.NAMESPACE_RETURN_SETTLE_MS = SETTLE_MS; });
+  beforeEach(() => { NamespaceFollower.RETURN_SETTLE_MS = 20; });
+  afterEach(() => { NamespaceFollower.RETURN_SETTLE_MS = SETTLE_MS; });
 
   it('is off unless configured', async () => {
     const adapter = createMockAdapter();
