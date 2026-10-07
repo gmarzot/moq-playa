@@ -55,11 +55,15 @@ function storageSet(store: () => Storage, key: string, value: string | null): bo
   }
 }
 
-/** Settings saved by the dialog, as URL parameters. */
+/**
+ * Settings saved by the dialog, as URL parameters: per tab in sessionStorage
+ * (kept across its reloads), and in localStorage as the start for new tabs.
+ */
 const SETTINGS_KEY = 'g5-broadcast.settings';
 /** Saved settings, each overridden by a URL parameter of the same name. */
 const params = (() => {
-  const merged = new URLSearchParams(storageGet(() => localStorage, SETTINGS_KEY) ?? '');
+  const saved = storageGet(() => sessionStorage, SETTINGS_KEY) ?? storageGet(() => localStorage, SETTINGS_KEY);
+  const merged = new URLSearchParams(saved ?? '');
   const url = new URLSearchParams(window.location.search);
   for (const name of new Set(url.keys())) {
     merged.delete(name);
@@ -298,7 +302,9 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     // them; where storage is refused, the URL carries them instead. `compat`
     // is URL-only and stays.
     const qs = np.toString();
-    const saved = storageSet(() => localStorage, SETTINGS_KEY, qs || null);
+    // An empty string, not removal: this tab chose the defaults.
+    const saved = storageSet(() => sessionStorage, SETTINGS_KEY, qs);
+    storageSet(() => localStorage, SETTINGS_KEY, qs || null);
     const next = new URLSearchParams(saved ? '' : qs);
     const compat = new URLSearchParams(window.location.search).get('compat');
     if (compat) next.set('compat', compat);
