@@ -632,7 +632,8 @@ const NS_WITHDRAW_MS = 500;
 // A page closing or reloading mid-broadcast cannot await the shutdown: start the
 // withdrawal and close the session now, so a reload reusing ?ns= finds no stale
 // registration at the relay.
-window.addEventListener('pagehide', () => {
+window.addEventListener('pagehide', (e) => {
+  if (e.persisted) return;
   if (currentConnection && nsRequestId !== null) {
     void currentConnection.publishNamespaceDone(BigInt(nsRequestId)).catch(() => {});
   }

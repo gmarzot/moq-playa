@@ -679,6 +679,7 @@ export class MoqtPlayer {
   private catalogParseFailures = 0;
   /** Empty Normal media objects skipped under compat `empty-objects`. */
   private _emptyMediaObjects = 0;
+  private _staleVideoDrops: { count: number; group: bigint | null; floor: bigint | null } = { count: 0, group: null, floor: null };
   /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
   private recoveryUpdateBlockedUntilUs = 0;
   private recoveryUpdateFailures = 0;
@@ -1440,12 +1441,7 @@ export class MoqtPlayer {
       return;
     }
 
-    // Early stale-group drop, as for CMAF: video only, the previous group tolerated.
-    if (mediaType === 'video' && this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-      const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
-        .getCommittedGroupFloor(mediaType, trackName);
-      if (floor !== undefined && groupId + 1n < floor) return;
-    }
+    if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
     this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes);
   }
@@ -2720,17 +2716,8 @@ export class MoqtPlayer {
         return;
       }
 
-      // Early stale-group drop (video only): skip groups older than the one
-      // before what MSE has committed. The immediately previous group's tail
-      // legitimately races the next group's head across concurrent subgroup
-      // streams; the assembler's reorder window places it. Anything older is
-      // replay. Audio is one group per object; no group floor applies.
       const groupId = BigInt(obj.groupId);
-      if (mediaType === 'video' && this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-        const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
-          .getCommittedGroupFloor(mediaType, trackName);
-        if (floor !== undefined && groupId + 1n < floor) return;
-      }
+      if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
       this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload);
@@ -5232,6 +5219,27 @@ export class MoqtPlayer {
   /** Empty Normal media objects skipped under compat `empty-objects`. */
   get emptyMediaObjectsSkipped(): number {
     return this._emptyMediaObjects;
+  }
+
+  /** Video objects dropped as stale before MSE, with the latest drop's group and floor. */
+  get staleVideoDrops(): { readonly count: number; readonly group: bigint | null; readonly floor: bigint | null } {
+    return this._staleVideoDrops;
+  }
+
+  /**
+   * Early stale-group drop on the MSE paths (video only): groups older than the
+   * one before what MSE has committed are replay. The immediately previous
+   * group's tail legitimately races the next group's head across concurrent
+   * subgroup streams; the assembler's reorder window places it. Audio is one
+   * group per object; no group floor applies.
+   */
+  private isStaleVideoGroup(mediaType: string, trackName: string, groupId: bigint): boolean {
+    if (mediaType !== 'video' || !this.mediaSource || !('getCommittedGroupFloor' in this.mediaSource)) return false;
+    const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
+      .getCommittedGroupFloor(mediaType, trackName);
+    if (floor === undefined || groupId + 1n >= floor) return false;
+    this._staleVideoDrops = { count: this._staleVideoDrops.count + 1, group: groupId, floor };
+    return true;
   }
 
   /** compat `empty-objects`: an empty Normal object on a media track never

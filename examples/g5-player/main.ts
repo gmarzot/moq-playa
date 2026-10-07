@@ -627,6 +627,8 @@ async function main(): Promise<void> {
   let underrunWindow = emptyUnderrunWindow();
   let underrunReportAtMs = 0;
   let audioOrderReported = '';
+  let staleDropsReported = 0;
+  let staleDropsReportedAtMs = 0;
   const noteUnderrun = (gapSec: number, lateSec: number | null): void => {
     underrunWindow.count++;
     underrunWindow.gapSec += gapSec;
@@ -1164,6 +1166,13 @@ async function main(): Promise<void> {
     const rateNow = (playerContainer.querySelector('video')?.playbackRate ?? 1);
     const audioOut = (player as any).audioOutput;
     if (audioOut && audioOut.onUnderrun === null) audioOut.onUnderrun = noteUnderrun;
+    const stale = (player as any).engine?.staleVideoDrops;
+    if (stale && stale.count !== staleDropsReported && tickNowMs - staleDropsReportedAtMs >= 1_000) {
+      log(`Stale video dropped before MSE: ${stale.count - staleDropsReported} object(s), `
+        + `latest group ${stale.group} below floor ${stale.floor} · total ${stale.count}`);
+      staleDropsReported = stale.count;
+      staleDropsReportedAtMs = tickNowMs;
+    }
     if (tickNowMs - underrunReportAtMs >= UNDERRUN_REPORT_MS) {
       underrunReportAtMs = tickNowMs;
       reportCompat();
@@ -1356,6 +1365,12 @@ async function main(): Promise<void> {
   }
   setText('conn-draft', draftVersion === undefined ? 'auto' : String(draftVersion));
   setupBadgeState = { tone: 'wait', detail: `SETUP to ${relayUrl}; awaiting the relay` };
+  // Closing, reloading or navigating away ends the session now instead of at the
+  // relay's idle timeout. A page kept in the back/forward cache stays connected.
+  window.addEventListener('pagehide', (e) => {
+    if (e.persisted) return;
+    void (player as any).engine?.connection?.close().catch(() => { /* already closed */ });
+  });
   player.load().catch((err) => log(`Fatal: ${(err as Error).message}`));
 }
 
