@@ -800,6 +800,16 @@ export class Player {
       this.emitter.emit('namespace_state', { state: e.state, detail: e.detail });
     });
 
+    this.engine.on('track_unsubscribed', (e) => {
+      this.emitter.emit('track_unsubscribed', { trackName: e.trackName, reason: e.reason });
+    });
+
+    this.engine.on('track_subscribe_failed', (e) => {
+      this.emitter.emit('track_subscribe_failed', {
+        trackName: e.trackName, mediaType: e.mediaType, errorCode: e.errorCode, reason: e.reason,
+      });
+    });
+
     this.engine.on('state_changed', (e) => {
       if (e.to === 'ended') {
         this.timeCtrl?.stop();

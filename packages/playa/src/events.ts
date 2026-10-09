@@ -59,6 +59,10 @@ export interface PlayerEventMap {
   'session_migrated': Record<string, never>;
   /** The followed namespace changed state at the relay (`followNamespace`). */
   'namespace_state': NamespaceStateEvent;
+  /** A media subscription ended and the player did not resubscribe. */
+  'track_unsubscribed': TrackUnsubscribedEvent;
+  /** The relay refused a media subscription. */
+  'track_subscribe_failed': TrackSubscribeFailedEvent;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -175,6 +179,18 @@ export interface NamespaceStateEvent {
   readonly state: NamespaceState;
   /** The MoQT message behind the change. */
   readonly detail: string;
+}
+
+export interface TrackUnsubscribedEvent {
+  readonly trackName: string;
+  readonly reason: string;
+}
+
+export interface TrackSubscribeFailedEvent {
+  readonly trackName: string;
+  readonly mediaType: 'video' | 'audio';
+  readonly errorCode: bigint;
+  readonly reason: string;
 }
 
 export interface ErrorEvent {

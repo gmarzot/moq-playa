@@ -13,6 +13,9 @@ import {
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
 } from '../shared/cert.js';
 import { parseCompat } from '../shared/compat.js';
+import {
+  readMdhdTimescale, readSegmentTimeRanges, readTrexDefaults, type TrexDefaults,
+} from '../../packages/browser/src/mp4-box.js';
 
 /** `?status=1` shows the playback state over the picture (off by default). */
 const showStatus = new URLSearchParams(location.search).get('status') === '1';
@@ -90,7 +93,9 @@ const setText = (id: string, value: string): void => {
 const MAX_LOG_LINES = 2000;
 
 function log(msg: string): void {
-  const ts = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
+  const ts = new Date().toLocaleTimeString('en-US', {
+    hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
+  });
   logEl.append(`[${ts}] ${msg}\n`);
   while (logEl.childNodes.length > MAX_LOG_LINES) logEl.firstChild!.remove();
   logEl.scrollTop = logEl.scrollHeight;
@@ -473,6 +478,12 @@ async function main(): Promise<void> {
   player.on('session_reconnecting', ({ attempt, delayMs }) => {
     log(`Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`);
     setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${attempt}` };
+  });
+  player.on('track_unsubscribed', ({ trackName, reason }) => {
+    log(`Track "${trackName}" ended: ${reason || '(no reason)'}`);
+  });
+  player.on('track_subscribe_failed', ({ trackName, mediaType, errorCode, reason }) => {
+    log(`Subscribe ${mediaType} "${trackName}" refused (0x${errorCode.toString(16)}): ${reason || '(no reason)'}`);
   });
   player.on('namespace_state', ({ state, detail }) => {
     nsBadgeState = { tone: NS_TONE[state] ?? 'idle', detail };
@@ -880,9 +891,119 @@ async function main(): Promise<void> {
     }
   };
 
+  // Arrival and CMAF video timeline trace, at most four lines a second: an
+  // arrival gap over 150 ms; a video fragment starting before the previous one
+  // (dropped), ending inside video already received (overlap), or starting more
+  // than two frames after the previous one (MSE drops to the next keyframe).
+  let traceVideoInit: { timescale: number; trex?: TrexDefaults } | null = null;
+  let tracePrev: { start: bigint; end: bigint; group: bigint } | null = null;
+  let traceMaxEnd: bigint | null = null;
+  let traceWindowMs = 0;
+  let traceLines = 0;
+  let traceUnlogged = 0;
+  // A hidden page runs its handlers late; arrival gaps then measure the throttle.
+  let traceShownAtMs = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) traceShownAtMs = performance.now();
+  });
+  /** When the trace last saw the video input reorder or jump. */
+  let traceJumpAtMs = -Infinity;
+  // Holes between buffered video ranges at or ahead of the playhead, and
+  // whether the trace saw the input jump or reorder just before.
+  let knownVideoHoles = new Set<string>();
+  const noteVideoHoles = (ms: any): void => {
+    const ranges: Array<[number, number]> | undefined = ms?.bufferedRanges?.('video');
+    const video = playerContainer.querySelector('video');
+    if (!ranges || !video) return;
+    const t = video.currentTime;
+    const holes = new Set<string>();
+    for (let i = 1; i < ranges.length; i++) {
+      const a = ranges[i - 1]![1];
+      const b = ranges[i]![0];
+      if (b < t - 1) continue;
+      const key = `${a.toFixed(2)}-${b.toFixed(2)}`;
+      holes.add(key);
+      if (knownVideoHoles.has(key)) continue;
+      const input = performance.now() - traceJumpAtMs < 5000
+        ? 'the trace saw the input jump or reorder within 5 s'
+        : 'input contiguous per trace';
+      log(`MSE video hole [${a.toFixed(2)}–${b.toFixed(2)}] (${Math.round((b - a) * 1000)}ms) `
+        + `at t=${t.toFixed(2)} · ${input}${describeBuffers()}`);
+    }
+    knownVideoHoles = holes;
+  };
+  const traceLog = (msg: string): void => {
+    const nowMs = performance.now();
+    if (nowMs - traceWindowMs >= 1000) {
+      if (traceUnlogged > 0) log(`trace: ${traceUnlogged} more lines not shown`);
+      traceWindowMs = nowMs;
+      traceLines = 0;
+      traceUnlogged = 0;
+    }
+    if (traceLines >= 4) {
+      traceUnlogged++;
+      return;
+    }
+    traceLines++;
+    log(msg);
+  };
+  /** Timescale and trex defaults of a CMAF track's init segment, from the catalog. */
+  const cmafInit = (cat: any, track: any): { timescale: number; trex?: TrexDefaults } | null => {
+    const b64: unknown = track?.initData
+      ?? (cat?.initDataList ?? []).find((d: any) => d.id === track?.initRef)?.data;
+    if (typeof b64 !== 'string') return null;
+    try {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const timescale = readMdhdTimescale(bytes);
+      if (!timescale) return null;
+      const trex = readTrexDefaults(bytes).values().next().value;
+      return trex ? { timescale, trex } : { timescale };
+    } catch {
+      return null;
+    }
+  };
+  const traceObject = (e: any, nowMs: number): void => {
+    const kind = e.mediaType as 'video' | 'audio';
+    const prevArrival = lastArrivalMs[kind];
+    const throttled = document.hidden || nowMs - traceShownAtMs < 1000;
+    if (!throttled && prevArrival !== undefined && nowMs - prevArrival > 150) {
+      traceLog(`trace ${kind}: arrival gap ${Math.round(nowMs - prevArrival)}ms before group ${e.groupId}/${e.objectId}`);
+    }
+    const init = traceVideoInit;
+    if (kind !== 'video' || !init || !e.payload) return;
+    const ranges = readSegmentTimeRanges(e.payload, init.trex);
+    if (!ranges || ranges.length === 0) return;
+    let start = ranges[0]!.startTime;
+    let end = ranges[0]!.endTime;
+    for (const r of ranges) {
+      if (r.startTime < start) start = r.startTime;
+      if (r.endTime > end) end = r.endTime;
+    }
+    const ms = (ticks: bigint): string => ((Number(ticks) * 1000) / init.timescale).toFixed(1);
+    const prev = tracePrev;
+    const maxEnd = traceMaxEnd;
+    const group = BigInt(e.groupId);
+    tracePrev = { start, end, group };
+    if (maxEnd === null || end > maxEnd) traceMaxEnd = end;
+    if (prev === null || maxEnd === null) return;
+    const where = `group ${e.groupId}/${e.objectId}${group !== prev.group ? ' (new group)' : ''}`;
+    const prevDur = `previous dur ${ms(prev.end - prev.start)}ms`;
+    if (start < prev.start) {
+      traceJumpAtMs = nowMs;
+      traceLog(`trace video: ${where} starts ${ms(prev.start - start)}ms before the previous fragment (out of order, dropped) · dur ${ms(end - start)}ms`);
+    } else if (end <= maxEnd) {
+      traceLog(`trace video: ${where} ends ${ms(maxEnd - end)}ms inside video already received (overlap, appended) · dur ${ms(end - start)}ms · ${prevDur}`);
+    } else if (start - prev.start > 2n * (prev.end - prev.start)) {
+      traceJumpAtMs = nowMs;
+      traceLog(`trace video: ${where} starts ${ms(start - prev.end)}ms after the previous fragment's end · ${prevDur}`);
+    }
+  };
+
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
-      lastArrivalMs[e.mediaType as 'video' | 'audio'] = performance.now();
+      const nowMs = performance.now();
+      traceObject(e, nowMs);
+      lastArrivalMs[e.mediaType as 'video' | 'audio'] = nowMs;
     }
     noteObject(e);
     if (e.mediaType === 'audio' && e.kind === 'data' && e.captureTimestamp && e.captureTimestamp > 0n) {
@@ -1103,6 +1224,7 @@ async function main(): Promise<void> {
     const tickNowMs = performance.now();
     renderStatusBadges(tickNowMs);
     const eng = (player as any).engine;
+    noteVideoHoles(eng?.mediaSource);
     const byKind = eng?.mediaSource?.getBufferAheadMsByKind?.();
     const renderer = (player as any).renderer;
     if (renderer && renderer.onFrameDrawn === null) renderer.onFrameDrawn = noteFrameDrawn;
@@ -1253,6 +1375,9 @@ async function main(): Promise<void> {
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
     const videoTrack = tracks.find((t) => (t.role ?? t.name) === 'video');
+    traceVideoInit = videoTrack?.packaging === 'cmaf' ? cmafInit(cat, videoTrack) : null;
+    tracePrev = null;
+    traceMaxEnd = null;
     audioCodec = tracks.find((t) => (t.role ?? t.name) === 'audio')?.codec ?? null;
     // Absent on the --ts path: the live demuxer has no framerate to declare.
     videoFps = Number(videoTrack?.framerate) || null;

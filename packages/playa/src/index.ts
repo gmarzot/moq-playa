@@ -31,6 +31,8 @@ export type {
   SessionClosedEvent,
   SessionReconnectingEvent,
   NamespaceStateEvent,
+  TrackUnsubscribedEvent,
+  TrackSubscribeFailedEvent,
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';
