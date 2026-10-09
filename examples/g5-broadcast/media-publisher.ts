@@ -35,6 +35,10 @@
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
 import { buildChunk } from '../shared/browser/cmaf-mux.js';
+import {
+  LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject,
+  type LocmafTrackContext,
+} from '@openmoq/locmaf';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {
@@ -79,6 +83,8 @@ export const CMAF_AUDIO_TRACK_ID = 2;
 /** Fallbacks when the encoder reports no duration: 30 fps, a 20 ms Opus frame. */
 const DEFAULT_VIDEO_FRAME_US = 33_333;
 const DEFAULT_AUDIO_FRAME_US = 20_000;
+/** Longest LOCMAF audio group when no video group starts meanwhile. */
+const LOCMAF_AUDIO_GROUP_MAX_US = 2_000_000n;
 
 /** The capture-clock anchor in use, measured against the best offset observed. */
 export interface AnchorReport {
@@ -167,9 +173,12 @@ export interface MediaPublisherOptions {
   /**
    * Object payload format. `loc` (default): the encoded frame. `cmaf`: one
    * CMAF chunk (moof + mdat) per frame, decode time in microseconds so it
-   * matches the capture timestamp property (CMSF-01 §3.3).
+   * matches the capture timestamp property (CMSF-01 §3.3). `locmaf`: that
+   * chunk as a LOCMAF Object (draft-einarsson-moq-locmaf-01); subgroups only.
    */
-  packaging?: 'loc' | 'cmaf';
+  packaging?: 'loc' | 'cmaf' | 'locmaf';
+  /** The CMAF init segments, once built; `locmaf` encodes against them. */
+  cmafInit?: () => { videoInit: Uint8Array; audioInit?: Uint8Array } | undefined;
   /** Video needs a keyframe now: a new subscription or a resume. The page
    *  asks its encoder for one. */
   onKeyframeNeeded?: () => void;
@@ -239,6 +248,14 @@ export class MediaPublisher {
   private readonly pauseProbeMs: number;
   private readonly audioDatagrams: boolean;
   private readonly cmaf: boolean;
+  private readonly locmaf: boolean;
+  private readonly cmafInit: MediaPublisherOptions['cmafInit'];
+  private readonly locmafEncoder = new LocmafEncoder();
+  private readonly locmafContexts = new Map<'video' | 'audio', LocmafTrackContext>();
+  /** LOCMAF chaining state of the open video group. */
+  private videoLocmafState = new LocmafGroupState();
+  /** LOCMAF headers sent: full, or delta against the previous object in the group. */
+  private readonly locmafHeaderCounts = { full: 0, delta: 0 };
   /** mfhd sequence numbers, per CMAF track. */
   private cmafVideoSequence = 0;
   private cmafAudioSequence = 0;
@@ -261,6 +278,15 @@ export class MediaPublisher {
   /** The alias the open video subgroup was opened under. */
   private videoStreamAlias: bigint | null = null;
   private audioGroupId: bigint;
+  /** LOCMAF: the open audio subgroup, its next object, and the video group it started under. */
+  private audioStreamId: bigint | null = null;
+  private audioStreamAlias: bigint | null = null;
+  private audioObjectId = 0n;
+  private audioStreamVideoGroup: bigint | null = null;
+  private audioGroupStartUs = 0n;
+  private audioLocmafState = new LocmafGroupState();
+  /** LOCMAF: where each track's decode timeline continues. */
+  private readonly nextDecodeUs: { video: bigint | null; audio: bigint | null } = { video: null, audio: null };
 
   private videoFrames = 0;
   private audioChunks = 0;
@@ -276,6 +302,9 @@ export class MediaPublisher {
   private videoPumping = false;
   /** In-flight audio publications (bounded by {@link audioMaxInFlight}). */
   private readonly audioInFlight = new Set<Promise<void>>();
+  /** LOCMAF audio is serial: a group's objects go in order on one subgroup. */
+  private audioPump: Promise<void> = Promise.resolve();
+  private audioPumping = false;
 
   /** Video continuity lost (queue overflow): dependents are invalid until
    *  the next keyframe opens a fresh group at Object 0. */
@@ -326,9 +355,12 @@ export class MediaPublisher {
     this.videoQueueMax = options.videoQueueMax ?? 60;
     this.audioQueueMax = options.audioQueueMax ?? 50;
     this.pauseProbeMs = options.pauseProbeMs ?? PAUSE_PROBE_MS;
+    this.locmaf = options.packaging === 'locmaf';
+    this.cmaf = options.packaging === 'cmaf' || this.locmaf;
+    this.cmafInit = options.cmafInit;
     // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
-    this.audioDatagrams = options.audioDatagrams === true && options.draft === 18;
-    this.cmaf = options.packaging === 'cmaf';
+    // LOCMAF is carried on subgroups only.
+    this.audioDatagrams = options.audioDatagrams === true && options.draft === 18 && !this.locmaf;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.onKeyframeNeeded = options.onKeyframeNeeded ?? null;
     this.onStatus = options.onStatus ?? null;
@@ -549,6 +581,7 @@ export class MediaPublisher {
    */
   async drain(): Promise<void> {
     await this.videoPump;
+    await this.audioPump;
     while (this.audioInFlight.size > 0) {
       await Promise.all([...this.audioInFlight]);
     }
@@ -558,6 +591,11 @@ export class MediaPublisher {
     if (this.videoStreamId !== null) {
       const sid = this.videoStreamId;
       this.videoStreamId = null;
+      try { await this.connection.closeSubgroup(sid); } catch { /* already closed */ }
+    }
+    if (this.audioStreamId !== null) {
+      const sid = this.audioStreamId;
+      this.audioStreamId = null;
       try { await this.connection.closeSubgroup(sid); } catch { /* already closed */ }
     }
   }
@@ -629,6 +667,10 @@ export class MediaPublisher {
    * monotonic group IDs.
    */
   private pumpAudio(): void {
+    if (this.locmaf) {
+      this.pumpAudioGrouped();
+      return;
+    }
     while (this.audioQueue.length > 0 && !this.stopped && this.audioInFlight.size < this.audioMaxInFlight) {
       const item = this.audioQueue.shift()!;
       const groupId = ++this.audioGroupId;
@@ -652,6 +694,93 @@ export class MediaPublisher {
         if (!this.stopped) this.pumpAudio();
       });
     }
+  }
+
+  /** LOCMAF audio, one chunk at a time (same failure handling as {@link pumpAudio}). */
+  private pumpAudioGrouped(): void {
+    if (this.audioPumping) return;
+    this.audioPumping = true;
+    this.audioPump = (async () => {
+      try {
+        while (this.audioQueue.length > 0 && !this.stopped) {
+          const item = this.audioQueue.shift()!;
+          const alias = this.audioAlias;
+          try {
+            await this.sendAudioGrouped(item.data, item.meta);
+            this.noteSent('audio');
+          } catch (err) {
+            if (alias !== this.audioAlias) continue;
+            if (this.pauseTrack('audio', err)) break;
+            if (this.retireTrack('audio', err)) break;
+            this.report('audio publish', err);
+          }
+        }
+      } finally {
+        this.audioPumping = false;
+      }
+    })();
+  }
+
+  /**
+   * LOCMAF decode time: where the track's previous chunk ended, so the delta
+   * header chains; capture time instead when that is over half a frame away.
+   * The capture timestamp property still carries the capture time.
+   */
+  private onDecodeTimeline(track: 'video' | 'audio', captureUs: bigint, durationUs: number): bigint {
+    const next = this.nextDecodeUs[track];
+    const half = BigInt(Math.floor(durationUs / 2));
+    const decodeUs = next !== null && captureUs - next <= half && next - captureUs <= half ? next : captureUs;
+    this.nextDecodeUs[track] = decodeUs + BigInt(durationUs);
+    return decodeUs;
+  }
+
+  /**
+   * One LOCMAF audio chunk on the open audio group. A group starts with the
+   * next video group (joint tune-in), a new subscription, a failure, or after
+   * {@link LOCMAF_AUDIO_GROUP_MAX_US} without video.
+   */
+  private async sendAudioGrouped(chunk: Uint8Array, meta: AudioChunkMeta): Promise<void> {
+    const captureUs = this.toWallClockUs('audio', meta.timestampUs);
+    const extensions = encodeLocHeaders({ captureTimestamp: captureUs }, this.locOptions());
+    const alias = this.audioAlias!;
+    if (this.audioStreamId === null || this.audioStreamAlias !== alias
+        || this.audioStreamVideoGroup !== this.videoGroupId
+        || captureUs - this.audioGroupStartUs >= LOCMAF_AUDIO_GROUP_MAX_US) {
+      if (this.audioStreamId !== null) {
+        const old = this.audioStreamId;
+        this.audioStreamId = null;
+        this.trackClose(old);
+      }
+      this.audioGroupId++;
+      this.audioObjectId = 0n;
+      this.audioLocmafState = new LocmafGroupState();
+      this.audioStreamVideoGroup = this.videoGroupId;
+      this.audioGroupStartUs = captureUs;
+      this.audioStreamId = await this.connection.openSubgroup(
+        this.wrapInt(alias), this.wrapInt(this.audioGroupId), this.wrapInt(0n), this.subgroupOptions(64));
+      this.audioStreamAlias = alias;
+    }
+    const duration = meta.durationUs && meta.durationUs > 0 ? meta.durationUs : DEFAULT_AUDIO_FRAME_US;
+    const cmafChunk = buildChunk({
+      trackId: CMAF_AUDIO_TRACK_ID,
+      sequence: ++this.cmafAudioSequence,
+      baseDecodeTime: this.onDecodeTimeline('audio', captureUs, duration),
+      duration,
+      keyframe: true,
+      data: chunk,
+    });
+    const payload = this.toLocmaf('audio', cmafChunk, this.audioLocmafState, this.audioObjectId);
+    try {
+      await this.connection.sendObject(this.audioStreamId, this.wrapInt(this.audioObjectId), payload, extensions);
+    } catch (err) {
+      // The group's delta chain is broken: the next chunk opens a new group.
+      const broken = this.audioStreamId;
+      this.audioStreamId = null;
+      this.trackClose(broken);
+      throw err;
+    }
+    this.noteAudioSent(chunk.byteLength, this.audioGroupId, this.audioObjectId);
+    this.audioObjectId++;
   }
 
   /**
@@ -790,6 +919,7 @@ export class MediaPublisher {
       }
       this.videoGroupId++;
       this.videoObjectId = 0n;
+      this.videoLocmafState = new LocmafGroupState();
       // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
       // Without this, receivers cannot distinguish normal group completion
       // from an incomplete group and will wait for the intra-group timeout.
@@ -812,7 +942,10 @@ export class MediaPublisher {
     if (this.videoStreamId === null) return;
 
     const captureUs = this.toWallClockUs('video', meta.timestampUs);
-    const payload = this.cmaf ? this.cmafVideoChunk(data, meta, captureUs) : data;
+    const chunk = this.cmaf ? this.cmafVideoChunk(data, meta, captureUs) : data;
+    const payload = this.locmaf
+      ? this.toLocmaf('video', chunk, this.videoLocmafState, this.videoObjectId)
+      : chunk;
     try {
       await this.connection.sendObject(
         this.videoStreamId, this.wrapInt(this.videoObjectId), payload, this.videoExtensions(meta, captureUs));
@@ -848,11 +981,12 @@ export class MediaPublisher {
         data: chunk,
       })
       : chunk;
+    const payload = this.locmaf ? this.toLocmaf('audio', data, new LocmafGroupState(), 0n) : data;
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     if (this.audioDatagrams && this.connection.sendDatagram) {
       await this.connection.sendDatagram(
-        this.audioAlias!, groupId, 0n, data,
+        this.audioAlias!, groupId, 0n, payload,
         { publisherPriority: 64, ...(extensions ? { extensions } : {}) },
       );
       this.noteAudioSent(chunk.byteLength, groupId);
@@ -863,7 +997,7 @@ export class MediaPublisher {
       this.subgroupOptions(64),
     );
     try {
-      await this.connection.sendObject(streamId, this.wrapInt(0n), data, extensions);
+      await this.connection.sendObject(streamId, this.wrapInt(0n), payload, extensions);
     } catch (err) {
       this.trackClose(streamId); // best-effort terminal cleanup for the failed stream
       throw err;
@@ -891,18 +1025,39 @@ export class MediaPublisher {
     return buildChunk({
       trackId: CMAF_VIDEO_TRACK_ID,
       sequence: ++this.cmafVideoSequence,
-      baseDecodeTime: captureUs,
+      baseDecodeTime: this.locmaf ? this.onDecodeTimeline('video', captureUs, duration) : captureUs,
       duration,
       keyframe: meta.isKeyframe,
       data,
     });
   }
 
+  /** LOCMAF headers sent so far, full and delta. */
+  get locmafHeaders(): { full: number; delta: number } {
+    return { ...this.locmafHeaderCounts };
+  }
+
+  /** A CMAF chunk as a serialized LOCMAF Object, chained in its group. */
+  private toLocmaf(track: 'video' | 'audio', chunk: Uint8Array, state: LocmafGroupState, objectId: bigint): Uint8Array {
+    let context = this.locmafContexts.get(track);
+    if (!context) {
+      const init = this.cmafInit?.();
+      const initBytes = track === 'video' ? init?.videoInit : init?.audioInit;
+      if (!initBytes) throw new Error(`LOCMAF ${track}: no CMAF init segment to encode against`);
+      context = parseLocmafTrackContext(initBytes);
+      this.locmafContexts.set(track, context);
+    }
+    const object = this.locmafEncoder.encode(chunk, state, context, false, objectId);
+    if (object.kind === 'moof') this.locmafHeaderCounts[object.header.full ? 'full' : 'delta']++;
+    return serializeLocmafObject(object);
+  }
+
   /** Accounting shared by the stream and datagram audio paths. Concurrent
    *  publications finish out of order, so the largest group is a max. */
-  private noteAudioSent(bytes: number, groupId: bigint): void {
-    if (this.audioLargest === null || groupId > this.audioLargest.group) {
-      this.audioLargest = { group: groupId, object: 0n };
+  private noteAudioSent(bytes: number, groupId: bigint, objectId = 0n): void {
+    const largest = this.audioLargest;
+    if (largest === null || groupId > largest.group || (groupId === largest.group && objectId > largest.object)) {
+      this.audioLargest = { group: groupId, object: objectId };
     }
     this.audioChunks++;
     this.audioBytes += bytes;

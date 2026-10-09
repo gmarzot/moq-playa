@@ -1,10 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import type { AnchorReport, DriftReport } from './media-publisher.js';
-import { MediaPublisher } from './media-publisher.js';
+import { MediaPublisher, CMAF_VIDEO_TRACK_ID, CMAF_AUDIO_TRACK_ID } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
 import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import { readBaseMediaDecodeTime, readSegmentTimeRanges } from '../../packages/browser/src/mp4-box.js';
+import { buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE } from '../shared/browser/cmaf-mux.js';
+import {
+  codecDescriptionFromInit, deserializeLocmafObject, LocmafGroupState, LocmafReconstructor, parseCmafChunk,
+  parseLocmafTrackContext,
+} from '@openmoq/locmaf';
 
 const wrapInt = (n: bigint) => n;
 
@@ -379,6 +384,167 @@ describe('MediaPublisher — CMAF packaging', () => {
     pub.publishAudio(chunk(9), { timestampUs: 500 });
     await settle();
     expect(conn.sends[0]!.payload).toEqual(chunk(9));
+  });
+});
+
+describe('MediaPublisher — LOCMAF packaging', () => {
+  const wall = 1_759_000_000_000_000;
+  const videoInit = buildVideoInit({
+    trackId: CMAF_VIDEO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, codec: 'avc1.42c01e',
+    width: 640, height: 360, description: new Uint8Array([0x01, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+  });
+  const audioInit = buildAudioInit({
+    trackId: CMAF_AUDIO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, sampleRate: 48_000, channels: 1,
+  });
+  const cmafInit = () => ({ videoInit, audioInit });
+  const frame = (isKeyframe: boolean, timestampUs: number) => ({ isKeyframe, timestampUs, durationUs: 40_000 });
+
+  /** The same video frames through a CMAF and a LOCMAF publisher. */
+  async function publishBoth(frames: ReturnType<typeof frame>[]) {
+    const run = async (packaging: 'cmaf' | 'locmaf') => {
+      const conn = recordingConnection();
+      const pub = makePublisher(conn, { packaging, cmafInit, wallClockUs: () => wall });
+      pub.setVideoAlias(2n);
+      frames.forEach((f, i) => pub.publishVideo(chunk(i), f));
+      await settle();
+      return { conn, pub };
+    };
+    return { cmaf: await run('cmaf'), locmaf: await run('locmaf') };
+  }
+
+  /** Rebuild each LOCMAF object of one track, group by group. */
+  function reconstructAll(sends: SendRecord[], init: Uint8Array): Uint8Array[] {
+    const context = parseLocmafTrackContext(init);
+    const reconstructor = new LocmafReconstructor();
+    let state = new LocmafGroupState();
+    return sends.map((sent) => {
+      if (sent.objectId === 0n) state = new LocmafGroupState();
+      const rebuilt = reconstructor.reconstruct(deserializeLocmafObject(sent.payload), state, context, sent.objectId);
+      expect(rebuilt.kind).toBe('chunk');
+      return rebuilt.bytes;
+    });
+  }
+
+  /** Decode time, per-sample values and media bytes; the rebuild is canonical, not our byte layout. */
+  const samplesOf = (chunkBytes: Uint8Array, init: Uint8Array) => {
+    const parsed = parseCmafChunk(chunkBytes, parseLocmafTrackContext(init));
+    if (!parsed.fits) throw new Error(parsed.reason);
+    return { effective: parsed.effective, mdat: [...parsed.mdat] };
+  };
+
+  it('each video object rebuilds into the samples of its CMAF chunk, smaller on the wire', async () => {
+    const { cmaf, locmaf } = await publishBoth([
+      frame(true, 0), frame(false, 40_000), frame(false, 80_000), frame(true, 120_000),
+    ]);
+    expect(reconstructAll(locmaf.conn.sends, videoInit).map((c) => samplesOf(c, videoInit)))
+      .toEqual(cmaf.conn.sends.map((s) => samplesOf(s.payload, videoInit)));
+    locmaf.conn.sends.forEach((s, i) => {
+      expect(s.payload.byteLength).toBeLessThan(cmaf.conn.sends[i]!.payload.byteLength);
+    });
+  });
+
+  it('starts each group with a full header and chains deltas inside it', async () => {
+    const { locmaf } = await publishBoth([
+      frame(true, 0), frame(false, 40_000), frame(false, 80_000), frame(true, 120_000), frame(false, 160_000),
+    ]);
+    expect(locmaf.pub.locmafHeaders).toEqual({ full: 2, delta: 3 });
+  });
+
+  /** Decode start of each sent object, rebuilt from its LOCMAF payload. */
+  const decodeStarts = (sends: SendRecord[], init: Uint8Array) =>
+    reconstructAll(sends, init).map((c) => samplesOf(c, init).effective.baseMediaDecodeTime);
+
+  it('keeps decode times on a regular timeline through capture jitter, so headers stay deltas', async () => {
+    const { locmaf } = await publishBoth([frame(true, 0), frame(false, 40_150), frame(false, 79_900)]);
+    expect(locmaf.pub.locmafHeaders).toEqual({ full: 1, delta: 2 });
+    const [d0, d1, d2] = decodeStarts(locmaf.conn.sends, videoInit);
+    expect([d1! - d0!, d2! - d1!]).toEqual([40_000n, 40_000n]);
+  });
+
+  it('snaps back to capture time past half a frame, with a full header', async () => {
+    const { locmaf } = await publishBoth([frame(true, 0), frame(false, 40_000), frame(false, 105_000)]);
+    expect(locmaf.pub.locmafHeaders).toEqual({ full: 2, delta: 1 });
+    const [d0, , d2] = decodeStarts(locmaf.conn.sends, videoInit);
+    expect(d2! - d0!).toBe(105_000n);
+  });
+
+  it('groups audio with video: one subgroup per video group, deltas inside it', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { draft: 18, packaging: 'locmaf', cmafInit, wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    const audio = (from: number, n: number) => {
+      for (let i = 0; i < n; i++) pub.publishAudio(chunk(i), { timestampUs: from + i * 20_000, durationUs: 20_000 });
+    };
+    pub.publishVideo(chunk(0), frame(true, 0));
+    await settle();
+    audio(0, 5);
+    await settle();
+    pub.publishVideo(chunk(1), frame(true, 100_000));
+    await settle();
+    audio(100_000, 3);
+    await settle();
+
+    const audioStreams = conn.opened.filter((o) => o.alias === 3n);
+    expect(audioStreams).toHaveLength(2);
+    expect(audioStreams[1]!.groupId).toBe(audioStreams[0]!.groupId + 1n);
+    const audioSends = conn.sends.filter((s) => audioStreams.some((o) => o.streamId === s.streamId));
+    expect(audioSends.map((s) => s.objectId)).toEqual([0n, 1n, 2n, 3n, 4n, 0n, 1n, 2n]);
+    // Video: 2 full. Audio: a full header per group, deltas after it.
+    expect(pub.locmafHeaders).toEqual({ full: 4, delta: 6 });
+    expect(reconstructAll(audioSends, audioInit).map((c) => c[c.length - 1])).toEqual([0, 1, 2, 3, 4, 0, 1, 2]);
+  });
+
+  it('starts a new audio group after 2 s without a video group', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, {
+      draft: 18, packaging: 'locmaf', cmafInit, wallClockUs: () => wall, audioQueueMax: 200,
+    });
+    pub.setAudioAlias(3n);
+    for (let i = 0; i < 150; i++) pub.publishAudio(chunk(i % 250), { timestampUs: i * 20_000, durationUs: 20_000 });
+    await settle();
+    await pub.stop();
+
+    const groups = conn.opened.filter((o) => o.alias === 3n);
+    expect(groups).toHaveLength(2);
+    expect(conn.sends.filter((s) => s.streamId === groups[0]!.streamId)).toHaveLength(100);
+    expect(conn.closed).toEqual(expect.arrayContaining(groups.map((g) => g.streamId)));
+  });
+
+  it('keeps audio on subgroups even when datagrams are asked for', async () => {
+    const conn = recordingConnection();
+    let datagrams = 0;
+    (conn as unknown as { sendDatagram: unknown }).sendDatagram = async () => { datagrams++; };
+    const pub = makePublisher(conn, {
+      draft: 18, audioDatagrams: true, packaging: 'locmaf', cmafInit, wallClockUs: () => wall,
+    });
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(9), { timestampUs: 500, durationUs: 20_000 });
+    await settle();
+
+    expect(datagrams).toBe(0);
+    expect(conn.opened).toHaveLength(1);
+    const [rebuilt] = reconstructAll(conn.sends, audioInit);
+    expect(rebuilt![rebuilt!.length - 1]).toBe(9);
+  });
+
+  it('the Opus init gives the frame path a WebCodecs OpusHead', () => {
+    const head = codecDescriptionFromInit(audioInit)!;
+    expect(new TextDecoder().decode(head.subarray(0, 8))).toBe('OpusHead');
+    expect(head[9]).toBe(1);                                          // channels
+    expect(new DataView(head.buffer).getUint32(12, true)).toBe(48_000); // input sample rate
+  });
+
+  it('reports a send without init segments as an error and sends nothing', async () => {
+    const conn = recordingConnection();
+    const errors: unknown[] = [];
+    const pub = makePublisher(conn, { packaging: 'locmaf', onError: (_c, e) => errors.push(e) });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), frame(true, 0));
+    await settle();
+
+    expect(conn.sends).toHaveLength(0);
+    expect(String((errors[0] as Error)?.message)).toContain('no CMAF init segment');
   });
 });
 

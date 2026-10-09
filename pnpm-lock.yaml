@@ -61,6 +61,9 @@ importers:
       '@openmoq/loc':
         specifier: workspace:*
         version: link:../packages/loc
+      '@openmoq/locmaf':
+        specifier: workspace:*
+        version: link:../packages/locmaf
       '@openmoq/msf':
         specifier: workspace:*
         version: link:../packages/msf

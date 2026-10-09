@@ -116,8 +116,10 @@ const showStatus = params.get('status') !== '0';
 const captureFps = parseInt(params.get('fps') ?? '60', 10);
 /** `?audioDatagram=1`: audio as OBJECT_DATAGRAMs. draft-18 only. */
 const audioDatagrams = params.get('audioDatagram') === '1';
-/** `?packaging=cmaf`: objects as CMAF chunks (CMSF-01) instead of LOC. */
-const packaging: 'loc' | 'cmaf' = params.get('packaging') === 'cmaf' ? 'cmaf' : 'loc';
+/** `?packaging=cmaf|locmaf`: objects as CMAF chunks (CMSF-01) or LOCMAF Objects instead of LOC. */
+const packagingParam = params.get('packaging');
+const packaging: 'loc' | 'cmaf' | 'locmaf' =
+  packagingParam === 'cmaf' || packagingParam === 'locmaf' ? packagingParam : 'loc';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
 const bitrateMode: 'constant' | 'variable' | undefined =
@@ -297,7 +299,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked) np.set('audioDatagram', '1');
-    if (sPackaging.value === 'cmaf') np.set('packaging', 'cmaf');
+    if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
     // them; where storage is refused, the URL carries them instead. `compat`
     // is URL-only and stays.
@@ -411,9 +413,10 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
     catJson.textContent = text;
   }
   // Same header shape as the player's catalog panel.
-  const packagings = [...new Set(tracks.map((t) => String(t['packaging'])))].join(', ');
+  const packagings = [...new Set(tracks.map((t) => (t['packaging'] === 'locmaf' && t['locmafVersion']
+    ? `locmaf ${String(t['locmafVersion'])}` : String(t['packaging']))))].join(', ');
   catMeta.textContent = packagings
-    ? `${packagings} (v${String(version ?? '?')})` : `v${String(version ?? '?')}`;
+    ? `v${String(version ?? '?')} · ${packagings}` : `v${String(version ?? '?')}`;
   catSize.textContent = ` · ${bytes.byteLength}B`;
   // Display order only; the published catalog keeps its own.
   const ordered = [...tracks].sort(
@@ -763,6 +766,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     ...(audioUs !== null ? [`audio ${driftMs(audioUs)}`] : []),
     ...(videoUs !== null && audioUs !== null ? [`video−audio ${driftMs(videoUs - audioUs)}`] : []),
   ].join(', ');
+  const describeLocmafHeaders = ({ full, delta }: { full: number; delta: number }): string =>
+    `full/delta ${full}/${delta}`;
   /** This period's capture-side drift and encoder peaks; starts the next period. */
   const takeCaptureDrift = (): string => {
     const at = (t: 'video' | 'audio'): number | null => {
@@ -959,6 +964,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       setText('conn-draft', String(negotiatedDraft));
       currentConnection = conn;
       log(`Session established (draft-${negotiatedDraft}).`);
+      if (packaging === 'locmaf' && audioDatagrams) log('LOCMAF: audio stays on subgroups (no datagrams)');
       log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
@@ -975,7 +981,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
         catalog,
-        ...(packaging === 'cmaf' ? { catalogReady: () => attachCmafInit(catalog) } : {}),
+        ...(packaging !== 'loc' ? { catalogReady: () => attachCmafInit(catalog) } : {}),
         ...(carriedCatalog ? { carriedCatalog } : {}),
         onCatalogGroup: (published) => {
           carriedCatalog = published;
@@ -986,6 +992,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           draft: negotiatedDraft,
           audioDatagrams,
           packaging,
+          cmafInit: () => catalog.cmaf,
           // The anchor's measured error, once per track.
           onAnchor: ({ track, excessUs, timeOriginDeltaUs }) => log(
             `Capture anchor ${track}: first chunk cost `
@@ -996,7 +1003,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           onDrift: ({ elapsedMs, videoUs, audioUs, followUs }) => {
             log(`Capture drift at ${(elapsedMs / 60_000).toFixed(1)} min: `
               + `sent ${describeDrift(videoUs, audioUs)} · ${takeCaptureDrift()}`
-              + (followUs !== null ? ` · wall-clock follow ${driftMs(followUs)}` : ''));
+              + (followUs !== null ? ` · wall-clock follow ${driftMs(followUs)}` : '')
+              + (packaging === 'locmaf' ? ` · LOCMAF headers ${describeLocmafHeaders(session.publisher.locmafHeaders)}` : ''));
           },
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
           onStatus: (track, message) => log(`${track}: ${message}`),
@@ -1122,7 +1130,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       shareBtn.hidden = false;
       // A CMAF catalog appears once its init segments exist (attachCmafInit).
       if (sessionCatalog && (packaging === 'loc' || sessionCatalog.cmaf)) renderCatalogPanel(sessionCatalog);
-      if (sessionCatalog && packaging === 'cmaf') {
+      if (sessionCatalog && packaging !== 'loc') {
         void attachCmafInit(sessionCatalog).catch((err: unknown) => log(`CMAF init: ${(err as Error)?.message ?? err}`));
       }
       setState('awaiting subscribe', 'starting');

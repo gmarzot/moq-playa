@@ -20,6 +20,7 @@
 import { varint, SubgroupIdMode, PublishDoneCode } from '@openmoq/transport';
 import type { DraftVersion } from '@openmoq/transport';
 import { buildCatalog } from '@openmoq/msf';
+import { LOCMAF_VERSION } from '@openmoq/locmaf';
 
 /** Bound on EACH step of an error-response transaction (the best-effort stream
  *  close and the terminal/rejection write). A write that never settles must not
@@ -105,9 +106,9 @@ export interface BroadcastCatalogParams {
     channels: number;
   };
   /** Object packaging. Default `loc`. */
-  packaging?: 'loc' | 'cmaf';
+  packaging?: 'loc' | 'cmaf' | 'locmaf';
   /** CMAF (CMSF-01): each track's init segment, carried in the catalog's
-   *  initDataList. Required to build a CMAF catalog. */
+   *  initDataList. Required to build a CMAF or LOCMAF catalog. */
   cmaf?: {
     videoInit: Uint8Array;
     audioInit?: Uint8Array;
@@ -238,8 +239,10 @@ async function terminateFailedCatalog(
  *  safely recoverable by answering the request with a rejection. */
 export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array {
   const packaging = params.packaging ?? 'loc';
-  const cmaf = packaging === 'cmaf' ? params.cmaf : undefined;
-  if (packaging === 'cmaf' && !cmaf) throw new Error('CMAF init segments are not ready yet');
+  const usesInit = packaging === 'cmaf' || packaging === 'locmaf';
+  const cmaf = usesInit ? params.cmaf : undefined;
+  if (usesInit && !cmaf) throw new Error('CMAF init segments are not ready yet');
+  const locmaf = packaging === 'locmaf' ? { locmafVersion: LOCMAF_VERSION } : {};
   if (cmaf && params.audio && !cmaf.audioInit) {
     throw new Error('CMAF catalog has an audio track without an init segment');
   }
@@ -257,6 +260,7 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
         name: 'video',
         packaging,
         ...(cmaf ? { initRef: 'v0' } : {}),
+        ...locmaf,
         isLive: true,
         role: 'video',
         codec: params.videoCodec,
@@ -271,6 +275,7 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
         name: 'audio',
         packaging,
         ...(cmaf ? { initRef: 'a0' } : {}),
+        ...locmaf,
         isLive: true as const,
         role: 'audio' as const,
         codec: 'opus',

@@ -349,10 +349,11 @@
 
       <label for="s-packaging">Packaging</label>
       <select id="s-packaging">
-        <option value="loc">LOC (default)</option>
-        <option value="cmaf">CMAF (CMSF)</option>
+        <option value="loc">LOC/MSF (default)</option>
+        <option value="cmaf">CMAF/CMSF</option>
+        <option value="locmaf">LOCMAF/CMSF</option>
       </select>
-      <div class="hint">LOC: encode/decode via WebCodecs. CMAF: fMP4 fragments, render via MSE.</div>
+      <div class="hint">LOC: encode/decode via WebCodecs. CMAF: fMP4 fragments, render via MSE. LOCMAF: CMAF with compact headers; audio on streams.</div>
 
       <label for="s-catalog-interval">Catalog refresh interval (ms)</label>
       <input id="s-catalog-interval" type="number" min="0" placeholder="0">
