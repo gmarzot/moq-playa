@@ -295,6 +295,21 @@ describe('handlePipelineEvent', () => {
     }));
   });
 
+  it('an audio skip_forward keeps the sync reference', () => {
+    const syncController = { reset: vi.fn() };
+    const setSyncReset = vi.fn();
+    const recordDiagnostic = vi.fn();
+    handlePipelineEvent('audio', { type: 'skip_forward', fromGroupId: 40n, toGroupId: 42n }, {
+      emitEvent: vi.fn(), log: mockLog, syncController: syncController as any,
+      syncResetThisTick: false, setSyncResetThisTick: setSyncReset, recordDiagnostic,
+      recoveryHook: (a: RecoveryAction) => a,
+    });
+    expect(syncController.reset).not.toHaveBeenCalled();
+    expect(setSyncReset).not.toHaveBeenCalled();
+    expect(recordDiagnostic).toHaveBeenCalledWith('skip_forward');
+    expect(recordDiagnostic).not.toHaveBeenCalledWith('sync_reset');
+  });
+
   it('does not double-reset sync within same tick', () => {
     const emitEvent = vi.fn();
     const syncController = { reset: vi.fn() };

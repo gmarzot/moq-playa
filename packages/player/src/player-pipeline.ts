@@ -456,7 +456,8 @@ export function handlePipelineEvent(
     case 'skip_forward':
       ctx.recordDiagnostic?.('skip_forward');
       ctx.log.warn('Skip forward %s group=%s→%s', mediaType, evt.fromGroupId, evt.toGroupId);
-      if (!ctx.syncResetThisTick && ctx.syncController) {
+      // Skipping a lost audio frame leaves the timeline where it was.
+      if (mediaType === 'video' && !ctx.syncResetThisTick && ctx.syncController) {
         ctx.syncController.reset();
         ctx.setSyncResetThisTick(true);
         ctx.recordDiagnostic?.('sync_reset');
