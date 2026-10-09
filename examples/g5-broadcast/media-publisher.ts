@@ -83,6 +83,11 @@ export const CMAF_AUDIO_TRACK_ID = 2;
 /** Fallbacks when the encoder reports no duration: 30 fps, a 20 ms Opus frame. */
 const DEFAULT_VIDEO_FRAME_US = 33_333;
 const DEFAULT_AUDIO_FRAME_US = 20_000;
+/** Room left under MSE's discontinuity threshold (decode delta > 2 x last frame duration). */
+const DECODE_DELTA_MARGIN_US = 100n;
+/** A longer decode gap is a pause, resumed at a keyframe; shorter ones are clamped. */
+const DECODE_CLAMP_MAX_US = 1_000_000n;
+
 /** Longest LOCMAF audio group when no video group starts meanwhile. */
 const LOCMAF_AUDIO_GROUP_MAX_US = 2_000_000n;
 
@@ -263,6 +268,8 @@ export class MediaPublisher {
   private lastVideoCaptureUs: bigint | null = null;
   /** Recent video capture intervals (µs), for the CMAF frame duration. */
   private readonly videoIntervalsUs: number[] = [];
+  /** Decode time and duration of the previous CMAF video chunk. */
+  private lastVideoDecode: { decodeUs: bigint; durationUs: number } | null = null;
   private readonly onKeyframeNeeded: (() => void) | null;
   private readonly onStatus: ((track: 'video' | 'audio', message: string) => void) | null;
   /** Largest (group, object) sent per track; Largest Location for a resume. */
@@ -735,6 +742,19 @@ export class MediaPublisher {
   }
 
   /**
+   * MSE drops video to the next keyframe when a decode delta exceeds twice the
+   * previous frame's duration, which one skipped camera frame plus jitter does.
+   * The delta stays just under that; after a longer capture stall the decode
+   * timeline catches up over the following frames. Pauses (over 1 s) keep their gap.
+   */
+  private clampVideoDecode(decodeUs: bigint): bigint {
+    const prev = this.lastVideoDecode;
+    if (prev === null || decodeUs - prev.decodeUs > DECODE_CLAMP_MAX_US) return decodeUs;
+    const limit = prev.decodeUs + 2n * BigInt(prev.durationUs) - DECODE_DELTA_MARGIN_US;
+    return decodeUs > limit ? limit : decodeUs;
+  }
+
+  /**
    * One LOCMAF audio chunk on the open audio group. A group starts with the
    * next video group (joint tune-in), a new subscription, a failure, or after
    * {@link LOCMAF_AUDIO_GROUP_MAX_US} without video.
@@ -1022,10 +1042,14 @@ export class MediaPublisher {
     const sorted = [...this.videoIntervalsUs].sort((a, b) => a - b);
     const duration = meta.durationUs && meta.durationUs > 0 ? meta.durationUs
       : sorted.length > 0 ? sorted[sorted.length >> 1]! : DEFAULT_VIDEO_FRAME_US;
+    const decodeUs = this.clampVideoDecode(
+      this.locmaf ? this.onDecodeTimeline('video', captureUs, duration) : captureUs);
+    if (this.locmaf) this.nextDecodeUs.video = decodeUs + BigInt(duration);
+    this.lastVideoDecode = { decodeUs, durationUs: duration };
     return buildChunk({
       trackId: CMAF_VIDEO_TRACK_ID,
       sequence: ++this.cmafVideoSequence,
-      baseDecodeTime: this.locmaf ? this.onDecodeTimeline('video', captureUs, duration) : captureUs,
+      baseDecodeTime: decodeUs,
       duration,
       keyframe: meta.isKeyframe,
       data,

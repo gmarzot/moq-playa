@@ -377,6 +377,41 @@ describe('MediaPublisher — CMAF packaging', () => {
     expect(sent.payload[sent.payload.length - 1]).toBe(9);
   });
 
+  /** Decode-time steps between the sent video chunks. */
+  const decodeSteps = (sends: SendRecord[]) => {
+    const d = sends.map((s) => readBaseMediaDecodeTime(s.payload)!);
+    return d.slice(1).map((t, i) => Number(t - d[i]!));
+  };
+  const publishFrames = async (stamps: number[]) => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    stamps.forEach((timestampUs, i) =>
+      pub.publishVideo(chunk(i), { isKeyframe: i === 0, timestampUs, durationUs: 41_700 }));
+    await settle();
+    return conn;
+  };
+
+  it('keeps one skipped frame under MSE\'s discontinuity threshold (twice the last duration)', async () => {
+    const conn = await publishFrames([0, 41_700, 83_400, 167_400, 209_100]);
+    expect(decodeSteps(conn.sends)).toEqual([41_700, 41_700, 83_300, 42_400]);
+  });
+
+  it('catches up after a capture stall over the following frames, never past the threshold', async () => {
+    const stamps = [0, 41_700, 83_400, ...Array.from({ length: 15 }, (_, i) => 541_400 + i * 41_700)];
+    const conn = await publishFrames(stamps);
+    const steps = decodeSteps(conn.sends);
+    expect(Math.max(...steps)).toBeLessThanOrEqual(83_300);
+    const first = readBaseMediaDecodeTime(conn.sends[0]!.payload)!;
+    const last = readBaseMediaDecodeTime(conn.sends.at(-1)!.payload)!;
+    expect(Number(last - first)).toBe(stamps.at(-1));
+  });
+
+  it('keeps a pause (over 1 s) as a real gap', async () => {
+    const conn = await publishFrames([0, 41_700, 1_541_700]);
+    expect(decodeSteps(conn.sends)).toEqual([41_700, 1_500_000]);
+  });
+
   it('leaves LOC payloads as the encoded frame', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn);
@@ -459,6 +494,12 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     expect(locmaf.pub.locmafHeaders).toEqual({ full: 1, delta: 2 });
     const [d0, d1, d2] = decodeStarts(locmaf.conn.sends, videoInit);
     expect([d1! - d0!, d2! - d1!]).toEqual([40_000n, 40_000n]);
+  });
+
+  it('keeps a skipped frame under MSE\'s discontinuity threshold on the LOCMAF timeline too', async () => {
+    const { locmaf } = await publishBoth([frame(true, 0), frame(false, 40_000), frame(false, 120_100)]);
+    const [d0, d1, d2] = decodeStarts(locmaf.conn.sends, videoInit);
+    expect([d1! - d0!, d2! - d1!]).toEqual([40_000n, 79_900n]);
   });
 
   it('snaps back to capture time past half a frame, with a full header', async () => {
