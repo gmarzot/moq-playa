@@ -23,6 +23,9 @@ const showStatus = new URLSearchParams(location.search).get('status') === '1';
 /** `?compat=`: opt-in interop for a non-conformant relay (shared/compat.ts). */
 const compatParam = parseCompat(new URLSearchParams(location.search).get('compat'));
 
+/** `?locmaf=frame`: LOCMAF tracks through WebCodecs instead of MSE (the default). */
+const locmafFrame = new URLSearchParams(location.search).get('locmaf') === 'frame';
+
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
   const v = Number(new URLSearchParams(location.search).get('catchUp'));
@@ -238,6 +241,7 @@ async function main(): Promise<void> {
     ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),
     ...(debug ? { logLevel: 'debug' as const } : {}),
     ...(compatParam.compat.length ? { compat: compatParam.compat } : {}),
+    ...(locmafFrame ? { locmafDecoding: 'frame' as const } : {}),
     // SUB_NS: report the namespace and re-establish when it is published again.
     followNamespace: true,
   };
@@ -1384,10 +1388,11 @@ async function main(): Promise<void> {
     // The engine runs at the URL override when one is given.
     targetLatencyMs = targetLatencyOverrideMs ?? Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
-    const packagings = [...new Set(tracks.map((t) => t.packaging))].join(', ');
+    const packagings = [...new Set(tracks.map((t) => (t.packaging === 'locmaf' && t.locmafVersion
+      ? `locmaf ${t.locmafVersion}` : t.packaging)))].join(', ');
     // Same header shape as the broadcaster's catalog panel.
     catMeta.textContent = packagings
-      ? `${packagings} (v${cat?.version ?? '?'})` : `v${cat?.version ?? '?'}`;
+      ? `v${cat?.version ?? '?'} · ${packagings}` : `v${cat?.version ?? '?'}`;
 
     // Display order only; the catalog keeps its published order.
     const ordered = [...tracks].sort((a, b) => trackRank(a.role ?? a.name) - trackRank(b.role ?? b.name));
