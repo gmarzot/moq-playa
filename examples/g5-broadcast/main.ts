@@ -721,7 +721,36 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   const captureAnchorUs = new Map<'video' | 'audio', number>();
   const captureMinUs = new Map<'video' | 'audio', number>();
   const encoderQueuePeak = { video: 0, audio: 0 };
+  // Camera frames about two frames apart or more, or whose stamp does not
+  // advance, are logged; at most one line a second.
+  let lastVideoCaptureUs: number | null = null;
+  let videoFrameUs: number | null = null;
+  let videoGapLoggedMs = 0;
+  let videoGapsUnlogged = 0;
+  const noteVideoCaptureGap = (timestampUs: number): void => {
+    const prev = lastVideoCaptureUs;
+    lastVideoCaptureUs = timestampUs;
+    if (prev === null) return;
+    const deltaUs = timestampUs - prev;
+    const frameUs = videoFrameUs;
+    // Typical spacing, learned from ordinary intervals only.
+    if (deltaUs > 0 && (frameUs === null || deltaUs < 1.5 * frameUs)) {
+      videoFrameUs = frameUs === null ? deltaUs : frameUs + (deltaUs - frameUs) / 32;
+    }
+    if (frameUs === null || (deltaUs > 0 && deltaUs < 1.8 * frameUs)) return;
+    const nowMs = performance.now();
+    if (nowMs - videoGapLoggedMs < 1000) {
+      videoGapsUnlogged++;
+      return;
+    }
+    log(`Capture ${deltaUs > 0 ? 'gap' : 'stamp did not advance'}: video frames ${(deltaUs / 1000).toFixed(1)}ms apart`
+      + ` (typical ${(frameUs / 1000).toFixed(1)}ms)`
+      + (videoGapsUnlogged > 0 ? ` · ${videoGapsUnlogged} more since the last line` : ''));
+    videoGapLoggedMs = nowMs;
+    videoGapsUnlogged = 0;
+  };
   const noteCapture = (track: 'video' | 'audio', timestampUs: number, queueDepth: number): void => {
+    if (track === 'video') noteVideoCaptureGap(timestampUs);
     const gapUs = Date.now() * 1000 - timestampUs;
     if (!captureAnchorUs.has(track)) captureAnchorUs.set(track, gapUs);
     const min = captureMinUs.get(track);

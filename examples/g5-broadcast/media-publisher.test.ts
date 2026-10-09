@@ -341,6 +341,22 @@ describe('MediaPublisher — CMAF packaging', () => {
     expect(sent.payload[sent.payload.length - 1]).toBe(7);
   });
 
+  it('gives a video frame the median recent capture interval, not the last one', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    // 24 fps, then a frame 4 ms after the last (burst), then one after a skipped frame.
+    const stamps = [0, 41_700, 83_400, 125_100, 129_100, 208_500];
+    stamps.forEach((timestampUs, i) => pub.publishVideo(chunk(i), { isKeyframe: i === 0, timestampUs }));
+    await settle();
+
+    const durations = conn.sends.map((s) => {
+      const [r] = readSegmentTimeRanges(s.payload)!;
+      return Number(r!.endTime - r!.startTime);
+    });
+    expect(durations).toEqual([33_333, 41_700, 41_700, 41_700, 41_700, 41_700]);
+  });
+
   it('wraps an audio chunk the same way, one per group', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });

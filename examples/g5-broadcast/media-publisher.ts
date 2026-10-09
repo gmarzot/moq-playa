@@ -244,6 +244,8 @@ export class MediaPublisher {
   private cmafAudioSequence = 0;
   /** Previous video decode time, for a duration when the encoder gives none. */
   private lastVideoCaptureUs: bigint | null = null;
+  /** Recent video capture intervals (µs), for the CMAF frame duration. */
+  private readonly videoIntervalsUs: number[] = [];
   private readonly onKeyframeNeeded: (() => void) | null;
   private readonly onStatus: ((track: 'video' | 'audio', message: string) => void) | null;
   /** Largest (group, object) sent per track; Largest Location for a resume. */
@@ -870,13 +872,22 @@ export class MediaPublisher {
     this.noteAudioSent(chunk.byteLength, groupId);
   }
 
-  /** One CMAF chunk around an encoded video frame, decode time = capture time. */
+  /**
+   * One CMAF chunk around an encoded video frame, decode time = capture time.
+   * Without an encoder duration, a frame lasts the median recent capture
+   * interval: one odd interval (a skipped frame, a burst) is not a frame's length.
+   */
   private cmafVideoChunk(data: Uint8Array, meta: VideoChunkMeta, captureUs: bigint): Uint8Array {
     const last = this.lastVideoCaptureUs;
     this.lastVideoCaptureUs = captureUs;
     const sinceLast = last === null ? 0 : Number(captureUs - last);
+    if (sinceLast > 0 && sinceLast < 1_000_000) {
+      this.videoIntervalsUs.push(sinceLast);
+      if (this.videoIntervalsUs.length > 15) this.videoIntervalsUs.shift();
+    }
+    const sorted = [...this.videoIntervalsUs].sort((a, b) => a - b);
     const duration = meta.durationUs && meta.durationUs > 0 ? meta.durationUs
-      : sinceLast > 0 && sinceLast < 1_000_000 ? sinceLast : DEFAULT_VIDEO_FRAME_US;
+      : sorted.length > 0 ? sorted[sorted.length >> 1]! : DEFAULT_VIDEO_FRAME_US;
     return buildChunk({
       trackId: CMAF_VIDEO_TRACK_ID,
       sequence: ++this.cmafVideoSequence,
