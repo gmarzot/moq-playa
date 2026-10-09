@@ -1409,7 +1409,7 @@ describe('CmafAssembler — audio decode order', () => {
     }
   });
 
-  it('holds as long as the buffered audio allows, less one frame', () => {
+  it('holds until the buffered audio falls to the 150 ms release margin', () => {
     vi.useFakeTimers();
     try {
       const { assembler, push, emitted } = setup(() => 200);
@@ -1420,8 +1420,9 @@ describe('CmafAssembler — audio decode order', () => {
       expect(emitted()).toEqual([0, 1, 2, 3]);
       expect(assembler.audioOrderStats).toMatchObject({ restored: 1, missing: 0, late: 0 });
 
+      // A frame that never arrives is skipped with 150 ms still buffered.
       [5].forEach(push);
-      vi.advanceTimersByTime(200 - FRAME_MS - 1);
+      vi.advanceTimersByTime(200 - 150 - 1);
       expect(emitted()).toEqual([0, 1, 2, 3]);
       vi.advanceTimersByTime(2);
       expect(emitted()).toEqual([0, 1, 2, 3, 5]);

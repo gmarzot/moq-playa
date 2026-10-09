@@ -75,8 +75,8 @@ export interface CmafAssemblerOptions {
   readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
   /**
    * Audio buffered ahead of the playhead (ms), or null when unknown. Held
-   * audio may wait until the playhead would reach the gap, less one frame;
-   * without it the wait is one frame.
+   * audio may wait until that depth falls to the release margin; without it
+   * the wait is one frame.
    */
   readonly audioAheadMs?: () => number | null;
   /** Video buffered ahead of the playhead (ms), or null when unknown; as for audio. */
@@ -285,6 +285,8 @@ export class CmafAssembler {
 
   /** How many startup fragments per media type carry a debug timing log. */
   private static readonly STARTUP_DIAG_COUNT = 5;
+  /** Buffered depth at which a hold gives up: Chrome reports `waiting` with ~100 ms still ahead. */
+  private static readonly HOLD_RELEASE_MARGIN_MS = 150;
   private diagVideoCount = 0;
   private diagAudioCount = 0;
 
@@ -617,9 +619,9 @@ export class CmafAssembler {
   }
 
   /**
-   * The head of the held segments waits until the playhead would reach the
-   * gap, less one frame of margin; at least one frame, and one frame when the
-   * buffered depth is unknown.
+   * The head of the held segments waits until the buffered depth ahead of the
+   * playhead falls to the release margin; at least one frame, and one frame
+   * when the depth is unknown.
    */
   private armHeldTimer(mediaType: 'video' | 'audio'): void {
     const o = this.order[mediaType];
@@ -628,7 +630,9 @@ export class CmafAssembler {
     const head = o.held[0]!;
     const frameMs = (Number(head.end - head.start) * 1000) / timescale;
     const aheadMs = (mediaType === 'video' ? this.videoAheadMs : this.audioAheadMs)?.() ?? null;
-    const ms = aheadMs === null ? frameMs : Math.max(frameMs, aheadMs - frameMs);
+    const ms = aheadMs === null
+      ? frameMs
+      : Math.max(frameMs, aheadMs - CmafAssembler.HOLD_RELEASE_MARGIN_MS);
     o.timer = setTimeout(() => {
       o.timer = null;
       this.releaseHeld(mediaType, true);
