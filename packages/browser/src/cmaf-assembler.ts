@@ -105,10 +105,13 @@ interface DecodeOrder {
   resumed: boolean;
   /** Group of the newest segment emitted. */
   lastGroup: bigint | null;
+  /** Latest decode start emitted. */
+  lastStart: bigint | null;
 }
 
 const newDecodeOrder = (): DecodeOrder => ({
   held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0 }, resumed: false, lastGroup: null,
+  lastStart: null,
 });
 
 /**
@@ -561,11 +564,15 @@ export class CmafAssembler {
       this.emitSegment(mediaType, segment, trackName, groupId);
       return;
     }
-    if (span.end <= emittedEnd) {
+    // Video is late when it starts before the latest start emitted (MSE would
+    // drop video to the next keyframe); in-order video ending early only overlaps.
+    const late = mediaType === 'audio'
+      ? span.end <= emittedEnd
+      : o.lastStart !== null && span.start < o.lastStart;
+    if (late) {
       o.stats.late++;
       const lateMs = (Number(emittedEnd - span.start) * 1000) / timescale;
       if (lateMs > o.stats.worstLateMs) o.stats.worstLateMs = lateMs;
-      // Video appended behind the emitted end makes MSE drop video until the next keyframe.
       if (mediaType === 'audio') this.emitSegment(mediaType, segment, trackName, groupId);
       return;
     }
@@ -670,6 +677,11 @@ export class CmafAssembler {
     const ranges = readSegmentTimeRanges(output, trex ?? undefined);
     this.onSegment(mediaType, output, trackName, groupId);
     if (ranges !== null && ranges.length > 0) {
+      const start = ranges.reduce(
+        (min, range) => range.startTime < min ? range.startTime : min,
+        ranges[0]!.startTime,
+      );
+      if (o.lastStart === null || start > o.lastStart) o.lastStart = start;
       const end = ranges.reduce(
         (max, range) => range.endTime > max ? range.endTime : max,
         ranges[0]!.endTime,
@@ -719,6 +731,7 @@ export class CmafAssembler {
     for (const o of Object.values(this.order)) {
       o.resumed = false;
       o.lastGroup = null;
+      o.lastStart = null;
     }
     this.videoEpoch = null;
     this.audioEpoch = null;

@@ -1,7 +1,8 @@
 /**
  * CmafAssembler video decode order: a group's late tail is placed before the
- * next group's keyframe, a skip inside a group is not held, and video already
- * behind the emitted end is dropped rather than appended.
+ * next group's keyframe, a skip inside a group is not held, video that starts
+ * before what was emitted is dropped rather than appended, and in-order video
+ * that ends early is kept.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { CmafAssembler } from './cmaf-assembler.js';
@@ -149,11 +150,23 @@ describe('CmafAssembler — video decode order', () => {
       expect(emitted()).toEqual([0, 1]);
       vi.advanceTimersByTime(2);
       expect(emitted()).toEqual([0, 1, 3]);
-      push(2, 0);            // behind the emitted end: appending it would cost the group
+      push(2, 0);            // starts before frame 3: appending it would cost the group
       expect(emitted()).toEqual([0, 1, 3]);
       expect(assembler.videoOrderStats).toMatchObject({ restored: 0, missing: 1, late: 1 });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('appends an in-order frame that ends inside a longer previous frame', () => {
+    const { assembler, emitted } = setup();
+    const pushSpan = (start: number, duration: number, seq: number) => assembler.push('video', 'video0', 0n,
+      concat(buildMoof(start, seq, duration), buildMdat(new Uint8Array([seq]))));
+    pushSpan(0, FRAME, 1);
+    pushSpan(FRAME, 3 * FRAME, 2);   // after a capture hiccup: a long duration
+    pushSpan(2 * FRAME, FRAME, 3);   // on time, ends inside the previous frame
+    pushSpan(3 * FRAME, FRAME, 4);
+    expect(emitted()).toEqual([0, 1, 2, 3]);
+    expect(assembler.videoOrderStats).toMatchObject({ restored: 0, missing: 0, late: 0 });
   });
 });
