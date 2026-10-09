@@ -591,6 +591,11 @@ async function main(): Promise<void> {
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
       cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
         FAULT(s.stallCount ?? 0)),
+      // MSE: video holes playback ran through — the picture froze while audio
+      // played on, so no stall was reported.
+      ...(!locPath ? [
+        cell('freezes', `${videoFreezes} (${videoFrozenSec.toFixed(1)}s)`, '', FAULT(videoFreezes)),
+      ] : []),
     ].join('');
   });
 
@@ -914,7 +919,10 @@ async function main(): Promise<void> {
   let traceJumpAtMs = -Infinity;
   // Holes between buffered video ranges at or ahead of the playhead, and
   // whether the trace saw the input jump or reorder just before.
-  let knownVideoHoles = new Set<string>();
+  const videoHolesSeen = new Map<string, [number, number]>();
+  /** Holes the playhead ran through, and their total length. */
+  let videoFreezes = 0;
+  let videoFrozenSec = 0;
   const noteVideoHoles = (ms: any): void => {
     const ranges: Array<[number, number]> | undefined = ms?.bufferedRanges?.('video');
     const video = playerContainer.querySelector('video');
@@ -927,14 +935,23 @@ async function main(): Promise<void> {
       if (b < t - 1) continue;
       const key = `${a.toFixed(2)}-${b.toFixed(2)}`;
       holes.add(key);
-      if (knownVideoHoles.has(key)) continue;
+      if (videoHolesSeen.has(key)) continue;
+      videoHolesSeen.set(key, [a, b]);
       const input = performance.now() - traceJumpAtMs < 5000
         ? 'the trace saw the input jump or reorder within 5 s'
         : 'input contiguous per trace';
       log(`MSE video hole [${a.toFixed(2)}–${b.toFixed(2)}] (${Math.round((b - a) * 1000)}ms) `
         + `at t=${t.toFixed(2)} · ${input}${describeBuffers()}`);
     }
-    knownVideoHoles = holes;
+    for (const [key, [a, b]] of videoHolesSeen) {
+      if (t >= b) {
+        videoFreezes++;
+        videoFrozenSec += b - a;
+        videoHolesSeen.delete(key);
+      } else if (!holes.has(key)) {
+        videoHolesSeen.delete(key); // filled before playback reached it
+      }
+    }
   };
   const traceLog = (msg: string): void => {
     const nowMs = performance.now();
