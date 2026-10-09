@@ -104,8 +104,9 @@ export class SubscriptionManager {
 
   /**
    * Callback: LOCMAF object (a compacted CMAF chunk) for reconstruction.
-   * Called with (mediaType, trackName, object) after objectTransform. No LOC
-   * header parsing — LOCMAF carries its fields in the object payload.
+   * Called with (mediaType, trackName, object, headers) after objectTransform.
+   * LOCMAF carries its fields in the object payload; the object properties are
+   * transport annotations only, as for CMAF.
    * @see draft-einarsson-moq-locmaf-01 §7 (Object Encoding)
    */
   onLocmafObject:
@@ -113,6 +114,7 @@ export class SubscriptionManager {
         mediaType: 'video' | 'audio' | 'eventtimeline',
         trackName: string,
         obj: MoqtObject,
+        headers: LocHeaders,
       ) => void)
     | null = null;
 
@@ -230,8 +232,8 @@ export class SubscriptionManager {
    * 2. Apply objectTransform (E2EE insertion point)
    * 3. Branch on packaging:
    *    - LOC: Parse LOC headers → onObject callback
-   *    - CMAF: Skip header parsing → onCmafObject callback
-   *    - LOCMAF: Skip header parsing → onLocmafObject callback
+   *    - CMAF: Parse properties leniently → onCmafObject callback
+   *    - LOCMAF: Parse properties leniently → onLocmafObject callback
    *    - mediatimeline: raw JSON → onTimelineObject callback
    *    - eventtimeline: raw JSON → onEventTimelineObject callback
    *
@@ -295,15 +297,6 @@ export class SubscriptionManager {
         if (!transformed) return; // Transform dropped the object
       }
 
-      if (info.packaging === 'locmaf') {
-        // LOCMAF path: skip LOC header parsing; the payload is a LOCMAF Object.
-        // An event-only track (§14) is registered as 'eventtimeline' and takes
-        // the same path; the player dispatches on the media type.
-        // @see draft-einarsson-moq-locmaf-01 §7, §15
-        this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
-        return;
-      }
-
       // Object properties ride LOC and CMAF: LOC needs them to decode,
       // CMAF carries its own payload timing but still reports transport
       // annotations (capture timestamp, frame marking) through them.
@@ -323,14 +316,21 @@ export class SubscriptionManager {
       const parse = this.extensionParser
         ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
 
-      if (info.packaging === 'cmaf') {
-        // CMAF carries its own timing: a malformed property block loses the
-        // annotations, not the track.
+      if (info.packaging === 'cmaf' || info.packaging === 'locmaf') {
+        // CMAF and LOCMAF carry their own timing: a malformed property block
+        // loses the annotations, not the track.
         let headers: ReturnType<typeof parse>;
         try { headers = parse(extensions); } catch { headers = {}; }
-        // §3.3: payload contains moof+mdat pairs — routed to MediaSource
-        // rather than the decode pipeline.
-        this.onCmafObject?.(mediaType, info.trackName, transformed, headers);
+        if (info.packaging === 'locmaf') {
+          // An event-only track (§14) is registered as 'eventtimeline' and takes
+          // the same path; the player dispatches on the media type.
+          // @see draft-einarsson-moq-locmaf-01 §7, §15
+          this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, headers);
+        } else {
+          // §3.3: payload contains moof+mdat pairs — routed to MediaSource
+          // rather than the decode pipeline.
+          this.onCmafObject?.(mediaType, info.trackName, transformed, headers);
+        }
       } else {
         this.onObject?.(mediaType, info.trackName, transformed, parse(extensions));
       }

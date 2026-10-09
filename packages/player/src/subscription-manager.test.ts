@@ -507,22 +507,26 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.objectContaining({ kind: 'data' }),
+      expect.anything(),
     );
     expect(onCmafObject).not.toHaveBeenCalled();
     expect(onObject).not.toHaveBeenCalled();
   });
 
-  it('locmaf objects skip LOC header parsing (a custom extensionParser is never invoked)', async () => {
+  it('locmaf object properties are annotations: parsed, and a malformed block loses only them', async () => {
     const mgr = new SubscriptionManager();
-    const parser = vi.fn();
-    mgr.extensionParser = parser;
-    mgr.onLocmafObject = vi.fn();
+    const onLocmafObject = vi.fn();
+    mgr.onLocmafObject = onLocmafObject;
     mgr.registerTrack(1n, 'video', 'video', 'locmaf');
 
+    mgr.extensionParser = () => ({ captureTimestamp: 123n });
     await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1) }));
+    expect(onLocmafObject).toHaveBeenLastCalledWith('video', 'video', expect.anything(), { captureTimestamp: 123n });
 
-    expect(parser).not.toHaveBeenCalled();
-    expect(mgr.onLocmafObject).toHaveBeenCalledTimes(1);
+    mgr.extensionParser = () => { throw new Error('malformed property block'); };
+    await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1) }));
+    expect(onLocmafObject).toHaveBeenCalledTimes(2);
+    expect(onLocmafObject).toHaveBeenLastCalledWith('video', 'video', expect.anything(), {});
   });
 
   it('objectTransform applies to locmaf objects before routing, and null drops them', async () => {
@@ -537,6 +541,7 @@ describe('SubscriptionManager', () => {
       'audio',
       'audio',
       expect.objectContaining({ payload: new Uint8Array([0xCA, 0xFE]) }),
+      expect.anything(),
     );
 
     mgr.objectTransform = () => null;
@@ -561,7 +566,7 @@ describe('SubscriptionManager', () => {
     await mgr.routeObject(0n, createMockObject({ trackAlias: varint(3) }));
 
     expect(onLocmafObject).toHaveBeenCalledTimes(1);
-    expect(onLocmafObject).toHaveBeenCalledWith('video', 'video', expect.anything());
+    expect(onLocmafObject).toHaveBeenCalledWith('video', 'video', expect.anything(), expect.anything());
     expect(onObject).toHaveBeenCalledTimes(1);
     expect(onObject).toHaveBeenCalledWith('audio', 'audio', expect.anything(), expect.anything());
     expect(onCmafObject).toHaveBeenCalledTimes(1);

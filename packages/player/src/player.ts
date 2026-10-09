@@ -1356,7 +1356,12 @@ export class MoqtPlayer {
    * sample flags), never on object ids.
    * @see draft-einarsson-moq-locmaf-01 §3, §9, §15, §16
    */
-  private onLocmafMediaObject(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, obj: MoqtObject): void {
+  private onLocmafMediaObject(
+    mediaType: 'video' | 'audio' | 'eventtimeline',
+    trackName: string,
+    obj: MoqtObject,
+    headers: LocHeaders = {},
+  ): void {
     if (mediaType === 'eventtimeline') {
       this.onLocmafEventObject(trackName, obj);
       return;
@@ -1382,7 +1387,9 @@ export class MoqtPlayer {
       objectId: BigInt(obj.objectId),
       kind: obj.kind,
       ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
+      ...(obj.kind === 'data' && obj.extensions ? { extensions: obj.extensions } : {}),
       ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+      ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
     });
 
     if (this.stateMachine.state === PlayerState.PAUSED) return;
@@ -2613,8 +2620,8 @@ export class MoqtPlayer {
 
     // Wire LOCMAF object delivery → reconstruction into CMAF chunks → assembler.
     // @see draft-einarsson-moq-locmaf-01 §15, §16
-    this.subscriptionManager.onLocmafObject = (mediaType, trackName, obj) => {
-      this.onLocmafMediaObject(mediaType, trackName, obj);
+    this.subscriptionManager.onLocmafObject = (mediaType, trackName, obj, headers) => {
+      this.onLocmafMediaObject(mediaType, trackName, obj, headers);
     };
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)

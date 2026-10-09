@@ -20,6 +20,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { ObjectStatus, varint } from '@openmoq/transport';
+import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
 import { LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject, ticksToMicros } from '@openmoq/locmaf';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
@@ -138,6 +139,29 @@ function sendLocmaf(adapter: any, alias: unknown, groupId: number, objectId: num
 const nal = (type: number, ...body: number[]) => Uint8Array.of(0, 0, 0, 1 + body.length, type, ...body);
 const IDR = nal(5, 0x88, 0x84);
 const P_SLICE = nal(1, 0x9a, 0x10);
+
+describe('LOCMAF object annotations', () => {
+  it('a capture timestamp property reaches media_object, as for CMAF', async () => {
+    const init = videoInit();
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
+    );
+    try {
+      const seen: any[] = [];
+      h.player.on('media_object', (e) => seen.push(e));
+      const chunk = buildChunk({ bmdt: 90000, samples: [{ duration: 3000, size: IDR.length, flags: SYNC_FLAGS }], mdat: IDR });
+      h.adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: await h.reqIdFor('video'), groupId: varint(5), subgroupId: varint(0),
+        objectId: varint(0), payload: serializeLocmafObject({ kind: 'rawBoxes', boxes: chunk }), publisherPriority: 128,
+        extensions: encodeLocHeaders({ captureTimestamp: 1_759_000_000_123_456n }, { wireProfile: locWireProfileForDraft(16) }),
+      } as MoqtObject);
+      await vi.waitFor(() => expect(seen.some((e) => e.mediaType === 'video')).toBe(true));
+      expect(seen.find((e) => e.mediaType === 'video').captureTimestamp).toBe(1_759_000_000_123_456n);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+});
 
 describe('LOCMAF frame-path regressions', () => {
   it.each(['valid', 'wrong track', 'sample outside mdat'])(
