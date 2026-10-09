@@ -193,6 +193,8 @@ export class CatalogBootstrap {
   /** The joining fetch failed before SUBSCRIBE_OK; its Largest picks the next rung. */
   private awaitingSubscribeOk = false;
   private deferredJoinError: 'invalid-range' | 'refused' | 'timeout' | null = null;
+  /** The join was re-sent once after SUBSCRIBE_OK. */
+  private joinRetried = false;
 
   /** The group whose independent base is currently applied, and per-group
    *  applied-head bookkeeping for the group-aware delta rule. */
@@ -293,6 +295,12 @@ export class CatalogBootstrap {
           this.replayHeldLive();
         } else if (deferred === 'refused' && largest === null && !this.subscriptionOver()) {
           this.awaitFirstLiveBase();
+        } else if (largest !== null && !this.joinRetried) {
+          // Streams are unordered: the relay may see the join before the SUBSCRIBE
+          // it references. It knows the subscription now, so join again.
+          this.cb.log('[catalog-bootstrap] joining fetch %s before SUBSCRIBE_OK; joining again', deferred);
+          this.joinRetried = true;
+          this.beginAttempt('joining');
         } else {
           this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
         }
