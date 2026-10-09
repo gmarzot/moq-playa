@@ -143,14 +143,15 @@ function sampleEntryFieldsLength(buf: Uint8Array, entry: IsoBoxHeader, handler: 
 }
 
 /** Box types whose payload is the WebCodecs `description` verbatim. */
-const DESCRIPTION_BOXES = new Set(['avcC', 'hvcC', 'av1C', 'vpcC', 'dOps', 'dfLa']);
+const DESCRIPTION_BOXES = new Set(['avcC', 'hvcC', 'av1C', 'vpcC']);
 
 /**
  * The decoder configuration of the CMAF Header's sample entry, as a frame
  * decoder expects it: the payload of the codec configuration box for video
- * (avcC, hvcC, av1C, vpcC), of dOps for Opus and dfLa for FLAC, or the
- * DecoderSpecificInfo (the AudioSpecificConfig) of an esds for MPEG-4 audio.
- * Returns null when the Header carries no sample entry or an unknown one.
+ * (avcC, hvcC, av1C, vpcC), the Opus Identification Header rebuilt from dOps,
+ * "fLaC" and the metadata blocks of a dfLa, or the DecoderSpecificInfo (the
+ * AudioSpecificConfig) of an esds for MPEG-4 audio. Returns null when the
+ * Header carries no sample entry or an unknown one.
  *
  * Maps to `VideoDecoderConfig.description` / `AudioDecoderConfig.description`
  * (section 16, "the CMAF Header supplies the codec configuration").
@@ -182,9 +183,49 @@ export function codecDescriptionFromInit(init: Uint8Array): Uint8Array | null {
 
     for (const child of childBoxes(init, entry.contentStart + fixed, entry.end, SECTION)) {
         if (DESCRIPTION_BOXES.has(child.type)) return init.slice(child.contentStart, child.end);
+        if (child.type === 'dOps') return opusHeadFromDops(init, child);
+        if (child.type === 'dfLa') return flacDescriptionFromDfla(init, child);
         if (child.type === 'esds') return decoderSpecificInfo(init, child);
     }
     return null;
+}
+
+/**
+ * The Opus Identification Header (RFC 7845 section 5.1) a WebCodecs Opus
+ * decoder takes as its description, from a dOps box: the same fields behind
+ * the "OpusHead" magic, little-endian where dOps is big-endian.
+ */
+function opusHeadFromDops(buf: Uint8Array, dops: IsoBoxHeader): Uint8Array {
+    const view = viewOf(buf);
+    const start = dops.contentStart;
+    if (dops.end - start < 11) throw new LocmafFormatError('6', start, 'dOps shorter than 11 bytes');
+    const channels = buf[start + 1]!;
+    const family = buf[start + 10]!;
+    const tableLength = family === 0 ? 0 : 2 + channels;
+    if (dops.end - start < 11 + tableLength) {
+        throw new LocmafFormatError('6', start, 'dOps channel mapping table truncated');
+    }
+    const head = new Uint8Array(19 + tableLength);
+    const out = new DataView(head.buffer);
+    head.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64]); // "OpusHead"
+    head[8] = 1;
+    head[9] = channels;
+    out.setUint16(10, view.getUint16(start + 2), true);
+    out.setUint32(12, view.getUint32(start + 4), true);
+    out.setInt16(16, view.getInt16(start + 8), true);
+    head[18] = family;
+    head.set(buf.subarray(start + 11, start + 11 + tableLength), 19);
+    return head;
+}
+
+/** A WebCodecs FLAC description, "fLaC" and the metadata blocks, from a dfLa full box. */
+function flacDescriptionFromDfla(buf: Uint8Array, dfla: IsoBoxHeader): Uint8Array {
+    const blocks = buf.subarray(dfla.contentStart + 4, dfla.end);
+    if (blocks.length < 38) throw new LocmafFormatError('6', dfla.contentStart, 'dfLa without a STREAMINFO block');
+    const description = new Uint8Array(4 + blocks.length);
+    description.set([0x66, 0x4c, 0x61, 0x43]); // "fLaC"
+    description.set(blocks, 4);
+    return description;
 }
 
 /**
