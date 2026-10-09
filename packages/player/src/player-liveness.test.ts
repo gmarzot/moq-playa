@@ -403,6 +403,52 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('a hidden page holds the restart until visible', async () => {
+    const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+    (globalThis as any).document = doc;
+    try {
+      const adapter = createMockAdapter();
+      const { player } = await startPlaying(adapter);
+      const subscribesAtStart = adapter.subscribe.mock.calls.length;
+
+      feedVideo(adapter); // arm
+      doc.visibilityState = 'hidden';
+      await sleep(400); // starved several timeouts over
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      expect(adapter.subscribe.mock.calls.length).toBe(subscribesAtStart);
+
+      doc.visibilityState = 'visible';
+      await vi.waitFor(() => expect(adapter.requestUpdate).toHaveBeenCalled(), { timeout: 2_000 });
+      await player.destroy();
+    } finally {
+      delete (globalThis as any).document;
+    }
+  });
+
+  it('delivery that resumes once visible needs no restart', async () => {
+    const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+    (globalThis as any).document = doc;
+    let feeder: ReturnType<typeof setInterval> | undefined;
+    try {
+      const adapter = createMockAdapter();
+      const { player } = await startPlaying(adapter);
+
+      feedVideo(adapter); // arm
+      doc.visibilityState = 'hidden';
+      await sleep(400);
+
+      doc.visibilityState = 'visible';
+      feedVideo(adapter);
+      feeder = setInterval(() => feedVideo(adapter), 20);
+      await sleep(400);
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      await player.destroy();
+    } finally {
+      if (feeder) clearInterval(feeder);
+      delete (globalThis as any).document;
+    }
+  });
+
   it('livenessTimeoutMs: 0 disables monitoring entirely', async () => {
     const adapter = createMockAdapter();
     const { player } = await startPlaying(adapter, { livenessTimeoutMs: 0 });

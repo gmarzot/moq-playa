@@ -109,6 +109,14 @@ const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 const TICK_INTERVAL_MS = 16;
 const TICK_INTERVAL_US = TICK_INTERVAL_MS * 1_000;
 
+/** PUBLISH_DONE resubscribe backoff: the first retry is immediate, then doubles to the cap. */
+const PUBLISH_DONE_RETRY_BASE_MS = 1_000;
+const PUBLISH_DONE_RETRY_MAX_MS = 30_000;
+/** A subscription that lived this long before ending starts the backoff over. */
+const PUBLISH_DONE_RETRY_RESET_MS = 60_000;
+/** Poll cadence for a retry parked while the document is hidden. */
+const HIDDEN_RETRY_POLL_MS = 1_000;
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /** Catalog track name per MSF §5.1.10. */
@@ -865,6 +873,13 @@ export class MoqtPlayer {
     attempts: number;
     active: boolean;
     cancelled: boolean;
+  }>();
+
+  /** PUBLISH_DONE resubscribe backoff per track name; at most one pending retry each. */
+  private readonly publishDoneRetries = new Map<string, {
+    attempts: number;
+    lastDoneAtMs: number;
+    timer: ReturnType<typeof setTimeout> | null;
   }>();
 
   /**
@@ -5480,6 +5495,10 @@ export class MoqtPlayer {
     // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
     // never emit MEDIA_STARVED for an intentional teardown) and disarm.
     for (const restart of this.livenessRestarts.values()) restart.cancelled = true;
+    for (const retry of this.publishDoneRetries.values()) {
+      if (retry.timer !== null) clearTimeout(retry.timer);
+    }
+    this.publishDoneRetries.clear();
     this.livenessMonitor?.clear();
     this.subgroupStreamAliases.clear();
     this.pendingMediaSubs.clear();
@@ -6548,12 +6567,18 @@ export class MoqtPlayer {
         // uses 0x5 (§15.10.3), draft-14/16 use 0x6 (§13.4.3). On draft-18, 0x6 is
         // EXPIRED, so comparing against the wrong table would both miss real
         // TOO_FAR_BEHIND and mis-fire recovery on EXPIRED.
-        const tooFarBehind = this.connection?.draftVersion === 18
-          ? PublishDoneCode18.TOO_FAR_BEHIND
-          : PublishDoneCode.TOO_FAR_BEHIND;
-        if (statusCode === BigInt(tooFarBehind)) {
-          this.log.warn('PUBLISH_DONE(TOO_FAR_BEHIND) "%s": resubscribing from live edge', trackName);
-          this.replaceSubscription(trackName, 'too_far_behind');
+        const d18 = this.connection?.draftVersion === 18;
+        const tooFarBehind = BigInt(d18 ? PublishDoneCode18.TOO_FAR_BEHIND : PublishDoneCode.TOO_FAR_BEHIND);
+        // INTERNAL_ERROR and EXCESSIVE_LOAD end a live subscription on a send-side
+        // condition (e.g. no stream credit toward us), not the end of the track.
+        const retriable = statusCode === tooFarBehind
+          || statusCode === BigInt(PublishDoneCode.INTERNAL_ERROR)
+          || (d18 && statusCode === BigInt(PublishDoneCode18.EXCESSIVE_LOAD));
+        if (retriable) {
+          this.log.warn('PUBLISH_DONE(0x%s) "%s": %s — resubscribing from live edge',
+            statusCode.toString(16), trackName, errorReason || '(no reason)');
+          this.schedulePublishDoneResubscribe(
+            trackName, statusCode === tooFarBehind ? 'too_far_behind' : 'publish_done');
           return;
         }
 
@@ -8445,6 +8470,8 @@ export class MoqtPlayer {
     try {
       const maxAttempts = this.config.livenessMaxRestarts!;
       while (restart.attempts < maxAttempts && this.livenessLadderMayContinue(restart)) {
+        if (await this.livenessHoldWhileHidden(track, restart)) return;
+        if (!this.livenessLadderMayContinue(restart)) return;
         const attempt = restart.attempts + 1;
         // Backoff before retries (not before the first attempt — the
         // starvation timeout already waited).
@@ -8523,6 +8550,8 @@ export class MoqtPlayer {
     while (this.livenessLadderMayContinue(restart)) {
       await this.livenessSleep(timeoutMs, restart);
       if (!this.livenessLadderMayContinue(restart)) return;
+      if (await this.livenessHoldWhileHidden(track, restart)) return;
+      if (!this.livenessLadderMayContinue(restart)) return;
       const attemptStartMs = performance.now();
       restart.attempts++;
       this.emitter.emit('recovery_action', {
@@ -8542,6 +8571,32 @@ export class MoqtPlayer {
         return;
       }
     }
+  }
+
+  /**
+   * Hold a restart while the document is hidden, where it only spends request
+   * streams. Once visible: true if delivery resumed within one reset probe,
+   * else the ladder continues with a fresh budget.
+   */
+  private async livenessHoldWhileHidden(
+    track: LivenessTrack,
+    restart: { attempts: number; cancelled: boolean },
+  ): Promise<boolean> {
+    if (!this.documentHidden()) return false;
+    const heldAtMs = performance.now();
+    this.log.info('Liveness: %s "%s" restart held while the page is hidden',
+      track.mediaType, track.trackName);
+    while (this.documentHidden()) {
+      if (!this.livenessLadderMayContinue(restart)) return false;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (await this.waitForTrackArrival(track, heldAtMs, this.config.livenessResetProbeMs!, restart)) {
+      this.log.info('Liveness: %s "%s" resumed once the page was visible',
+        track.mediaType, track.trackName);
+      return true;
+    }
+    restart.attempts = 0;
+    return false;
   }
 
   /** The ladder stops on cancel (stop/destroy), destroy, or leaving PLAYING. */
@@ -8658,6 +8713,48 @@ export class MoqtPlayer {
   }
 
   /**
+   * Resubscribe after a retriable PUBLISH_DONE: at once, then with doubling
+   * backoff, one pending retry per track; parked while the document is hidden.
+   */
+  private schedulePublishDoneResubscribe(
+    trackName: string,
+    cause: 'too_far_behind' | 'publish_done',
+  ): void {
+    const nowMs = performance.now();
+    let retry = this.publishDoneRetries.get(trackName);
+    if (!retry) {
+      retry = { attempts: 0, lastDoneAtMs: nowMs, timer: null };
+      this.publishDoneRetries.set(trackName, retry);
+    } else if (nowMs - retry.lastDoneAtMs >= PUBLISH_DONE_RETRY_RESET_MS) {
+      retry.attempts = 0;
+    }
+    retry.lastDoneAtMs = nowMs;
+    if (retry.timer !== null) return;
+    const delayMs = retry.attempts === 0
+      ? 0
+      : Math.min(PUBLISH_DONE_RETRY_BASE_MS * 2 ** (retry.attempts - 1), PUBLISH_DONE_RETRY_MAX_MS);
+    retry.attempts++;
+    const state = retry;
+    const conn = this.connection;
+    const fire = (): void => {
+      state.timer = null;
+      // A reconnect or migration resubscribes every track itself.
+      if (this._destroyed || this.connection !== conn || this.reconnect !== null) return;
+      if (this.documentHidden()) {
+        state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
+        return;
+      }
+      for (const sub of this.activeSubscriptions.values()) {
+        if (sub.trackName === trackName) return;
+      }
+      this.replaceSubscription(trackName, cause,
+        () => this.schedulePublishDoneResubscribe(trackName, cause));
+    };
+    if (delayMs === 0) fire();
+    else state.timer = setTimeout(fire, delayMs);
+  }
+
+  /**
    * Replace a track's subscription with a fresh one.
    *
    * Shared by two unrelated causes, which must stay distinguishable to an
@@ -8671,7 +8768,8 @@ export class MoqtPlayer {
    */
   private replaceSubscription(
     trackName: string,
-    cause: 'too_far_behind' | 'liveness',
+    cause: 'too_far_behind' | 'publish_done' | 'liveness',
+    onFailed?: () => void,
   ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
 
@@ -8756,6 +8854,7 @@ export class MoqtPlayer {
         trackName,
         reason: `${cause} resubscribe failed: ${failure.message}`,
       });
+      if (!this._destroyed) onFailed?.();
     });
 
     // Now that the replacement exists and its outcome is observed, announce it.

@@ -1846,6 +1846,153 @@ describe('MoqtPlayer', () => {
       });
     });
 
+    // INTERNAL_ERROR / EXCESSIVE_LOAD end a live subscription on a publisher
+    // send-side condition (e.g. no stream credit toward a slow page): retried,
+    // never as a storm.
+    describe('retriable PUBLISH_DONE backoff', () => {
+      const done = (requestId: unknown, code: number, reason = 'Failed to create uni stream.') => ({
+        type: 'PUBLISH_DONE',
+        requestId,
+        statusCode: varint(code),
+        streamCount: varint(0),
+        errorReason: reason,
+      }) as ControlMessage;
+      const videoSubscribes = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.subscribe as any).mock.calls
+          .filter((c: any[]) => new TextDecoder().decode(c[1] as Uint8Array) === 'video').length;
+      const latestReqId = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.subscribe as any).mock.results.at(-1)?.value;
+
+      it('resubscribes at once on INTERNAL_ERROR and does not end the track', async () => {
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const unsubscribed = vi.fn();
+        player.on('track_unsubscribed', unsubscribed);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = videoSubscribes(adapter);
+
+        adapter._triggerMessage(done(videoReqId, 0x0));
+
+        expect(videoSubscribes(adapter)).toBe(before + 1);
+        expect(unsubscribed).not.toHaveBeenCalled();
+        await player.destroy();
+      });
+
+      it('resubscribes on draft-18 EXCESSIVE_LOAD', async () => {
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = videoSubscribes(adapter);
+
+        adapter._triggerMessage(done(videoReqId, 0x9, 'overloaded'));
+
+        expect(videoSubscribes(adapter)).toBe(before + 1);
+        await player.destroy();
+      });
+
+      it('backs off a repeated end: the next retry waits, doubling', async () => {
+        vi.useFakeTimers();
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          const before = videoSubscribes(adapter);
+
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(0); // the replacement registers
+
+          adapter._triggerMessage(done(await latestReqId(adapter), 0x0));
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(999);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(videoSubscribes(adapter)).toBe(before + 2);
+
+          adapter._triggerMessage(done(await latestReqId(adapter), 0x0));
+          await vi.advanceTimersByTimeAsync(1_999);
+          expect(videoSubscribes(adapter)).toBe(before + 2);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(videoSubscribes(adapter)).toBe(before + 3);
+          await player.destroy();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('a failed replacement retries on the backoff, not at once', async () => {
+        vi.useFakeTimers();
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          const before = videoSubscribes(adapter);
+          (adapter.subscribe as any).mockRejectedValueOnce(new Error('Failed to create bidirectional stream.'));
+
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          await vi.advanceTimersByTimeAsync(0);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(999);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(videoSubscribes(adapter)).toBe(before + 2);
+          await player.destroy();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('parks the retry while the document is hidden and resubscribes once visible', async () => {
+        vi.useFakeTimers();
+        const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+        (globalThis as any).document = doc;
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          const before = videoSubscribes(adapter);
+          doc.visibilityState = 'hidden';
+
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(videoSubscribes(adapter)).toBe(before);
+
+          doc.visibilityState = 'visible';
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await player.destroy();
+        } finally {
+          delete (globalThis as any).document;
+          vi.useRealTimers();
+        }
+      });
+
+      it('destroy cancels a pending retry', async () => {
+        vi.useFakeTimers();
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          await vi.advanceTimersByTimeAsync(0);
+          adapter._triggerMessage(done(await latestReqId(adapter), 0x0));
+          const pending = videoSubscribes(adapter);
+
+          await player.destroy();
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(videoSubscribes(adapter)).toBe(pending);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
+
     it('removes subscription from active set — no REQUEST_UPDATE after PUBLISH_DONE', async () => {
       // After PUBLISH_DONE for video, pause() should only send
       // REQUEST_UPDATE for audio (the remaining active subscription).
