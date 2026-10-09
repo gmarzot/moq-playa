@@ -747,6 +747,8 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly STALL_NUDGE_MIN_AHEAD_SEC = 0.5;
   /** After a stall, a cushion this far over target is shed by one seek (live only). */
   private static readonly STALL_SNAP_EXCESS_SEC = 1.0;
+  /** Cap on the stall length the snap keeps above target. */
+  private static readonly STALL_SNAP_MARGIN_MAX_SEC = 1.0;
 
   /** Per-attempt wait before jumping; 0 disables. */
   private readonly gapJumpMs: number;
@@ -3133,7 +3135,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.onFirstFrame?.();
     }
     if (recoveredMs !== null) {
-      this.snapAfterStall();
+      this.snapAfterStall(recoveredMs / 1000);
       this.onStallRecovered?.(recoveredMs);
     }
   };
@@ -3220,16 +3222,18 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * After a detected stall on a live stream, shed the backlog it built with
-   * one seek to the live edge rather than over a minute at SoftChase.RATE.
+   * one seek rather than over a minute at SoftChase.RATE, keeping the stall's
+   * length (capped) above target: a pause that stalled once tends to recur.
    */
-  private snapAfterStall(): void {
+  private snapAfterStall(outageSec: number): void {
     if (!Number.isFinite(this.maxAheadSec) || !this.playbackIntent) return;
     const v = this.video;
     if (v.paused || v.seeking) return;
     const ct = v.currentTime;
     const end = this.containingRangeEnd(ct);
     if (end === null) return;
-    const to = end - this.targetAheadSec;
+    const to = end - this.targetAheadSec
+      - Math.min(Math.max(outageSec, 0), MseMediaSource.STALL_SNAP_MARGIN_MAX_SEC);
     if (to - ct <= MseMediaSource.STALL_SNAP_EXCESS_SEC) return;
     this.resetPlaybackRate();
     v.currentTime = to;
@@ -3267,6 +3271,16 @@ export class MseMediaSource implements MediaSourceLike {
       .getVideoPlaybackQuality?.();
     return `video=${fmt(this.videoBuffer)} audio=${fmt(this.audioBuffer)}`
       + (q ? ` frames=${q.totalVideoFrames} dropped=${q.droppedVideoFrames}` : '');
+  }
+
+  /** One SourceBuffer's buffered ranges in seconds; empty when absent. */
+  bufferedRanges(kind: 'video' | 'audio'): Array<[number, number]> {
+    const sb = kind === 'video' ? this.videoBuffer : this.audioBuffer;
+    const out: Array<[number, number]> = [];
+    try {
+      if (sb) for (let i = 0; i < sb.buffered.length; i++) out.push([sb.buffered.start(i), sb.buffered.end(i)]);
+    } catch { /* detached SourceBuffer */ }
+    return out;
   }
 
   private handleTimeUpdate = (): void => {

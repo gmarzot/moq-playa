@@ -255,18 +255,22 @@ describe('stall nudge and post-stall live-edge snap', () => {
         }
     });
 
-    it('after a detected stall, snaps a live cushion more than 1 s over target to the live edge', () => {
+    it('after a detected stall, snaps a live cushion more than 1 s over target, keeping the stall\'s length above target', () => {
         vi.useFakeTimers();
         try {
             const { adapter, video, adjusts } = stallSetup();
+            let outageSec: number | null = null;
+            adapter.onStallRecovered = (ms) => { outageSec = ms / 1000; };
             video.currentTime = 20;                     // 5 s ahead, target 0.2 s
             (adapter as any).handleWaiting();
             vi.advanceTimersByTime(300);                // detected (default threshold)
             video.currentTime = 20;                     // undo the nudge for a clean read
             adjusts.length = 0;
             (adapter as any).handlePlaying();
-            expect(video.currentTime).toBeCloseTo(24.8, 5);
-            expect(adjusts).toEqual([['snap', 20, expect.closeTo(24.8, 5)]]);
+            expect(outageSec).toBeCloseTo(0.3, 2);
+            const to = 25 - 0.2 - Math.min(outageSec!, 1);   // 24.5
+            expect(video.currentTime).toBeCloseTo(to, 5);
+            expect(adjusts).toEqual([['snap', 20, expect.closeTo(to, 5)]]);
         } finally {
             vi.useRealTimers();
         }
@@ -305,5 +309,8 @@ describe('stall nudge and post-stall live-edge snap', () => {
         (adapter as any).audioBuffer = { buffered: makeTimeRanges([[5, 12], [12.04, 25]]) };
         expect(adapter.describeBuffers())
             .toBe('video=[5.00–25.00] audio=[5.00–12.00][12.04–25.00] frames=100 dropped=2');
+        expect(adapter.bufferedRanges('audio')).toEqual([[5, 12], [12.04, 25]]);
+        (adapter as any).videoBuffer = null;
+        expect(adapter.bufferedRanges('video')).toEqual([]);
     });
 });
