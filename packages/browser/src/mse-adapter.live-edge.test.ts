@@ -171,6 +171,30 @@ describe('stale-group floor', () => {
     });
 });
 
+describe('replay containment', () => {
+    it('appends a new frame inside a long previous frame; drops a true redelivery', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        stubs.ms().open();
+        await flush();
+        await flush();
+        const vsb = stubs.ms().videoBuffer;
+        const frame = (bmd: number, dur: number) => makeSegment({ bmd, defaultDur: dur, sampleCount: 1 });
+
+        adapter.appendChunk('video', frame(1000, 81), 'v', 1n);     // after a skipped frame: [1000, 1081)
+        await flush(); await flush();
+        const base = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', frame(1004, 4), 'v', 1n);      // burst, 4 later: inside, but new
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.appendChunk('video', frame(1000, 81), 'v', 1n);     // redelivered: dropped
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.destroy();
+    });
+});
+
 describe('stall nudge and post-stall live-edge snap', () => {
     function stallSetup(opts: { maxAheadSec?: number } = {}) {
         const video = new MockVideoElement();

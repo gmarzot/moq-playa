@@ -614,6 +614,9 @@ export class MseMediaSource implements MediaSourceLike {
   /** Per-(mediaType:trackName) committed group high-water mark. */
   private readonly committedGroupFloor = new Map<string, bigint>();
 
+  /** Per-(mediaType:trackName) decode start of the latest sample committed. */
+  private readonly latestSampleStart = new Map<string, bigint>();
+
   private readonly video: HTMLVideoElement;
   private objectUrl: string | null = null;
   private destroyed = false;
@@ -1390,6 +1393,7 @@ export class MseMediaSource implements MediaSourceLike {
   clearTimeline(mediaType: 'video' | 'audio', trackName: string): void {
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
     const clearedFloor = this.committedGroupFloor.delete(`${mediaType}:${trackName}`);
+    this.latestSampleStart.delete(`${mediaType}:${trackName}`);
     if (timelines.delete(trackName) || clearedFloor) {
       this.logWarn('[MSE] timeline cleared for %s track "%s" (discontinuity)', mediaType, trackName);
     }
@@ -1429,6 +1433,7 @@ export class MseMediaSource implements MediaSourceLike {
     // Timeline-owned append state.
     this.videoTimelines.clear();
     this.audioTimelines.clear();
+    this.latestSampleStart.clear();
     this.committedGroupFloor.clear();
     this.pendingVideoRanges = [];
     this.pendingAudioRanges = [];
@@ -2707,7 +2712,11 @@ export class MseMediaSource implements MediaSourceLike {
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
     const timeline = timelines.get(trackName);
     if (ranges !== null && ranges.length > 0 && timeline) {
-      const allContained = ranges.every((r) => timeline.containsRange(r.startTime, r.endTime));
+      // A replay starts at or before the latest sample committed; a new frame
+      // inside the recorded range (under a long previous frame) starts after it.
+      const latestStart = this.latestSampleStart.get(`${mediaType}:${trackName}`);
+      const allContained = ranges.every((r) => timeline.containsRange(r.startTime, r.endTime)
+        && (latestStart === undefined || r.startTime <= latestStart));
       if (allContained) {
         // Logged with group id and the exact decode range so an eviction can be
         // correlated against a later drop of the SAME range — the evidence
@@ -2877,6 +2886,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.audioQueue.length = 0;
     this.videoTimelines.clear();
     this.audioTimelines.clear();
+    this.latestSampleStart.clear();
     this.quotaRetried.video = false;
     this.quotaRetried.audio = false;
     this.chaseAfterFlush = true;
@@ -2947,8 +2957,15 @@ export class MseMediaSource implements MediaSourceLike {
           timeline = new TimelineIndex();
           timelines.set(pendingTrack, timeline);
         }
+        const startKey = `${mediaType}:${pendingTrack}`;
         for (const r of pending) {
           timeline.insert(r.startTime, r.endTime);
+          // The last sample's start; samples taken as equal length when there are several.
+          const lastSample = r.sampleCount > 1
+            ? r.endTime - (r.endTime - r.startTime) / BigInt(r.sampleCount)
+            : r.startTime;
+          const prev = this.latestSampleStart.get(startKey);
+          if (prev === undefined || lastSample > prev) this.latestSampleStart.set(startKey, lastSample);
         }
         // Advance committed group floor on successful append.
         if (pendingGroup !== undefined) {
