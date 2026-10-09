@@ -729,6 +729,8 @@ export class MseMediaSource implements MediaSourceLike {
   // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
   /** Minimum spacing between jumps (swiss-cheese streams keep jumping, bounded). */
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
+  /** How far past a range end a playhead parked in the following hole may be. */
+  private static readonly GAP_PARKED_PAST_END_MAX_SEC = 1.0;
   /** Wait floor and per-hole-second scaling: small holes clear fast, wide
    *  holes get proportionally longer for infill to arrive; gapJumpMs caps. */
   private static readonly GAP_JUMP_WAIT_FLOOR_MS = 300;
@@ -2360,10 +2362,24 @@ export class MseMediaSource implements MediaSourceLike {
         break;
       }
     }
+    // Audio can carry the playhead a little past the end of the video before
+    // it stops, parking it inside the hole itself.
+    if (curEnd === null) {
+      for (let i = 0; i + 1 < buffered.length; i++) {
+        const end = buffered.end(i);
+        if (ct > end && ct < buffered.start(i + 1)
+            && ct - end <= MseMediaSource.GAP_PARKED_PAST_END_MAX_SEC) {
+          curEnd = end;
+          nextStart = buffered.start(i + 1);
+          nextEnd = buffered.end(i + 1);
+          break;
+        }
+      }
+    }
 
-    // Only the proven shape arms: inside a range, with a hole and more
-    // buffered media ahead. (Outside-every-range states also match
-    // startup/reset/eviction/user seeks — deliberately excluded.)
+    // Only the proven shape arms: inside a range, or parked just past its end,
+    // with a hole and more buffered media ahead. (Playheads farther from any
+    // range also match startup/reset/eviction/user seeks — deliberately excluded.)
     //
     // Distance to the range end is NOT a condition: a stalled playhead parks
     // wherever the last decodable frame left it, which can be a second or

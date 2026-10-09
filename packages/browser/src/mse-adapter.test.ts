@@ -3340,6 +3340,22 @@ describe('buffered-hole gap-jump', () => {
         expect(video.seekCount).toBe(0);
     });
 
+    it('jumps when the playhead drifted just past a range end into the hole (field case: 0.21s past, 1.59s hole)', () => {
+        const { video, jumps, check } = gapSetup({
+            ranges: [[3138.73, 3147.28], [3148.87, 3151.0]],
+            ct: 3147.49,
+        });
+        check(0);
+        check(1_000);
+        expect(video.seekCount).toBe(0);
+
+        check(3_100);      // 1.59s hole → wait capped by gapJumpMs (2s)
+        expect(video.seekCount).toBe(1);
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0].from).toBeCloseTo(3147.49, 5);
+        expect(jumps[0].holeSec).toBeCloseTo(1.59, 2);
+    });
+
     it('never arms when the playhead is outside every buffered range (this slice)', () => {
         const { video, check } = gapSetup({ ranges: [[5, 15], [19.78, 25]], ct: 17 });
         check(0); check(1_000); check(2_100); check(3_200);
