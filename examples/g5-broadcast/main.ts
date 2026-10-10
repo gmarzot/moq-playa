@@ -405,7 +405,6 @@ let nsBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 
 /** The MoQT session itself: SETUP, established, or closed. */
 let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
 let liveSinceMs: number | null = null;
-let catalogJsonText = '';
 
 /** Copy to the clipboard, confirming in the button itself. */
 function wireCopy(btn: HTMLButtonElement, text: () => string): void {
@@ -439,7 +438,6 @@ const catalogLabel = (packagings: unknown[], version: unknown): string => {
 function renderCatalogPanel(params: BroadcastCatalogParams): void {
   const bytes = buildCatalogPayload(params);
   const text = new TextDecoder().decode(bytes);
-  catalogJsonText = text;
   let tracks: Array<Record<string, unknown>> = [];
   let version: unknown;
   try {
@@ -634,7 +632,7 @@ const setCatalogHidden = (hidden: boolean): void => {
 };
 catToggle.addEventListener('click', () => setCatalogHidden(true));
 catRestore.addEventListener('click', () => setCatalogHidden(false));
-wireCopy(catCopy, () => catalogJsonText);
+wireCopy(catCopy, () => catJson.textContent ?? '');
 wireCopy(logCopy, () => document.getElementById('log')?.textContent ?? '');
 
 // ─── Share modal ─────────────────────────────────────────────────────
