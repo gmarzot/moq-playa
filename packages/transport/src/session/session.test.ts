@@ -562,6 +562,27 @@ describe('Session', () => {
         .toEqual([varint(0x2n)]);
     });
 
+    it('subscribe() includes NEW_GROUP_REQUEST when specified (§10.2.13)', () => {
+      const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
+      const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
+
+      const { actions } = session.subscribe(namespace, name, { newGroupRequest: 0n });
+
+      const msg = (actions[0] as SendControlAction).message as Subscribe;
+      expect(msg.parameters.get(MessageParam.NEW_GROUP_REQUEST as bigint)).toEqual([varint(0n)]);
+    });
+
+    it('subscribe() refuses NEW_GROUP_REQUEST on draft-14, which has none', () => {
+      const s = new Session(EndpointRole.CLIENT, 14);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      expect(() => s.subscribe([new Uint8Array([0x6c])], new Uint8Array([0x76]), { newGroupRequest: 0n }))
+        .toThrow(/NEW_GROUP_REQUEST/);
+    });
+
     it('subscribe() omits parameters when not specified (§9.2.2)', () => {
       // Default: empty parameters map
       const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
@@ -2252,6 +2273,16 @@ describe('Session', () => {
         // FORWARD param (0x10) should be set to 0
         const forwardVal = msg.parameters.get(MessageParam.FORWARD);
         expect(forwardVal).toEqual([varint(0n)]);
+      });
+
+      it('sends REQUEST_UPDATE with NEW_GROUP_REQUEST (§10.2.13)', () => {
+        const subId = establishSubscription();
+
+        const { actions } = session.requestUpdate(varint(subId), { newGroupRequest: 8n });
+
+        const msg = (actions[0] as { type: string; message: RequestUpdate }).message;
+        expect(msg.parameters.get(MessageParam.NEW_GROUP_REQUEST)).toEqual([varint(8n)]);
+        expect(msg.parameters.has(MessageParam.FORWARD)).toBe(false);
       });
 
       it('sends REQUEST_UPDATE with FORWARD=1 to resume', () => {

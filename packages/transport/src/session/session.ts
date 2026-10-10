@@ -324,6 +324,11 @@ export interface SubscribeOptions extends AuthorizationOptions {
    * If omitted, the subscription is unfiltered (all objects pass).
    */
   subscriptionFilter?: SubscriptionFilter;
+  /**
+   * §10.2.13: NEW_GROUP_REQUEST — the largest Group ID known plus 1, or 0 when none
+   * is. MAY be sent without knowing the track has dynamic groups. Draft-16/18.
+   */
+  newGroupRequest?: bigint;
 }
 
 /**
@@ -344,6 +349,8 @@ export interface RequestUpdateOptions extends AuthorizationOptions {
   objectDeliveryTimeout?: Varint;
   /** §8 / §10.2.3: SUBGROUP_DELIVERY_TIMEOUT (0x06), in ms — MAY appear in REQUEST_UPDATE (draft-18 only). */
   subgroupDeliveryTimeout?: Varint;
+  /** §10.2.13: NEW_GROUP_REQUEST; only for a track with DYNAMIC_GROUPS=1. Draft-16/18. */
+  newGroupRequest?: bigint;
   /**
    * draft-18 §10.9.2 / §10.2.14: a new Track Namespace Prefix. Valid ONLY when
    * `existingRequestId` is an outbound SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS;
@@ -2730,6 +2737,7 @@ export class Session {
     }
 
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'SUBSCRIBE');
+    this.assertNewGroupRequestDraft(options.newGroupRequest);
     const parameters = authorizationParameters(options);
 
     const requestId = this.requestIdAllocator.allocate();
@@ -2753,6 +2761,9 @@ export class Session {
     }
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [options.groupOrder]);
+    }
+    if (options.newGroupRequest !== undefined) {
+      parameters.set(MessageParam.NEW_GROUP_REQUEST, [varint(options.newGroupRequest)]);
     }
     if (requestedForward !== undefined) {
       // §9.2.2.8: FORWARD MAY appear in SUBSCRIBE — initial forward state.
@@ -2932,6 +2943,7 @@ export class Session {
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+    this.assertNewGroupRequestDraft(options.newGroupRequest);
     const parameters = authorizationParameters(options);
 
     // draft-18 §10.9.2: a prefix update targets an outbound SUBSCRIBE_NAMESPACE /
@@ -3023,6 +3035,9 @@ export class Session {
     }
     if (options.subgroupDeliveryTimeout !== undefined) {
       parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
+    }
+    if (options.newGroupRequest !== undefined) {
+      parameters.set(MessageParam.NEW_GROUP_REQUEST, [varint(options.newGroupRequest)]);
     }
 
     if (this._draftVersion === 14) {
@@ -3725,6 +3740,13 @@ export class Session {
    * throw rather than being silently encoded. Returns the map to attach (possibly
    * empty).
    */
+  /** NEW_GROUP_REQUEST (§10.2.13) does not exist on draft-14. */
+  private assertNewGroupRequestDraft(value: bigint | undefined): void {
+    if (value !== undefined && this._draftVersion === 14) {
+      throw new SessionError('newGroupRequest (NEW_GROUP_REQUEST, 0x32) needs draft-16 or later', 'INVALID_STATE');
+    }
+  }
+
   private resolveTrackProperties(trackProperties: TrackProperties | undefined, context: string): TrackProperties {
     const props = trackProperties ?? new Map();
     if (this._draftVersion !== 18 && props.size > 0) {
@@ -4853,6 +4875,9 @@ export class Session {
     }
     if (options.subgroupDeliveryTimeout !== undefined) {
       parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
+    }
+    if (options.newGroupRequest !== undefined) {
+      parameters.set(MessageParam.NEW_GROUP_REQUEST, [varint(options.newGroupRequest)]);
     }
 
     // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
