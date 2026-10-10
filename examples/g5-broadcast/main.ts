@@ -465,8 +465,7 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
     const detail = t['name'] === 'audio'
       ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
         + (audioOnDatagrams ? ' · datagrams' : '')
-      : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
-        + (videoDynamicGroups ? ' · dynamic groups' : '');
+      : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`;
     row.innerHTML = `<span class="nm">${String(t['name'])}:</span>`
       + `<span class="dt">${detail}</span>`
       + `<span class="badge idle" data-track="${String(t['name'])}">FWD --</span>`;
