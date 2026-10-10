@@ -688,6 +688,7 @@ export class MoqtPlayer {
   /** Empty Normal media objects skipped under compat `empty-objects`. */
   private _emptyMediaObjects = 0;
   private _staleVideoDrops: { count: number; group: bigint | null; floor: bigint | null } = { count: 0, group: null, floor: null };
+  private readonly _datagramObjects = { audio: 0, video: 0 };
   /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
   private recoveryUpdateBlockedUntilUs = 0;
   private recoveryUpdateFailures = 0;
@@ -5248,6 +5249,11 @@ export class MoqtPlayer {
     return this._staleVideoDrops;
   }
 
+  /** Media objects that arrived as datagrams, per media type. */
+  get datagramObjects(): { readonly audio: number; readonly video: number } {
+    return { ...this._datagramObjects };
+  }
+
   /**
    * Early stale-group drop on the MSE paths (video only): groups older than the
    * one before what MSE has committed are replay. The immediately previous
@@ -6465,7 +6471,9 @@ export class MoqtPlayer {
       // §10.3: Datagram objects — convert to MoqtObject for routing
       onDatagram: stageable((datagram) => {
         const alias = BigInt(datagram.trackAlias);
-        if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
+        const datagramMedia = this.subscriptionManager?.getMediaType(alias);
+        if (datagramMedia === undefined || !this.subscriptionManager) return;
+        if (datagramMedia === 'audio' || datagramMedia === 'video') this._datagramObjects[datagramMedia]++;
         this.log.debug('Datagram alias=%s group=%s obj=%s', alias, datagram.groupId, datagram.objectId);
 
         const obj: MoqtObject = datagram.status !== undefined

@@ -462,3 +462,16 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 });
+
+describe('datagram arrivals', () => {
+  it('are counted per media type', async () => {
+    const adapter = createMockAdapter();
+    const { player } = await startPlaying(adapter);
+    adapter.onDatagram?.({
+      trackAlias: varint(AUDIO_ALIAS), groupId: varint(1), objectId: varint(0),
+      publisherPriority: 64, payload: new Uint8Array([1, 2, 3]),
+    });
+    expect(player.datagramObjects).toEqual({ audio: 1, video: 0 });
+    await player.destroy();
+  });
+});
