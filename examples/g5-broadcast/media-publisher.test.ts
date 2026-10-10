@@ -1216,6 +1216,74 @@ describe('MediaPublisher — relay Forward State changes', () => {
   });
 });
 
+describe('MediaPublisher — new group requests', () => {
+  it('a request against a group minGroupMs old asks for a keyframe at once; repeats share it', async () => {
+    let wall = 1_700_000_000_000_000;
+    let keyframes = 0;
+    const pub = makePublisher(recordingConnection(), {
+      wallClockUs: () => wall, minGroupMs: 500, onKeyframeNeeded: () => { keyframes++; },
+    });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    wall += 600_000;
+    pub.requestNewGroup();
+    pub.requestNewGroup();
+    expect(keyframes).toBe(2);
+    expect(pub.newGroupRequestCount).toBe(1);
+
+    pub.publishVideo(chunk(1), kf(40_000));
+    await settle();
+    wall += 600_000;
+    pub.requestNewGroup();
+    expect(keyframes).toBe(3);
+    expect(pub.newGroupRequestCount).toBe(2);
+  });
+
+  it('a request against a young group waits for minGroupMs; a keyframe meanwhile answers it', async () => {
+    let keyframes = 0;
+    const pub = makePublisher(recordingConnection(), {
+      wallClockUs: () => 1_700_000_000_000_000, minGroupMs: 20, onKeyframeNeeded: () => { keyframes++; },
+    });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    pub.requestNewGroup();
+    expect(keyframes).toBe(1);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(keyframes).toBe(2);
+    expect(pub.newGroupRequestCount).toBe(1);
+
+    pub.publishVideo(chunk(1), kf(40_000));
+    await settle();
+    pub.requestNewGroup();
+    pub.publishVideo(chunk(2), kf(80_000));
+    await settle();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(keyframes).toBe(2);
+    expect(pub.newGroupRequestCount).toBe(1);
+  });
+
+  it('retiring cancels a deferred request', async () => {
+    let keyframes = 0;
+    const pub = makePublisher(recordingConnection(), {
+      wallClockUs: () => 1_700_000_000_000_000, minGroupMs: 10, onKeyframeNeeded: () => { keyframes++; },
+    });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    pub.requestNewGroup();
+    pub.retire();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(keyframes).toBe(1);
+    expect(pub.newGroupRequestCount).toBe(0);
+  });
+
+  it('rejects an invalid minGroupMs', () => {
+    expect(() => makePublisher(recordingConnection(), { minGroupMs: -1 })).toThrow(/minGroupMs/);
+  });
+});
+
 describe('MediaPublisher — capture clock drift', () => {
   it('reports each track\'s drift against its anchor once per period', async () => {
     let wallUs = 1_700_000_000_000_000;

@@ -187,6 +187,8 @@ export interface MediaPublisherOptions {
   /** Video needs a keyframe now: a new subscription or a resume. The page
    *  asks its encoder for one. */
   onKeyframeNeeded?: () => void;
+  /** Youngest video group a NEW_GROUP_REQUEST may end, in ms (default 1000). */
+  minGroupMs?: number;
   /** A track's MoQT state changed in a way only a send revealed: Forward
    *  State, or a terminated subscription. Not an error. */
   onStatus?: (track: 'video' | 'audio', message: string) => void;
@@ -271,6 +273,13 @@ export class MediaPublisher {
   /** Decode time and duration of the previous CMAF video chunk. */
   private lastVideoDecode: { decodeUs: bigint; durationUs: number } | null = null;
   private readonly onKeyframeNeeded: (() => void) | null;
+  private readonly minGroupMs: number;
+  /** Wall-clock ms at which the open video group started. */
+  private videoGroupStartMs: number | null = null;
+  /** A requested new group is due or deferred; the next keyframe clears it. */
+  private newGroupPending = false;
+  private newGroupTimer: ReturnType<typeof setTimeout> | null = null;
+  private newGroupsOnRequest = 0;
   private readonly onStatus: ((track: 'video' | 'audio', message: string) => void) | null;
   /** Largest (group, object) sent per track; Largest Location for a resume. */
   private videoLargest: { group: bigint; object: bigint } | null = null;
@@ -340,6 +349,10 @@ export class MediaPublisher {
     if (options.videoQueueMax !== undefined) assertPositiveInteger(options.videoQueueMax, 'videoQueueMax');
     if (options.audioQueueMax !== undefined) assertPositiveInteger(options.audioQueueMax, 'audioQueueMax');
     if (options.audioMaxInFlight !== undefined) assertPositiveInteger(options.audioMaxInFlight, 'audioMaxInFlight');
+    if (options.minGroupMs !== undefined
+        && !(Number.isFinite(options.minGroupMs) && options.minGroupMs >= 0)) {
+      throw new Error(`minGroupMs must be a non-negative number, got ${options.minGroupMs}`);
+    }
     this.connection = connection;
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
@@ -370,6 +383,7 @@ export class MediaPublisher {
     this.audioDatagrams = options.audioDatagrams === true && options.draft === 18 && !this.locmaf;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.onKeyframeNeeded = options.onKeyframeNeeded ?? null;
+    this.minGroupMs = options.minGroupMs ?? 1_000;
     this.onStatus = options.onStatus ?? null;
     this.videoGroupId = BigInt(Date.now());
     this.audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
@@ -412,6 +426,33 @@ export class MediaPublisher {
   /** Largest (group, object) sent on a track, or null before its first. */
   largestLocation(track: 'video' | 'audio'): { group: bigint; object: bigint } | null {
     return track === 'video' ? this.videoLargest : this.audioLargest;
+  }
+
+  /**
+   * A subscriber asked for a new video group (NEW_GROUP_REQUEST). The keyframe
+   * is requested once the open group is minGroupMs old; requests until the
+   * next keyframe share it.
+   */
+  requestNewGroup(): void {
+    if (this.stopped || this.newGroupPending) return;
+    this.newGroupPending = true;
+    const ageMs = this.videoGroupStartMs === null
+      ? Infinity : this.wallClockUs() / 1000 - this.videoGroupStartMs;
+    const waitMs = this.minGroupMs - ageMs;
+    if (waitMs <= 0) {
+      this.startRequestedGroup();
+      return;
+    }
+    this.newGroupTimer = setTimeout(() => {
+      this.newGroupTimer = null;
+      this.startRequestedGroup();
+    }, waitMs);
+  }
+
+  private startRequestedGroup(): void {
+    if (this.stopped) return;
+    this.newGroupsOnRequest++;
+    this.requestKeyframe();
   }
 
   /** The keyframe hook is application code: a throw is reported, not raised. */
@@ -516,6 +557,8 @@ export class MediaPublisher {
   get videoByteCount(): number { return this.videoBytes; }
   get audioByteCount(): number { return this.audioBytes; }
   get keyframeCount(): number { return this.videoKeyframes; }
+  /** Keyframes requested to answer a NEW_GROUP_REQUEST. */
+  get newGroupRequestCount(): number { return this.newGroupsOnRequest; }
   /** Enqueued but not yet sent, against videoQueueMax / audioQueueMax. */
   get videoQueueDepth(): number { return this.videoQueue.length; }
   get audioQueueDepth(): number { return this.audioQueue.length; }
@@ -576,6 +619,8 @@ export class MediaPublisher {
    */
   retire(): void {
     this.stopped = true;
+    if (this.newGroupTimer !== null) clearTimeout(this.newGroupTimer);
+    this.newGroupTimer = null;
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
   }
@@ -940,6 +985,11 @@ export class MediaPublisher {
       this.videoGroupId++;
       this.videoObjectId = 0n;
       this.videoLocmafState = new LocmafGroupState();
+      this.videoGroupStartMs = this.wallClockUs() / 1000;
+      // Any new group answers an outstanding request.
+      this.newGroupPending = false;
+      if (this.newGroupTimer !== null) clearTimeout(this.newGroupTimer);
+      this.newGroupTimer = null;
       // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
       // Without this, receivers cannot distinguish normal group completion
       // from an incomplete group and will wait for the intra-group timeout.

@@ -118,6 +118,15 @@ const captureFps = parseInt(params.get('fps') ?? '60', 10);
 const audioDatagrams = params.get('audioDatagram') === '1';
 /** Audio actually on datagrams: asked for, draft-18, and not LOCMAF (subgroups only). */
 let audioOnDatagrams = false;
+/** `?dynamicGroups=1`: video honours NEW_GROUP_REQUEST (§10.2.13). draft-18 only. */
+const dynamicGroups = params.get('dynamicGroups') === '1';
+/** `?minGroup=ms`: youngest video group a NEW_GROUP_REQUEST may end. */
+const minGroupParam = parseInt(params.get('minGroup') ?? '', 10);
+const minGroupMs = Number.isFinite(minGroupParam) && minGroupParam >= 0 ? minGroupParam : 1000;
+/** Dynamic groups in effect: asked for and draft-18. */
+let videoDynamicGroups = false;
+/** Parameter carrying a NEW_GROUP_REQUEST (§10.2.13). */
+const NEW_GROUP_REQUEST_PARAM = 0x32n;
 /** `?packaging=cmaf|locmaf`: objects as CMAF chunks (CMSF-01) or LOCMAF Objects instead of LOC. */
 const packagingParam = params.get('packaging');
 const packaging: 'loc' | 'cmaf' | 'locmaf' =
@@ -210,6 +219,8 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sStatus = document.getElementById('s-status') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
   const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
+  const sDynamicGroups = document.getElementById('s-dynamic-groups') as HTMLInputElement;
+  const sMinGroup = document.getElementById('s-min-group') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
@@ -253,7 +264,21 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sDebug.checked = debug;
     sAudioDatagram.checked = audioDatagrams;
     sPackaging.value = packaging;
+    sDynamicGroups.checked = dynamicGroups;
+    sMinGroup.value = String(minGroupMs);
+    showApplicableFields();
   }
+
+  /** Only the options the selected draft and packaging can use are offered. */
+  const datagramsApply = () => sVersion.value === '18' && sPackaging.value !== 'locmaf';
+  function showApplicableFields() {
+    document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
+    document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
+    document.getElementById('s-min-group-row')!.hidden = sVersion.value !== '18' || !sDynamicGroups.checked;
+  }
+  sVersion.addEventListener('change', showApplicableFields);
+  sPackaging.addEventListener('change', showApplicableFields);
+  sDynamicGroups.addEventListener('change', showApplicableFields);
 
   /** The blank interval's value: the selected draft's default. */
   function showCatalogIntervalDefault() {
@@ -300,7 +325,11 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sCatalogInterval.value) np.set('catalogInterval', sCatalogInterval.value);
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
-    if (sAudioDatagram.checked) np.set('audioDatagram', '1');
+    if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
+    if (sDynamicGroups.checked && sVersion.value === '18') {
+      np.set('dynamicGroups', '1');
+      if (sMinGroup.value && sMinGroup.value !== '1000') np.set('minGroup', sMinGroup.value);
+    }
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
     // them; where storage is refused, the URL carries them instead. `compat`
@@ -437,7 +466,8 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
     const detail = t['name'] === 'audio'
       ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
         + (audioOnDatagrams ? ' · datagrams' : '')
-      : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`;
+      : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
+        + (videoDynamicGroups ? ' · dynamic groups' : '');
     row.innerHTML = `<span class="nm">${String(t['name'])}:</span>`
       + `<span class="dt">${detail}</span>`
       + `<span class="badge idle" data-track="${String(t['name'])}">FWD --</span>`;
@@ -480,7 +510,7 @@ const CELL_TIPS: Record<string, string> = {
   'fps enc': 'Video frames encoded per second.',
   'target': 'Target latency in the catalog.',
   'objects a/v': 'Objects sent, audio/video.',
-  'keyframes': 'Keyframes sent, one per group.',
+  'keyframes': 'Keyframes sent, one per group. Small: made on a new-group request.',
   'queue a/v': 'Chunks waiting to send, audio/video. Small: queue limit.',
   'uptime': 'Time since going live.',
 };
@@ -524,7 +554,8 @@ function renderMetrics(): void {
     // A setting published in the catalog, so it reads the same live or idle.
     cell('target', `${targetLatencyMs}${u('ms')}`, 'num'),
     cell('objects a/v', p ? `${p.audioChunkCount}/${p.frameCount}` : '—', p ? 'num' : 'idle'),
-    cell('keyframes', p ? String(p.keyframeCount) : '—', p ? 'num' : 'idle'),
+    cell('keyframes', p ? `${p.keyframeCount}${videoDynamicGroups ? u(`${p.newGroupRequestCount} req`) : ''}` : '—',
+      p ? 'num' : 'idle'),
     // Frames waiting for the wire, against the depth where shedding starts.
     cell('queue a/v', p ? `${qa}/${qv}${u(`max ${q.audio}/${q.video}`)}` : '—',
       backlog ? 'fault' : p ? 'num' : 'idle'),
@@ -985,6 +1016,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       log(`Session established (draft-${negotiatedDraft}).`);
       audioOnDatagrams = audioDatagrams && negotiatedDraft === 18 && packaging !== 'locmaf';
       if (packaging === 'locmaf' && audioDatagrams) log('LOCMAF: audio stays on subgroups (no datagrams)');
+      videoDynamicGroups = dynamicGroups && negotiatedDraft === 18;
+      if (dynamicGroups && !videoDynamicGroups) log(`Dynamic groups need draft-18; off on draft-${negotiatedDraft}`);
       log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
@@ -1029,7 +1062,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
           onStatus: (track, message) => log(`${track}: ${message}`),
           onKeyframeNeeded: () => videoEncoder?.requestKeyframe(),
+          minGroupMs,
         },
+        dynamicGroups: videoDynamicGroups,
         log,
         catalogIntervalMs: catalogIntervalFor(negotiatedDraft),
         ...(debug ? { onCatalogReemitted: (bytes: number) => log(`Catalog re-emitted (${bytes} bytes)`) } : {}),
@@ -1058,6 +1093,14 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       conn.onFetch = (requestId, fetch) => session.handleFetch(requestId, fetch);
       conn.onSubscribeForwardStateChange = (requestId, forward) =>
         session.handleForwardChange(requestId, forward);
+      const logControl = conn.onMessage;
+      conn.onMessage = (msg) => {
+        logControl?.(msg);
+        // A NEW_GROUP_REQUEST rides a REQUEST_UPDATE on the video subscription.
+        if (msg.type !== 'REQUEST_UPDATE') return;
+        const value = msg.parameters.get(NEW_GROUP_REQUEST_PARAM)?.[0];
+        if (typeof value === 'bigint') session.handleNewGroupRequest(BigInt(msg.existingRequestId), value);
+      };
       // A draft-18 resume must carry the Largest Location (§5.1).
       conn.setLargestLocationProvider((requestId) => session.largestLocation(requestId));
       return session;

@@ -233,6 +233,7 @@
       display: block; font-size: .7rem; color: #888; margin: 12px 0 4px;
       text-transform: uppercase; letter-spacing: .5px;
     }
+    .modal [hidden] { display: none !important; }
     .modal input[type=text], .modal input[type=number], .modal select {
       width: 100%; padding: 7px 9px; border-radius: 6px;
       border: 1px solid #444; background: #222; color: #eee;
@@ -389,16 +390,26 @@
       <label for="s-keyframe">Keyframe interval (frames)</label>
       <input id="s-keyframe" type="number" min="1" value="60">
 
+      <div class="check" id="s-dynamic-groups-row" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+        <input id="s-dynamic-groups" type="checkbox" style="width:auto">
+        <label for="s-dynamic-groups" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
+          dynamic groups: a joining viewer may request a keyframe</label>
+      </div>
+      <div id="s-min-group-row">
+        <label for="s-min-group">Shortest requested group (ms)</label>
+        <input id="s-min-group" type="number" min="0" placeholder="1000">
+      </div>
+
       <label for="s-target">Target playback latency (ms)</label>
       <input id="s-target" type="number" min="1" placeholder="200">
 
       <label for="s-hash">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)">
 
-      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+      <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin-top:12px">
         <input id="s-audio-datagram" type="checkbox" style="width:auto">
         <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          audio over datagrams (draft 18 only)</label>
+          audio over datagrams</label>
       </div>
 
       <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">

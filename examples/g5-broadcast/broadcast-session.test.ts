@@ -28,13 +28,16 @@ function recordingConnection() {
   const fetchObjects: Array<{ groupId: bigint; objectId: bigint; payload: Uint8Array }> = [];
   /** LARGEST_OBJECT of each SUBSCRIBE_OK, or undefined when it carried none. */
   const largests: Array<{ group: bigint; object: bigint } | undefined> = [];
+  /** Track Properties of each SUBSCRIBE_OK, or undefined when it carried none. */
+  const properties: Array<Map<bigint, bigint[]> | undefined> = [];
   /** Joining Location per subscription request, as the adapter would have saved it. */
   const joiningLocations = new Map<bigint, { group: bigint; object: bigint }>();
   /** [requestId, statusCode] of every PUBLISH_DONE. */
   const dones: Array<[bigint, bigint]> = [];
   let nextStream = 100n;
   const recorded = {
-    calls, accepted, sends, groups, fetchOk, fetchErrors, fetchObjects, largests, joiningLocations, dones,
+    calls, accepted, sends, groups, fetchOk, fetchErrors, fetchObjects, largests, properties, joiningLocations,
+    dones,
   };
   const conn: BroadcastSessionConnection & typeof recorded = {
     ...recorded,
@@ -43,6 +46,7 @@ function recordingConnection() {
       accepted.push(alias as bigint);
       const largest = options?.parameters?.get(0x09n)?.[0] as { group: bigint; object: bigint } | undefined;
       largests.push(largest);
+      properties.push(options?.trackProperties);
       if (largest) joiningLocations.set(requestId as bigint, largest);
     },
     rejectSubscribe: async () => { calls.push('rejectSubscribe'); },
@@ -862,6 +866,54 @@ describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
     } finally {
       now.mockRestore();
     }
+  });
+});
+
+describe('BroadcastSession — dynamic groups (§10.2.13)', () => {
+  const dynamicSession = (conn: BroadcastSessionConnection, draft: 16 | 18, dynamicGroups = true) =>
+    new BroadcastSession(conn, {
+      catalog: CATALOG, publisher: { wrapInt, draft }, log: () => {}, catalogIntervalMs: 0, dynamicGroups,
+    });
+
+  it('video SUBSCRIBE_OK advertises DYNAMIC_GROUPS, on draft 18 only', async () => {
+    const conn18 = recordingConnection();
+    const s18 = dynamicSession(conn18, 18);
+    s18.handleSubscribe(3n, 'video');
+    s18.handleSubscribe(4n, 'audio');
+    await settle();
+    expect(conn18.properties).toEqual([new Map([[0x30n, [1n]]]), undefined]);
+    const conn16 = recordingConnection();
+    const s16 = dynamicSession(conn16, 16);
+    s16.handleSubscribe(3n, 'video');
+    await settle();
+    expect(conn16.properties).toEqual([undefined]);
+  });
+
+  it('a request on the current video subscription asks for a group; other requests and started groups do not', async () => {
+    const conn = recordingConnection();
+    const session = dynamicSession(conn, 18);
+    const asked = vi.spyOn(session.publisher, 'requestNewGroup');
+    session.handleSubscribe(3n, 'video');
+    session.handleSubscribe(4n, 'audio');
+    await settle();
+    vi.spyOn(session.publisher, 'largestLocation').mockReturnValue({ group: 7n, object: 3n });
+    session.handleNewGroupRequest(4n, 0n);
+    session.handleNewGroupRequest(3n, 7n);
+    expect(asked).not.toHaveBeenCalled();
+    session.handleNewGroupRequest(3n, 8n);
+    session.handleNewGroupRequest(3n, 0n);
+    expect(asked).toHaveBeenCalledTimes(2);
+  });
+
+  it('without the option nothing is advertised and a request is ignored', async () => {
+    const conn = recordingConnection();
+    const session = dynamicSession(conn, 18, false);
+    const asked = vi.spyOn(session.publisher, 'requestNewGroup');
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    session.handleNewGroupRequest(3n, 0n);
+    expect(asked).not.toHaveBeenCalled();
+    expect(conn.properties).toEqual([undefined]);
   });
 });
 

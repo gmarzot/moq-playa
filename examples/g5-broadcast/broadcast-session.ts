@@ -18,7 +18,9 @@ import type { MediaPublishConnection, MediaPublisherOptions } from './media-publ
 
 /** The subset of MoqtConnection a broadcast generation uses. */
 export interface BroadcastSessionConnection extends MediaPublishConnection {
-  acceptSubscribe(requestId: unknown, alias: unknown, options?: { parameters?: Map<bigint, unknown[]> }): Promise<void>;
+  acceptSubscribe(requestId: unknown, alias: unknown, options?: {
+    parameters?: Map<bigint, unknown[]>; trackProperties?: Map<bigint, bigint[]>;
+  }): Promise<void>;
   rejectSubscribe(requestId: unknown, errorCode: unknown, reason: string): Promise<void>;
   /** Terminal for a subscription accepted but not servable (catalog transaction). */
   publishDone(requestId: unknown, statusCode: unknown, reason: string): Promise<void>;
@@ -43,6 +45,8 @@ const CATALOG_PRIORITY = 128;
 const GROUP_ORDER_PARAM = 0x22n;
 /** SUBSCRIBE_OK / REQUEST_UPDATE_OK parameter carrying the Largest Location (§10.2.11). */
 const LARGEST_OBJECT_PARAM = 0x09n;
+/** Track Property: subscribers may send NEW_GROUP_REQUEST (§12.6). */
+const DYNAMIC_GROUPS_PROPERTY = 0x30n;
 /** PUBLISH_DONE TRACK_ENDED, "the track is no longer being published" (§10.11);
  *  0x2 in the draft-18 and the draft-14/16 tables alike. */
 const TRACK_ENDED = 0x2n;
@@ -79,6 +83,8 @@ export interface BroadcastSessionOptions {
   carriedCatalog?: CarriedCatalog;
   /** Draft-18: the current catalog group and its bytes, whenever they change. */
   onCatalogGroup?: (catalog: CarriedCatalog) => void;
+  /** Draft-18: video advertises DYNAMIC_GROUPS and honours NEW_GROUP_REQUEST. */
+  dynamicGroups?: boolean;
   /** THIS generation's session closed while it was still current (UI hook).
    *  Never invoked for a retired generation — a superseded session must not
    *  stop its replacement. */
@@ -276,7 +282,7 @@ export class BroadcastSession {
     } else if (trackName === 'video') {
       this.connection.acceptSubscribe(
         this.wrapInt(requestId), this.wrapInt(alias),
-        this.subscribeOkOptions(this.publisher.largestLocation('video')))
+        this.subscribeOkOptions(this.publisher.largestLocation('video'), this.dynamicGroups))
         .then(() => {
           if (this.retired) return; // never arm a retired generation's publisher
           this.warnOnAliasReplace('video', this.publisher.videoAliasArmed, alias);
@@ -386,12 +392,33 @@ export class BroadcastSession {
     this.trackWork(work);
   }
 
-  /** Draft-18 SUBSCRIBE_OK carries LARGEST_OBJECT once the track has objects (§10.2.11). */
+  /** Draft-18 SUBSCRIBE_OK carries LARGEST_OBJECT once the track has objects (§10.2.11),
+   *  and DYNAMIC_GROUPS when the track honours NEW_GROUP_REQUEST. */
   private subscribeOkOptions(
     largest: { group: bigint; object: bigint } | null,
-  ): { parameters: Map<bigint, unknown[]> } | undefined {
-    if (this.opts.publisher.draft !== 18 || largest === null) return undefined;
-    return { parameters: new Map([[LARGEST_OBJECT_PARAM, [largest]]]) };
+    dynamicGroups = false,
+  ): { parameters?: Map<bigint, unknown[]>; trackProperties?: Map<bigint, bigint[]> } | undefined {
+    if (this.opts.publisher.draft !== 18 || (largest === null && !dynamicGroups)) return undefined;
+    return {
+      ...(largest !== null ? { parameters: new Map([[LARGEST_OBJECT_PARAM, [largest]]]) } : {}),
+      ...(dynamicGroups ? { trackProperties: new Map([[DYNAMIC_GROUPS_PROPERTY, [1n]]]) } : {}),
+    };
+  }
+
+  private get dynamicGroups(): boolean {
+    return this.opts.dynamicGroups === true && this.opts.publisher.draft === 18;
+  }
+
+  /**
+   * NEW_GROUP_REQUEST on the current video subscription (§10.2.13): 0, or a
+   * value past the largest group, asks the publisher for a new group.
+   */
+  handleNewGroupRequest(requestId: bigint, value: bigint): void {
+    if (this.retired || !this.dynamicGroups || this.currentRequest.get('video') !== requestId) return;
+    const largest = this.publisher.largestLocation('video');
+    if (value !== 0n && largest !== null && value <= largest.group) return;
+    this.safeLog(`video: NEW_GROUP_REQUEST ${value} (reqId=${requestId})`);
+    this.publisher.requestNewGroup();
   }
 
   /**
