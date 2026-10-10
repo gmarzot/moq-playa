@@ -116,6 +116,8 @@ const showStatus = params.get('status') !== '0';
 const captureFps = parseInt(params.get('fps') ?? '60', 10);
 /** `?audioDatagram=1`: audio as OBJECT_DATAGRAMs. draft-18 only. */
 const audioDatagrams = params.get('audioDatagram') === '1';
+/** Audio actually on datagrams: asked for, draft-18, and not LOCMAF (subgroups only). */
+let audioOnDatagrams = false;
 /** `?packaging=cmaf|locmaf`: objects as CMAF chunks (CMSF-01) or LOCMAF Objects instead of LOC. */
 const packagingParam = params.get('packaging');
 const packaging: 'loc' | 'cmaf' | 'locmaf' =
@@ -430,8 +432,9 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
     const fps = Number(Number(t['framerate']).toFixed(3));
     const detail = t['name'] === 'audio'
       ? `${t['codec']} · ${t['samplerate']}Hz · ${t['channelConfig']}ch · ${Math.round(Number(t['bitrate']) / 1000)}kbps`
+        + (audioOnDatagrams ? ' · datagrams' : '')
       : `${t['codec']} · ${t['width']}×${t['height']} · ${fps}fps · ${Math.round(Number(t['bitrate']) / 1000)}kbps`;
-    row.innerHTML = `<span class="nm">${String(t['name'])}</span>`
+    row.innerHTML = `<span class="nm">${String(t['name'])}:</span>`
       + `<span class="dt">${detail}</span>`
       + `<span class="badge idle" data-track="${String(t['name'])}">FWD --</span>`;
     return row;
@@ -467,8 +470,20 @@ function renderStatusBadges(): void {
 
 // ─── Metrics strip ───────────────────────────────────────────────────
 
+/** Metrics-row hover text. */
+const CELL_TIPS: Record<string, string> = {
+  'bitrate a/v': 'Sent kbps, audio/video.',
+  'fps enc': 'Video frames encoded per second.',
+  'target': 'Target latency in the catalog.',
+  'objects a/v': 'Objects sent, audio/video.',
+  'keyframes': 'Keyframes sent, one per group.',
+  'queue a/v': 'Chunks waiting to send, audio/video. Small: queue limit.',
+  'uptime': 'Time since going live.',
+};
+
 function cell(label: string, value: string, cls = ''): string {
-  return `<div class="cell">${label}<b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
+  const tip = CELL_TIPS[label];
+  return `<div class="cell"${tip ? ` title="${tip}"` : ''}>${label}<b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
 }
 const u = (s: string): string => `<span class="u">${s}</span>`;
 
@@ -964,6 +979,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       setText('conn-draft', String(negotiatedDraft));
       currentConnection = conn;
       log(`Session established (draft-${negotiatedDraft}).`);
+      audioOnDatagrams = audioDatagrams && negotiatedDraft === 18 && packaging !== 'locmaf';
       if (packaging === 'locmaf' && audioDatagrams) log('LOCMAF: audio stays on subgroups (no datagrams)');
       log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);

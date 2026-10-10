@@ -95,6 +95,22 @@ const setText = (id: string, value: string): void => {
 /** Lines kept; the oldest are dropped past this. */
 const MAX_LOG_LINES = 2000;
 
+/** Metrics-row hover text. */
+const CELL_TIPS: Record<string, string> = {
+  'ttff': 'Connection start to first frame drawn.',
+  'bitrate a/v': 'Received kbps, audio/video.',
+  'reorder a/v': 'Out-of-order arrivals, audio/video. Small: slowest to settle.',
+  'lag': 'Worst page stall. Hundreds of ms: page blocked or throttled.',
+  'clk drift': 'Publisher clock vs this browser, ms/min. Removed from the latency chart.',
+  'slowest t/a/d': 'Slowest object: transfer / assembly / dispatch ms. Small: its size.',
+  'resyncs': 'A/V sync reference re-anchored.',
+  'underruns': 'Audio ran dry. Small: total silence.',
+  'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
+  'dropped': "Video frames the browser didn't draw.",
+  'obj lost a/v': 'Objects that never arrived, audio/video.',
+  'stalls': 'Time playback was interrupted.',
+};
+
 function log(msg: string): void {
   const ts = new Date().toLocaleTimeString('en-US', {
     hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
@@ -520,8 +536,8 @@ async function main(): Promise<void> {
     }
     // `unit` renders small and muted after the value; `tone` colours the value
     // by health, so a non-zero fault counter is visible without reading labels.
-    const cell = (label: string, v: string, unit = '', tone = '', unitTone = '') =>
-      `<div class="cell">${label}:<b${tone ? ` class="${tone}"` : ''}>${v}`
+    const cell = (label: string, v: string, unit = '', tone = '', unitTone = '', tip = CELL_TIPS[label]) =>
+      `<div class="cell"${tip ? ` title="${tip}"` : ''}>${label}:<b${tone ? ` class="${tone}"` : ''}>${v}`
       + `${unit ? `<span class="u${unitTone ? ` ${unitTone}` : ''}">${unit}</span>` : ''}</b></div>`;
     // Role, not severity: green measures, amber marks the counters that
     // should stay at zero. Stream identity lives in the catalog panel.
@@ -539,6 +555,15 @@ async function main(): Promise<void> {
     // exist on the MSE path, and a column of em-dashes is worse than no column.
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
+    // Interruptions: playback stalls, plus on MSE the video holes played through
+    // (picture frozen while audio continues; no stall is reported).
+    const stalls = s.stallCount ?? 0;
+    const freezes = locPath ? 0 : videoFreezes;
+    const stallSec = (s.stallDurationMs ?? 0) / 1000;
+    const interruptedSec = stallSec + (locPath ? 0 : videoFrozenSec);
+    // TTFF runs from connection start; the connect share goes in its tooltip.
+    const connectMs: number | null = (player as any).engine?.stats?.ttffBreakdown?.setupCompleteMs ?? null;
+    noteAudioDatagrams();
     // Compared against the playout cushion, which is on screen and static: a
     // reorder settling inside it is absorbed invisibly, one settling beyond it
     // arrived later than the buffer was sized to cope with. The adaptive gap
@@ -548,7 +573,8 @@ async function main(): Promise<void> {
     const lagWorst = Math.max(0, ...lagSamples.map(([, d]) => d));
     const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
-      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM),
+      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM, '',
+        connectMs != null ? `${CELL_TIPS['ttff']} Connect: ${connectMs.toFixed(0)} ms.` : CELL_TIPS['ttff']),
       cell('bitrate a/v', `${fmtKbps(trackKbps('audio'))}/${fmtKbps(trackKbps('video'))}`, 'kbps', NUM),
       // Cross-stream arrival order, not a fault: LOC audio is one group per frame
       // on its own QUIC stream and independent streams carry no ordering between
@@ -589,13 +615,9 @@ async function main(): Promise<void> {
       cell('obj lost a/v',
         `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`, '',
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
-      cell('stalls', `${s.stallCount ?? 0} (${((s.stallDurationMs ?? 0) / 1000).toFixed(1)}s)`, '',
-        FAULT(s.stallCount ?? 0)),
-      // MSE: video holes playback ran through — the picture froze while audio
-      // played on, so no stall was reported.
-      ...(!locPath ? [
-        cell('freezes', `${videoFreezes} (${videoFrozenSec.toFixed(1)}s)`, '', FAULT(videoFreezes)),
-      ] : []),
+      cell('stalls', interruptedSec.toFixed(1), 's', FAULT(stalls + freezes), '',
+        `${CELL_TIPS['stalls']} Stalls: ${stalls} (${stallSec.toFixed(1)} s)`
+        + (locPath ? '' : ` · Freezes: ${freezes} (${videoFrozenSec.toFixed(1)} s)`)),
     ].join('');
   });
 
@@ -639,6 +661,7 @@ async function main(): Promise<void> {
   let audioLatPct: [number, number, number] | null = null;
   /** CMAF: estimated capture-to-screen latency, arrival p50 plus the video buffered ahead. */
   let cmafPlayoutMs: number | null = null;
+  const playoutWindow: Array<[number, number]> = [];
   /** LOC: capture-to-paint age of each frame drawn, kept like latWindow. */
   const screenWindow: Array<[number, number]> = [];
   const noteFrameDrawn = (captureUs: number, drawnAtWallMs: number): void => {
@@ -1279,7 +1302,11 @@ async function main(): Promise<void> {
     audioLatPct = audioLat.length
       ? [percentile(audioLat, 0.5), percentile(audioLat, 0.95), percentile(audioLat, 0.99)] : null;
     // MSE plays behind its buffered end, so on screen is roughly arrival plus that buffer.
-    cmafPlayoutMs = byKind && latVals.length ? percentile(latVals, 0.5) + byKind.video : null;
+    // The buffered-ahead term is a sawtooth between appends: report its p50
+    // over the chart's window, as the drawn-frame E2E is on LOC.
+    if (byKind && latVals.length) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
+    while (playoutWindow.length && tickNowMs - playoutWindow[0]![0] > LAT_WINDOW_MS) playoutWindow.shift();
+    cmafPlayoutMs = playoutWindow.length ? percentile(playoutWindow.map(([, v]) => v), 0.5) : null;
     while (screenWindow.length && tickNowMs - screenWindow[0]![0] > LAT_WINDOW_MS) screenWindow.shift();
     const screenVals = screenWindow.map(([, v]) => v - driftCorrectionMs);
     // Every series takes a value on every sampled tick, NaN where there is
@@ -1380,11 +1407,8 @@ async function main(): Promise<void> {
     latMax.textContent = peakMs?.toFixed(0) ?? '—';
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = clockDriftMsPerMin !== null
-      ? `This browser's clock and the publisher's ran ${clockDriftMsPerMin.toFixed(1)} `
-        + `ms/min apart over the last ten minutes; the ${driftCorrectionMs.toFixed(0)} ms `
-        + 'the latency floor has moved since it was first fitted is removed. Any constant difference between the '
-        + 'two clocks remains, because a one-way measurement cannot tell it from '
-        + 'transit — read these as relative, not as true one-way delay.'
+      ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; ${driftCorrectionMs.toFixed(0)} ms removed. `
+        + 'Constant offset remains.'
       : '';
     jitVal.textContent = lastFinite(jitSamples)?.toFixed(1) ?? '—';
   }, TICK_MS);
@@ -1396,6 +1420,25 @@ async function main(): Promise<void> {
   /** Audio, then video, then anything else in the order it arrived. */
   const trackRank = (role: unknown): number =>
     role === 'audio' ? 0 : role === 'video' ? 1 : 2;
+
+  // Audio delivery shown on its catalog line while audio objects arrive as datagrams.
+  let audioViaDatagrams = false;
+  let datagramAudioSeen = 0;
+  let datagramAudioAtMs = -Infinity;
+  const audioDetail = (base: string): string => (audioViaDatagrams ? `${base} · datagrams` : base);
+  function noteAudioDatagrams(): void {
+    const count: number = (player as any).engine?.datagramObjects?.audio ?? 0;
+    const nowMs = performance.now();
+    if (count > datagramAudioSeen) {
+      datagramAudioSeen = count;
+      datagramAudioAtMs = nowMs;
+    }
+    const via = nowMs - datagramAudioAtMs < 3_000;
+    if (via === audioViaDatagrams) return;
+    audioViaDatagrams = via;
+    const dt = catTracks.querySelector<HTMLElement>('.cat-track.audio .dt');
+    if (dt?.dataset['base'] !== undefined) dt.textContent = audioDetail(dt.dataset['base']);
+  }
 
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
@@ -1440,6 +1483,10 @@ async function main(): Promise<void> {
         t.bitrate ? `${Math.round(t.bitrate / 1000)}kbps` : '',
         t.initRef ? `init=${t.initRef}` : '',
       ].filter(Boolean).join(' · ');
+      if (role === ' audio') {
+        detail.dataset['base'] = detail.textContent;
+        detail.textContent = audioDetail(detail.textContent);
+      }
       const badge = document.createElement('span');
       badge.className = 'badge idle';
       badge.dataset['track'] = String(t.name ?? '');

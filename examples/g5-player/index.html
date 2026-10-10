@@ -266,7 +266,7 @@
       justify-content: space-between; gap: 12px;
     }
     .cat-head .chart-label { font-size: .95rem; color: #fff; font-weight: 700; white-space: nowrap; }
-    .cat-head .chart-label b { font-size: 1rem; }
+    .cat-head .chart-label b { font-size: 1rem; color: #4d4; font-weight: 600; }
     .cat-head .chart-label .aside { color: #8a94a6; font-weight: 400; }
     button.mini {
       padding: 4px 12px; font-size: .8rem;
@@ -473,17 +473,17 @@
     <div class="diag">
       <div class="diag-grid" id="diag-grid"></div>
       <div class="diag-charts">
-        <div class="chart" title="Arrival latency in milliseconds: the publisher's capture stamp subtracted from its arrival time in this page, per video object.&#10;&#10;Two curves on the shared 250 ms axis, both over the same rolling 4 s window: mustard is p50, amber is p95. Each curve is exactly the number printed beside it, so the lines and the readouts cannot disagree.&#10;&#10;'max' is the worst single sample in the 45 s the chart covers, marked by the red dot (pinned to the top edge when off scale); it ages out as the dot scrolls off. p95 over ~120 samples cannot be moved by one outlier (a 150 ms congestion-control stall touches about 5 of them), so an isolated spike appears here and in neither curve. Expect it to sit above both. A gap in the curves means no video arrived.&#10;&#10;Absolute when the publisher and the browser share a clock. When they do not, the two differ by an offset and by a RATE. Only the rate is removed here, from a fit of the per-tick floor against session time — it would otherwise ramp the reading without bound; hovering the label reports it and how much has been taken out. The constant offset remains, because a one-way measurement cannot separate it from transit. Read the numbers as relative rather than true one-way delay: spikes, jitter and shape are intact, the absolute is not.&#10;&#10;It measures delivery only — the playout cushion, decode and paint are not in it.&#10;&#10;'e2e' is what the viewer sees: the p50 age of the frames actually drawn, capture to paint, over the same window and with the same rate removed. On CMAF there is no frame-level report, so it is estimated (≈) as arrival p50 plus the video buffered ahead.">
+        <div class="chart" title="Video arrival latency, ms: p50 (mustard) and p95 (amber) over 4 s; red dot is the 45 s max. E2E is capture to paint (≈ estimated on CMAF). Relative unless both clocks agree.">
           <span class="chart-label split2" id="lat-label"><span>latency:
             p50:<b id="lat-val">—</b> p95:<b id="lat-p95">—</b> max:<b id="lat-max">—</b></span>
             <span>e2e: <b id="lat-screen">—</b></span></span>
           <canvas id="lat-spark"></canvas>
         </div>
-        <div class="chart" title="RFC 3550 interarrival jitter, in milliseconds: how much the spacing between arrivals differs from the spacing between their capture stamps, smoothed by 1/16.&#10;&#10;Clock offset cancels out here, so this is trustworthy across machines. It rises with network bursts — and also when this page's main thread stalls, because arrival is stamped in JavaScript.">
+        <div class="chart" title="Arrival jitter (RFC 3550), ms. Rises with network bursts or a blocked page.">
           <span class="chart-label">jitter: <b id="jit-val">—</b></span>
           <canvas id="jit-spark"></canvas>
         </div>
-        <div class="chart" title="Queued media ahead of the playhead in milliseconds, measured per track and plotted as two lines. Nothing is combined or intersected.&#10;&#10;CMAF: each MSE SourceBuffer&#39;s contiguous range ahead of currentTime. LOC: audio scheduled into WebAudio, and decoded frames held in the render queue.&#10;&#10;The deeper line is the delay you are watching; the shallower one is the margin before that track starves. Δ is the difference between the two printed numbers — not a lip-sync figure, since the depths are measured from different origins.&#10;&#10;LOC&#39;s video depth excludes frames still inside the decoder, so it understates that pipeline. CMAF has no equivalent blind spot.&#10;&#10;Dashed line is the catalog&#39;s target latency. Red marks are stalls.">
+        <div class="chart" title="Media buffered ahead of the playhead, per track, ms. Dashed: target. Red: stalls.">
           <span class="chart-label split3"><span>queued: a:<b id="cus-a" class="ser-a">—</b>/<!--
             -->v:<b id="cus-v" class="ser-v">—</b> Δ: <b id="cus-d">—</b></span>
             <span>target: <b id="cus-target">—</b></span>
