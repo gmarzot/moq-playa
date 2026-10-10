@@ -7842,21 +7842,19 @@ export class MoqtPlayer {
 
       // Warm start (§5.1.3): a live LOC track subscribes with the Largest
       // Object filter so a relative Joining FETCH can prepend the current
-      // group's head (issued below). CMAF is excluded — its MSE append path
-      // is not warm-start safe (see cmafBootstrap notes) — and non-live
-      // tracks already start from group 0. Config validation guarantees any
-      // explicit subscriptionFilter is LargestObject when warm start is on.
-      const warmStart = this.config.warmStartCurrentGroup === true
-        && track?.isLive === true
-        && !isMsePackaging(packaging);
-      if (this.config.warmStartCurrentGroup === true && isMsePackaging(packaging)) {
-        this.log.warn('[warm-start] CMAF track "%s" skipped — LOC only in this slice', name);
-      }
+      // group's head (issued below). MSE packagings cannot take that backlog
+      // (see cmafBootstrap notes): their live video asks for a new group
+      // instead (NEW_GROUP_REQUEST 0, §10.2.13), which a publisher with
+      // dynamic groups honours and any other ignores. Non-live tracks already
+      // start from group 0. Config validation guarantees any explicit
+      // subscriptionFilter is LargestObject when warm start is on.
+      const warmStartAsked = this.config.warmStartCurrentGroup === true && track?.isLive === true;
+      const warmStart = warmStartAsked && !isMsePackaging(packaging);
+      const newGroupRequest = warmStartAsked && isMsePackaging(packaging)
+        && mediaType === 'video' && this.connection.draftVersion !== 14;
+      if (newGroupRequest) this.log.info('[warm-start] %s track "%s" asks for a new group', packaging, name);
       // Warm start overrides ONLY the filter — configured subscribe options
       // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
-      // A publisher with dynamic groups starts a group for this viewer (§10.2.13).
-      const newGroupRequest = this.config.requestNewGroupOnJoin === true
-        && mediaType === 'video' && track?.isLive === true && this.connection.draftVersion !== 14;
       const mediaOptions = {
         ...(warmStart
           ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }

@@ -49,7 +49,7 @@ export const authority: string | undefined = (() => {
   return value || undefined;
 })();
 
-/** `?warmStart=1`: joining-FETCH warm start of the current group (live LOC tracks). */
+/** `?warmStart=1`: LOC fetches the current group; CMAF/LOCMAF video asks for a new group. */
 export const warmStart: boolean = params.get('warmStart') === '1';
 
 /** Catalog retrieval mode override (?catalogBootstrap=auto|joining-fetch|strict|subscribe).

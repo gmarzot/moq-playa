@@ -11,7 +11,8 @@
  *   - INITIAL TUNE-IN ONLY: the ABR switch path (selectVideoTrack) never
  *     issues a joining FETCH.
  *   - FETCH failure is non-fatal: warn + clean up + live-only.
- *   - CMAF and non-live tracks are skipped (LOC-only slice).
+ *   - CMAF and LOCMAF live video asks for a new group instead; non-live
+ *     tracks are skipped.
  *   - Default behavior (warm start off) keeps NextGroupStart untouched.
  *
  * @module
@@ -135,6 +136,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
       const call = subscribeCalls().find(([n]: [string, unknown]) => n === name);
       expect(call, `subscribe(${name})`).toBeDefined();
       expect(call![1]?.subscriptionFilter?.type).toBe('LargestObject');
+      expect(call![1]?.newGroupRequest).toBeUndefined();
     }
 
     expect(adapter.joiningFetch).toHaveBeenCalledTimes(2);
@@ -226,7 +228,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     await player.destroy();
   });
 
-  it('CMAF tracks are skipped (LOC-only slice): no joining FETCH, NextGroupStart preserved', async () => {
+  it('CMAF video asks for a new group instead: no joining FETCH, NextGroupStart preserved', async () => {
     const cmafCatalog = locCatalog([
       { name: 'video', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
         codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000 },
@@ -237,10 +239,11 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     expect(adapter.joiningFetch).not.toHaveBeenCalled();
     const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
     expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(call![1]?.newGroupRequest).toBe(0n);
     await player.destroy();
   });
 
-  it('LOCMAF tracks are skipped like CMAF (MSE path): no joining FETCH, NextGroupStart preserved', async () => {
+  it('LOCMAF video asks for a new group like CMAF (MSE path): no joining FETCH, NextGroupStart preserved', async () => {
     const locmafCatalog = locCatalog([
       { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', renderGroup: 1,
         codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000 },
@@ -251,6 +254,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     expect(adapter.joiningFetch).not.toHaveBeenCalled();
     const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
     expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(call![1]?.newGroupRequest).toBe(0n);
     await player.destroy();
   });
 
@@ -719,23 +723,34 @@ describe('warm start OFF (default)', () => {
   });
 });
 
-describe('new group on join (requestNewGroupOnJoin, §10.2.13)', () => {
-  it('the live video SUBSCRIBE carries NEW_GROUP_REQUEST 0; audio does not', async () => {
-    const { subscribeCalls } = await bootPlayer(
-      locCatalog([VIDEO_LOC, AUDIO_LOC]), { requestNewGroupOnJoin: true });
-    const opts = (name: string) => subscribeCalls().find(([n]: [string, unknown]) => n === name)?.[1];
-    expect(opts('video')?.newGroupRequest).toBe(0n);
-    expect(opts('audio')?.newGroupRequest).toBeUndefined();
+describe('warm start on MSE packagings asks for a new group (§10.2.13)', () => {
+  const CMAF_VIDEO = {
+    name: 'video', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+    codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000,
+  };
+  const CMAF_AUDIO = {
+    name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio', renderGroup: 1,
+    codec: 'opus', samplerate: 48000, channelConfig: '2', bitrate: 128_000,
+  };
+  const opts = (calls: Array<[string, any]>, name: string) => calls.find(([n]) => n === name)?.[1];
+
+  it('only the video SUBSCRIBE carries NEW_GROUP_REQUEST 0', async () => {
+    const { player, subscribeCalls } = await bootPlayer(
+      locCatalog([CMAF_VIDEO, CMAF_AUDIO]), { warmStartCurrentGroup: true });
+    expect(opts(subscribeCalls(), 'video')?.newGroupRequest).toBe(0n);
+    expect(opts(subscribeCalls(), 'audio')).toBeDefined();
+    expect(opts(subscribeCalls(), 'audio')?.newGroupRequest).toBeUndefined();
+    await player.destroy();
   });
 
-  it('is off by default and on draft-14, which has no NEW_GROUP_REQUEST', async () => {
-    const off = await bootPlayer(locCatalog([VIDEO_LOC]));
-    const d14 = await bootPlayer(locCatalog([VIDEO_LOC]), { requestNewGroupOnJoin: true },
+  it('is not sent without warm start, nor on draft-14, which has no NEW_GROUP_REQUEST', async () => {
+    const off = await bootPlayer(locCatalog([CMAF_VIDEO]));
+    const d14 = await bootPlayer(locCatalog([CMAF_VIDEO]), { warmStartCurrentGroup: true },
       (adapter) => { adapter.draftVersion = 14; });
-    for (const { subscribeCalls } of [off, d14]) {
-      const video = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
-      expect(video).toBeDefined();
-      expect(video![1]?.newGroupRequest).toBeUndefined();
+    for (const { player, subscribeCalls } of [off, d14]) {
+      expect(opts(subscribeCalls(), 'video')).toBeDefined();
+      expect(opts(subscribeCalls(), 'video')?.newGroupRequest).toBeUndefined();
+      await player.destroy();
     }
   });
 });

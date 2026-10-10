@@ -27,9 +27,6 @@ const compatParam = parseCompat(new URLSearchParams(location.search).get('compat
 /** `?locmaf=frame`: LOCMAF tracks through WebCodecs instead of MSE (the default). */
 const locmafFrame = new URLSearchParams(location.search).get('locmaf') === 'frame';
 
-/** `?newGroup=1`: ask a publisher with dynamic groups for a new group on join. */
-const newGroupOnJoin = new URLSearchParams(location.search).get('newGroup') === '1';
-
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
   const v = Number(new URLSearchParams(location.search).get('catchUp'));
@@ -130,7 +127,7 @@ function log(msg: string): void {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
   const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'cushion', 'cushionMax',
-    'catchUp', 'catalogBootstrap', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
+    'catchUp', 'catalogBootstrap', 'warmStart', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const backdrop = byId('settings-backdrop');
@@ -142,6 +139,7 @@ function log(msg: string): void {
   const fCushionMax = byId<HTMLInputElement>('s-cushion-max');
   const fCatchUp = byId<HTMLInputElement>('s-catchup');
   const fBootstrap = byId<HTMLSelectElement>('s-bootstrap');
+  const fWarmStart = byId<HTMLInputElement>('s-warm-start');
   const fCc = byId<HTMLSelectElement>('s-cc');
   const fAuthority = byId<HTMLInputElement>('s-authority');
   const fHash = byId<HTMLInputElement>('s-hash');
@@ -161,6 +159,7 @@ function log(msg: string): void {
     fCushionMax.value = p.get('cushionMax') ?? '';
     fCatchUp.value = p.get('catchUp') ?? '';
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
+    fWarmStart.checked = p.get('warmStart') === '1';
     fCc.value = p.get('congestionControl') ?? '';
     fAuthority.value = p.get('authority') ?? '';
     fHash.value = p.get('hash') ?? '';
@@ -201,6 +200,7 @@ function log(msg: string): void {
     set('cushionMax', fCushionMax.value.trim());
     set('catchUp', fCatchUp.value.trim());
     set('catalogBootstrap', fBootstrap.value);
+    if (fWarmStart.checked) next.set('warmStart', '1');
     set('congestionControl', fCc.value);
     set('authority', fAuthority.value.trim());
     set('hash', fHash.value.trim());
@@ -256,7 +256,6 @@ async function main(): Promise<void> {
   const engineConfig = {
     ...(catalogBootstrap ? { catalogBootstrap } : {}),
     ...(warmStart ? { warmStartCurrentGroup: true } : {}),
-    ...(newGroupOnJoin ? { requestNewGroupOnJoin: true } : {}),
     ...(catchUpRate ? { maxCatchUpRate: catchUpRate } : {}),
     ...(renderCushionFloorMs ? { renderCushionFloorMs } : {}),
     ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),

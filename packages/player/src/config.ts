@@ -329,25 +329,20 @@ export interface PlaybackTuningConfig {
    * boundary. The FETCH and the live subscription are contiguous and
    * non-overlapping by construction (§9.16.2.1).
    *
-   * Scope: initial tune-in only (never ABR switches), live LOC tracks only —
-   * CMAF tracks keep their normal boundary start (MSE append ordering is not
-   * warm-start safe yet) and non-live tracks already start from group 0. A
-   * refused FETCH is non-fatal: playback continues live-only from the next
-   * group boundary.
+   * Live CMAF and LOCMAF video cannot take that backlog through MSE; its
+   * SUBSCRIBE carries NEW_GROUP_REQUEST 0 instead (draft-16/18 §10.2.13), so a
+   * publisher with dynamic groups starts a new group at once. A publisher
+   * without them ignores it, and playback starts at the next group.
+   *
+   * Scope: initial tune-in only (never ABR switches); non-live tracks already
+   * start from group 0. A refused FETCH is non-fatal: playback continues
+   * live-only from the next group boundary.
    *
    * Default: off. Incompatible with an explicit `subscriptionFilter` other
    * than `'LargestObject'` — draft-16 §9.16.2 closes the session when a
    * Joining Fetch references a subscription with any other filter.
    */
   readonly warmStartCurrentGroup?: boolean;
-
-  /**
-   * Live video SUBSCRIBEs carry NEW_GROUP_REQUEST 0 (draft-16/18 §10.2.13): a
-   * publisher with dynamic groups starts a new group, so playback begins at a
-   * fresh keyframe instead of the next scheduled one. Publishers without
-   * dynamic groups, and relays forwarding to them, ignore it. Default: off.
-   */
-  readonly requestNewGroupOnJoin?: boolean;
 
   /**
    * Static floor of the LOC render cushion in milliseconds: the minimum
