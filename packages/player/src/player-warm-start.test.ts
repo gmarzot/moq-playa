@@ -718,3 +718,24 @@ describe('warm start OFF (default)', () => {
     await player.destroy();
   });
 });
+
+describe('new group on join (requestNewGroupOnJoin, §10.2.13)', () => {
+  it('the live video SUBSCRIBE carries NEW_GROUP_REQUEST 0; audio does not', async () => {
+    const { subscribeCalls } = await bootPlayer(
+      locCatalog([VIDEO_LOC, AUDIO_LOC]), { requestNewGroupOnJoin: true });
+    const opts = (name: string) => subscribeCalls().find(([n]: [string, unknown]) => n === name)?.[1];
+    expect(opts('video')?.newGroupRequest).toBe(0n);
+    expect(opts('audio')?.newGroupRequest).toBeUndefined();
+  });
+
+  it('is off by default and on draft-14, which has no NEW_GROUP_REQUEST', async () => {
+    const off = await bootPlayer(locCatalog([VIDEO_LOC]));
+    const d14 = await bootPlayer(locCatalog([VIDEO_LOC]), { requestNewGroupOnJoin: true },
+      (adapter) => { adapter.draftVersion = 14; });
+    for (const { subscribeCalls } of [off, d14]) {
+      const video = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
+      expect(video).toBeDefined();
+      expect(video![1]?.newGroupRequest).toBeUndefined();
+    }
+  });
+});

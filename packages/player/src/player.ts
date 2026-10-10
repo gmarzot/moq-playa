@@ -7854,9 +7854,15 @@ export class MoqtPlayer {
       }
       // Warm start overrides ONLY the filter — configured subscribe options
       // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
-      const mediaOptions = warmStart
-        ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }
-        : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
+      // A publisher with dynamic groups starts a group for this viewer (§10.2.13).
+      const newGroupRequest = this.config.requestNewGroupOnJoin === true
+        && mediaType === 'video' && track?.isLive === true && this.connection.draftVersion !== 14;
+      const mediaOptions = {
+        ...(warmStart
+          ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }
+          : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true))),
+        ...(newGroupRequest ? { newGroupRequest: 0n } : {}),
+      };
       // Pre-send ownership (§9.10): register inside onRequestId — a
       // zero-latency SUBSCRIBE_OK must find the pending entry already in place. Adapters
       // that don't invoke the callback fall back to post-await registration.
@@ -7865,7 +7871,7 @@ export class MoqtPlayer {
         + ` nsFields=${nsBytes.length} nsHex=${nsBytes.map(hexBytes).join('/')}`
         + ` track="${name}" trackHex=${hexBytes(nameBytes)}`
         + ` filter=${(mediaOptions as { subscriptionFilter?: { type?: string } }).subscriptionFilter?.type ?? 'default'}`
-        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}`;
+        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}${newGroupRequest ? ' newGroupRequest=0' : ''}`;
       let subRegistered = false;
       const registerMediaSub = (reqIdBigInt: bigint): void => {
         if (subRegistered) return;

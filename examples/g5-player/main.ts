@@ -26,6 +26,9 @@ const compatParam = parseCompat(new URLSearchParams(location.search).get('compat
 /** `?locmaf=frame`: LOCMAF tracks through WebCodecs instead of MSE (the default). */
 const locmafFrame = new URLSearchParams(location.search).get('locmaf') === 'frame';
 
+/** `?newGroup=1`: ask a publisher with dynamic groups for a new group on join. */
+const newGroupOnJoin = new URLSearchParams(location.search).get('newGroup') === '1';
+
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
   const v = Number(new URLSearchParams(location.search).get('catchUp'));
@@ -252,6 +255,7 @@ async function main(): Promise<void> {
   const engineConfig = {
     ...(catalogBootstrap ? { catalogBootstrap } : {}),
     ...(warmStart ? { warmStartCurrentGroup: true } : {}),
+    ...(newGroupOnJoin ? { requestNewGroupOnJoin: true } : {}),
     ...(catchUpRate ? { maxCatchUpRate: catchUpRate } : {}),
     ...(renderCushionFloorMs ? { renderCushionFloorMs } : {}),
     ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),

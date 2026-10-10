@@ -342,6 +342,14 @@ export interface PlaybackTuningConfig {
   readonly warmStartCurrentGroup?: boolean;
 
   /**
+   * Live video SUBSCRIBEs carry NEW_GROUP_REQUEST 0 (draft-16/18 §10.2.13): a
+   * publisher with dynamic groups starts a new group, so playback begins at a
+   * fresh keyframe instead of the next scheduled one. Publishers without
+   * dynamic groups, and relays forwarding to them, ignore it. Default: off.
+   */
+  readonly requestNewGroupOnJoin?: boolean;
+
+  /**
    * Static floor of the LOC render cushion in milliseconds: the minimum
    * playout delay video and audio schedule ahead of arrival.
    * Default: 200, or 50 when the WebTransport handshake RTT is under 5 ms.
