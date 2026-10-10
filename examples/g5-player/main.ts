@@ -2,8 +2,8 @@
  * G5 Player
  *
  * Plays LOC and CMAF through the relay and instruments what it sees: a metrics
- * row of health counters, three charts on one shared time axis, the catalog as
- * delivered, and a transport panel. Built on openmoq/moq-playa; the engine is
+ * row of health counters, three charts on one shared time axis, the catalog,
+ * and a transport panel. Built on openmoq/moq-playa; the engine is
  * theirs, the instrument is not.
  */
 
@@ -13,6 +13,7 @@ import {
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
 } from '../shared/cert.js';
 import { parseCompat } from '../shared/compat.js';
+import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import {
   readMdhdTimescale, readSegmentTimeRanges, readTrexDefaults, type TrexDefaults,
 } from '../../packages/browser/src/mp4-box.js';
@@ -1503,7 +1504,7 @@ async function main(): Promise<void> {
       return row;
     }));
 
-    catJson.textContent = JSON.stringify(cat, null, 2);
+    catJson.textContent = JSON.stringify(orderCatalogForDisplay(cat), null, 2);
   }
 
   // Periodic catalog refreshes repeat an unchanged catalog; logging each one

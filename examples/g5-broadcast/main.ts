@@ -27,6 +27,7 @@ import { buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE } from '../shared
 import { log } from '../shared/log.js';
 import { parseCertHashHex } from '../shared/relay-url.js';
 import { parseCompat } from '../shared/compat.js';
+import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
@@ -446,7 +447,7 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
       { tracks?: Array<Record<string, unknown>>; version?: unknown };
     tracks = doc.tracks ?? [];
     version = doc.version;
-    catJson.textContent = JSON.stringify(doc, null, 2);
+    catJson.textContent = JSON.stringify(orderCatalogForDisplay(doc), null, 2);
   } catch {
     catJson.textContent = text;
   }
