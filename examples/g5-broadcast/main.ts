@@ -397,6 +397,13 @@ function wireCopy(btn: HTMLButtonElement, text: () => string): void {
 const trackRank = (name: unknown): number =>
   name === 'audio' ? 0 : name === 'video' ? 1 : 2;
 
+/** CMSF when any track is CMAF or LOCMAF, else MSF, with the catalog's version. */
+const catalogLabel = (packagings: unknown[], version: unknown): string => {
+  const format = packagings.some((p) => p === 'cmaf' || p === 'locmaf') ? 'CMSF' : 'MSF';
+  const v = String(version ?? '?');
+  return `${format} ${v.startsWith('draft-') ? v : `v${v}`}`;
+};
+
 /** Render the catalog from the SAME builder the catalog track publishes, so
  *  the panel cannot drift from the bytes on the wire. */
 function renderCatalogPanel(params: BroadcastCatalogParams): void {
@@ -414,11 +421,8 @@ function renderCatalogPanel(params: BroadcastCatalogParams): void {
   } catch {
     catJson.textContent = text;
   }
-  // Same header shape as the player's catalog panel.
-  const packagings = [...new Set(tracks.map((t) => (t['packaging'] === 'locmaf' && t['locmafVersion']
-    ? `locmaf ${String(t['locmafVersion'])}` : String(t['packaging']))))].join(', ');
-  catMeta.textContent = packagings
-    ? `v${String(version ?? '?')} · ${packagings}` : `v${String(version ?? '?')}`;
+  // Same header as the player's catalog panel.
+  catMeta.textContent = catalogLabel(tracks.map((t) => t['packaging']), version);
   catSize.textContent = ` · ${bytes.byteLength}B`;
   // Display order only; the published catalog keeps its own.
   const ordered = [...tracks].sort(

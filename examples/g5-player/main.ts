@@ -1421,6 +1421,13 @@ async function main(): Promise<void> {
   const trackRank = (role: unknown): number =>
     role === 'audio' ? 0 : role === 'video' ? 1 : 2;
 
+  /** CMSF when any track is CMAF or LOCMAF, else MSF, with the catalog's version. */
+  const catalogLabel = (packagings: unknown[], version: unknown): string => {
+    const format = packagings.some((p) => p === 'cmaf' || p === 'locmaf') ? 'CMSF' : 'MSF';
+    const v = String(version ?? '?');
+    return `${format} ${v.startsWith('draft-') ? v : `v${v}`}`;
+  };
+
   // Audio delivery shown on its catalog line while audio objects arrive as datagrams.
   let audioViaDatagrams = false;
   let datagramAudioSeen = 0;
@@ -1452,11 +1459,8 @@ async function main(): Promise<void> {
     // The engine runs at the URL override when one is given.
     targetLatencyMs = targetLatencyOverrideMs ?? Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
-    const packagings = [...new Set(tracks.map((t) => (t.packaging === 'locmaf' && t.locmafVersion
-      ? `locmaf ${t.locmafVersion}` : t.packaging)))].join(', ');
-    // Same header shape as the broadcaster's catalog panel.
-    catMeta.textContent = packagings
-      ? `v${cat?.version ?? '?'} · ${packagings}` : `v${cat?.version ?? '?'}`;
+    // Same header as the broadcaster's catalog panel.
+    catMeta.textContent = catalogLabel(tracks.map((t) => t.packaging), cat?.version);
 
     // Display order only; the catalog keeps its published order.
     const ordered = [...tracks].sort((a, b) => trackRank(a.role ?? a.name) - trackRank(b.role ?? b.name));
