@@ -983,15 +983,18 @@ async function main(): Promise<void> {
       return null;
     }
   };
-  const traceObject = (e: any, nowMs: number): void => {
+  const traceArrival = (e: any, nowMs: number): void => {
     const kind = e.mediaType as 'video' | 'audio';
     const prevArrival = lastArrivalMs[kind];
     const throttled = document.hidden || nowMs - traceShownAtMs < 1000;
     if (!throttled && prevArrival !== undefined && nowMs - prevArrival > 150) {
       traceLog(`trace ${kind}: arrival gap ${Math.round(nowMs - prevArrival)}ms before group ${e.groupId}/${e.objectId}`);
     }
+  };
+  /** CMAF video decode steps, from the engine's event: playa's carries no payload. */
+  const traceVideoTimeline = (e: any, nowMs: number): void => {
     const init = traceVideoInit;
-    if (kind !== 'video' || !init || !e.payload) return;
+    if (e.mediaType !== 'video' || e.kind !== 'data' || !init || !e.payload) return;
     const ranges = readSegmentTimeRanges(e.payload, init.trex);
     if (!ranges || ranges.length === 0) return;
     let start = ranges[0]!.startTime;
@@ -1020,10 +1023,11 @@ async function main(): Promise<void> {
     }
   };
 
+  (player as any).engine?.on('media_object', (e: any) => traceVideoTimeline(e, performance.now()));
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
-      traceObject(e, nowMs);
+      traceArrival(e, nowMs);
       lastArrivalMs[e.mediaType as 'video' | 'audio'] = nowMs;
     }
     noteObject(e);
