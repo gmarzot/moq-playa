@@ -8,14 +8,14 @@
  * @see draft-ietf-moq-transport-16 §10.2.1.1 (Object Status)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { DefaultRecoveryController } from './recovery.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
-import type { MoqtObjectData, MoqtObjectGap } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
-import type { LocHeaders } from '@moqt/loc';
+import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
+import type { LocHeaders } from '@openmoq/loc';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -98,6 +98,7 @@ function createPipeline(opts: {
     config?: PlaybackConfig;
     sync?: SyncController;
     recovery?: import('./recovery.js').RecoveryController;
+    getPlaybackDelayUs?: () => number;
 }) {
     const commands: DecoderCommand[] = [];
     const events: PlaybackEvent[] = [];
@@ -115,6 +116,7 @@ function createPipeline(opts: {
         onCommand: (cmd) => commands.push(cmd),
         onEvent: (evt) => events.push(evt),
         recovery: opts.recovery,
+        ...(opts.getPlaybackDelayUs ? { getPlaybackDelayUs: opts.getPlaybackDelayUs } : {}),
     });
 
     return { pipeline, commands, events, sync };
@@ -1892,6 +1894,27 @@ describe('PlaybackPipeline', () => {
             expect(resetIdx).toBeLessThan(decodeIdx);
         });
 
+        it('per-group END_OF_GROUP state stays at the groups in flight over a long audio run', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, sync } = createPipeline({ mediaType: 'audio', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            for (let g = 0; g < 5_000; g++) {
+                pipeline.pushObject(makeData(g, 0), audioHeaders(1_000_000_000n + BigInt(g) * 21_333n));
+                pipeline.pushObject(makeGap(g, 1, ObjectStatus.END_OF_GROUP));
+                clock.advance(21_333);
+                pipeline.tick();
+            }
+            const state = pipeline as unknown as {
+                endedGroups: Set<bigint>;
+                gapDetector: { endedGroups: Set<bigint>; groupFirstSeenUs: Map<bigint, number> };
+            };
+            expect(state.endedGroups.size).toBeLessThanOrEqual(2);
+            expect(state.gapDetector.endedGroups.size).toBeLessThanOrEqual(2);
+            expect(state.gapDetector.groupFirstSeenUs.size).toBeLessThanOrEqual(2);
+        });
+
         it('END_OF_GROUP for N allows normal transition to N+1 without abandon/reset', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
@@ -2001,5 +2024,96 @@ describe('PlaybackPipeline', () => {
             const decodes = commands.filter(c => c.type === 'decode_audio');
             expect(decodes.length).toBe(1);
         });
+    });
+
+    describe('PlaybackPipeline — media-time timestamps', () => {
+        it('adapts equally to arrival jitter for wall-clock and media-time timestamp epochs', () => {
+            const run = (isWallClock: boolean) => {
+                const clock = new MockClock();
+                const { pipeline } = createPipeline({
+                    mediaType: 'audio', clock,
+                    config: { ...DEFAULT_CONFIG, adaptiveTolerance: true },
+                });
+                const epoch = isWallClock ? 1_800_000_000_000_000n : 0n;
+                for (let i = 0; i < 30; i++) {
+                    clock.advance(i % 2 === 0 ? 20_000 : 270_000);
+                    pipeline.pushObject(makeData(i, 0), {
+                        captureTimestamp: epoch + BigInt(i) * 20_000n,
+                        timestampIsWallClock: isWallClock,
+                    });
+                }
+                return pipeline.effectiveGapTimeoutUs;
+            };
+            expect(run(false)).toBeCloseTo(run(true), 0);
+        });
+
+        it('does not measure wall-clock latency when timestampIsWallClock is false', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const config: PlaybackConfig = { ...DEFAULT_CONFIG, adaptiveTolerance: true };
+            const { pipeline, sync } = createPipeline({ mediaType: 'audio', clock, config });
+            const spy = vi.spyOn(sync, 'evaluateCatchUp');
+
+            pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
+            pipeline.tick();
+
+            expect(spy).toHaveBeenCalledWith(1_000_000n, false);
+            expect(sync.latencyUs).toBe(0);
+        });
+
+        it('a timescale-bearing stream schedules like its microsecond equivalent', () => {
+            const clockA = new MockClock();
+            const clockB = new MockClock();
+            const a = createPipeline({ mediaType: 'audio', clock: clockA });
+            const b = createPipeline({ mediaType: 'audio', clock: clockB });
+
+            a.pipeline.configure(new Uint8Array([0x01]));
+            b.pipeline.configure(new Uint8Array([0x01]));
+
+            for (let i = 0; i < 3; i++) {
+                a.pipeline.pushObject(makeData(i, 0), { captureTimestamp: BigInt(i) * 20_000n, timestampIsWallClock: true });
+                b.pipeline.pushObject(makeData(i, 0), {
+                    timestamp: BigInt(i) * 960n,
+                    timescale: 48_000n,
+                    captureTimestamp: BigInt(i) * 20_000n,
+                    timestampIsWallClock: false,
+                });
+            }
+            a.pipeline.tick();
+            b.pipeline.tick();
+
+            const renderA = a.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            const renderB = b.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            expect(renderA.length).toBe(3);
+            expect(renderB).toEqual(renderA);
+        });
+    });
+});
+
+describe('PlaybackPipeline — LOC-04 Audio Config', () => {
+    it('emits configure once for repeated identical audioConfig', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands } = createPipeline({ mediaType: 'audio', clock });
+        const cfg = Uint8Array.from([0x12, 0x10]);
+        pipeline.pushObject(makeData(0, 0), { captureTimestamp: 0n, audioConfig: cfg });
+        pipeline.pushObject(makeData(1, 0), { captureTimestamp: 20_000n, audioConfig: Uint8Array.from(cfg) });
+        pipeline.tick();
+        const configures = commands.filter(c => c.type === 'configure');
+        expect(configures).toHaveLength(1);
+        expect(configures[0]).toEqual({ type: 'configure', mediaType: 'audio', config: cfg });
+    });
+
+    it('a video pipeline ignores audioConfig', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands } = createPipeline({ mediaType: 'video', clock });
+        pipeline.pushObject(makeData(0, 0), {
+            captureTimestamp: 0n,
+            audioConfig: Uint8Array.from([1]),
+            videoFrameMarking: { startOfFrame: true, endOfFrame: true, independent: true, discardable: false, baseLayerSync: false, temporalId: 0 },
+        });
+        pipeline.tick();
+        expect(commands.filter(c => c.type === 'configure')).toHaveLength(0);
     });
 });

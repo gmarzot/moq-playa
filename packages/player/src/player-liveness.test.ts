@@ -18,10 +18,10 @@ import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -238,6 +238,38 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('followNamespace: an exhausted ladder waits, keeps resubscribing, and recovers when media returns', async () => {
+    const adapter = createMockAdapter();
+    adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+    const { player } = await startPlaying(adapter, { followNamespace: true });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    feedVideo(adapter); // arm, then silence
+    await vi.waitFor(() => {
+      expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true);
+    }, { timeout: 3_000 });
+    const starved = errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED);
+    expect(starved.severity).toBe('degraded');
+    expect(player.state).toBe(PlayerState.PLAYING);
+
+    // Still resubscribing after the ladder ran out.
+    const subscribesAtWait = adapter.subscribe.mock.calls.length;
+    await vi.waitFor(() => expect(adapter.subscribe.mock.calls.length).toBeGreaterThan(subscribesAtWait),
+      { timeout: 2_000 });
+
+    // Media returns on the newest subscription; no fatal follows.
+    const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: newReqId, groupId: varint(5), subgroupId: varint(0),
+      objectId: varint(0), payload: new Uint8Array([0xcc]),
+    } as MoqtObject);
+    await sleep(200);
+    expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED && e.severity === 'fatal')).toBe(false);
+    expect(player.state).toBe(PlayerState.PLAYING);
+    await player.destroy();
+  });
+
   it('a data-stream reset shortens the fuse — starvation fires long before the full timeout', async () => {
     const adapter = createMockAdapter();
     // Full timeout far away (5s): only the reset fuse (40ms) can fire below.
@@ -371,6 +403,52 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('a hidden page holds the restart until visible', async () => {
+    const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+    (globalThis as any).document = doc;
+    try {
+      const adapter = createMockAdapter();
+      const { player } = await startPlaying(adapter);
+      const subscribesAtStart = adapter.subscribe.mock.calls.length;
+
+      feedVideo(adapter); // arm
+      doc.visibilityState = 'hidden';
+      await sleep(400); // starved several timeouts over
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      expect(adapter.subscribe.mock.calls.length).toBe(subscribesAtStart);
+
+      doc.visibilityState = 'visible';
+      await vi.waitFor(() => expect(adapter.requestUpdate).toHaveBeenCalled(), { timeout: 2_000 });
+      await player.destroy();
+    } finally {
+      delete (globalThis as any).document;
+    }
+  });
+
+  it('delivery that resumes once visible needs no restart', async () => {
+    const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+    (globalThis as any).document = doc;
+    let feeder: ReturnType<typeof setInterval> | undefined;
+    try {
+      const adapter = createMockAdapter();
+      const { player } = await startPlaying(adapter);
+
+      feedVideo(adapter); // arm
+      doc.visibilityState = 'hidden';
+      await sleep(400);
+
+      doc.visibilityState = 'visible';
+      feedVideo(adapter);
+      feeder = setInterval(() => feedVideo(adapter), 20);
+      await sleep(400);
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      await player.destroy();
+    } finally {
+      if (feeder) clearInterval(feeder);
+      delete (globalThis as any).document;
+    }
+  });
+
   it('livenessTimeoutMs: 0 disables monitoring entirely', async () => {
     const adapter = createMockAdapter();
     const { player } = await startPlaying(adapter, { livenessTimeoutMs: 0 });
@@ -381,6 +459,19 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await sleep(250); // many times the (disabled) timeout
     expect(recoveries.filter((a) => a.type === 'track_restart')).toHaveLength(0);
     expect(adapter.requestUpdate).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+});
+
+describe('datagram arrivals', () => {
+  it('are counted per media type', async () => {
+    const adapter = createMockAdapter();
+    const { player } = await startPlaying(adapter);
+    adapter.onDatagram?.({
+      trackAlias: varint(AUDIO_ALIAS), groupId: varint(1), objectId: varint(0),
+      publisherPriority: 64, payload: new Uint8Array([1, 2, 3]),
+    });
+    expect(player.datagramObjects).toEqual({ audio: 1, video: 0 });
     await player.destroy();
   });
 });

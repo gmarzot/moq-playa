@@ -63,6 +63,41 @@ describe('Session', () => {
       expect(() => session.initiateSetup()).toThrow();
     });
 
+    describe('SERVER_SETUP without MAX_REQUEST_ID', () => {
+      const ns = [new TextEncoder().encode('ns')];
+      const name = new TextEncoder().encode('t');
+
+      it('grants no request credit by default (§9.3.1.3)', () => {
+        session.initiateSetup({ maxRequestId: varint(100n) });
+        session.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map() } as ServerSetup);
+        expect(() => session.subscribe(ns, name)).toThrow();
+        expect(session.uncappedRequestCredit.engaged).toBe(false);
+      });
+
+      it('opt-in: requests go uncapped and counted until a MAX_REQUEST_ID arrives', () => {
+        session.initiateSetup({ maxRequestId: varint(100n), requestsUncappedUntilMaxRequestId: true });
+        session.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map() } as ServerSetup);
+        session.subscribe(ns, name);
+        session.subscribe(ns, name);
+        expect(session.uncappedRequestCredit).toEqual({ engaged: true, active: true, requests: 2 });
+
+        session.handleControlMessage({ type: 'MAX_REQUEST_ID', maxRequestId: varint(10n) } as MaxRequestId);
+        expect(session.uncappedRequestCredit).toEqual({ engaged: true, active: false, requests: 2 });
+        expect(session.subscribe(ns, name).requestId).toBe(4n);
+      });
+
+      it('opt-in is inert when SERVER_SETUP grants credit', () => {
+        session.initiateSetup({ maxRequestId: varint(100n), requestsUncappedUntilMaxRequestId: true });
+        session.handleControlMessage({
+          type: 'SERVER_SETUP',
+          parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(2n)]]]),
+        } as ServerSetup);
+        session.subscribe(ns, name);
+        expect(() => session.subscribe(ns, name)).toThrow();
+        expect(session.uncappedRequestCredit.engaged).toBe(false);
+      });
+    });
+
     it('returns close_connection with PROTOCOL_VIOLATION on non-SERVER_SETUP before established', () => {
       session.initiateSetup();
 
@@ -525,6 +560,27 @@ describe('Session', () => {
       const msg = (actions[0] as SendControlAction).message as Subscribe;
       expect(msg.parameters.get(MessageParam.GROUP_ORDER as bigint))
         .toEqual([varint(0x2n)]);
+    });
+
+    it('subscribe() includes NEW_GROUP_REQUEST when specified (§10.2.13)', () => {
+      const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
+      const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
+
+      const { actions } = session.subscribe(namespace, name, { newGroupRequest: 0n });
+
+      const msg = (actions[0] as SendControlAction).message as Subscribe;
+      expect(msg.parameters.get(MessageParam.NEW_GROUP_REQUEST as bigint)).toEqual([varint(0n)]);
+    });
+
+    it('subscribe() refuses NEW_GROUP_REQUEST on draft-14, which has none', () => {
+      const s = new Session(EndpointRole.CLIENT, 14);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      expect(() => s.subscribe([new Uint8Array([0x6c])], new Uint8Array([0x76]), { newGroupRequest: 0n }))
+        .toThrow(/NEW_GROUP_REQUEST/);
     });
 
     it('subscribe() omits parameters when not specified (§9.2.2)', () => {
@@ -2219,6 +2275,16 @@ describe('Session', () => {
         expect(forwardVal).toEqual([varint(0n)]);
       });
 
+      it('sends REQUEST_UPDATE with NEW_GROUP_REQUEST (§10.2.13)', () => {
+        const subId = establishSubscription();
+
+        const { actions } = session.requestUpdate(varint(subId), { newGroupRequest: 8n });
+
+        const msg = (actions[0] as { type: string; message: RequestUpdate }).message;
+        expect(msg.parameters.get(MessageParam.NEW_GROUP_REQUEST)).toEqual([varint(8n)]);
+        expect(msg.parameters.has(MessageParam.FORWARD)).toBe(false);
+      });
+
       it('sends REQUEST_UPDATE with FORWARD=1 to resume', () => {
         const subId = establishSubscription();
 
@@ -2517,7 +2583,7 @@ describe('Session', () => {
         expect(ns?.discoveredNamespaces[0]).toEqual(suffix);
       });
 
-      it('terminates namespace SM on NAMESPACE_DONE', () => {
+      it('NAMESPACE_DONE withdraws the suffix and keeps the subscription ACTIVE (§10.17)', () => {
         const prefix = [new Uint8Array([0x6c])];
         const { requestId } = session.subscribeNamespace(prefix);
 
@@ -2533,13 +2599,42 @@ describe('Session', () => {
           trackNamespaceSuffix: [],
         });
 
-        session.handleNamespaceStreamMessage(requestId, {
+        const actions = session.handleNamespaceStreamMessage(requestId, {
           type: 'NAMESPACE_DONE',
           trackNamespaceSuffix: [],
         });
 
+        expect(actions).toEqual([]);
         const ns = session.getNamespaceSubscription(requestId);
-        expect(ns?.state).toBe(NamespaceState.TERMINATED);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
+        expect(ns?.discoveredNamespaces.length).toBe(0);
+      });
+
+      it('accepts NAMESPACE again after NAMESPACE_DONE (publisher restart)', () => {
+        const prefix = [new Uint8Array([0x6c])];
+        const { requestId } = session.subscribeNamespace(prefix);
+        session.handleNamespaceStreamMessage(requestId, {
+          type: 'REQUEST_OK',
+          requestId,
+          parameters: new Map(),
+        });
+
+        session.handleNamespaceStreamMessage(requestId, { type: 'NAMESPACE', trackNamespaceSuffix: [] });
+        session.handleNamespaceStreamMessage(requestId, { type: 'NAMESPACE_DONE', trackNamespaceSuffix: [] });
+        expect(() => session.handleNamespaceStreamMessage(requestId, {
+          type: 'NAMESPACE',
+          trackNamespaceSuffix: [],
+        })).not.toThrow();
+
+        const ns = session.getNamespaceSubscription(requestId);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
+        expect(ns?.hasDiscoveredSuffix([])).toBe(true);
+        // A second withdrawal is legal again once re-announced.
+        const actions = session.handleNamespaceStreamMessage(requestId, {
+          type: 'NAMESPACE_DONE',
+          trackNamespaceSuffix: [],
+        });
+        expect(actions).toEqual([]);
       });
 
       it('terminates namespace SM on REQUEST_ERROR', () => {
@@ -2601,8 +2696,9 @@ describe('Session', () => {
         });
 
         const ns = session.getNamespaceSubscription(requestId);
-        expect(ns?.discoveredNamespaces.length).toBe(2);
-        expect(ns?.state).toBe(NamespaceState.TERMINATED);
+        expect(ns?.discoveredNamespaces.length).toBe(1);
+        expect(ns?.hasDiscoveredSuffix(videoSuffix)).toBe(false);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
       });
 
       // ─── Combined Namespace Validation (§2.4.1) ────────────────────────
@@ -2752,9 +2848,8 @@ describe('Session', () => {
           });
 
           expect(actions.length).toBe(0);
-          // SM transitions to TERMINATED (current behavior)
           const ns = session.getNamespaceSubscription(requestId);
-          expect(ns?.state).toBe(NamespaceState.TERMINATED);
+          expect(ns?.state).toBe(NamespaceState.ACTIVE);
         });
 
         it('validates combined namespace on NAMESPACE_DONE too', () => {

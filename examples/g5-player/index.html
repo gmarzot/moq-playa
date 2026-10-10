@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>G5 Player</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* The UA's [hidden] rule loses to any class selector that sets display. */
+    [hidden] { display: none !important; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
+
+    .wrapper { max-width: 1440px; margin: 0 auto; padding: 24px; }
+
+    /* Two-column layout: video+controls+metrics left, catalog right.
+       The catalog column is absolutely positioned inside .cat-col so the
+       row height is set by the left column alone; the catalog scrolls
+       within it. Stacks to one column on narrow viewports. */
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(400px, 44%);
+      gap: 20px;
+      align-items: stretch;
+    }
+    .main-col { min-width: 0; }
+    .cat-col { position: relative; min-width: 0; }
+    /* Catalog dismissed: the column is gone, not just empty, so the video
+       reclaims its width. A restore button rides the controls bar. */
+    .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
+    .layout.cat-hidden .cat-col { display: none; }
+    h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: #fff; }
+    h1 .five { color: #e42126; }
+    /* Session identity after the title. */
+    h1 .conn {
+      font-size: .82rem; font-weight: 500; color: #8a94a6;
+      text-transform: uppercase; letter-spacing: .05em; margin-left: 20px;
+    }
+    h1 .conn > span { margin-right: 14px; }
+    h1 .conn > span:last-of-type { margin-right: 0; }
+    h1 .conn b {
+      color: #6cf; font-weight: 700;
+      text-transform: none; letter-spacing: 0;
+    }
+    h1 .conn b.copyable { cursor: copy; position: relative; }
+    h1 .conn b.copyable:hover { text-decoration: underline dotted; }
+    /* Floats above the value so the heading does not reflow. */
+    h1 .conn b.copied::after {
+      content: 'copied'; position: absolute; left: 50%; bottom: calc(100% + 4px);
+      transform: translateX(-50%); padding: 1px 6px; border-radius: 3px;
+      background: #2a2f3a; color: #cfd6e4; font-size: .7rem; font-weight: 500;
+      white-space: nowrap; pointer-events: none;
+    }
+    .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
+    .attrib-note {
+      color: #666; font-size: .75rem; margin-top: 18px;
+      padding-top: 10px; border-top: 1px solid #222;
+    }
+    .attrib-note a { color: #8a94a6; text-decoration: none; border-bottom: 1px solid #333; }
+    .attrib-note a:hover { color: #b8c2d0; border-bottom-color: #555; }
+    .subtitle code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+
+    /* Player container */
+    #player-container {
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Controls bar */
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 0;
+      /* One line always. The two sliders absorb every bit of shrink down to
+         their minimums; past that the layout stacks (see the media query). */
+      flex-wrap: nowrap;
+      min-width: 0;
+    }
+    /* Tighten the spacing before the sliders bottom out, so the row keeps
+       breathing room between items rather than running them together. */
+    @media (max-width: 1280px) { .controls { gap: 8px; } }
+    button {
+      background: #333;
+      color: #eee;
+      border: 1px solid #555;
+      padding: 8px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: background 0.15s;
+    }
+    button:hover { background: #444; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.active { background: #2a6; border-color: #2a6; }
+
+    /* Seek bar */
+    .seek-bar {
+      /* Shrink is distributed by (shrink factor x basis), so volume's higher
+         factor makes it give up width faster. The seek floor sits above the
+         volume basis, which keeps the timeline the longer of the two at every
+         width. A range input's intrinsic width would otherwise floor the row,
+         so both carry explicit minimums. */
+      flex: 1 1 240px;
+      min-width: 80px;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #333;
+      border-radius: 2px;
+      outline: none;
+    }
+    .seek-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px; height: 14px;
+      background: #eee;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* Volume */
+    /* No min-width:0 here — the group must stay at least as wide as the mute
+       button plus the slider's minimum, or its children overflow the box and
+       run under the next control. The slider's own flex does the shrinking. */
+    .volume-group { display: flex; align-items: center; gap: 6px; }
+    .volume-bar {
+      flex: 0 4 64px;
+      min-width: 30px;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #333;
+      border-radius: 2px;
+      outline: none;
+    }
+    .volume-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 12px; height: 12px;
+      background: #eee;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* Time display */
+    .time {
+      font-size: 0.85rem; color: #aaa; font-variant-numeric: tabular-nums;
+      min-width: 44px; text-align: center; flex-shrink: 0;
+    }
+
+    /* Quality selector */
+    select {
+      background: #333; color: #eee; border: 1px solid #555;
+      padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
+    }
+
+    /* Diagnostics strip — always visible beneath the playback window */
+    .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
+    /* Equal columns on a tight gap: every cell is the same width, and a
+       second row lines up under the first instead of stretching. */
+    /* Content-sized, not equal columns: a static ttff and a counter climbing
+       into six digits do not deserve the same width. Free space goes to the
+       gaps, so the row still spans the strip. */
+    .diag-grid {
+      display: flex; flex-wrap: wrap; justify-content: space-between;
+      gap: 12px 18px;
+      font-variant-numeric: tabular-nums;
+    }
+    .diag-grid .cell {
+      flex: 0 1 auto; white-space: nowrap;
+      color: #8a94a6; text-transform: uppercase; letter-spacing: .04em;
+      font-size: .72rem; line-height: 1.25;
+    }
+    .diag-grid .cell b {
+      display: block; color: #e8e8f0; font-weight: 600; font-size: 1.1rem;
+      text-transform: none; letter-spacing: 0; white-space: nowrap;
+      margin-top: 4px;
+    }
+    /* Units ride small and muted next to the number they belong to. */
+    .diag-grid .cell b .u {
+      font-size: .68rem; font-weight: 500; color: #8a94a6;
+      margin-left: 3px; letter-spacing: .03em;
+    }
+    /* Second line of a two-fact cell, same weight as the first. */
+    .diag-grid .cell b .ln2 { display: block; }
+    /* Colour by role: blue names the stream, green measures it, amber marks
+       the counters that should stay at zero. */
+    .diag-grid .cell b.str { color: #6cf; }
+    .diag-grid .cell b.num { color: #4d4; }
+    .diag-grid .cell b.fault { color: #d9922e; }
+    /* A unit can warn while its value stays neutral. */
+    .diag-grid .cell b .u.fault { color: #d9922e; }
+    /* Fixed counts, not auto-fit: the charts share one time axis, so a ragged
+       row would break the comparison. */
+    .diag-charts {
+      display: grid; gap: 16px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    @media (max-width: 900px) {
+      .diag-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 520px) {
+      .diag-charts { grid-template-columns: 1fr; }
+    }
+    /* Block so the underline spans the graph rather than the text; nowrap
+       keeps every label one line, so every canvas sits at the same y. */
+    .chart-label {
+      display: block; white-space: nowrap;
+      font-size: .8rem; color: #778; text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .chart-label b { color: #4d4; font-variant-numeric: tabular-nums; }
+    /* Every printed value carries its own line's colour. */
+    .diag-charts .chart-label b#lat-val { color: #d9c25c; }   /* p50 */
+    .diag-charts .chart-label b#lat-p95 { color: #d9922e; }   /* p95, number only */
+    .diag-charts .chart-label b#lat-max { color: #e07a7a; }   /* the chart's peak dot */
+    .diag-charts .chart-label b#lat-screen { color: #eee; }   /* capture to paint */
+    .diag-charts .chart-label b#jit-val { color: #d9922e; }
+    .diag-charts .chart-label b#cus-target { color: #8a94a6; }
+    .diag-charts .chart-label b#cus-d { color: #d9922e; }     /* arithmetic on a and v */
+    /* A steady readout that is not currently doing anything. */
+    .chart-label b.idle { color: #e8e8f0; }
+    .chart-label b.ser-a { color: #6cf; }                     /* audio line */
+    .chart-label b.ser-v { color: #a98cf0; }                  /* video line */
+    /* Equal outer tracks pin the middle item dead centre, so a growing
+       value on the left cannot shove the target reading sideways. */
+    .chart-label.split3 {
+      display: grid; grid-template-columns: 1fr auto 1fr;
+      gap: 12px; align-items: baseline;
+    }
+    .chart-label.split3 > :last-child { text-align: right; }
+    .chart-label.split2 { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+    .chart-label .aside { color: #8a94a6; }
+        .adv { margin-top: 10px; }
+    .adv > summary {
+      cursor: pointer; color: #8a94a6; font-size: .72rem;
+      text-transform: uppercase; letter-spacing: .04em; padding: 4px 0;
+    }
+    .adv > summary:hover { color: #b8c2d0; }
+    .adv[open] > summary { color: #b8c2d0; }
+    .adv .diag-grid { padding: 6px 0 2px; }
+    /* Each chart carries its explanation in a title tooltip. */
+    .chart { cursor: help; }
+    .chart .chart-label { border-bottom: 1px dotted #444a58; padding-bottom: 2px; }
+    .chart canvas {
+      width: 100%; height: 69px; background: #161622;
+      border-radius: 6px; display: block; margin-top: 4px;
+    }
+
+    /* Catalog panel — the MSF/CMSF catalog in display order, redrawn on deltas.
+       Fills the right column at the left column's height; JSON scrolls. */
+    .catalog-panel {
+      /* The column stretches to the main column, whose last 12px are the
+         controls' bottom padding — inset by that so the panel ends level with
+         the buttons rather than with the padding. */
+      position: absolute; inset: 0 0 12px 0;
+      display: flex; flex-direction: column;
+      background: #1a1a2e;
+      border-radius: 8px; padding: 10px 14px;
+    }
+    .cat-head {
+      display: flex; align-items: baseline;
+      justify-content: space-between; gap: 12px;
+    }
+    .cat-head .chart-label { font-size: .95rem; color: #fff; font-weight: 700; white-space: nowrap; }
+    .cat-head .chart-label b { font-size: 1rem; color: #4d4; font-weight: 600; }
+    .cat-head .chart-label .aside { color: #8a94a6; font-weight: 400; }
+    button.mini {
+      padding: 4px 12px; font-size: .8rem;
+      color: #bbb; border-color: #444;
+    }
+    /* Control-bar chips read at the resolution picker's size. Scoped so the
+       in-panel copy buttons keep the smaller treatment. Centred by flex rather
+       than baseline: the gear glyph's metrics differ from the text beside it. */
+    .controls button.mini {
+      font-size: .85rem; padding: 6px 12px;
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 5px; line-height: 1;
+      /* The seek bar takes all slack; these must not be squeezed into wrapping. */
+      white-space: nowrap; flex-shrink: 0;
+    }
+    /* A quiet link after the catalog size. */
+    .cat-head .cat-hide {
+      background: none; border: none; padding: 0; cursor: pointer; font: inherit;
+      color: #8a94a6; font-weight: 400; text-transform: none; letter-spacing: 0;
+    }
+    .cat-head .cat-hide:hover { color: #ddd; text-decoration: underline; }
+    /* MoQT state badges: one word; grey idle, yellow waiting or paused,
+       green flowing, red fault. Right-justified on their line. */
+    .badge {
+      border-radius: 4px; padding: 1px 6px; white-space: nowrap; flex-shrink: 0;
+      font-weight: 700; font-size: .68rem; letter-spacing: .06em;
+      border: 1px solid #3a3a52; background: #23233a; color: #8a94a6;
+    }
+    .badge.wait { color: #d9c25c; border-color: #5a532f; background: #26241a; }
+    .badge.ok { color: #4d4; border-color: #2f5a35; background: #16271a; }
+    .badge.bad { color: #e55; border-color: #5a2f2f; background: #271616; }
+    .cat-track .badge { margin-left: auto; }
+    .cat-badges { display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto; }
+    .cat-tracks {
+      display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
+      font-size: 1rem; font-variant-numeric: tabular-nums;
+    }
+    /* Name and badge hold their line; the detail wraps under them rather than
+       scrolling the panel sideways. Nothing is clipped either way. */
+    /* One line per track: the summary ellipsises rather than wrapping under
+       the name, so every track row is the same height. */
+    .cat-track {
+      display: flex; flex-wrap: nowrap; gap: 8px;
+      align-items: baseline; color: #aab; padding: 3px 0;
+    }
+    /* Track values use the queued-chart colours. */
+    .cat-track .dt {
+      color: #8a94a6; font-weight: 600; font-size: .9rem;
+      min-width: 0; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
+    .cat-track.audio .dt { color: #6cf; }
+    .cat-track.video .dt { color: #a98cf0; }
+    .cat-json {
+      margin: 0; padding: 10px 12px; background: #12121f;
+      border-radius: 6px; font-family: monospace; font-size: 1rem;
+      line-height: 1.5; flex: 1; min-width: 0; min-height: 0; overflow-y: auto;
+      /* Wrap rather than scroll sideways, indentation preserved. break-all
+         rather than overflow-wrap: a normal break opportunity would push a long
+         value to its own line first, leaving `"data":` stranded above it. */
+      white-space: pre-wrap; word-break: break-all; color: #9fb0c4;
+    }
+
+    /* Narrow viewports: stack back to a single column. Same breakpoint as
+       the broadcaster, so a same-size window opens with the same layout. */
+    @media (max-width: 1150px) {
+      .layout { grid-template-columns: 1fr; }
+      .cat-col { position: static; }
+      .catalog-panel { position: static; margin-top: 12px; }
+      /* Stacked, the panel has no column height to fill — the JSON pane needs
+         an explicit one or it collapses to the header. Its flex stays 1: the
+         wrap is a row, so flex sets the pane's width. */
+      .json-wrap { flex: none; }
+      .cat-json { min-height: 220px; max-height: 45vh; }
+    }
+    .catalog-panel.collapsed .cat-tracks,
+    .catalog-panel.collapsed .cat-json { display: none; }
+
+    /* State overlay, as on the broadcaster: playing is green; red is reserved for faults. */
+    .video-wrap { position: relative; }
+    .state-badge {
+      position: absolute; top: 12px; left: 12px;
+      padding: 3px 10px; border-radius: 4px;
+      font-size: 11px; font-weight: 700; letter-spacing: 1px;
+      text-transform: uppercase;
+      background: rgba(0, 0, 0, .45); color: #cfd8e3;
+    }
+    .state-badge.playing { background: rgba(63, 143, 67, .75); color: #fff; }
+    .state-badge.loading { background: rgba(160, 140, 40, .65); color: #ffe9a8; }
+    .state-badge.error { background: rgba(190, 60, 60, .7); color: #ffdede; }
+
+    /* Log */
+    /* A copy control rides the top-right of the pane it belongs to, so the
+       pane keeps its full height and the button never moves with the content. */
+    .log-wrap { position: relative; }
+    .copy {
+      position: absolute; top: 10px; z-index: 1; opacity: .5;
+      /* Clear of the pane's own scrollbar, and opaque so text scrolling
+         underneath is occluded cleanly rather than showing through. */
+      right: 24px;
+      background: #23233a; border-color: #3a3a52;
+    }
+    .copy:hover, .copy:focus-visible { opacity: 1; }
+    .json-wrap {
+      position: relative; flex: 1; min-height: 0; display: flex;
+      margin-top: 10px;
+    }
+
+    #log {
+      background: #1a1a2e;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 0.8rem;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      margin-top: 12px;
+    }
+
+    /* ─── Settings modal ─────────────────────────── */
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+      z-index: 100; backdrop-filter: blur(4px);
+    }
+    .modal-backdrop.visible { display: flex; align-items: center; justify-content: center; }
+    .modal {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      padding: 20px; width: min(500px, 92vw); max-height: 86vh; overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    }
+    .modal h2 { font-size: 1rem; margin-bottom: 4px; }
+    .modal .lede { color: #888; font-size: .8rem; margin-bottom: 8px; }
+    .modal label {
+      display: block; font-size: .7rem; color: #888; margin: 12px 0 4px;
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .modal input[type=text], .modal input[type=number], .modal select {
+      width: 100%; padding: 7px 9px; border-radius: 6px;
+      border: 1px solid #444; background: #222; color: #eee;
+      font-family: monospace; font-size: .85rem;
+    }
+    .modal input:focus, .modal select:focus { outline: none; border-color: #2a6; }
+    .modal .hint { font-size: .68rem; color: #666; margin-top: 3px; }
+    .modal .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+    .modal .check input { width: auto; }
+    .modal .check label { margin: 0; text-transform: none; letter-spacing: 0; font-size: .8rem; color: #bbb; }
+    .modal .adv-sec { margin-top: 16px; border-top: 1px solid #2a2a2a; padding-top: 4px; }
+    .modal .adv-sec summary { cursor: pointer; font-size: .8rem; color: #bbb; padding: 8px 0; }
+    .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+    .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
+    .modal #set-apply { background: #2a6; border-color: #2a6; color: #fff; }
+    .modal #set-apply:hover { background: #2b7; }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <h1>G<span class="five">5</span> Player<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span></h1>
+
+    <div class="layout" id="layout">
+    <div class="main-col">
+    <div class="video-wrap">
+      <div id="player-container"></div>
+      <span class="state-badge" id="state">idle</span>
+    </div>
+
+    <div class="controls">
+      <button id="play-btn" disabled>Play</button>
+      <input type="range" class="seek-bar" id="seek" min="0" max="1000" value="0" disabled>
+      <span class="time" id="time">0:00</span>
+      <div class="volume-group">
+        <button id="mute-btn" disabled>Mute</button>
+        <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100">
+      </div>
+      <select id="quality" disabled><option>Auto</option></select>
+      <button id="settings-btn" class="mini" type="button" title="Connection settings">⚙ settings</button>
+      <button id="cat-restore" class="mini" hidden>catalog</button>
+    </div>
+    </div>
+
+    <div class="cat-col">
+    <div class="catalog-panel" id="catalog-panel">
+      <div class="cat-head">
+        <span class="chart-label">catalog: <b id="cat-meta">waiting…</b><span
+          class="aside" id="cat-size"></span><span class="aside"> · </span><button
+          id="cat-toggle" class="cat-hide" type="button" title="Hide the catalog panel">hide</button></span>
+        <span class="cat-badges">
+          <span class="badge idle" id="setup-badge">SETUP</span>
+          <span class="badge idle" id="ns-badge">SUB_NS</span>
+          <span class="badge idle" id="cat-badge">FWD --</span>
+        </span>
+      </div>
+      <div class="cat-tracks" id="cat-tracks"></div>
+      <div class="json-wrap">
+        <button id="cat-copy" class="mini copy" type="button">copy</button>
+        <pre class="cat-json" id="cat-json"></pre>
+      </div>
+    </div>
+    </div>
+    </div>
+
+    <div class="diag">
+      <div class="diag-grid" id="diag-grid"></div>
+      <div class="diag-charts">
+        <div class="chart" title="Video arrival latency, ms: p50 (mustard) and p95 (amber) over 4 s; red dot is the 45 s max. E2E is capture to paint (≈ estimated on CMAF). Relative unless both clocks agree.">
+          <span class="chart-label split2" id="lat-label"><span>latency:
+            p50:<b id="lat-val">—</b> p95:<b id="lat-p95">—</b> max:<b id="lat-max">—</b></span>
+            <span>e2e: <b id="lat-screen">—</b></span></span>
+          <canvas id="lat-spark"></canvas>
+        </div>
+        <div class="chart" title="Arrival jitter (RFC 3550), ms. Rises with network bursts or a blocked page.">
+          <span class="chart-label">jitter: <b id="jit-val">—</b></span>
+          <canvas id="jit-spark"></canvas>
+        </div>
+        <div class="chart" title="Media buffered ahead of the playhead, per track, ms. Dashed: target. Red: stalls.">
+          <span class="chart-label split3"><span>queued: a:<b id="cus-a" class="ser-a">—</b>/<!--
+            -->v:<b id="cus-v" class="ser-v">—</b> Δ: <b id="cus-d">—</b></span>
+            <span>target: <b id="cus-target">—</b></span>
+            <span id="cus-cushion" class="aside"></span></span>
+          <canvas id="cus-spark"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="log-wrap">
+      <button id="log-copy" class="mini copy" type="button">copy</button>
+      <pre id="log"></pre>
+    </div>
+    <details class="adv" id="adv-panel">
+      <summary>transport (QUIC / WebTransport)</summary>
+      <div class="diag-grid" id="adv-grid"></div>
+    </details>
+
+    <footer class="attrib-note">Built on <a href="https://github.com/openmoq/moq-playa" target="_blank" rel="noopener noreferrer">openmoq/moq-playa</a>.</footer>
+  </div>
+
+  <div id="settings-backdrop" class="modal-backdrop">
+    <div class="modal">
+      <h2>Connection settings</h2>
+      <div class="lede">Applying reloads the page with these as URL parameters.</div>
+
+      <label for="s-url">Relay WebTransport URL</label>
+      <input id="s-url" type="text" placeholder="blank = discover on this host">
+
+      <label for="s-ns">Namespace</label>
+      <input id="s-ns" type="text" placeholder="live">
+
+      <label for="s-v">Draft version</label>
+      <select id="s-v">
+        <option value="">Auto (offers moqt-16)</option>
+        <option value="18">Draft 18</option>
+        <option value="16">Draft 16</option>
+        <option value="14">Draft 14</option>
+      </select>
+
+      <details class="adv-sec" id="s-adv">
+        <summary>Advanced</summary>
+
+        <label for="s-target">Target latency (ms)</label>
+        <input id="s-target" type="number" min="1" placeholder="from catalog">
+        <div class="hint">Overrides the catalog's targetLatency.</div>
+
+        <label for="s-cushion">Render cushion floor / max (ms)</label>
+        <input id="s-cushion" type="number" min="1" placeholder="engine default">
+        <input id="s-cushion-max" type="number" min="1" placeholder="cap" style="margin-top:6px">
+
+        <label for="s-catchup">Catch-up rate</label>
+        <input id="s-catchup" type="number" min="1" step="0.01" placeholder="1 (off)">
+        <div class="hint">Max playback rate while chasing the target.</div>
+
+        <label for="s-bootstrap">Catalog bootstrap</label>
+        <select id="s-bootstrap">
+          <option value="">Player default</option>
+          <option value="subscribe">subscribe (publishers without FETCH)</option>
+          <option value="auto">auto</option>
+          <option value="joining-fetch">joining-fetch</option>
+          <option value="strict">strict</option>
+        </select>
+
+        <div class="check">
+          <input id="s-warm-start" type="checkbox">
+          <label for="s-warm-start">warm start</label>
+        </div>
+        <div class="hint">LOC: fetch the current group. CMAF/LOCMAF: ask for a new group (broadcaster needs dynamic groups).</div>
+
+        <label for="s-cc">Congestion control (hint)</label>
+        <select id="s-cc">
+          <option value="">Browser default</option>
+          <option value="low-latency">Low latency</option>
+          <option value="throughput">Throughput</option>
+        </select>
+        <div class="hint">The browser may ignore it; the log shows what it applied.</div>
+
+        <label for="s-authority">Authority</label>
+        <input id="s-authority" type="text" placeholder="(none)">
+
+        <label for="s-hash">Certificate hash</label>
+        <input id="s-hash" type="text" placeholder="(none)">
+
+        <div class="check">
+          <input id="s-status" type="checkbox">
+          <label for="s-status">status overlay</label>
+        </div>
+        <div class="check">
+          <input id="s-debug" type="checkbox">
+          <label for="s-debug">verbose logging</label>
+        </div>
+      </details>
+
+      <div class="btn-row">
+        <button id="set-cancel" type="button">Cancel</button>
+        <button id="set-apply" type="button">Apply &amp; reload</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

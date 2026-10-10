@@ -12,10 +12,10 @@
  * @module
  */
 
-import type { MoqtConnection, WebTransportLike } from '@moqt/webtransport';
-import type { QlogEvent, MoqtObject, DraftVersion } from '@moqt/transport';
-import type { TrackConstraints, CatalogTrack, CatalogState } from '@moqt/msf';
-import type { ClockSource, DecoderCommand, RecoveryController } from '@moqt/playback';
+import type { MoqtConnection, WebTransportLike, ConnectionAuthorization } from '@openmoq/webtransport';
+import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
+import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
+import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
 import type { LogLevel, LoggerLike } from './logger.js';
@@ -63,7 +63,15 @@ export interface KnownTrackConfig {
 
 // ─── Category Interfaces (documentation grouping — type stays flat) ───
 
+export interface PlayerAuthorization extends Omit<ConnectionAuthorization, 'relayUrl'> {
+  /** Additional trusted relay origins for GOAWAY migration. Default: original origin only. */
+  readonly allowedRelayOrigins?: readonly string[];
+}
+
 /** Connection options. */
+/** Opt-in interop behaviour for a non-conformant relay ({@link ConnectionConfig.compat}). */
+export type PlayerCompat = 'request-credit' | 'empty-objects';
+
 export interface ConnectionConfig {
   /** WebTransport URL to the relay (e.g., "https://relay.example.com/moq"). */
   readonly url: string;
@@ -154,6 +162,18 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   readonly authTokens?: Uint8Array[];
+  /** Credentials for SETUP and every authorized request, including recovery and reconnects. */
+  readonly authorization?: PlayerAuthorization;
+
+  /**
+   * Opt-in interop behaviours for relays that deviate from the spec; none by
+   * default. Each is logged once when it takes effect and counted.
+   * - `request-credit`: when SERVER_SETUP grants no MAX_REQUEST_ID, send
+   *   requests uncapped until the relay sends one (draft-14/16).
+   * - `empty-objects`: skip empty Normal objects on media tracks instead of
+   *   passing them to the decoder.
+   */
+  readonly compat?: readonly PlayerCompat[];
 
   /**
    * MOQT implementation identifier included in CLIENT_SETUP.
@@ -230,6 +250,17 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.16.2, draft-ietf-moq-transport-18 §10.12.2
    */
   readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe';
+
+  /**
+   * Follow {@link namespace} with SUBSCRIBE_NAMESPACE on every session and
+   * report its state (`namespace_state`). When it is published again after
+   * going away — NAMESPACE_DONE, or a track refused as not existing — the
+   * player re-establishes its session, catalog and subscriptions as a
+   * reconnect does. Draft-18 sessions only. Default false.
+   *
+   * @see draft-ietf-moq-transport-18 §10.18
+   */
+  readonly followNamespace?: boolean;
 }
 
 /** Playback tuning options. */
@@ -298,17 +329,33 @@ export interface PlaybackTuningConfig {
    * boundary. The FETCH and the live subscription are contiguous and
    * non-overlapping by construction (§9.16.2.1).
    *
-   * Scope: initial tune-in only (never ABR switches), live LOC tracks only —
-   * CMAF tracks keep their normal boundary start (MSE append ordering is not
-   * warm-start safe yet) and non-live tracks already start from group 0. A
-   * refused FETCH is non-fatal: playback continues live-only from the next
-   * group boundary.
+   * Live CMAF and LOCMAF video cannot take that backlog through MSE; its
+   * SUBSCRIBE carries NEW_GROUP_REQUEST 0 instead (draft-16/18 §10.2.13), so a
+   * publisher with dynamic groups starts a new group at once. A publisher
+   * without them ignores it, and playback starts at the next group.
+   *
+   * Scope: initial tune-in only (never ABR switches); non-live tracks already
+   * start from group 0. A refused FETCH is non-fatal: playback continues
+   * live-only from the next group boundary.
    *
    * Default: off. Incompatible with an explicit `subscriptionFilter` other
    * than `'LargestObject'` — draft-16 §9.16.2 closes the session when a
    * Joining Fetch references a subscription with any other filter.
    */
   readonly warmStartCurrentGroup?: boolean;
+
+  /**
+   * Static floor of the LOC render cushion in milliseconds: the minimum
+   * playout delay video and audio schedule ahead of arrival.
+   * Default: 200, or 50 when the WebTransport handshake RTT is under 5 ms.
+   */
+  readonly renderCushionFloorMs?: number;
+
+  /**
+   * Cap of the LOC render cushion in milliseconds; bounds how far arrival
+   * jitter can raise the playout delay. Default: 750. Never below the floor.
+   */
+  readonly renderCushionMaxMs?: number;
 }
 
 /** Latency and catch-up options. */
@@ -436,6 +483,37 @@ export interface RecoveryConfig {
   readonly cmafBootstrapTimeoutMs?: number;
 
   /**
+   * CMAF first-frame bootstrap deadline EXTENSION ceiling.
+   *
+   * The `cmaf_first_frame` deadline (`cmafBootstrapTimeoutMs`) is renewed
+   * each time a video segment is appended, as long as media keeps arriving —
+   * a fixed 10s deadline from `cmaf_init` alone misfires on longer-RTT paths
+   * (e.g. long-haul QUIC handshakes) where legitimate startup buffering can
+   * take longer than 10s even though delivery is healthy the whole time.
+   * This caps the total renewal window measured from `cmaf_init`: once
+   * elapsed time since init exceeds this value, renewal stops and the next
+   * `cmafBootstrapTimeoutMs` deadline is allowed to fire — so a genuinely
+   * broken decode path (segments arriving, appendBuffer succeeding, but the
+   * browser never painting a frame) still surfaces as fatal instead of
+   * buffering forever.
+   * Default: 60_000. Only meaningful when `cmafBootstrapTimeoutMs` > 0.
+   */
+  readonly cmafFirstFrameMaxWaitMs?: number;
+
+  /**
+   * Consumption path for LOCMAF tracks (draft-einarsson-moq-locmaf-01 §16).
+   * `'mse'` (default) reconstructs every Object into a canonical CMAF chunk
+   * and plays it through MSE like a cmaf track. `'frame'` slices every Object
+   * into its coded samples and feeds them to the LOC WebCodecs pipeline
+   * (`createVideoDecoder` / `createAudioDecoder`), with the codec configuration
+   * read from the track's CMAF Header. The frame path cannot decrypt: a
+   * protected (CENC) LOCMAF track is dropped with a warning there, while the
+   * MSE path hands the reconstructed senc/saiz/saio to the browser for EME.
+   * Default: 'mse'.
+   */
+  readonly locmafDecoding?: 'mse' | 'frame';
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
@@ -454,7 +532,8 @@ export interface RecoveryConfig {
 
   /**
    * Maximum delivery-restart attempts per starvation incident before
-   * escalating to a fatal MEDIA_STARVED error. Default: 3.
+   * escalating to a fatal MEDIA_STARVED error; with followNamespace, to a
+   * degraded one and a slow resubscribe until media returns. Default: 3.
    */
   readonly livenessMaxRestarts?: number;
 
@@ -500,7 +579,7 @@ export interface FactoryConfig {
    * The factory returns a ready `WebTransportLike` which is passed to `connection.connect()`.
    *
    * This cleanly separates transport creation (browser concern) from protocol logic.
-   * Browser usage: `createTransport: createWebTransport({ certHash })` from @moqt/browser.
+   * Browser usage: `createTransport: createWebTransport({ certHash })` from @openmoq/browser.
    */
   readonly createTransport?: (url: string) => Promise<WebTransportLike>;
 
@@ -536,6 +615,10 @@ export interface FactoryConfig {
   readonly createCmafAssembler?: (options: {
     onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void;
     onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+    /** Audio buffered ahead of the playhead (ms), or null when unknown. */
+    audioAheadMs?: () => number | null;
+    /** Video buffered ahead of the playhead (ms), or null when unknown. */
+    videoAheadMs?: () => number | null;
   }) => CmafAssemblerLike;
 
   /**
@@ -559,8 +642,10 @@ export interface TransformConfig {
    * Custom extension parser for non-LOC packaging formats.
    *
    * When set, called instead of parseLocHeaders() for LOC-packaged tracks.
+   * The default parser accepts both draft-ietf-moq-loc-01 and -04 property
+   * sets; see LocHeaders.version.
    * Return LocHeaders with whatever fields could be extracted.
-   * Default: undefined (uses standard LOC parser per draft-ietf-moq-loc-01 §2.3).
+   * Default: undefined (uses the LOC-01/LOC-04 property parser).
    *
    * Use case: relays that use non-standard extension encoding (e.g., absolute
    * type IDs instead of delta-encoded KVPs per MoQT §1.4.2).
@@ -568,7 +653,7 @@ export interface TransformConfig {
    * @see draft-ietf-moq-loc-01 §2.3 (LOC Header Extensions)
    * @see draft-ietf-moq-transport-16 §1.4.2 (KVP encoding)
    */
-  readonly extensionParser?: (extensions: Uint8Array | undefined) => import('@moqt/loc').LocHeaders;
+  readonly extensionParser?: (extensions: Uint8Array | undefined) => import('@openmoq/loc').LocHeaders;
 
   /**
    * Command transform: runs on every DecoderCommand before browser adapter execution.
@@ -687,6 +772,7 @@ export const DEFAULT_PLAYER_CONFIG = {
 
   // CMAF bootstrap (0 disables)
   cmafBootstrapTimeoutMs: 10_000,
+  cmafFirstFrameMaxWaitMs: 60_000,
 
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
@@ -711,6 +797,15 @@ export const DEFAULT_PLAYER_CONFIG = {
  * into a stream.
  */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
+    throw new TypeError('Invalid authorization configuration');
+  }
+  if (config.authorization && config.authTokens !== undefined) {
+    throw new TypeError('Specify authorization or authTokens, not both');
+  }
+  if (config.authorization && config.connection) {
+    throw new TypeError('Configure authorization when connecting an externally owned connection, not on its player');
+  }
   // subscriberPriority: 0–255 (§9.2.2.3)
   if (config.subscriberPriority !== undefined) {
     if (!Number.isInteger(config.subscriberPriority) || config.subscriberPriority < 0 || config.subscriberPriority > 255) {
@@ -744,12 +839,21 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     ['livenessResetProbeMs', config.livenessResetProbeMs],
     ['livenessRestartBackoffMs', config.livenessRestartBackoffMs],
     ['livenessHealthyResetMs', config.livenessHealthyResetMs],
+    ['renderCushionFloorMs', config.renderCushionFloorMs],
+    ['renderCushionMaxMs', config.renderCushionMaxMs],
   ];
 
   for (const [name, value] of msFields) {
     if (value !== undefined && value <= 0) {
       throw new RangeError(`${name} must be > 0, got ${value}`);
     }
+  }
+
+  if (config.renderCushionFloorMs !== undefined && config.renderCushionMaxMs !== undefined
+      && config.renderCushionMaxMs < config.renderCushionFloorMs) {
+    throw new RangeError(
+      `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
+    );
   }
 
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
@@ -760,6 +864,12 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // cmafBootstrapTimeoutMs: >= 0 (0 disables the bootstrap deadlines)
   if (config.cmafBootstrapTimeoutMs !== undefined && config.cmafBootstrapTimeoutMs < 0) {
     throw new RangeError(`cmafBootstrapTimeoutMs must be >= 0 (0 disables), got ${config.cmafBootstrapTimeoutMs}`);
+  }
+
+  // cmafFirstFrameMaxWaitMs: > 0 (it bounds renewal, not a disable switch)
+  if (config.cmafFirstFrameMaxWaitMs !== undefined
+      && (!Number.isFinite(config.cmafFirstFrameMaxWaitMs) || config.cmafFirstFrameMaxWaitMs <= 0)) {
+    throw new RangeError(`cmafFirstFrameMaxWaitMs must be finite and > 0, got ${config.cmafFirstFrameMaxWaitMs}`);
   }
 
   if (config.authority !== undefined && config.authority.trim().length === 0) {
@@ -778,6 +888,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(
       `warmStartCurrentGroup requires the LargestObject subscription filter (§9.16.2), got ${config.subscriptionFilter.type}`,
     );
+  }
+
+  if (config.locmafDecoding !== undefined && !['mse', 'frame'].includes(config.locmafDecoding)) {
+    throw new RangeError(`locmafDecoding must be 'mse' | 'frame', got ${String(config.locmafDecoding)}`);
   }
 
   if (config.catalogBootstrap !== undefined

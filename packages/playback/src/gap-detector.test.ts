@@ -178,4 +178,24 @@ describe('GapDetector', () => {
         const decision = gd.evaluate(2n, [3n, 4n, 5n]);
         expect(decision.action).toBe(GapAction.WAIT);
     });
+
+    it('keeps per-group state only for groups still ahead of playback', () => {
+        const clock = new MockClock();
+        const gd = new GapDetector({ gapTimeoutUs: GAP_TIMEOUT, clock });
+        const state = gd as unknown as { groupFirstSeenUs: Map<bigint, number>; endedGroups: Set<bigint> };
+
+        for (let g = 0n; g < 10_000n; g++) {
+            gd.observeGroup(g + 1n);
+            gd.observeEndOfGroup(g);
+            gd.evaluate(g, [g + 1n]);
+        }
+        expect(state.groupFirstSeenUs.size).toBeLessThanOrEqual(1);
+        expect(state.endedGroups.size).toBe(0);
+
+        // A later gap is still timed from its first observation.
+        gd.observeGroup(10_005n);
+        clock.advance(GAP_TIMEOUT + 1);
+        expect(gd.evaluate(9_999n, [10_005n])).toEqual(
+            { action: GapAction.SKIP_FORWARD, targetGroupId: 10_005n });
+    });
 });

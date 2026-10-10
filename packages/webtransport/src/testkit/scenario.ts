@@ -22,8 +22,8 @@
  *
  * @module
  */
-import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@moqt/transport';
-import type { MoqtObject, DraftVersion, DataStreamHeader, ControlMessage } from '@moqt/transport';
+import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@openmoq/transport';
+import type { MoqtObject, DraftVersion, DataStreamHeader, ControlMessage } from '@openmoq/transport';
 import { connectedPair, ns, nm, type ConnectedPair } from './pair.js';
 import { flush, type PipeFaults } from './loopback.js';
 import { makePrng } from './prng.js';

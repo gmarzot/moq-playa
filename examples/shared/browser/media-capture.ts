@@ -8,6 +8,10 @@
  * @module
  */
 
+/** AudioData the microphone processor holds while the page is busy (~10 ms
+ *  each); past it the processor drops input. */
+const AUDIO_BUFFER_FRAMES = 50;
+
 /**
  * Captures media from camera or screen and delivers raw frames.
  *
@@ -141,7 +145,7 @@ export class MediaCapture {
   private async readAudioData(track: MediaStreamTrack, signal: AbortSignal): Promise<void> {
     try {
       // @ts-expect-error MediaStreamTrackProcessor is not yet in TypeScript lib
-      const processor = new MediaStreamTrackProcessor({ track });
+      const processor = new MediaStreamTrackProcessor({ track, maxBufferSize: AUDIO_BUFFER_FRAMES });
       const reader: ReadableStreamDefaultReader<AudioData> = processor.readable.getReader();
 
       while (!signal.aborted) {

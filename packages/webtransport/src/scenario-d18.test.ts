@@ -13,8 +13,8 @@
  *   SCENARIO_SEEDS=2000 SCENARIO_STEPS=200 npx vitest run scenario-d18.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@moqt/transport';
-import type { MoqtObject, ControlMessage } from '@moqt/transport';
+import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@openmoq/transport';
+import type { MoqtObject, ControlMessage } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 import { runScenario } from './testkit/scenario.js';
@@ -347,7 +347,7 @@ describe('draft-18 publish preludes (hand-authored invariants)', () => {
 });
 
 describe('draft-18 continuing-stream preludes (hand-authored invariants)', () => {
-  it('subscribeNamespace → accept → NAMESPACE → NAMESPACE_DONE terminates the subscription (§6.1)', async () => {
+  it('subscribeNamespace → accept → NAMESPACE → NAMESPACE_DONE → NAMESPACE keeps the subscription (§10.17)', async () => {
     const { client, server, errors } = await connectedPair();
     let snReqId = -1n;
     server.onSubscribeNamespace = (rid) => { snReqId = rid; };
@@ -365,13 +365,16 @@ describe('draft-18 continuing-stream preludes (hand-authored invariants)', () =>
     await flush();
     expect(recv.filter((m) => m.type === 'NAMESPACE').length).toBe(1);
 
-    // §6.1: NAMESPACE_DONE for an announced suffix TERMINATES the subscriber's
-    // namespace subscription (it is not a per-suffix withdrawal at the sub level).
+    // §10.17: NAMESPACE_DONE withdraws the suffix; the same suffix may return.
     await server.sendNamespaceDone(snReqId, [nm('s1')]);
     await flush();
     expect(recv.some((m) => m.type === 'NAMESPACE_DONE')).toBe(true);
-    const cs = client.session.getNamespaceSubscription(reqId);
-    expect(cs === undefined || cs.state === NamespaceState.TERMINATED).toBe(true);
+    expect(client.session.getNamespaceSubscription(reqId)!.state).toBe(NamespaceState.ACTIVE);
+
+    await server.sendNamespace(snReqId, [nm('s1')]);
+    await flush();
+    expect(recv.filter((m) => m.type === 'NAMESPACE').length).toBe(2);
+    expect(client.session.getNamespaceSubscription(reqId)!.state).toBe(NamespaceState.ACTIVE);
     expect(errors).toEqual([]);
     expect(client.session.state).toBe(SessionState.ESTABLISHED);
   });

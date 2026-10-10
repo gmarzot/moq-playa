@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { parseCatalogAuto, type Catalog, type CatalogTrack } from '@moqt/msf';
+import { parseCatalogAuto, type Catalog, type CatalogTrack } from '@openmoq/msf';
 import { catalogProjection } from '../catalog-exec.js';
 import { fc, fcParams, catalogFuzzInput, catalogFuzzBytes, toHex, describeText, expectParserSafe, allowCatalogError, assertJsonSafe, assertNoMutation } from './media-fuzz.js';
 
@@ -147,6 +147,8 @@ describe('Catalog crash fuzz — parseCatalogAuto', () => {
       eventType: 'sap', parentName: 'base', parentNamespace: 'base-ns', maxGrpSapStartingType: 1, maxObjSapStartingType: 2,
       // MSF-01 / CMSF-01: template carried in its canonical 6-tuple wire shape.
       initRef: 'i1', template: [0, 2002, [0, 0], [1, 0], 1759924158381, 2002], contentProtectionRefIDs: ['1'],
+      // draft-einarsson-moq-locmaf-01 §5.
+      locmafVersion: '0.3',
     } satisfies Required<CatalogTrack>;
     const cat: Catalog = { version: 1, generatedAt: 1700000000, isComplete: true, tracks: [track] };
 

@@ -201,6 +201,143 @@ describe('SyncController', () => {
         expect(timing!.shouldDrop).toBe(false);
     });
 
+    // ─── Bounded re-anchor ──────────────────────────────────────────
+
+    describe('bounded audio re-anchor', () => {
+        const newSync = () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+            sync.setAudioReference(1_000_000_000n);
+            return { clock, sync };
+        };
+
+        it('shifts render times later by the step', () => {
+            const { sync } = newSync();
+            const before = sync.computeVideoRenderTime(1_000_100_000n)!.renderTimeUs;
+
+            expect(sync.reanchorAudioBounded(40_000)).toBe(40_000);
+
+            const after = sync.computeVideoRenderTime(1_000_100_000n)!.renderTimeUs;
+            expect(after - before).toBe(40_000);
+        });
+
+        it('caps a single step, so one late frame cannot move the reference far', () => {
+            const { sync } = newSync();
+            expect(sync.reanchorAudioBounded(5_000_000)).toBe(100_000);
+            expect(sync.baselineDebtUs).toBe(100_000);
+        });
+
+        it('accumulates debt across re-anchors', () => {
+            const { sync } = newSync();
+            sync.reanchorAudioBounded(30_000);
+            sync.reanchorAudioBounded(25_000);
+            expect(sync.baselineDebtUs).toBe(55_000);
+        });
+
+        it('is inert without a reference', () => {
+            const clock = new MockClock();
+            const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+            expect(sync.reanchorAudioBounded(40_000)).toBe(0);
+            expect(sync.baselineDebtUs).toBe(0);
+        });
+
+        it('early arrivals walk the shift back and retire the debt', () => {
+            const { sync } = newSync();
+            const before = sync.computeVideoRenderTime(1_000_100_000n)!.renderTimeUs;
+            sync.reanchorAudioBounded(60_000);
+
+            // Frames now arrive 60 ms early against the shifted anchor and walk it back.
+            let offsetUs = 60_000;
+            for (let i = 0; i < 10; i++) offsetUs -= sync.lowerReference(offsetUs);
+            expect(sync.baselineDebtUs).toBe(0);
+            expect(sync.computeVideoRenderTime(1_000_100_000n)!.renderTimeUs).toBe(before);
+        });
+
+        it('a hard re-anchor clears the debt — the new reference is the truth', () => {
+            const { sync } = newSync();
+            sync.reanchorAudioBounded(60_000);
+            sync.setAudioReference(1_000_500_000n);
+            expect(sync.baselineDebtUs).toBe(0);
+        });
+
+        it('reset clears the debt', () => {
+            const { sync } = newSync();
+            sync.reanchorAudioBounded(60_000);
+            sync.reset();
+            expect(sync.baselineDebtUs).toBe(0);
+        });
+    });
+
+    describe('lower-only reference', () => {
+        // Frames that beat the reference lower it; frames that miss it are late.
+        const newSync = () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+            sync.setAudioReference(1_000_000_000n);
+            return { clock, sync };
+        };
+        const renderOf = (sync: SyncController) =>
+            sync.computeVideoRenderTime(1_000_100_000n)!.renderTimeUs;
+
+        it('a late frame never moves the anchor', () => {
+            const { sync } = newSync();
+            const before = renderOf(sync);
+            expect(sync.lowerReference(-40_000)).toBe(0);
+            expect(sync.lowerReference(0)).toBe(0);
+            expect(renderOf(sync)).toBe(before);
+        });
+
+        it('an early frame walks the anchor down by the excess', () => {
+            const { sync } = newSync();
+            const before = renderOf(sync);
+            expect(sync.lowerReference(12_000)).toBe(12_000);
+            expect(before - renderOf(sync)).toBe(12_000);
+        });
+
+        it('leaves the tolerance in place rather than retiring it', () => {
+            const { sync } = newSync();
+            expect(sync.lowerReference(30_000, 25_000)).toBe(5_000);
+            expect(sync.lowerReference(20_000, 25_000)).toBe(0);
+        });
+
+        it('bounds one step, so a lone early stamp cannot collapse the anchor', () => {
+            const { sync } = newSync();
+            expect(sync.lowerReference(5_000_000)).toBe(20_000);
+        });
+
+        it('converges on the best delivery observed, not the first', () => {
+            const { sync } = newSync();
+            const before = renderOf(sync);
+            // 60 ms of startup slack; each step shortens the next frame's lookahead.
+            let offsetUs = 60_000;
+            for (let i = 0; i < 20; i++) offsetUs -= sync.lowerReference(offsetUs);
+            expect(offsetUs).toBe(0);
+            expect(before - renderOf(sync)).toBe(60_000);
+            // Converged: further frames arriving on time move nothing.
+            expect(sync.lowerReference(0)).toBe(0);
+        });
+
+        it('retires re-anchor debt alongside the slack, never twice', () => {
+            const { sync } = newSync();
+            sync.reanchorAudioBounded(30_000);
+            expect(sync.baselineDebtUs).toBe(30_000);
+
+            sync.lowerReference(18_000);
+            expect(sync.baselineDebtUs).toBe(12_000);
+
+            sync.lowerReference(18_000);
+            expect(sync.baselineDebtUs).toBe(0);
+        });
+
+        it('is inert without a reference', () => {
+            const clock = new MockClock();
+            const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+            expect(sync.lowerReference(50_000)).toBe(0);
+        });
+    });
+
     // ─── Live Catch-Up (§5.1.16 targetLatency) ─────────────────────
 
     describe('catch-up', () => {
@@ -525,6 +662,23 @@ describe('SyncController', () => {
 
             const after = sync.computeVideoRenderTime(1_000_033_333n);
             expect(after!.renderTimeUs).toBe(before!.renderTimeUs);
+        });
+    });
+
+    describe('SyncController — media-time timestamps', () => {
+        it('measureLatency returns null when the timestamp is not wall clock', () => {
+            const sync = new SyncController({ wallClock: { now: () => 5_000_000 } });
+            expect(sync.measureLatency(1_000_000n)).toBe(4_000_000);
+            expect(sync.measureLatency(1_000_000n, true)).toBe(4_000_000);
+            expect(sync.measureLatency(1_000_000n, false)).toBeNull();
+        });
+
+        it('evaluateCatchUp returns null and leaves latency untouched for media time', () => {
+            const sync = new SyncController({ wallClock: { now: () => 5_000_000 }, targetLatencyMs: 100, maxCatchUpRate: 1.5 });
+            sync.evaluateCatchUp(1_000_000n);
+            const before = sync.latencyUs;
+            expect(sync.evaluateCatchUp(2_000_000n, false)).toBeNull();
+            expect(sync.latencyUs).toBe(before);
         });
     });
 });

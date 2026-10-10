@@ -10,7 +10,7 @@
  * the same SCENARIO_SEEDS / SCENARIO_SEED_START / SCENARIO_STEPS env vars apply.
  */
 import { describe, it, expect } from 'vitest';
-import { SessionState, SubscriptionState } from '@moqt/transport';
+import { SessionState, SubscriptionState } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 import { runScenario } from './testkit/scenario.js';
@@ -101,6 +101,23 @@ for (const version of [16, 14] as const) {
       await expect(server.sendObject(sid, 1n, new Uint8Array([3]))).rejects.toThrow(/Unknown outgoing stream/);
       await expect(server.openSubgroup(6n, 3n, 0n, { publisherPriority: 1 })).rejects.toThrow(/terminated/);
       expect(delivered).toEqual(['1:0', '2:0']); // nothing after cancel
+      expect(errors).toEqual([]);
+    });
+
+    it('an inbound UNSUBSCRIBE reaches the publisher through onSubscribeClosed', async () => {
+      const { client, server, errors } = await connectedPair(version);
+      let rid = -1n;
+      server.onSubscribe = (r) => { rid = r; };
+      const closed: bigint[] = [];
+      server.onSubscribeClosed = (r) => { closed.push(r); };
+      const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => { /* none */ } });
+      await flush();
+      await server.acceptSubscribe(rid, 7n);
+      const sub = await subP;
+
+      await sub.unsubscribe();
+      await flush();
+      expect(closed).toEqual([rid]);
       expect(errors).toEqual([]);
     });
 

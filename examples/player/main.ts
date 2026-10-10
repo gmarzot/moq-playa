@@ -1,5 +1,5 @@
 /**
- * Player API example — A/V playback using @moqt/player with browser adapters.
+ * Player API example — A/V playback using @openmoq/player with browser adapters.
  *
  * Demonstrates the convenience facade: load()/play()/pause()/destroy()
  * with adapter factories for plug-and-play decode/render.
@@ -17,10 +17,10 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer, PlayerErrorCode } from '@moqt/player';
-import { MoqtConnection } from '@moqt/webtransport';
-import { QlogTrace, varint } from '@moqt/transport';
-import { CATALOG_TRACK_NAME } from '@moqt/msf';
+import { MoqtPlayer, PlayerErrorCode, isMsePackaging } from '@openmoq/player';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { QlogTrace, varint } from '@openmoq/transport';
+import { CATALOG_TRACK_NAME } from '@openmoq/msf';
 import { log } from '../shared/log.js';
 import { namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
@@ -35,9 +35,9 @@ import {
     type CmafStartupGeometry,
     CmafAssembler,
     createWebTransport,
-} from '@moqt/browser';
+} from '@openmoq/browser';
 
-import type { PlayerStats, TTFFBreakdown } from '@moqt/player';
+import type { PlayerStats, TTFFBreakdown } from '@openmoq/player';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -1070,6 +1070,10 @@ async function startPlayback(): Promise<void> {
     // Lets a standard/object-url control carry the same disableRemotePlayback
     // flag that managed always sets, so that flag is not a hidden variable.
     const mseRemote = pickParam('mseremote', ['auto', 'disabled'] as const, 'auto');
+    // ?locmaf=mse|frame — how LOCMAF tracks are consumed (draft-einarsson-moq-locmaf-01
+    // §16): reconstructed into CMAF chunks for MSE (default), or sliced into
+    // coded frames for the WebCodecs decoders, the same sink LOC tracks use.
+    const locmafDecoding = pickParam('locmaf', ['mse', 'frame'] as const, 'mse');
     // DIAGNOSTIC: `legacy` restores pre-RED5DEV-2315 per-track zero-basing, which
     // maps both tracks to 0 and erases the publisher's real A/V offset. It is
     // knowingly incorrect and exists only to compare startup geometry in one
@@ -1114,6 +1118,7 @@ async function startPlayback(): Promise<void> {
         ...(prefetched ? { catalog: prefetched.catalog, connection: prefetched.connection } : {}),
         ...(lateMs ? { lateFrameThresholdMs: lateMs } : {}),
         ...(gapMs ? { gapTimeoutMs: gapMs } : {}),
+        ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
         createTransport: createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
         createConnection: () => new MoqtConnection(draftVersion),
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),
@@ -1129,10 +1134,12 @@ async function startPlayback(): Promise<void> {
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
+            const licenseUrl = params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
+                ...(licenseUrl ? { drmConfig: { licenseUrl } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
@@ -1206,8 +1213,8 @@ async function startPlayback(): Promise<void> {
             log(`  ${parts.join(' | ')}`);
         }
 
-        // Detect packaging: CMAF uses <video> element, LOC uses <canvas>
-        const hasCmaf = e.catalog.tracks.some(t => t.packaging === 'cmaf');
+        // Detect packaging: CMAF/LOCMAF use <video> element (MSE), LOC uses <canvas>
+        const hasCmaf = e.catalog.tracks.some(t => isMsePackaging(t.packaging));
         cmafActive = hasCmaf; // gates unexpected-pause recovery to the <video> sink
         if (hasCmaf) {
             canvas.style.display = 'none';

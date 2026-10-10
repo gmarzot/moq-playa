@@ -98,6 +98,10 @@ export class RequestIdAllocator {
   /** Request IDs already seen from the peer — duplicate tracker for draft-18. */
   private readonly seenIncoming = new Set<bigint>();
 
+  /** Compat: allocate without credit until the peer's first MAX_REQUEST_ID. */
+  private uncapped = false;
+  private _uncappedAllocations = 0;
+
   constructor(
     private readonly role: EndpointRoleValue,
     config?: RequestIdAllocatorConfig,
@@ -157,11 +161,32 @@ export class RequestIdAllocator {
       );
     }
     this.peerMaxRequestId = maxRequestId;
+    this.uncapped = false;
 
     // Clear blocked state if we can now allocate
     if (this.nextOutgoingId < this.peerMaxRequestId) {
       this.blocked = false;
     }
+  }
+
+  /**
+   * Compat for a peer that grants no request credit (no MAX_REQUEST_ID in its
+   * SETUP, none sent later) yet accepts requests: allocate without credit until
+   * its first MAX_REQUEST_ID, which ends the mode. No-op once credit exists.
+   * Not a large ceiling: a later, smaller MAX_REQUEST_ID must still be valid.
+   */
+  allowUncappedUntilMaxRequestId(): void {
+    if (this.hasCredit && this.peerMaxRequestId === 0n) this.uncapped = true;
+  }
+
+  /** Whether allocation is currently uncapped (compat). */
+  get isUncapped(): boolean {
+    return this.uncapped;
+  }
+
+  /** Requests allocated beyond the peer's credit while uncapped. */
+  get uncappedAllocations(): number {
+    return this._uncappedAllocations;
   }
 
   /**
@@ -192,7 +217,7 @@ export class RequestIdAllocator {
    * Returns false if next ID would exceed peer's MAX_REQUEST_ID.
    */
   canAllocate(): boolean {
-    return !this.hasCredit || this.nextOutgoingId < this.peerMaxRequestId;
+    return !this.hasCredit || this.uncapped || this.nextOutgoingId < this.peerMaxRequestId;
   }
 
   /**
@@ -222,11 +247,15 @@ export class RequestIdAllocator {
     // draft-14/16: gated by the peer's MAX_REQUEST_ID credit window. draft-18
     // (hasCredit = false): no credit gate, and we never become blocked.
     if (this.hasCredit && this.nextOutgoingId >= this.peerMaxRequestId) {
-      this.blocked = true;
-      throw new RequestIdError(
-        `Cannot allocate request ID ${this.nextOutgoingId}: exceeds peer MAX_REQUEST_ID ${this.peerMaxRequestId}`,
-        'TOO_MANY_REQUESTS',
-      );
+      if (this.uncapped) {
+        this._uncappedAllocations++;
+      } else {
+        this.blocked = true;
+        throw new RequestIdError(
+          `Cannot allocate request ID ${this.nextOutgoingId}: exceeds peer MAX_REQUEST_ID ${this.peerMaxRequestId}`,
+          'TOO_MANY_REQUESTS',
+        );
+      }
     }
 
     // Return a semantic bigint request ID (no QUIC-varint cap); the draft-14/16

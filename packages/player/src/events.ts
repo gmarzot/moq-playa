@@ -15,8 +15,9 @@
  */
 
 import type { PlayerStateValue } from './state.js';
-import type { RecoveryAction, DecoderCommand } from '@moqt/playback';
-import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@moqt/msf';
+import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
+import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
+import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
@@ -66,6 +67,14 @@ export interface SessionClosedEvent {
   readonly type: 'session_closed';
   readonly error?: number;
   readonly reason?: string;
+}
+
+/** The current session closed during playback; a fresh session is attempted after `delayMs`. */
+export interface SessionReconnectingEvent {
+  readonly type: 'session_reconnecting';
+  /** 1 for the first attempt after the close. */
+  readonly attempt: number;
+  readonly delayMs: number;
 }
 
 /**
@@ -159,7 +168,7 @@ export interface TrackSubscribeFailedEvent {
   readonly reason: string;
 }
 
-// ─── Playback Events (bridged from @moqt/playback) ──────────────────
+// ─── Playback Events (bridged from @openmoq/playback) ──────────────────
 
 /**
  * Group gap detected — missing objects in sequence.
@@ -463,6 +472,21 @@ export interface NamespaceDoneEvent {
   readonly namespaceSuffix: Uint8Array[];
 }
 
+/** The followed namespace at the relay (config `followNamespace`). */
+export type NamespaceState = 'pending' | 'listening' | 'published' | 'withdrawn' | 'refused';
+
+/**
+ * The followed namespace changed state: SUBSCRIBE_NAMESPACE sent (`pending`),
+ * accepted (`listening`), NAMESPACE received (`published`), NAMESPACE_DONE
+ * (`withdrawn`), or REQUEST_ERROR / stream failure (`refused`).
+ * @see draft-ietf-moq-transport-18 §10.18
+ */
+export interface NamespaceStateEvent {
+  readonly type: 'namespace_state';
+  readonly state: NamespaceState;
+  readonly detail: string;
+}
+
 /**
  * The peer has announced a full Track Namespace via control-stream
  * PUBLISH_NAMESPACE. Fires for both v14 and v16 control-stream
@@ -572,6 +596,28 @@ export interface EventTimelineReceivedEvent {
   readonly records: EventTimelineRecord[];
 }
 
+/**
+ * Timed events carried by a LOCMAF event-only track: the `emsg` boxes that
+ * rode as genBox elements ahead of one chunk's header, parsed. A version-0
+ * emsg's presentation time is a delta from this chunk's
+ * `baseMediaDecodeTime`; a version-1 emsg's is absolute.
+ *
+ * @see draft-einarsson-moq-locmaf-01 §8, §14 (Event-Only Tracks)
+ */
+export interface LocmafEventReceivedEvent {
+  readonly type: 'locmaf_event';
+  /** Name of the locmaf track in the catalog. */
+  readonly trackName: string;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
+  /** The track's timescale (mdhd), which the chunk's decode time is in. */
+  readonly timescale: number;
+  /** The chunk's tfdt base media decode time. */
+  readonly baseMediaDecodeTime: bigint;
+  /** The chunk's emsg boxes, in order. */
+  readonly events: readonly EmsgEvent[];
+}
+
 // ─── Seek Events ────────────────────────────────────────────────────
 
 /**
@@ -619,6 +665,7 @@ export interface PlayerEventMap {
   session_goaway: SessionGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
+  session_reconnecting: SessionReconnectingEvent;
   session_error: SessionErrorEvent;
 
   // Errors (structured)
@@ -665,6 +712,7 @@ export interface PlayerEventMap {
   // Namespace discovery
   namespace_discovered: NamespaceDiscoveredEvent;
   namespace_done: NamespaceDoneEvent;
+  namespace_state: NamespaceStateEvent;
   namespace_announced: NamespaceAnnouncedEvent;
   namespace_announcement_done: NamespaceAnnouncementDoneEvent;
 
@@ -676,6 +724,7 @@ export interface PlayerEventMap {
   // SAP / Event Timeline
   sap_event: SapEventReceivedEvent;
   event_timeline: EventTimelineReceivedEvent;
+  locmaf_event: LocmafEventReceivedEvent;
 
   // Seek
   seeking: SeekingEvent;

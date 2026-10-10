@@ -443,7 +443,7 @@ describe('LOC pipeline diagnostics (stutter observability)', () => {
       gapDetectedCount: 0, skipForwardCount: 0, keyframeWaitingCount: 0,
       partialGroupAbandonedCount: 0, backlogShedCount: 0,
       recoveryActionCount: 0, syncResetCount: 0,
-      videoEffectiveGapTimeoutMs: null, renderCushionMs: null,
+      videoEffectiveGapTimeoutMs: null, renderCushionMs: null, audioLateDrops: null,
     });
   });
 
@@ -472,6 +472,16 @@ describe('LOC pipeline diagnostics (stutter observability)', () => {
     const s = acc.snapshot({ videoEffectiveGapTimeoutMs: 120, renderCushionMs: 200 });
     expect(s.loc.videoEffectiveGapTimeoutMs).toBe(120);
     expect(s.loc.renderCushionMs).toBe(200);
+  });
+});
+
+describe('LOCMAF stats', () => {
+  it('recordLocmafObjectRejected increments locmafObjectsRejected in the snapshot', () => {
+    const stats = new StatsAccumulator();
+    expect(stats.snapshot().locmafObjectsRejected).toBe(0);
+    stats.recordLocmafObjectRejected();
+    stats.recordLocmafObjectRejected();
+    expect(stats.snapshot().locmafObjectsRejected).toBe(2);
   });
 });
 
