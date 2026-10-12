@@ -48,7 +48,10 @@ export interface MessageAdapter {
 /** Minimal subscription manager interface. */
 export interface MessageSubscriptionManager {
   unregisterTrack(trackAlias: bigint): void;
-  registerTrack(trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline', packaging?: TrackPackaging): void;
+  registerTrack(
+    trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline',
+    packaging?: TrackPackaging, timescale?: bigint,
+  ): void;
   /** Check if a track alias is already registered. */
   getMediaType(trackAlias: bigint): 'video' | 'audio' | 'mediatimeline' | 'eventtimeline' | undefined;
 }
@@ -242,7 +245,10 @@ export function handleControlMessage(
       if (pending && active) {
         ctx.pendingMediaSubs.delete(okReqId);
         active.trackAlias = alias;
-        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
+        // Draft-18 TIMESCALE track property (0x08): the units of the track's object Timestamps.
+        const timescale = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties?.get(0x08n)?.[0];
+        const declared: [] | [bigint] = typeof timescale === 'bigint' && timescale > 0n ? [timescale] : [];
+        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging, ...declared);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
           ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);
         }

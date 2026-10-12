@@ -206,6 +206,23 @@ describe('SubscriptionManager', () => {
     );
   });
 
+  it('a declared track timescale reads object Timestamps as media time', () => {
+    const mgr = new SubscriptionManager();
+    const onObject = vi.fn();
+    mgr.registerTrack(1n, 'video', 'video', 'loc', 1000n);
+    mgr.registerTrack(2n, 'audio', 'audio');
+    mgr.onObject = onObject;
+    const extensions = encodeLocHeaders({ captureTimestamp: 5000n }, { locVersion: 4 });
+
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions }));
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(2), extensions }));
+
+    expect(onObject.mock.calls[0]![3]).toEqual(
+      expect.objectContaining({ captureTimestamp: 5_000_000n, timestampIsWallClock: false }));
+    expect(onObject.mock.calls[1]![3]).toEqual(
+      expect.objectContaining({ captureTimestamp: 5000n, timestampIsWallClock: true }));
+  });
+
   it('does not call onMalformedTrack for valid objects', () => {
     const mgr = new SubscriptionManager();
     const onMalformedTrack = vi.fn();

@@ -203,6 +203,23 @@ describe('handleControlMessage', () => {
     expect(ctx.onMediaAliasBound).toHaveBeenCalledExactlyOnceWith(5n, 99n);
   });
 
+  it('SUBSCRIBE_OK: a draft-18 TIMESCALE track property registers the track\'s timestamp units', () => {
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
+    ctx.subscriptionManager = subMgr as any;
+    ctx.pendingMediaSubs.set(5n, { trackName: 'video', mediaType: 'video', packaging: 'loc' });
+    ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: null });
+
+    const msg = {
+      type: 'SUBSCRIBE_OK', requestId: 5n, trackAlias: 99n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+      trackProperties: new Map([[0x08n, [1000n]]]),
+    } as unknown as ControlMessage;
+    handleControlMessage(msg, ctx);
+
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(99n, 'video', 'video', 'loc', 1000n);
+  });
+
   it.each(['mediatimeline', 'eventtimeline'] as const)('SUBSCRIBE_OK: binds %s without unregistering its request ID', (packaging) => {
     const ctx = createContext();
     const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };

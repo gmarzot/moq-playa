@@ -33,6 +33,8 @@ interface TrackInfo {
   readonly trackName: string;
   readonly mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
   readonly packaging: TrackPackaging;
+  /** Units of the track's object Timestamps (TIMESCALE track property), when declared. */
+  readonly timescale?: bigint;
 }
 
 /**
@@ -205,8 +207,9 @@ export class SubscriptionManager {
     trackName: string,
     mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline',
     packaging: TrackPackaging = 'loc',
+    timescale?: bigint,
   ): void {
-    this.tracks.set(trackAlias, { trackName, mediaType, packaging });
+    this.tracks.set(trackAlias, { trackName, mediaType, packaging, ...(timescale !== undefined ? { timescale } : {}) });
   }
 
   /**
@@ -309,9 +312,13 @@ export class SubscriptionManager {
       // @see draft-ietf-moq-transport-14 §1.4.2
       // @see draft-ietf-moq-transport-16 §1.4.2
       // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
+      // A declared track timescale makes object Timestamps media time (LOC-04 §2.3.1.2).
       const opts: LocHeaderOptions | undefined =
-        draft !== undefined
-          ? { wireProfile: locWireProfileForDraft(draft) }
+        draft !== undefined || info.timescale !== undefined
+          ? {
+            ...(draft !== undefined ? { wireProfile: locWireProfileForDraft(draft) } : {}),
+            ...(info.timescale !== undefined ? { track: { timescale: info.timescale } } : {}),
+          }
           : undefined;
       const parse = this.extensionParser
         ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));

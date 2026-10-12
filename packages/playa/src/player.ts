@@ -727,6 +727,7 @@ export class Player {
         // Size only: the payload itself stays inside the engine.
         bytes: e.payload?.byteLength ?? 0,
         captureTimestamp: e.captureTimestamp,
+        timestampIsWallClock: e.timestampIsWallClock,
         isKeyframe: e.isKeyframe,
       });
     });

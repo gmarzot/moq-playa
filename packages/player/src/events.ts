@@ -326,6 +326,8 @@ export interface MediaObjectEvent {
   readonly extensions?: Uint8Array;
   readonly status?: bigint;
   readonly captureTimestamp?: bigint;
+  /** False when captureTimestamp is media time under a declared timescale, not wall clock. */
+  readonly timestampIsWallClock?: boolean;
   readonly isKeyframe?: boolean;
 }
 

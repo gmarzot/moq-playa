@@ -107,6 +107,8 @@ export interface MediaObjectEvent {
   readonly bytes: number;
   /** Publisher capture time, µs since the epoch, when the object carries it. */
   readonly captureTimestamp?: bigint | undefined;
+  /** False when captureTimestamp is media time, not wall clock. */
+  readonly timestampIsWallClock?: boolean | undefined;
   readonly isKeyframe?: boolean | undefined;
 }
 
