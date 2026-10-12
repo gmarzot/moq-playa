@@ -70,6 +70,8 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
   private lastWidth: number | undefined;
   private lastHeight: number | undefined;
   private lastDescription: Uint8Array | undefined;
+  /** lastDescription came from a keyframe's in-band parameter sets. */
+  private descriptionDerived = false;
 
   /** Codec-specific strategy — selected at configure() time. */
   private strategy: CodecStrategy = createCodecStrategy('');
@@ -146,6 +148,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     this.lastWidth = width;
     this.lastHeight = height;
     this.lastDescription = config.byteLength > 0 ? config : undefined;
+    this.descriptionDerived = false;
 
     // Select codec-specific strategy (only when codec changes)
     if (codecChanged) {
@@ -213,6 +216,18 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       this.reset(); // full reset preserving description/codedSize/optimizeForLatency
       this.onError?.(new Error('decode queue overflow — reset to keyframe'));
       return;
+    }
+
+    // Without a configured description, a keyframe may carry its parameter
+    // sets in the payload (LOC-04 §2.1.1): configure from those.
+    if (chunk.type === 'key' && this.strategy.descriptionFromKeyframe
+        && (this.lastDescription === undefined || this.descriptionDerived)) {
+      const derived = this.strategy.descriptionFromKeyframe(chunk.data);
+      if (derived && !sameBytes(derived, this.lastDescription)) {
+        this.lastDescription = derived;
+        this.descriptionDerived = true;
+        this.applyConfig();
+      }
     }
 
     // Codec-specific chunk preparation (format conversion, sanitization)
@@ -494,4 +509,8 @@ function toBase64(data: Uint8Array | null | undefined): string {
   let binary = '';
   for (const byte of data) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array | undefined): boolean {
+  return b !== undefined && a.byteLength === b.byteLength && a.every((v, i) => v === b[i]);
 }
