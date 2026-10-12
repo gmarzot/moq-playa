@@ -85,6 +85,8 @@ export class WebCodecsVideoEncoder {
        * default is `variable`.
        */
       bitrateMode?: 'constant' | 'variable';
+      /** H.264: parameter sets in every keyframe (Annex B), and no description. */
+      annexb?: boolean;
     },
   ): void {
     this.keyframeInterval = options?.keyframeInterval ?? DEFAULT_KEYFRAME_INTERVAL;
@@ -132,6 +134,7 @@ export class WebCodecsVideoEncoder {
       framerate: options?.framerate ?? 30,
       latencyMode: options?.latencyMode ?? 'realtime',
       ...(options?.bitrateMode ? { bitrateMode: options.bitrateMode } : {}),
+      ...(options?.annexb && codec.startsWith('avc') ? { avc: { format: 'annexb' as const } } : {}),
     };
 
     this.encoder.configure(config);

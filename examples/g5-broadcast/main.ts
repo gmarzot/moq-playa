@@ -132,6 +132,10 @@ const NEW_GROUP_REQUEST_PARAM = 0x32n;
 const packagingParam = params.get('packaging');
 const packaging: 'loc' | 'cmaf' | 'locmaf' =
   packagingParam === 'cmaf' || packagingParam === 'locmaf' ? packagingParam : 'loc';
+/** `?annexb=1`: LOC H.264 carries its parameter sets in each keyframe (LOC-04 §2.1.1)
+ *  rather than the VIDEO_CONFIG property, which some relays drop. */
+const annexbParam = params.get('annexb') === '1';
+const annexb = annexbParam && packaging === 'loc' && videoCodec.startsWith('avc');
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
 const bitrateMode: 'constant' | 'variable' | undefined =
@@ -221,6 +225,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
   const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
   const sDynamicGroups = document.getElementById('s-dynamic-groups') as HTMLInputElement;
+  const sAnnexb = document.getElementById('s-annexb') as HTMLInputElement;
   const sMinGroup = document.getElementById('s-min-group') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
@@ -266,13 +271,16 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sAudioDatagram.checked = audioDatagrams;
     sPackaging.value = packaging;
     sDynamicGroups.checked = dynamicGroups;
+    sAnnexb.checked = annexbParam;
     sMinGroup.value = String(minGroupMs);
     showApplicableFields();
   }
 
   /** Only the options the selected draft and packaging can use are offered. */
   const datagramsApply = () => sVersion.value === '18' && sPackaging.value !== 'locmaf';
+  const annexbApplies = () => sPackaging.value === 'loc' && sCodec.value.startsWith('avc');
   function showApplicableFields() {
+    document.getElementById('s-annexb-row')!.hidden = !annexbApplies();
     document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
     document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
     document.getElementById('s-min-group-row')!.hidden = sVersion.value !== '18' || !sDynamicGroups.checked;
@@ -280,6 +288,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   sVersion.addEventListener('change', showApplicableFields);
   sPackaging.addEventListener('change', showApplicableFields);
   sDynamicGroups.addEventListener('change', showApplicableFields);
+  sCodec.addEventListener('change', showApplicableFields);
 
   /** The blank interval's value: the selected draft's default. */
   function showCatalogIntervalDefault() {
@@ -327,6 +336,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
+    if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
     if (sDynamicGroups.checked && sVersion.value === '18') {
       np.set('dynamicGroups', '1');
       if (sMinGroup.value && sMinGroup.value !== '1000') np.set('minGroup', sMinGroup.value);
@@ -931,9 +941,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         keyframeInterval,
         latencyMode: 'realtime',
         ...(bitrateMode ? { bitrateMode } : {}),
+        ...(annexb ? { annexb: true } : {}),
       });
       log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`
-        + ` · ${bitrateMode ?? 'variable'} bitrate`);
+        + ` · ${bitrateMode ?? 'variable'} bitrate${annexb ? ' · parameter sets in keyframes (Annex B)' : ''}`);
+      if (annexbParam && !annexb) log('Annex B applies to LOC H.264 only; off');
       if (audio) {
         const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });
         ctx.onCancel(() => { try { ae.destroy(); } catch { /* already destroyed */ } });
@@ -978,7 +990,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         log(fatal ? `Session error: ${err.message}` : err.message);
       };
       conn.onMessage = (msg) => {
-        log(`[CTRL] ${msg.type}${('requestId' in msg) ? ` reqId=${(msg as any).requestId}` : ''}`);
+        const refusal = msg.type === 'REQUEST_ERROR' ? ` code=0x${msg.errorCode.toString(16)} "${msg.errorReason}"` : '';
+        log(`[CTRL] ${msg.type}${('requestId' in msg) ? ` reqId=${(msg as any).requestId}` : ''}${refusal}`);
         // The relay's reply to our PUBLISH_NAMESPACE.
         const rid = (msg as { requestId?: unknown }).requestId;
         if (rid === undefined || nsRequestId === null || String(rid) !== nsRequestId) return;
@@ -1020,7 +1033,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
       const catalog: BroadcastCatalogParams = {
-        videoCodec,
+        // avc3: parameter sets may be carried in-band.
+        videoCodec: annexb ? videoCodec.replace(/^avc1/, 'avc3') : videoCodec,
         width,
         height,
         fps,
@@ -1101,6 +1115,17 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       };
       // A draft-18 resume must carry the Largest Location (§5.1).
       conn.setLargestLocationProvider((requestId) => session.largestLocation(requestId));
+      // The relay asks which namespaces we publish under a prefix (§10.18):
+      // accept, and report ours when it falls under that prefix.
+      conn.onSubscribeNamespace = (requestId, msg) => {
+        const ours = namespace.split('/').map((p) => new TextEncoder().encode(p));
+        const prefix = msg.trackNamespacePrefix;
+        const under = prefix.length <= ours.length
+          && prefix.every((f, i) => f.length === ours[i]!.length && f.every((b, j) => b === ours[i]![j]));
+        conn.acceptSubscribeNamespace(requestId)
+          .then(() => (under ? conn.sendNamespace(requestId, ours.slice(prefix.length)) : undefined))
+          .catch((err: unknown) => log(`SUBSCRIBE_NAMESPACE reqId=${requestId}: ${(err as Error)?.message ?? err}`));
+      };
       return session;
     },
 
