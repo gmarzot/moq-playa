@@ -70,6 +70,7 @@ const latVal = document.getElementById('lat-val')!;
 const latP95 = document.getElementById('lat-p95')!;
 const latMax = document.getElementById('lat-max')!;
 const latScreen = document.getElementById('lat-screen')!;
+const latKind = document.getElementById('lat-kind')!;
 const latLabel = document.getElementById('lat-label')!;
 const jitVal = document.getElementById('jit-val')!;
 const catalogPanel = document.getElementById('catalog-panel')!;
@@ -728,6 +729,9 @@ async function main(): Promise<void> {
   let prevCaptureMs = 0;
   let jitterEwma = 0;
   let expectedIntervalMs = 0;
+  /** Media-time stamps carry no capture clock: delay is drawn above its lowest value. */
+  let relativeDelay = false;
+  let relativeBaseMs: number | null = null;
   (window as any).__player = player;
   const chartSeries = [sampleAtMs, latP50Samples, latP95Samples, latTickMaxSamples,
     jitSamples, queuedASamples, queuedVSamples];
@@ -1075,7 +1079,7 @@ async function main(): Promise<void> {
       jitterEwma += (Math.abs(d) - jitterEwma) / 16;
     } else if (prevArrivalMs) {
       const interval = arrivalMs - prevArrivalMs;
-      if (expectedIntervalMs) jitterEwma = Math.abs(interval - expectedIntervalMs);
+      if (expectedIntervalMs) jitterEwma += (Math.abs(interval - expectedIntervalMs) - jitterEwma) / 16;
       expectedIntervalMs = expectedIntervalMs
         ? expectedIntervalMs * 0.9 + interval * 0.1 : interval;
     }
@@ -1083,7 +1087,15 @@ async function main(): Promise<void> {
     prevArrivalMs = arrivalMs;
     if (captureMs) {
       prevCaptureMs = captureMs;
-      const latencyMs = Date.now() - captureMs;
+      let latencyMs = Date.now() - captureMs;
+      if (e.timestampIsWallClock === false) {
+        relativeDelay = true;
+        // A lower value, or a jump past any plausible delay, rebases.
+        if (relativeBaseMs === null || latencyMs < relativeBaseMs || latencyMs - relativeBaseMs > 120_000) {
+          relativeBaseMs = latencyMs;
+        }
+        latencyMs -= relativeBaseMs;
+      }
       // Kept whatever the sign: a publisher stamping ahead of its own clock,
       // or an unsynchronised pair of machines, is an offset the tick removes.
       // Only a stamp too far out to be a clock difference is dropped.
@@ -1406,11 +1418,15 @@ async function main(): Promise<void> {
 
     latVal.textContent = latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
     latP95.textContent = latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
-    latScreen.textContent = screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
+    latKind.textContent = relativeDelay ? 'relative delay' : 'latency';
+    latScreen.textContent = relativeDelay ? '—'
+      : screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
       : cmafPlayoutMs != null ? `≈${cmafPlayoutMs.toFixed(0)}` : '—';
     latMax.textContent = peakMs?.toFixed(0) ?? '—';
     // Drift details ride the label's hover; an empty title falls back to the chart's.
-    latLabel.title = clockDriftMsPerMin !== null
+    latLabel.title = relativeDelay
+      ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
+      : clockDriftMsPerMin !== null
       ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; ${driftCorrectionMs.toFixed(0)} ms removed. `
         + 'Constant offset remains.'
       : '';
