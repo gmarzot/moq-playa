@@ -5532,6 +5532,14 @@ export class MoqtConnection {
           // open), including §9.16.2 pending-join parking: a join whose
           // subscription is still PENDING is buffered and settled by
           // acceptSubscribe / rejectSubscribe.
+          // draft-14/16: an admitted TRACK_STATUS rides the control stream too.
+          if (message.type === 'TRACK_STATUS') {
+            const ts = message as TrackStatus;
+            if (this.session.getIncomingTrackStatus(ts.requestId as bigint) !== undefined
+                && this.session.state !== SessionState.CLOSED) {
+              this.onTrackStatus?.(ts.requestId as bigint, ts);
+            }
+          }
           if (message.type === 'FETCH') {
             const f = message as Fetch;
             const fReqId = f.requestId as bigint;

@@ -1507,6 +1507,25 @@ describe('MoqtConnection(16) loopback — serving FETCH (§10.4.4)', () => {
     await expect(server.openFetchStream(fetchReqId)).rejects.toThrow(/No admitted inbound FETCH/i);
   });
 
+  it('a draft-16 TRACK_STATUS reaches onTrackStatus and its answer carries the largest location', async () => {
+    const { client, server, errors } = await connectedPair(16);
+    let statusReqId = -1n;
+    server.onTrackStatus = (rid) => { statusReqId = rid; };
+    const replies: ControlMessage[] = [];
+    client.onMessage = (m) => replies.push(m);
+
+    await client.trackStatus(ns('live'), nm('catalog'));
+    await flush();
+    expect(statusReqId).toBe(0n);
+
+    await server.acceptTrackStatus(statusReqId, { parameters: new Map([[0x09n, [new Uint8Array([7, 0])]]]) });
+    await flush();
+    const ok = replies.find((m) => (m as { requestId?: bigint }).requestId === 0n) as
+      { parameters: Map<bigint, unknown[]> } | undefined;
+    expect(Array.from(ok?.parameters.get(0x09n)?.[0] as Uint8Array)).toEqual([7, 0]);
+    expect(errors).toEqual([]);
+  });
+
   it('draft-14 still refuses to open a FETCH response stream', async () => {
     const { client, server } = await connectedPair(14);
     let fetchReqId = -1n;
