@@ -243,13 +243,17 @@ export interface ConnectionConfig {
    * - `'subscribe'` — the explicitly named COMPATIBILITY escape hatch:
    *   legacy wire behavior (`AbsoluteStart{0,0}` subscription, no fetch),
    *   accepting any catalog profile. Forever reachable.
+   * - `'fetch'` — for relays that serve the catalog only by FETCH: no catalog
+   *   subscription. TRACK_STATUS finds the latest group, fetched with a standalone
+   *   FETCH; failing that, one FETCH of every group newest first. The catalog is
+   *   then fixed for the session (no live updates).
    *
    * Ignored when {@link catalog} is injected (no catalog subscription exists).
    *
    * @see draft-ietf-moq-msf-01 §5
    * @see draft-ietf-moq-transport-16 §9.16.2, draft-ietf-moq-transport-18 §10.12.2
    */
-  readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe';
+  readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | 'fetch';
 
   /**
    * Follow {@link namespace} with SUBSCRIBE_NAMESPACE on every session and
@@ -895,9 +899,9 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   }
 
   if (config.catalogBootstrap !== undefined
-      && !['auto', 'joining-fetch', 'strict', 'subscribe'].includes(config.catalogBootstrap)) {
+      && !['auto', 'joining-fetch', 'strict', 'subscribe', 'fetch'].includes(config.catalogBootstrap)) {
     throw new RangeError(
-      `catalogBootstrap must be 'auto' | 'joining-fetch' | 'strict' | 'subscribe', got ${String(config.catalogBootstrap)}`,
+      `catalogBootstrap must be 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | 'fetch', got ${String(config.catalogBootstrap)}`,
     );
   }
 

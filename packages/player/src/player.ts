@@ -84,6 +84,7 @@ import { computePlaybackDelayUs,
   type TrackInfo,
 } from './player-pipeline.js';
 import {
+  extractLargestLocation,
   handleControlMessage as doControlMessage,
   removeSubscription,
   validateKnownTracks as doValidateKnownTracks,
@@ -948,6 +949,8 @@ export class MoqtPlayer {
       resolve: (state: CatalogState) => void;
       reject: (error: Error) => void;
       timeout: ReturnType<typeof setTimeout>;
+      /** An open-ended range: cancel what is left once the first object settles it. */
+      cancelOnSettle?: boolean;
     }
   >();
 
@@ -3104,6 +3107,11 @@ export class MoqtPlayer {
     const live = (): boolean => !this._destroyed && this.connection === conn
       && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
+    // Fetch-only retrieval reports its own outcome; load() does not wait on it.
+    if (this.config.catalogBootstrap === 'fetch') {
+      void this.fetchOnlyCatalog(conn);
+      return;
+    }
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
@@ -3137,6 +3145,49 @@ export class MoqtPlayer {
       if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
     }
     coord?.start();
+  }
+
+  /** Bounds TRACK_STATUS before fetch-only retrieval falls back to the open-ended FETCH. */
+  private static readonly FETCH_ONLY_STATUS_TIMEOUT_MS = 2_000;
+  /** End group of the open-ended catalog FETCH: the largest QUIC varint. */
+  private static readonly LAST_GROUP = (1n << 62n) - 1n;
+
+  /**
+   * `catalogBootstrap: 'fetch'`: the catalog without a subscription. TRACK_STATUS
+   * names the latest group for a standalone FETCH; without an answer, one FETCH of
+   * every group, newest first, takes the first object.
+   */
+  private async fetchOnlyCatalog(conn: MoqtConnection): Promise<void> {
+    const gen = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && this.connection === conn && gen === this.bootstrapGeneration;
+    let group: bigint | undefined;
+    try {
+      const status = await this.queryTrackStatus(catalogTrackName(), MoqtPlayer.FETCH_ONLY_STATUS_TIMEOUT_MS);
+      group = extractLargestLocation(status.parameters)?.group;
+    } catch (err) {
+      this.log.info('[catalog-fetch] no catalog location from TRACK_STATUS (%s)',
+        err instanceof Error ? err.message : String(err));
+    }
+    if (!live()) return;
+    try {
+      const state = group !== undefined
+        ? await this.fetchCatalog({ group })
+        : await this.fetchCatalog({ group: 0n, endGroup: MoqtPlayer.LAST_GROUP, descending: true });
+      if (!live()) return;
+      this.log.info('[catalog-fetch] catalog fetched %s',
+        group !== undefined ? `from group ${group}` : 'newest first');
+      this.onCatalogBootstrapReady(state);
+    } catch (err) {
+      if (!live()) return;
+      const reason = err instanceof Error ? err.message : String(err);
+      if (this.follower.awaitPublisher(conn)) {
+        this.emitError(createPlayerError('degraded', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+          `catalog fetch: ${reason}; waiting for the publisher`));
+        return;
+      }
+      this.emitError(createPlayerError('fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+        `catalog fetch failed: ${reason}`));
+    }
   }
 
   /**
@@ -4002,11 +4053,16 @@ export class MoqtPlayer {
   async fetchCatalog(opts?: {
     group?: bigint;
     object?: bigint;
+    /** End group of a wider range; the first object returned settles the call. */
+    endGroup?: bigint;
+    /** Newest group first (GROUP_ORDER Descending). */
+    descending?: boolean;
     timeoutMs?: number;
   }): Promise<CatalogState> {
     if (!this.connection) throw new Error('Player not loaded');
     const group = opts?.group ?? 0n;
     const object = opts?.object ?? 0n;
+    const endGroup = opts?.endGroup ?? group;
     const timeoutMs = opts?.timeoutMs ?? 5_000;
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
@@ -4014,8 +4070,9 @@ export class MoqtPlayer {
     const fetchOptions = {
       startGroup: varint(group),
       startObject: varint(object),
-      endGroup: varint(group),
+      endGroup: varint(endGroup),
       endObject: varint(object),
+      ...(opts?.descending ? { groupOrder: varint(0x2n) } : {}),
     };
 
     // Pre-send ownership: register the pending fetch inside `onRequestId`
@@ -4036,7 +4093,7 @@ export class MoqtPlayer {
           this.connection?.fetchCancel(varint(id)).catch(() => { /* ignore */ });
           pending.reject(new Error(`fetchCatalog timed out after ${timeoutMs}ms`));
         }, timeoutMs);
-        this.pendingCatalogFetches.set(id, { resolve, reject, timeout });
+        this.pendingCatalogFetches.set(id, { resolve, reject, timeout, ...(endGroup > group ? { cancelOnSettle: true } : {}) });
       };
       void (async () => {
         try {
@@ -5163,6 +5220,7 @@ export class MoqtPlayer {
     const pending = this.pendingCatalogFetches.get(reqId);
     if (!pending) return;
     this.cleanupCatalogFetch(reqId);
+    if (pending.cancelOnSettle) this.connection?.fetchCancel(varint(reqId)).catch(() => { /* already done */ });
     if (result.ok) pending.resolve(result.state);
     else pending.reject(result.error);
   }
@@ -5220,7 +5278,7 @@ export class MoqtPlayer {
    *
    * @see draft-ietf-moq-transport-16 §9.19 (TRACK_STATUS)
    */
-  async queryTrackStatus(trackName: string): Promise<TrackStatusResult> {
+  async queryTrackStatus(trackName: string, timeoutMs?: number): Promise<TrackStatusResult> {
     if (!this.connection) throw new Error('Player not loaded');
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
@@ -5230,7 +5288,14 @@ export class MoqtPlayer {
     const reqIdBigInt = BigInt(reqId);
 
     return new Promise<TrackStatusResult>((resolve, reject) => {
-      this.pendingTrackStatuses.set(reqIdBigInt, { resolve, reject });
+      const timer = timeoutMs === undefined ? null : setTimeout(() => {
+        if (!this.pendingTrackStatuses.delete(reqIdBigInt)) return;
+        reject(new Error(`TRACK_STATUS for "${trackName}" unanswered after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingTrackStatuses.set(reqIdBigInt, {
+        resolve: (result) => { if (timer) clearTimeout(timer); resolve(result); },
+        reject: (err) => { if (timer) clearTimeout(timer); reject(err); },
+      });
     });
   }
 
