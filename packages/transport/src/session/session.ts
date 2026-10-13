@@ -554,6 +554,8 @@ export class Session {
    *  Bounded, oldest dropped first. */
   private readonly endedByPublisher = new Set<bigint>();
   private readonly endedBySubscriber = new Set<bigint>();
+  /** Fetches we finished serving or refused, whose FETCH_CANCEL may still be in flight. */
+  private readonly endedFetches = new Set<bigint>();
   private static readonly ENDED_RACE_MAX = 64;
 
   /** Incoming fetches (as publisher). */
@@ -2363,6 +2365,9 @@ export class Session {
       return [];
     }
 
+    // A FETCH_CANCEL crossing our completed or refused response names a valid request.
+    if (this.endedFetches.delete(msg.requestId as bigint)) return [];
+
     return this.closeWithError(
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for FETCH_CANCEL`,
@@ -3455,7 +3460,12 @@ export class Session {
     const fetch = this.incomingFetches.get(requestId as bigint);
     if (!fetch) return;
     fetch.markDataFinished();
-    if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
+    if (fetch.isPublisherComplete) this.endIncomingFetch(requestId as bigint);
+  }
+
+  private endIncomingFetch(requestId: bigint): void {
+    this.incomingFetches.delete(requestId);
+    Session.noteEnded(this.endedFetches, requestId);
   }
 
   // ─── Track Alias Operations ───────────────────────────────────────────
@@ -4990,7 +5000,7 @@ export class Session {
     // §10.13: the response stream may have closed BEFORE this FETCH_OK. If so, both
     // are now done — reclaim the served fetch; otherwise keep it (reclaimServedFetch
     // reclaims when the data stream later closes).
-    if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
+    if (fetch.isPublisherComplete) this.endIncomingFetch(requestId as bigint);
 
     return [this.sendControl(fetchOk)];
   }
@@ -5013,7 +5023,7 @@ export class Session {
     // REQUEST_ERROR is terminal — RECLAIM the incoming fetch state (bounded; a peer
     // cannot grow incomingFetches with valid unique rejected requests). The adapter
     // seals the request context, so its close callback will not run this cleanup.
-    this.incomingFetches.delete(requestId as bigint);
+    this.endIncomingFetch(requestId as bigint);
 
     const requestError: RequestErrorMsg = {
       type: 'REQUEST_ERROR',

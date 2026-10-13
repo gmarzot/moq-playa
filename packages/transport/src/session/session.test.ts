@@ -3323,6 +3323,26 @@ describe('Session', () => {
         const close = actions[0] as CloseConnectionAction;
         expect(close.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
       });
+
+      it('a FETCH_CANCEL crossing our completed response is accepted once; a second one still closes', () => {
+        session.handleControlMessage(incomingFetch(0n));
+        session.acceptFetch(varint(0n));
+        session.reclaimServedFetch(0n);
+        expect(session.getIncomingFetch(varint(0n))).toBeUndefined();
+
+        const cancel = { type: 'FETCH_CANCEL', requestId: varint(0n) } as FetchCancel;
+        expect(session.handleControlMessage(cancel)).toEqual([]);
+        const again = session.handleControlMessage(cancel);
+        expect((again[0] as CloseConnectionAction).error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
+      });
+
+      it('a FETCH_CANCEL crossing our REQUEST_ERROR is accepted', () => {
+        session.handleControlMessage(incomingFetch(0n));
+        session.rejectFetch(varint(0n), varint(0x11n), 'Invalid range');
+
+        expect(session.handleControlMessage({ type: 'FETCH_CANCEL', requestId: varint(0n) } as FetchCancel))
+          .toEqual([]);
+      });
     });
 
     // ─── Publisher-Side REQUEST_UPDATE (§9.11) ───────────────────────────
