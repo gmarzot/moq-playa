@@ -209,7 +209,7 @@ describe('SubscriptionManager', () => {
   it('a declared track timescale reads object Timestamps as media time', () => {
     const mgr = new SubscriptionManager();
     const onObject = vi.fn();
-    mgr.registerTrack(1n, 'video', 'video', 'loc', 1000n);
+    mgr.registerTrack(1n, 'video', 'video', 'loc', { timescale: 1000n });
     mgr.registerTrack(2n, 'audio', 'audio');
     mgr.onObject = onObject;
     const extensions = encodeLocHeaders({ captureTimestamp: 5000n }, { locVersion: 4 });
@@ -221,6 +221,24 @@ describe('SubscriptionManager', () => {
       expect.objectContaining({ captureTimestamp: 5_000_000n, timestampIsWallClock: false }));
     expect(onObject.mock.calls[1]![3]).toEqual(
       expect.objectContaining({ captureTimestamp: 5000n, timestampIsWallClock: true }));
+  });
+
+  it('the catalog\'s decoder configuration fills in until objects carry their own', () => {
+    const mgr = new SubscriptionManager();
+    const onObject = vi.fn();
+    const catalogConfig = new Uint8Array([1, 2, 3]);
+    const objectConfig = new Uint8Array([4, 5, 6]);
+    mgr.registerTrack(1n, 'video', 'video', 'loc', { initConfig: catalogConfig });
+    mgr.onObject = onObject;
+    const plain = encodeLocHeaders({ captureTimestamp: 1000n });
+    const configured = encodeLocHeaders({ captureTimestamp: 1000n, videoConfig: objectConfig }, { locVersion: 4 });
+
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions: plain }));
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions: configured }));
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions: plain }));
+
+    const configs = onObject.mock.calls.map((c) => (c[3] as LocHeaders).videoConfig);
+    expect(configs).toEqual([catalogConfig, objectConfig, undefined]);
   });
 
   it('does not call onMalformedTrack for valid objects', () => {

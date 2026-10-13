@@ -33,8 +33,15 @@ interface TrackInfo {
   readonly trackName: string;
   readonly mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
   readonly packaging: TrackPackaging;
-  /** Units of the track's object Timestamps (TIMESCALE track property), when declared. */
+  readonly context?: TrackContext;
+}
+
+/** What a track declares outside its objects. */
+export interface TrackContext {
+  /** Units of the track's object Timestamps (TIMESCALE track property). */
   readonly timescale?: bigint;
+  /** LOC decoder configuration from the catalog's initialization data (MSF §5.1.7). */
+  readonly initConfig?: Uint8Array;
 }
 
 /**
@@ -43,6 +50,8 @@ interface TrackInfo {
 export class SubscriptionManager {
   /** Map of track alias (bigint) → track info. */
   private readonly tracks = new Map<bigint, TrackInfo>();
+  /** LOC tracks whose objects carry their own decoder configuration. */
+  private readonly objectConfigSeen = new Set<bigint>();
 
   /**
    * Object transform: applied to every MoqtObject before routing.
@@ -207,9 +216,10 @@ export class SubscriptionManager {
     trackName: string,
     mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline',
     packaging: TrackPackaging = 'loc',
-    timescale?: bigint,
+    context?: TrackContext,
   ): void {
-    this.tracks.set(trackAlias, { trackName, mediaType, packaging, ...(timescale !== undefined ? { timescale } : {}) });
+    this.tracks.set(trackAlias, { trackName, mediaType, packaging, ...(context ? { context } : {}) });
+    this.objectConfigSeen.delete(trackAlias);
   }
 
   /**
@@ -218,6 +228,7 @@ export class SubscriptionManager {
    */
   unregisterTrack(trackAlias: bigint): void {
     this.tracks.delete(trackAlias);
+    this.objectConfigSeen.delete(trackAlias);
   }
 
   /**
@@ -313,11 +324,12 @@ export class SubscriptionManager {
       // @see draft-ietf-moq-transport-16 §1.4.2
       // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
       // A declared track timescale makes object Timestamps media time (LOC-04 §2.3.1.2).
+      const timescale = info.context?.timescale;
       const opts: LocHeaderOptions | undefined =
-        draft !== undefined || info.timescale !== undefined
+        draft !== undefined || timescale !== undefined
           ? {
             ...(draft !== undefined ? { wireProfile: locWireProfileForDraft(draft) } : {}),
-            ...(info.timescale !== undefined ? { track: { timescale: info.timescale } } : {}),
+            ...(timescale !== undefined ? { track: { timescale } } : {}),
           }
           : undefined;
       const parse = this.extensionParser
@@ -339,7 +351,16 @@ export class SubscriptionManager {
           this.onCmafObject?.(mediaType, info.trackName, transformed, headers);
         }
       } else {
-        this.onObject?.(mediaType, info.trackName, transformed, parse(extensions));
+        let headers = parse(extensions);
+        // The catalog's decoder configuration stands in until objects carry their own,
+        // so two differing configurations never alternate.
+        const initConfig = info.context?.initConfig;
+        if (initConfig) {
+          const key = mediaType === 'video' ? 'videoConfig' : 'audioConfig';
+          if (headers[key]) this.objectConfigSeen.add(alias);
+          else if (!this.objectConfigSeen.has(alias)) headers = { ...headers, [key]: initConfig };
+        }
+        this.onObject?.(mediaType, info.trackName, transformed, headers);
       }
     } catch (error) {
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with

@@ -891,7 +891,8 @@ export class MoqtPlayer {
    */
   private readonly pendingMediaSubs = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; packaging?: TrackPackaging }
+    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; packaging?: TrackPackaging;
+      initConfig?: Uint8Array }
   >();
   private _mediaSubsExpected = 0;
   private _mediaSubsOk = 0;
@@ -1338,6 +1339,24 @@ export class MoqtPlayer {
       if (entry?.type === 'inline') return entry.data;
     }
     return undefined;
+  }
+
+  /**
+   * A LOC track's decoder configuration from the catalog's initialization data
+   * (MSF-00 initData, or MSF-01 initRef into initDataList): the codec's
+   * description, as LOC's VIDEO_CONFIG / AUDIO_CONFIG carry it.
+   */
+  private catalogInitConfig(trackName: string): { initConfig?: Uint8Array } {
+    const track = this._catalogState?.tracks.find((t) => t.name === trackName);
+    if (!track || mediaTrackPackaging(track.packaging) !== 'loc') return {};
+    const b64 = this.resolveInlineInitData(track);
+    if (!b64) return {};
+    try {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      return bytes.byteLength > 0 ? { initConfig: bytes } : {};
+    } catch {
+      return {};
+    }
   }
 
   /** Consecutive groups with no reconstructable chunk before a LOCMAF track is malformed (§2.4.2). */
@@ -2100,7 +2119,7 @@ export class MoqtPlayer {
       if (!this.subscriptionManager || this.connection !== switchConn) return;
       this.pendingAliasBinds.add(id);
       this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null });
-      this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging });
+      this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging, ...this.catalogInitConfig(trackName) });
     };
     let reqIdBigInt: bigint;
     try {
@@ -3039,7 +3058,7 @@ export class MoqtPlayer {
             this.activeSubscriptions.set(reqIdBigInt, {
               trackName: track.name, mediaType, trackAlias: null,
             });
-            this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType });
+            this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType, ...this.catalogInitConfig(track.name) });
             this.log.info('Subscribe %s "%s" requestId=%s (pre-known)', mediaType, track.name, reqIdBigInt);
           };
           let knownRegisteredId: bigint | null = null;
@@ -7880,7 +7899,7 @@ export class MoqtPlayer {
         if (!this.subscriptionManager || this.connection !== connAtSubscribe) return;
         this.pendingAliasBinds.add(reqIdBigInt);
         this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null });
-        this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
+        this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging, ...this.catalogInitConfig(name) });
         this.recordMediaSubWire(reqIdBigInt, wireDetail);
         this.log.info('SUBSCRIBE media reqId=%s %s', reqIdBigInt.toString(), wireDetail);
       };
@@ -8839,7 +8858,7 @@ export class MoqtPlayer {
       if (!this.subscriptionManager || this.connection !== resubConn) return;
       this.pendingAliasBinds.add(id);
       this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
-      this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
+      this.pendingMediaSubs.set(id, { trackName, mediaType, packaging, ...this.catalogInitConfig(trackName) });
     };
     // Start through the CAPTURED connection and attach both observers before
     // publishing: a recovery listener may synchronously destroy or migrate the

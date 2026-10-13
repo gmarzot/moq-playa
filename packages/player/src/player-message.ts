@@ -16,7 +16,7 @@ import type { ControlMessage, Parameters } from '@openmoq/transport';
 import { varint, readLocation, MessageParam } from '@openmoq/transport';
 import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LoggerLike } from './logger.js';
-import type { TrackPackaging } from './subscription-manager.js';
+import type { TrackContext, TrackPackaging } from './subscription-manager.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -32,6 +32,8 @@ export interface PendingMediaSub {
   trackName: string;
   mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
   packaging?: TrackPackaging;
+  /** LOC decoder configuration from the catalog's initialization data. */
+  initConfig?: Uint8Array;
 }
 
 /** Pending track status promise handles. */
@@ -50,7 +52,7 @@ export interface MessageSubscriptionManager {
   unregisterTrack(trackAlias: bigint): void;
   registerTrack(
     trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline',
-    packaging?: TrackPackaging, timescale?: bigint,
+    packaging?: TrackPackaging, context?: TrackContext,
   ): void;
   /** Check if a track alias is already registered. */
   getMediaType(trackAlias: bigint): 'video' | 'audio' | 'mediatimeline' | 'eventtimeline' | undefined;
@@ -247,7 +249,11 @@ export function handleControlMessage(
         active.trackAlias = alias;
         // Draft-18 TIMESCALE track property (0x08): the units of the track's object Timestamps.
         const timescale = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties?.get(0x08n)?.[0];
-        const declared: [] | [bigint] = typeof timescale === 'bigint' && timescale > 0n ? [timescale] : [];
+        const context: TrackContext = {
+          ...(typeof timescale === 'bigint' && timescale > 0n ? { timescale } : {}),
+          ...(pending.initConfig ? { initConfig: pending.initConfig } : {}),
+        };
+        const declared: [] | [TrackContext] = Object.keys(context).length > 0 ? [context] : [];
         ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging, ...declared);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
           ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);

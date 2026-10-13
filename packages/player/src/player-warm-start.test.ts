@@ -754,3 +754,19 @@ describe('warm start on MSE packagings asks for a new group (§10.2.13)', () => 
     }
   });
 });
+
+describe('LOC decoder configuration from the catalog (MSF §5.1.7, §5.2.13)', () => {
+  it('a LOC track\'s initRef resolves to its pending subscription\'s initConfig', async () => {
+    const avcc = new Uint8Array([1, 0x42, 0xc0, 0x1f, 0xff, 0xe1]);
+    const catalog = JSON.stringify({
+      version: '1',
+      tracks: [{ ...VIDEO_LOC, initRef: 'v0' }, AUDIO_LOC],
+      initDataList: [{ id: 'v0', type: 'inline', data: btoa(String.fromCharCode(...avcc)) }],
+    });
+    const { player } = await bootPlayer(catalog);
+    const pending = [...(player as any).pendingMediaSubs.values()] as Array<{ trackName: string; initConfig?: Uint8Array }>;
+    expect(Array.from(pending.find((p) => p.trackName === 'video')?.initConfig ?? [])).toEqual(Array.from(avcc));
+    expect(pending.find((p) => p.trackName === 'audio')?.initConfig).toBeUndefined();
+    await player.destroy();
+  });
+});
