@@ -1473,6 +1473,52 @@ describe('MoqtConnection(18) loopback — terminal-alias guard delivery timeout 
 
 });
 
+describe('MoqtConnection(16) loopback — serving FETCH (§10.4.4)', () => {
+  it('a draft-16 server answers a FETCH with objects and an end-of-range marker', async () => {
+    const { client, server, errors } = await connectedPair(16);
+    let fetchReqId = -1n;
+    server.onFetch = (rid) => { fetchReqId = rid; };
+    const recv: MoqtObject[] = [];
+    client.onObject = (_sid, o) => recv.push(o);
+
+    await client.fetch(ns('live'), nm('catalog'), {
+      startGroup: varint(5n), startObject: varint(0n), endGroup: varint(5n), endObject: varint(0n),
+    });
+    await flush();
+    expect(fetchReqId).toBe(0n);
+
+    await server.acceptFetch(fetchReqId, { endLocation: { group: 5n, object: 1n } });
+    const sid = await server.openFetchStream(fetchReqId);
+    await server.sendFetchObject(sid, { groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 128, payload: new Uint8Array([0x7b, 0x7d]) });
+    await server.sendFetchObject(sid, {
+      groupId: 5n, subgroupId: 2n, objectId: 3n, publisherPriority: 7,
+      extensions: new Uint8Array([0x04, 0x01]), payload: new Uint8Array([0xaa]),
+    });
+    await server.sendFetchEndOfRange(sid, true, 6n, 0n);
+    await server.closeFetchStream(sid);
+    await flush();
+
+    const data = recv.filter((o) => o.kind === 'data');
+    expect(data.map((o) => [o.groupId, o.subgroupId, o.objectId])).toEqual([[5n, 0n, 0n], [5n, 2n, 3n]]);
+    expect(data.map((o) => Array.from((o as { payload: Uint8Array }).payload))).toEqual([[0x7b, 0x7d], [0xaa]]);
+    expect(recv.some((o) => o.kind === 'gap')).toBe(true);
+    expect(errors).toEqual([]);
+    // The one response stream is spent and its authorization released.
+    await expect(server.openFetchStream(fetchReqId)).rejects.toThrow(/No admitted inbound FETCH/i);
+  });
+
+  it('draft-14 still refuses to open a FETCH response stream', async () => {
+    const { client, server } = await connectedPair(14);
+    let fetchReqId = -1n;
+    server.onFetch = (rid) => { fetchReqId = rid; };
+    await client.fetch(ns('live'), nm('catalog'), {
+      startGroup: varint(5n), startObject: varint(0n), endGroup: varint(5n), endObject: varint(0n),
+    });
+    await flush();
+    await expect(server.openFetchStream(fetchReqId)).rejects.toThrow(/draft-16\/18 only/);
+  });
+});
+
 describe('MoqtConnection(18) loopback — FETCH happy path + cancel (§10.12)', () => {
   it('client FETCH → server onFetch → acceptFetch → fetch data → client onObject (objects + EOR gap); then cancel', async () => {
     const { client, server, errors } = await connectedPair();

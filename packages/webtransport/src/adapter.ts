@@ -30,6 +30,12 @@ import {
   encodeFetchHeader18,
   encodeFetchObject18,
   encodeFetchEndOfRange18,
+  encodeFetchHeader,
+  encodeFetchObject,
+  encodeFetchEndOfRange,
+  FetchFlags,
+  FetchSubgroupMode,
+  FetchSpecialFlags,
   createDataCodec,
   hasObjectOnlyTrackProperty,
   hasUnsupportedMandatoryTrackProperty,
@@ -5133,8 +5139,9 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-18 §11.4.4
    */
   async openFetchStream(requestId: bigint): Promise<bigint> {
-    if (this.session.draftVersion !== 18) {
-      throw new MoqtConnectionError('openFetchStream is draft-18 only', { errorSource: 'data' });
+    const draft = this.session.draftVersion;
+    if (draft !== 18 && draft !== 16) {
+      throw new MoqtConnectionError('openFetchStream is draft-16/18 only', { errorSource: 'data' });
     }
     const groupOrder = this.inboundFetchGroupOrder.get(requestId);
     if (groupOrder === undefined) {
@@ -5165,7 +5172,7 @@ export class MoqtConnection {
       throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
     }
     try {
-      await writer.write(encodeFetchHeader18(requestId));
+      await writer.write(draft === 18 ? encodeFetchHeader18(requestId) : encodeFetchHeader({ requestId }));
     } catch (err) {
       // The FETCH_HEADER write failed: the stream is unusable — abort it so it is
       // not left half-open, and surface the failure (do not register a dead writer).
@@ -5190,6 +5197,22 @@ export class MoqtConnection {
   async sendFetchObject(streamId: bigint, fields: FetchObjectFields): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
+    if (this.session.draftVersion === 16) {
+      // Draft-16 §10.4.4: every field explicit, so nothing depends on the prior object.
+      await state.writer.write(encodeFetchObject({
+        flags: varint(BigInt(FetchSubgroupMode.EXPLICIT | FetchFlags.OBJECT_ID | FetchFlags.GROUP_ID
+          | FetchFlags.PRIORITY | (fields.extensions ? FetchFlags.EXTENSIONS : 0))),
+        groupId: fields.groupId,
+        subgroupId: fields.subgroupId,
+        objectId: fields.objectId,
+        publisherPriority: fields.publisherPriority,
+        isDatagram: false,
+        extensions: fields.extensions,
+        payload: fields.payload,
+      }));
+      state.isFirstObject = false;
+      return;
+    }
     const { bytes, nextPrior } = encodeFetchObject18(fields, state.prior, state.isFirstObject, state.groupOrder);
     await state.writer.write(bytes);
     state.prior = nextPrior;
@@ -5200,6 +5223,14 @@ export class MoqtConnection {
   async sendFetchEndOfRange(streamId: bigint, nonExistent: boolean, groupId: bigint, objectId: bigint): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
+    if (this.session.draftVersion === 16) {
+      await state.writer.write(encodeFetchEndOfRange({
+        flags: varint(BigInt(nonExistent ? FetchSpecialFlags.END_NON_EXISTENT : FetchSpecialFlags.END_UNKNOWN)),
+        groupId, objectId, nonExistent,
+      }));
+      state.isFirstObject = false;
+      return;
+    }
     const { bytes, nextPrior } = encodeFetchEndOfRange18(nonExistent, groupId, objectId, state.prior);
     await state.writer.write(bytes);
     state.prior = nextPrior;
@@ -5212,6 +5243,11 @@ export class MoqtConnection {
     if (!state) return;
     try { await state.writer.close(); } catch { /* already closed */ }
     this.fetchOutgoingStreams.delete(streamId);
+    // Draft-16 has no request stream whose teardown would release the authorization.
+    if (this.session.draftVersion === 16) {
+      this.inboundFetchGroupOrder.delete(state.requestId);
+      this.fetchServeReserved.delete(state.requestId);
+    }
     // §10.13: the publisher finished serving — RECLAIM the accepted incoming fetch in
     // the Session so serving-side state is bounded. Do NOT release the one-stream
     // reservation: §11.4.4 permits EXACTLY ONE response stream per fetch, and that
@@ -5543,7 +5579,10 @@ export class MoqtConnection {
           // (from PENDING or TRANSFERRING). Abort any response stream we opened for
           // it so we no longer write data for a fetch the peer abandoned.
           if (message.type === 'FETCH_CANCEL') {
-            await this.abortFetchStreamsForRequest((message as { requestId: bigint }).requestId, 'inbound FETCH_CANCEL');
+            const cancelled = (message as { requestId: bigint }).requestId;
+            this.inboundFetchGroupOrder.delete(cancelled);
+            this.fetchServeReserved.delete(cancelled);
+            await this.abortFetchStreamsForRequest(cancelled, 'inbound FETCH_CANCEL');
           }
         }
       }
