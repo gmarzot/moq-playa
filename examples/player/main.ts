@@ -1477,12 +1477,10 @@ audioTrackBtn.addEventListener('click', (e) => {
 });
 
 /**
- * Program names by catalog order (the catalog carries none); programs beyond
- * the list fall back to "Program <renderGroup>". `?programs=Name A,Name B`
- * overrides the default names.
+ * Program names by catalog order (the catalog carries none), from
+ * `?programs=Name A,Name B`; programs without one show "Program <renderGroup>".
  */
-const PROGRAM_NAMES = params.get('programs')?.split(',').map(n => n.trim()).filter(Boolean)
-    ?? ['NASA TV', 'extended CAM'];
+const PROGRAM_NAMES = params.get('programs')?.split(',').map(n => n.trim()).filter(Boolean) ?? [];
 
 function programName(renderGroup: number, index: number): string {
     return PROGRAM_NAMES[index] ?? `Program ${renderGroup}`;
