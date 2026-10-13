@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection, CarriedCatalog } from './broadcast-session.js';
-import type { Fetch } from '@openmoq/transport';
+import type { Fetch, TrackStatus } from '@openmoq/transport';
+import { readLocation } from '@openmoq/transport';
 import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 
@@ -32,12 +33,14 @@ function recordingConnection() {
   const properties: Array<Map<bigint, bigint[]> | undefined> = [];
   /** Joining Location per subscription request, as the adapter would have saved it. */
   const joiningLocations = new Map<bigint, { group: bigint; object: bigint }>();
+  /** Parameters of every accepted TRACK_STATUS. */
+  const trackStatuses: Array<Map<bigint, unknown[]>> = [];
   /** [requestId, statusCode] of every PUBLISH_DONE. */
   const dones: Array<[bigint, bigint]> = [];
   let nextStream = 100n;
   const recorded = {
     calls, accepted, sends, groups, fetchOk, fetchErrors, fetchObjects, largests, properties, joiningLocations,
-    dones,
+    dones, trackStatuses,
   };
   const conn: BroadcastSessionConnection & typeof recorded = {
     ...recorded,
@@ -64,6 +67,8 @@ function recordingConnection() {
     close: async () => { calls.push('close'); },
     acceptFetch: async (_rid, options) => { calls.push('acceptFetch'); fetchOk.push(options?.endLocation); },
     rejectFetch: async (_rid, code, reason) => { calls.push('rejectFetch'); fetchErrors.push({ code, reason }); },
+    acceptTrackStatus: async (_rid, options) => { calls.push('acceptTrackStatus'); trackStatuses.push(options.parameters); },
+    rejectTrackStatus: async (_rid, code) => { calls.push(`rejectTrackStatus ${code}`); },
     openFetchStream: async () => { calls.push('openFetchStream'); return nextStream++; },
     sendFetchObject: async (_sid, { groupId, objectId, payload }) => {
       calls.push('sendFetchObject');
@@ -702,7 +707,7 @@ describe('BroadcastSession — per-track MoQT status', () => {
 });
 
 /** A session on the given draft with the default catalog interval. */
-function fetchSession(conn: BroadcastSessionConnection, draft: 16 | 18 = 18) {
+function fetchSession(conn: BroadcastSessionConnection, draft: 14 | 16 | 18 = 18) {
   const lines: string[] = [];
   const session = new BroadcastSession(conn, {
     catalog: CATALOG,
@@ -813,14 +818,52 @@ describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
     expect(conn.fetchOk).toEqual([]);
   });
 
-  it('draft-16 answers FETCH with NOT_SUPPORTED', async () => {
+  it('draft-14 answers FETCH with NOT_SUPPORTED', async () => {
     const conn = recordingConnection();
-    const { session } = fetchSession(conn, 16);
+    const { session } = fetchSession(conn, 14);
     session.handleSubscribe(1n, 'catalog');
     await settle();
     session.handleFetch(9n, standaloneFetch('catalog', [0n, 0n], [conn.groups[0]! + 1n, 0n]));
     await settle();
     expect(conn.fetchErrors.map((e) => e.code)).toEqual([0x3n]);
+  });
+
+  const trackStatus = (name: string): TrackStatus => ({
+    type: 'TRACK_STATUS', requestId: 4n, trackNamespace: [], trackName: new TextEncoder().encode(name),
+    parameters: new Map(),
+  } as TrackStatus);
+
+  it('draft-16: TRACK_STATUS finds the catalog group and a standalone FETCH serves it, with no subscription', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn, 16);
+    session.handleTrackStatus(4n, trackStatus('catalog'));
+    await settle();
+    const { value: largest } = readLocation(conn.trackStatuses[0]!.get(0x09n)![0] as Uint8Array, 0);
+    expect(largest.object).toBe(0n);
+
+    session.handleFetch(6n, standaloneFetch('catalog', [largest.group, 0n], [largest.group, 0n]));
+    await settle();
+    expect(conn.fetchErrors).toEqual([]);
+    expect(conn.fetchObjects.map((o) => o.groupId)).toEqual([largest.group]);
+    expect(new TextDecoder().decode(conn.fetchObjects[0]!.payload)).toContain('"tracks"');
+  });
+
+  it('draft-18 TRACK_STATUS carries the Largest Location as a Location', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn, 18);
+    session.handleTrackStatus(4n, trackStatus('catalog'));
+    await settle();
+    expect(conn.trackStatuses[0]!.get(0x09n)![0]).toEqual({ group: expect.any(BigInt), object: 0n });
+  });
+
+  it('TRACK_STATUS for an unknown track is refused; a media track with nothing sent has no Largest Location', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn, 16);
+    session.handleTrackStatus(4n, trackStatus('subtitles'));
+    session.handleTrackStatus(5n, trackStatus('video'));
+    await settle();
+    expect(conn.calls).toContain('rejectTrackStatus 16');
+    expect(conn.trackStatuses).toEqual([new Map()]);
   });
 
   it('re-emits nothing by default, and a resume sends nothing', async () => {
@@ -862,7 +905,8 @@ describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
       session.handleForwardChange(1n, false);
       session.handleForwardChange(1n, true);
       await settle();
-      expect(conn.groups).toEqual([5_000n, 5_001n]);
+      // 5_000 is the catalog group issued at start-up, for FETCH and TRACK_STATUS.
+      expect(conn.groups).toEqual([5_001n, 5_002n]);
     } finally {
       now.mockRestore();
     }

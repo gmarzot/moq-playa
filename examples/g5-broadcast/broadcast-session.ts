@@ -10,7 +10,8 @@
  * stop or mutate the replacement generation.
  */
 import { RequestError, RequestError18 } from '@openmoq/transport';
-import type { Fetch } from '@openmoq/transport';
+import { writeLocation, locationEncodingLength } from '@openmoq/transport';
+import type { Fetch, TrackStatus as TrackStatusMessage } from '@openmoq/transport';
 import { acceptCatalogSubscribe, buildCatalogPayload, publishCatalogGroup } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import { MediaPublisher } from './media-publisher.js';
@@ -27,6 +28,8 @@ export interface BroadcastSessionConnection extends MediaPublishConnection {
   close(): Promise<void>;
   acceptFetch(requestId: bigint, options?: { endLocation?: { group: bigint; object: bigint } }): Promise<void>;
   rejectFetch(requestId: bigint, errorCode: bigint, reason: string): Promise<void>;
+  acceptTrackStatus(requestId: bigint, options: { parameters: Map<bigint, unknown[]> }): Promise<void>;
+  rejectTrackStatus(requestId: bigint, errorCode: bigint, reason: string): Promise<void>;
   openFetchStream(requestId: bigint): Promise<bigint>;
   sendFetchObject(streamId: bigint, fields: {
     groupId: bigint; subgroupId: bigint; objectId: bigint; publisherPriority: number; payload: Uint8Array;
@@ -165,8 +168,9 @@ export class BroadcastSession {
     this.publisher = new MediaPublisher(connection, opts.publisher);
     // Group IDs keep increasing across this broadcast's sessions.
     if (opts.carriedCatalog) this.catalogGroupIssued = opts.carriedCatalog.group;
-    // Draft-18: the catalog exists from the start; SUBSCRIBE_OK reports it and FETCH serves it.
-    if (opts.publisher.draft === 18) this.catalogGroup = this.nextCatalogGroup();
+    // Draft-16/18: the catalog exists from the start, so FETCH and TRACK_STATUS find it
+    // without a subscription; on draft-18 SUBSCRIBE_OK reports it too.
+    if (opts.publisher.draft !== 14) this.catalogGroup = this.nextCatalogGroup();
   }
 
   /** A track carries one alias, so a second concurrent subscription would be
@@ -438,19 +442,19 @@ export class BroadcastSession {
         this.safeLog(`FETCH reqId=${requestId}: REQUEST_ERROR not sent: ${(err as Error)?.message ?? err}`);
       });
     };
-    // FETCH response streams are draft-18 only in this adapter.
-    if (this.opts.publisher.draft !== 18) {
-      reject(RequestError.NOT_SUPPORTED, 'FETCH is served on draft-18 only');
+    // FETCH response streams are draft-16/18 only in this adapter.
+    if (this.opts.publisher.draft === 14) {
+      reject(RequestError.NOT_SUPPORTED, 'FETCH is served on draft-16/18 only');
       return;
     }
+    const E = this.requestErrors;
     const f = fetch.fetch;
     const trackName = f.fetchType === 0x1
       ? new TextDecoder().decode(f.trackName)
       : this.subscribedTrack.get(f.joiningRequestId as bigint) ?? 'catalog';
     if (trackName !== 'catalog') {
       const known = trackName === 'video' || (trackName === 'audio' && !!this.opts.catalog.audio);
-      reject(known ? RequestError18.NOT_SUPPORTED : RequestError18.DOES_NOT_EXIST,
-        `FETCH of "${trackName}" is not served`);
+      reject(known ? E.NOT_SUPPORTED : E.DOES_NOT_EXIST, `FETCH of "${trackName}" is not served`);
       return;
     }
     let range: { startLocation: { group: bigint; object: bigint }; endLocation: { group: bigint; object: bigint } };
@@ -460,7 +464,7 @@ export class BroadcastSession {
       try {
         range = this.connection.resolveJoiningFetch(requestId);
       } catch (err) {
-        reject(RequestError18.INVALID_RANGE, `no Joining Location: ${(err as Error)?.message ?? err}`);
+        reject(E.INVALID_RANGE, `no Joining Location: ${(err as Error)?.message ?? err}`);
         return;
       }
     }
@@ -468,18 +472,18 @@ export class BroadcastSession {
     try {
       payload = this.currentCatalogPayload();
     } catch (err) {
-      reject(RequestError18.INTERNAL_ERROR, `catalog build failed: ${(err as Error)?.message ?? err}`);
+      reject(E.INTERNAL_ERROR, `catalog build failed: ${(err as Error)?.message ?? err}`);
       return;
     }
     const g = this.catalogGroup!;
     const start = range.startLocation;
     if (start.group > g || (start.group === g && start.object > 0n)) {
-      reject(RequestError18.INVALID_RANGE, 'start is past the current catalog');
+      reject(E.INVALID_RANGE, 'start is past the current catalog');
       return;
     }
     // End is exclusive, and Object 0 means the whole End group: {g,0} is inside iff g <= end.group.
     if (range.endLocation.group < g) {
-      reject(RequestError18.INVALID_RANGE, 'only the current catalog group is retained');
+      reject(E.INVALID_RANGE, 'only the current catalog group is retained');
       return;
     }
     const descending = fetch.parameters.get(GROUP_ORDER_PARAM)?.[0] === 2n;
@@ -502,6 +506,42 @@ export class BroadcastSession {
       this.safeLog(`catalog: FETCH reqId=${requestId} failed: ${(err as Error)?.message ?? err}`);
     });
     this.trackWork(work);
+  }
+
+  /** The REQUEST_ERROR code table of the negotiated draft. */
+  private get requestErrors(): typeof RequestError | typeof RequestError18 {
+    return this.opts.publisher.draft === 18 ? RequestError18 : RequestError;
+  }
+
+  /**
+   * Answer a TRACK_STATUS with the track's Largest Location, so a viewer that
+   * only FETCHes the catalog can find its current group (§9.18 / §10.14).
+   */
+  handleTrackStatus(requestId: bigint, msg: TrackStatusMessage): void {
+    if (this.retired) return;
+    const trackName = new TextDecoder().decode(msg.trackName);
+    const report = (err: unknown) => this.safeLog(
+      `TRACK_STATUS reqId=${requestId}: reply not sent: ${(err as Error)?.message ?? err}`);
+    const largest = trackName === 'catalog' ? (this.catalogGroup !== null ? { group: this.catalogGroup, object: 0n } : null)
+      : trackName === 'video' || (trackName === 'audio' && !!this.opts.catalog.audio)
+        ? this.publisher.largestLocation(trackName) : undefined;
+    if (largest === undefined) {
+      this.connection.rejectTrackStatus(requestId, this.requestErrors.DOES_NOT_EXIST, `Unknown track: ${trackName}`)
+        .catch(report);
+      return;
+    }
+    const parameters = new Map<bigint, unknown[]>();
+    if (largest !== null) parameters.set(LARGEST_OBJECT_PARAM, [this.largestParam(largest)]);
+    this.safeLog(`${trackName}: TRACK_STATUS (reqId=${requestId}) · largest ${largest ? `${largest.group}/${largest.object}` : 'none'}`);
+    this.connection.acceptTrackStatus(requestId, { parameters }).catch(report);
+  }
+
+  /** LARGEST_OBJECT's value: a Location on draft-18, its raw encoding on draft-14/16. */
+  private largestParam(loc: { group: bigint; object: bigint }): unknown {
+    if (this.opts.publisher.draft === 18) return loc;
+    const bytes = new Uint8Array(locationEncodingLength(loc));
+    writeLocation(loc, bytes, 0);
+    return bytes;
   }
 
   /**

@@ -1114,6 +1114,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       };
       conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
       conn.onFetch = (requestId, fetch) => session.handleFetch(requestId, fetch);
+      conn.onTrackStatus = (requestId, msg) => session.handleTrackStatus(requestId, msg);
       conn.onSubscribeForwardStateChange = (requestId, forward) =>
         session.handleForwardChange(requestId, forward);
       const logControl = conn.onMessage;
