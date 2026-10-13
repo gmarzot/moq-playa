@@ -12,8 +12,8 @@
  * @module
  */
 
-import { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
 import { createWebTransport } from '../shared/browser/index.js';
 import { resolveRelayEndpoint } from '../shared/relay-endpoint.js';
 import { parseCertHashHex, relayCandidates } from '../shared/relay-url.js';
@@ -28,7 +28,7 @@ import {
   parseMsfCatalog,
   type CatalogState,
   type CatalogTrack,
-} from '@moqt/msf';
+} from '@openmoq/msf';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -182,7 +182,7 @@ async function run(): Promise<void> {
   const ns = (document.getElementById('namespace') as HTMLInputElement).value.trim();
   const vRaw = (document.getElementById('draft-version') as HTMLSelectElement).value;
   const hashHex = (document.getElementById('cert-hash') as HTMLInputElement).value.trim();
-  const v: 14 | 16 | 18 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : undefined;
+  const v: 14 | 16 | 18 | 22 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : vRaw === '22' ? 22 : undefined;
 
   if (!ns) { setStatus('Namespace required.', 'error'); return; }
   if (!url) {

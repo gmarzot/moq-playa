@@ -50,17 +50,18 @@ interface Harness {
         standaloneFetches: Array<{ startGroup: bigint; startObject: bigint; endGroupWholeOf: bigint }>;
         cancels: number;
         ready: Array<string[]>;      // track names at readiness
+        settled: Array<string[]>;
         updated: Array<string[]>;    // track names per catalog_updated
         legacyResubscribes: number;
         fatals: string[];
     };
 }
 
-function makeHarness(overrides?: { draft?: 14 | 16 | 18 }): Harness {
+function makeHarness(overrides?: { draft?: 14 | 16 | 18 | 22; abortOnDegraded?: boolean; abortOnReady?: boolean }): Harness {
     const manager = new CatalogManager('live/test');
     const calls: Harness['calls'] = {
         joiningFetch: 0, standaloneFetches: [], cancels: 0,
-        ready: [], updated: [], legacyResubscribes: 0, fatals: [],
+        ready: [], settled: [], updated: [], legacyResubscribes: 0, fatals: [],
     };
     let currentAttempt = 0;
     const callbacks: CatalogBootstrapCallbacks = {
@@ -70,11 +71,18 @@ function makeHarness(overrides?: { draft?: 14 | 16 | 18 }): Harness {
         issueJoiningFetch: (attempt) => { currentAttempt = attempt; calls.joiningFetch += 1; },
         issueStandaloneFetch: (range, attempt) => { currentAttempt = attempt; calls.standaloneFetches.push(range); },
         cancelFetch: () => { calls.cancels += 1; },
-        onReady: (state) => calls.ready.push(state.tracks.map((t) => t.name)),
+        onReady: (state) => {
+            calls.ready.push(state.tracks.map((t) => t.name));
+            if (overrides?.abortOnReady) coord.abort();
+        },
+        onReadySettled: () => calls.settled.push(manager.currentState!.tracks.map((t) => t.name)),
         onUpdated: (state) => calls.updated.push(state.tracks.map((t) => t.name)),
         requestLegacyResubscribe: () => { calls.legacyResubscribes += 1; },
         onFatal: (reason) => calls.fatals.push(reason),
-        onDegraded: (reason) => calls.fatals.push(`degraded:${reason}`),
+        onDegraded: (reason) => {
+            calls.fatals.push(`degraded:${reason}`);
+            if (overrides?.abortOnDegraded) coord.abort();
+        },
         requestStagedRecovery: () => calls.fatals.push('staged-recovery'),
         log: () => { /* silent */ },
     };
@@ -104,6 +112,13 @@ function completeSimplePrefix(h: Harness, group = 5n): void {
 afterEach(() => { vi.useRealTimers(); });
 
 describe('CatalogBootstrap — happy path', () => {
+    it('an abort from onReady cannot resume the coordinator or settle adoption', () => {
+        const h = makeHarness({ abortOnReady: true });
+        completeSimplePrefix(h);
+        expect(h.coord.phase).toBe('aborted');
+        expect(h.calls.settled).toEqual([]);
+    });
+
     it('#3-shape: start() issues the joining fetch immediately on d16/18, before SUBSCRIBE_OK', () => {
         const h = makeHarness();
         h.coord.start();
@@ -398,12 +413,90 @@ describe('CatalogBootstrap — failure ladder', () => {
         expect(h.calls.ready).toEqual([['video']]);
     });
 
-    it('refusal with NO largest available → straight to rung 2', () => {
+    it('refusal before SUBSCRIBE_OK waits for history before choosing a fallback', () => {
         const h = makeHarness();
         h.coord.start();
         h.f.err('refused');       // SUBSCRIBE_OK not yet seen
         expect(h.calls.standaloneFetches).toHaveLength(0);
-        expect(h.calls.legacyResubscribes).toBe(1);
+        expect(h.calls.legacyResubscribes).toBe(0);
+        h.coord.onSubscribeOk({ group: 6n, object: 4n });
+        expect(h.calls.standaloneFetches).toEqual([
+            { startGroup: 6n, startObject: 0n, endGroupWholeOf: 6n },
+        ]);
+        expect(h.calls.legacyResubscribes).toBe(0);
+    });
+
+    it('a refused join on an empty subscription retains the first live catalog', () => {
+        const h = makeHarness({ draft: 18 });
+        h.coord.start();
+        h.f.err('refused');
+        h.coord.onSubscribeOk(null);
+        expect(h.calls.legacyResubscribes).toBe(0);
+        h.coord.onLiveCatalogObject({ location: { group: 5n, object: 0n },
+            kind: 'payload', payload: msf00Indep(['video']) }, 112n);
+        expect(h.calls.ready).toEqual([['video']]);
+        expect(h.calls.legacyResubscribes).toBe(0);
+    });
+
+    it('a refused join does not classify parked live data before the history boundary arrives', () => {
+        for (const largest of [null, { group: 6n, object: 4n }]) {
+            const h = makeHarness({ draft: 18 });
+            h.coord.start();
+            h.f.err('refused');
+            h.coord.onLiveCatalogObject({ location: { group: 5n, object: 0n },
+                kind: 'payload', payload: msf00Indep(['video']) }, 112n);
+            expect(h.calls.ready).toEqual([]);
+            h.coord.onSubscribeOk(largest);
+            expect(h.calls.ready).toEqual(largest === null ? [['video']] : []);
+            expect(h.calls.standaloneFetches).toHaveLength(largest === null ? 0 : 1);
+            h.coord.abort();
+        }
+    });
+
+    it('refusal without a subscription response or live payload stays bounded', () => {
+        vi.useFakeTimers();
+        for (const accepted of [false, true]) {
+            const h = makeHarness({ draft: 18 });
+            h.coord.start();
+            if (accepted) h.coord.onSubscribeOk(null);
+            h.f.err('refused');
+            expect(h.calls.legacyResubscribes).toBe(0);
+            vi.advanceTimersByTime(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
+            expect(h.calls.legacyResubscribes).toBe(1);
+            h.coord.onSubscribeOk({ group: 6n, object: 0n });
+            h.f.obj({ location: { group: 6n, object: 0n }, kind: 'payload', payload: msf00Indep(['stale']) });
+            expect(h.calls.standaloneFetches).toEqual([]);
+            expect(h.calls.ready).toEqual([]);
+            h.coord.abort();
+        }
+    });
+
+    it('a retained empty-track catalog settles only after its parked deltas are processed', () => {
+        const h = makeHarness({ draft: 18 });
+        h.coord.start();
+        h.f.err('refused');
+        h.coord.onLiveCatalogObject({ location: { group: 5n, object: 0n },
+            kind: 'payload', payload: msf00Indep(['video']) }, 112n);
+        h.coord.onLiveCatalogObject({ location: { group: 5n, object: 1n },
+            kind: 'payload', payload: msfDelta('audio') }, 112n);
+        h.coord.onSubscribeOk(null);
+        expect(h.calls.ready).toEqual([['video']]);
+        expect(h.calls.settled).toEqual([['video', 'audio']]);
+        expect(h.calls.updated).toEqual([['video', 'audio']]);
+    });
+
+    it('a malformed parked delta can abort adoption before the ready barrier settles', () => {
+        const h = makeHarness({ draft: 18, abortOnDegraded: true });
+        h.coord.start();
+        h.f.err('refused');
+        h.coord.onLiveCatalogObject({ location: { group: 5n, object: 0n },
+            kind: 'payload', payload: msf00Indep(['video']) }, 112n);
+        h.coord.onLiveCatalogObject({ location: { group: 5n, object: 1n },
+            kind: 'payload', payload: enc({ deltaUpdate: [{ op: 'invalid' }] }) }, 112n);
+        h.coord.onSubscribeOk(null);
+        expect(h.calls.fatals).toHaveLength(1);
+        expect(h.calls.settled).toEqual([]);
+        expect(h.coord.phase).toBe('aborted');
     });
 
     it('#20: rung 1 failure → rung 2; legacy path ready on first acceptable base', () => {
@@ -465,6 +558,45 @@ describe('CatalogBootstrap — failure ladder', () => {
         // Then a stall trips it.
         vi.advanceTimersByTime(1_100);
         expect(h.calls.standaloneFetches).toHaveLength(1);
+    });
+});
+
+describe('CatalogBootstrap — draft-22 fill', () => {
+    // draft-22 §3.4: a fill range that starts after Largest Object opens no fill
+    // stream. With no Largest Object the track is empty: wait for the first
+    // live head, exactly like a Joining FETCH answered with INVALID_RANGE.
+    it('SUBSCRIBE_OK without a Largest Object resolves the fill attempt as an empty track', () => {
+        vi.useFakeTimers();
+        const h = makeHarness({ draft: 22 });
+        h.coord.start();
+        h.coord.onSubscribeOk(null);
+        expect(h.coord.phase).toBe('empty-wait');
+        vi.advanceTimersByTime(60_000);
+        expect(h.calls.legacyResubscribes).toBe(0);
+        expect(h.calls.standaloneFetches).toHaveLength(0);
+        h.coord.onLiveCatalogObject({ location: { group: 0n, object: 0n }, kind: 'payload', payload: msf01Indep(['video']) }, 110n);
+        expect(h.calls.ready).toEqual([['video']]);
+    });
+
+    it('the same holds when SUBSCRIBE_OK arrives before the coordinator starts', () => {
+        const h = makeHarness({ draft: 22 });
+        h.coord.onSubscribeOk(null);
+        h.coord.start();
+        expect(h.coord.phase).toBe('empty-wait');
+    });
+
+    it('with a Largest Object the fill is awaited', () => {
+        const h = makeHarness({ draft: 22 });
+        h.coord.start();
+        h.coord.onSubscribeOk({ group: 5n, object: 1n });
+        expect(h.coord.phase).toBe('fetching');
+    });
+
+    it('draft 18 keeps waiting for the Joining FETCH response', () => {
+        const h = makeHarness({ draft: 18 });
+        h.coord.start();
+        h.coord.onSubscribeOk(null);
+        expect(h.coord.phase).toBe('fetching');
     });
 });
 

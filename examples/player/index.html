@@ -100,6 +100,7 @@
       position: absolute; inset: 0;
       display: flex; align-items: center; justify-content: center;
       z-index: 15;
+      pointer-events: none;
     }
     .loading-spinner svg {
       width: 40px; height: 40px; color: rgba(255,255,255,0.6);
@@ -131,6 +132,10 @@
     .controls-row button:disabled { opacity: 0.3; cursor: default; }
     .controls-row svg { width: 20px; height: 20px; }
     .controls-spacer { flex: 1; }
+    @media (max-width: 520px) {
+      .controls-row { flex-wrap: wrap; }
+      .controls { padding-left: 8px; padding-right: 8px; }
+    }
 
     /* ─── Track dropdowns (in controls) ──────────── */
     .track-dropdown { position: relative; display: none; }

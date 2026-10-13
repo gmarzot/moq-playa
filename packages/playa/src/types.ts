@@ -1,5 +1,5 @@
 /**
- * Public types for @playa/player.
+ * Public types for @openmoq/playa.
  *
  * UI-friendly types that abstract away protocol internals.
  * Designed for developer ergonomics — no bigints, no spec jargon.
@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig } from '@moqt/player';
+import type { MoqtPlayerConfig } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -16,7 +16,7 @@ export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 
  * Options for the Player constructor.
  *
  * Simple, flat config with sensible defaults. Power users can pass
- * `moqtPlayerConfig` for full control over the underlying @moqt/player instance.
+ * `moqtPlayerConfig` for full control over the underlying @openmoq/player instance.
  */
 export interface PlayerOptions {
   /** WebTransport relay URL (e.g., `https://relay.example.com/moq`). */
@@ -29,9 +29,11 @@ export interface PlayerOptions {
   /** SHA-256 cert hash for self-signed certs (local dev). */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version. Default: 16. */
-  readonly draftVersion?: 14 | 16 | 18;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
   /** Auth tokens for CLIENT_SETUP. */
   readonly authTokens?: Uint8Array[];
+  /** Issuer-supplied credentials for SETUP and subsequent requests. */
+  readonly authorization?: MoqtPlayerConfig['authorization'];
 
   // ── Playback ──
 
@@ -58,6 +60,8 @@ export interface PlayerOptions {
   readonly autoQuality?: boolean;
   /** Initial quality level: 'auto' | 'lowest' | level index. Default: 'auto'. */
   readonly startLevel?: number | 'lowest' | 'auto';
+  /** Initial video view (catalog altGroup). Omitted: first video group. */
+  readonly videoAltGroup?: number;
   /** Cap quality to a maximum resolution. */
   readonly maxResolution?: { readonly width: number; readonly height: number };
 
@@ -91,7 +95,7 @@ export interface PlayerOptions {
 
   // ── Advanced ──
 
-  /** Pass-through overrides for the underlying @moqt/player config. */
+  /** Pass-through overrides for the underlying @openmoq/player config. */
   readonly moqtPlayerConfig?: Partial<MoqtPlayerConfig>;
 }
 

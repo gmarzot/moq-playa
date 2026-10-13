@@ -16,12 +16,13 @@
     "relay-server": "tsx src/relay-server.ts",
     "relay-smoke": "tsx src/relay-smoke.ts",
     "relay-load-smoke": "tsx src/relay-load-smoke.ts",
+    "relay-namespace-load-smoke": "tsx src/relay-namespace-load-smoke.ts",
     "relay-media-smoke": "tsx src/relay-media-smoke.ts",
     "relay-fetch-smoke": "tsx src/relay-fetch-smoke.ts"
   },
   "dependencies": {
-    "@moqt/transport": "workspace:*",
-    "@moqt/webtransport": "workspace:*",
+    "@openmoq/transport": "workspace:*",
+    "@openmoq/webtransport": "workspace:*",
     "@fails-components/webtransport": "1.6.8",
     "@fails-components/webtransport-transport-http3-quiche": "1.6.8"
   },

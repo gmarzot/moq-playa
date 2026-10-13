@@ -43,8 +43,8 @@
  * @module
  */
 
-import type { DataStreamTerminal } from '@moqt/webtransport';
-import type { CatalogState } from '@moqt/msf';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
+import type { CatalogState } from '@openmoq/msf';
 
 /** Inactivity/progress deadline for an ACTIVE attempt (ms). Re-armed on every
  *  fetch object / FETCH_OK, and — in the waiting states — on live catalog
@@ -177,7 +177,7 @@ interface Attempt {
 
 export class CatalogBootstrap {
   private readonly cb: CatalogBootstrapCallbacks;
-  private readonly draft: 14 | 16 | 18;
+  private readonly draft: 14 | 16 | 18 | 22;
 
   private _phase: BootstrapPhase = 'idle';
   private attemptSeq = 0;
@@ -187,6 +187,7 @@ export class CatalogBootstrap {
   /** SUBSCRIBE_OK largest location; null = explicitly none (empty track);
    *  undefined = not yet known. */
   private largest: { group: bigint; object: bigint } | null | undefined = undefined;
+  private joinRefusedBeforeSubscribeOk = false;
 
   /** The group whose independent base is currently applied, and per-group
    *  applied-head bookkeeping for the group-aware delta rule. */
@@ -223,7 +224,7 @@ export class CatalogBootstrap {
    *  degradation. */
   private readonly strict: boolean;
 
-  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
+  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18 | 22; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
     this.cb = callbacks;
     this.draft = options.draft;
     this.startMode = options.startMode ?? 'joining';
@@ -277,9 +278,41 @@ export class CatalogBootstrap {
   onSubscribeOk(largest: { group: bigint; object: bigint } | null): void {
     if (this.inert()) return;
     this.largest = largest;
+    if (this.joinRefusedBeforeSubscribeOk && this._phase === 'await-first-payload') {
+      this.joinRefusedBeforeSubscribeOk = false;
+      if (largest !== null) {
+        this.rungTransaction();
+        this.beginStandaloneAttempt('emulation', {
+          startGroup: largest.group, startObject: 0n, endGroupWholeOf: largest.group,
+        });
+      } else {
+        // Keep the suffix owned until reachReady() drains it before settlement.
+        const held = [...this.suffix].sort((a, b) => locCmp(a.location, b.location));
+        for (const entry of held) {
+          if (this.inert() || this.phase === 'live' || this.phase === 'fetching') break;
+          this.onLiveCatalogObject({ location: entry.location, kind: 'payload', payload: entry.payload }, entry.streamId);
+        }
+      }
+    }
     if (this.draft === 14 && this._phase === 'joining' && !this.attempt) {
       this.beginAttempt('joining');
     }
+    this.resolveEmptyFill();
+  }
+
+  /**
+   * draft-22 §3.4: the fill range never extends beyond Largest Object, and a
+   * range starting after it opens no fill stream. A SUBSCRIBE_OK without a
+   * Largest Object therefore means no fill will come: resolve the attempt as
+   * an empty track, as INVALID_RANGE does for a Joining FETCH.
+   */
+  private resolveEmptyFill(): void {
+    const attempt = this.attempt;
+    // `largest` is undefined until SUBSCRIBE_OK; null means it carried none.
+    if (this.draft !== 22 || this.largest !== null) return;
+    if (!attempt || attempt.kind !== 'joining' || attempt.cancelled) return;
+    this.cb.log('[catalog-bootstrap] SUBSCRIBE_OK has no Largest Object: the track is empty, no fill will open');
+    this.onFetchError(attempt.id, 'invalid-range');
   }
 
   // ─── FETCH side (attempt-token-guarded) ───────────────────────────
@@ -362,6 +395,18 @@ export class CatalogBootstrap {
       this.disarmInactivity();
       return;
     }
+    if (kind === 'refused' && attempt.kind === 'joining' && this.largest == null
+        && !this.strict && !(this.doneReason !== null && this.drained)) {
+      // A refused pending join does not prove the live subscription failed.
+      // Wait for its history boundary, or its first live base on an empty track,
+      // before replacing it. Silence still advances the bounded failure ladder.
+      const awaitingResponse = this.largest === undefined;
+      this.rungTransaction();
+      this.joinRefusedBeforeSubscribeOk = awaitingResponse;
+      this._phase = 'await-first-payload';
+      this.armInactivity();
+      return;
+    }
     this.failAttempt(`fetch ${kind}`);
   }
 
@@ -371,6 +416,10 @@ export class CatalogBootstrap {
     if (this.inert()) return;
     this.bumpInactivity();
     if (event.kind === 'gap') return; // accounting only on the live side too
+    if (this.joinRefusedBeforeSubscribeOk && this._phase === 'await-first-payload') {
+      this.bufferSuffix(event.location, event.payload!, streamId);
+      return;
+    }
 
     switch (this._phase) {
       case 'ready':
@@ -530,6 +579,7 @@ export class CatalogBootstrap {
     this._phase = 'fetching';
     if (kind === 'joining') this.cb.issueJoiningFetch(this.attempt.id);
     this.armInactivity();
+    if (kind === 'joining') this.resolveEmptyFill();
   }
 
   /** First-payload / prefix ingestion with the profile-specific base rules. */
@@ -805,6 +855,7 @@ export class CatalogBootstrap {
     this._phase = 'ready';
     this.disarmInactivity();
     this.cb.onReady(state);
+    if (this.inert()) return;
     this._phase = 'live';
     // Release the held suffix in ascending location order through the dedup.
     const held = this.suffix.sort((a, b) => locCmp(a.location, b.location));
@@ -822,7 +873,7 @@ export class CatalogBootstrap {
     // examined. A staged-recovery candidate must adopt here, not at onReady: a
     // malformed suffix delta between the two must abort the transaction, never
     // degrade an already-adopted snapshot.
-    this.cb.onReadySettled?.();
+    if (!this.inert()) this.cb.onReadySettled?.();
   }
 
   private bufferSuffix(location: { group: bigint; object: bigint }, payload: Uint8Array, streamId: bigint): void {
@@ -840,6 +891,7 @@ export class CatalogBootstrap {
    *  retire+cancel the old fetch, reset the manager and applied state,
    *  RETAIN the buffered suffix. */
   private rungTransaction(): void {
+    this.joinRefusedBeforeSubscribeOk = false;
     if (this.attempt && !this.attempt.cancelled) {
       this.attempt.cancelled = true;
       this.cb.cancelFetch();

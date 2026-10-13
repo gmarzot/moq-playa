@@ -34,11 +34,12 @@ import {
   type DecodedControlMessage,
   type CloseConnectionAction,
   type Session,
-} from '@moqt/transport';
-import type { SetupOptions } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { SetupOptions } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportLike, WebTransportBidirectionalStream } from '../types.js';
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';
+import type { RequestStreamDraft } from '@openmoq/transport';
 
 /**
  * Marks a request stream torn down by a LOCAL cancellation (e.g. draft-18 FETCH
@@ -107,8 +108,9 @@ export interface ContinuingRequestStream {
 }
 
 export class UniPairTopology {
-  readonly version = 18 as const;
-  private readonly codec: ControlCodec = createControlCodec(18);
+  /** The request-stream draft (18 or 22) this topology speaks. */
+  readonly version: RequestStreamDraft;
+  private readonly codec: ControlCodec;
 
   /** Our outbound uni control stream writer. Held open for the session lifetime
    *  (the draft-18 control stream pair must NOT be closed after SETUP). */
@@ -168,7 +170,10 @@ export class UniPairTopology {
    *  topology (and our writable half is FINned on a clean FIN — no half-open). */
   onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset') => void | Promise<void>;
 
-  constructor(private readonly session: Session) {}
+  constructor(private readonly session: Session) {
+    this.version = session.draftVersion === 22 ? 22 : 18;
+    this.codec = createControlCodec(this.version);
+  }
 
   /**
    * Establish the draft-18 control-stream pair: open our outbound uni control
@@ -966,6 +971,22 @@ class RequestStreamContext {
               throw new ProtocolViolationError(
                 'peer REQUEST_UPDATE before the initial PUBLISH response',
               );
+            }
+            await this.onPeerRequest?.(message);
+            continue;
+          }
+          // draft-22 §9.10: PUBLISH_STATE_NOTIFY is a publisher's report on a
+          // subscription's request stream, after SUBSCRIBE_OK. Not a response to
+          // any local operation — never FIFO-matched. Anywhere else it is a
+          // protocol violation.
+          if (message.type === 'PUBLISH_STATE_NOTIFY') {
+            if (this.openerType !== 'SUBSCRIBE') {
+              throw new ProtocolViolationError(
+                `PUBLISH_STATE_NOTIFY not accepted on a ${this.openerType} request stream`,
+              );
+            }
+            if (!this.subscribeEstablished) {
+              throw new ProtocolViolationError('PUBLISH_STATE_NOTIFY without a preceding SUBSCRIBE_OK');
             }
             await this.onPeerRequest?.(message);
             continue;

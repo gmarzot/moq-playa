@@ -12,10 +12,10 @@
  * @module
  */
 
-import type { MoqtConnection, WebTransportLike } from '@moqt/webtransport';
-import type { QlogEvent, MoqtObject, DraftVersion } from '@moqt/transport';
-import type { TrackConstraints, CatalogTrack, CatalogState } from '@moqt/msf';
-import type { ClockSource, DecoderCommand, RecoveryController } from '@moqt/playback';
+import type { MoqtConnection, WebTransportLike, ConnectionAuthorization } from '@openmoq/webtransport';
+import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
+import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
+import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
 import type { LogLevel, LoggerLike } from './logger.js';
@@ -62,6 +62,11 @@ export interface KnownTrackConfig {
 }
 
 // ─── Category Interfaces (documentation grouping — type stays flat) ───
+
+export interface PlayerAuthorization extends Omit<ConnectionAuthorization, 'relayUrl'> {
+  /** Additional trusted relay origins for GOAWAY migration. Default: original origin only. */
+  readonly allowedRelayOrigins?: readonly string[];
+}
 
 /** Connection options. */
 export interface ConnectionConfig {
@@ -154,6 +159,8 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   readonly authTokens?: Uint8Array[];
+  /** Credentials for SETUP and every authorized request, including recovery and reconnects. */
+  readonly authorization?: PlayerAuthorization;
 
   /**
    * MOQT implementation identifier included in CLIENT_SETUP.
@@ -375,19 +382,10 @@ export interface QualityConfig {
   readonly startLevel?: number | 'lowest' | 'auto';
 
   /**
-   * altGroup of the video view to start on when the catalog carries several
-   * views (distinct altGroups, e.g. a landscape and a portrait canvas).
-   * Default: the first view in catalog order. An unknown value falls back to
-   * the default. Switch later with `selectView()`.
-   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
-   */
-  readonly initialView?: number;
-
-  /**
    * renderGroup of the program to start on when the catalog carries several
    * (sets of tracks meant to be rendered together, e.g. a commentator booth
    * and the match). Default: the program of the first video track in catalog
-   * order. `initialView` wins when it names a view of another program.
+   * order. `videoAltGroup` wins when it names a view of another program.
    * Switch later with `selectProgram()`.
    * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
    */
@@ -420,6 +418,17 @@ export interface QualityConfig {
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
   readonly videoConstraints?: TrackConstraints;
+
+  /**
+   * Video alternate group (view) to select at tune-in, e.g. a landscape or a
+   * portrait canvas; it also selects the view's program. Omitted: the first
+   * view in catalog order. An unknown group fails rather than falling back to
+   * other content. Quality selection and ABR stay within the view; switch
+   * later with `selectView()`. Cannot be combined with the catalog-free
+   * knownTracks fast path.
+   * @see draft-ietf-moq-msf-01 §4.2, §5.2.12
+   */
+  readonly videoAltGroup?: number;
 
   /**
    * Constraints for initial audio track selection from altGroup.
@@ -558,7 +567,7 @@ export interface FactoryConfig {
    * The factory returns a ready `WebTransportLike` which is passed to `connection.connect()`.
    *
    * This cleanly separates transport creation (browser concern) from protocol logic.
-   * Browser usage: `createTransport: createWebTransport({ certHash })` from @moqt/browser.
+   * Browser usage: `createTransport: createWebTransport({ certHash })` from @openmoq/browser.
    */
   readonly createTransport?: (url: string) => Promise<WebTransportLike>;
 
@@ -628,7 +637,7 @@ export interface TransformConfig {
    * @see draft-ietf-moq-loc-01 §2.3 (LOC Header Extensions)
    * @see draft-ietf-moq-transport-16 §1.4.2 (KVP encoding)
    */
-  readonly extensionParser?: (extensions: Uint8Array | undefined) => import('@moqt/loc').LocHeaders;
+  readonly extensionParser?: (extensions: Uint8Array | undefined) => import('@openmoq/loc').LocHeaders;
 
   /**
    * Command transform: runs on every DecoderCommand before browser adapter execution.
@@ -772,6 +781,23 @@ export const DEFAULT_PLAYER_CONFIG = {
  * into a stream.
  */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.videoAltGroup !== undefined) {
+    if (!Number.isSafeInteger(config.videoAltGroup)) {
+      throw new RangeError('videoAltGroup must be a safe integer');
+    }
+    if (config.knownTracks && !config.catalog && !config.disableVideo) {
+      throw new TypeError('videoAltGroup cannot be combined with knownTracks; select from the catalog');
+    }
+  }
+  if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
+    throw new TypeError('Invalid authorization configuration');
+  }
+  if (config.authorization && config.authTokens !== undefined) {
+    throw new TypeError('Specify authorization or authTokens, not both');
+  }
+  if (config.authorization && config.connection) {
+    throw new TypeError('Configure authorization when connecting an externally owned connection, not on its player');
+  }
   // subscriberPriority: 0–255 (§9.2.2.3)
   if (config.subscriberPriority !== undefined) {
     if (!Number.isInteger(config.subscriberPriority) || config.subscriberPriority < 0 || config.subscriberPriority > 255) {
@@ -914,11 +940,6 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   if (config.preferredLanguage !== undefined
     && (typeof config.preferredLanguage !== 'string' || config.preferredLanguage.trim() === '')) {
     throw new RangeError('preferredLanguage must be a non-empty language tag');
-  }
-
-  // initialView: an altGroup number (non-negative integer)
-  if (config.initialView !== undefined && (config.initialView < 0 || !Number.isInteger(config.initialView))) {
-    throw new RangeError(`initialView must be a non-negative integer altGroup, got ${config.initialView}`);
   }
 
   // capLevelToResolution: both dimensions > 0

@@ -22,13 +22,13 @@ import { QualityController } from './quality-controller.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { PlayerEventMap } from './events.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
-import { encodeLocHeaders } from '@moqt/loc';
-import type { ClockSource } from '@moqt/playback';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
+import { encodeLocHeaders } from '@openmoq/loc';
+import type { ClockSource } from '@openmoq/playback';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -684,8 +684,9 @@ describe('MoqtPlayer', () => {
   it('destroy() cleans up and transitions to ended', async () => {
     const adapter = createMockAdapter();
     const player = new MoqtPlayer(createConfig(adapter));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     await player.destroy();
     expect(adapter.close).toHaveBeenCalled();
@@ -762,8 +763,9 @@ describe('MoqtPlayer', () => {
     const player = new MoqtPlayer(createConfig(adapter));
     const errorEvents: unknown[] = [];
     player.on('error', (e) => errorEvents.push(e));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     // Quiet-destroy contract: a dead transport rejecting close() must not
     // make destroy() reject for library consumers without a try/catch.
@@ -3207,6 +3209,43 @@ describe('MoqtPlayer', () => {
       expect(createAudioDecoder).toHaveBeenCalledOnce();
       expect(createRenderer).toHaveBeenCalledOnce();
       expect(createAudioOutput).toHaveBeenCalledOnce();
+    });
+
+    it('exposes optional renderer draw evidence through the catalog-created pipeline', async () => {
+      const adapter = createMockAdapter();
+      const renderer = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+        videoPresentation: null as import('./interfaces.js').VideoPresentation | null,
+      };
+      const player = await loadWithCatalog(adapter, {
+        ...createPipelineConfig(adapter),
+        createRenderer: () => renderer,
+        createVideoDecoder: () => ({
+          configure: vi.fn(), decode: vi.fn(), flush: vi.fn(async () => {}),
+          reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+        }),
+      });
+      try {
+        expect(player.videoPresentation).toBeNull();
+        renderer.videoPresentation = {
+          frameTimestampUs: 0n, timestampDomain: 'unknown', renderedAtUs: 123,
+        };
+        expect(player.videoPresentation).toEqual(renderer.videoPresentation);
+        expect(player.videoPresentation).not.toBe(renderer.videoPresentation);
+      } finally {
+        await player.destroy();
+      }
+      expect(player.videoPresentation).toBeNull();
+    });
+
+    it('has no video presentation without an instrumented renderer', async () => {
+      const player = await loadWithCatalog(createMockAdapter());
+      try {
+        expect(player.videoPresentation).toBeNull();
+      } finally {
+        await player.destroy();
+      }
     });
 
     // The stall metric only means something if the player actually wires both
@@ -6705,7 +6744,7 @@ describe('MoqtPlayer', () => {
 
     /**
      * Minimal CMAF assembler for testing — pairs moof+mdat by media type.
-     * Matches CmafAssemblerLike interface without importing @moqt/browser.
+     * Matches CmafAssemblerLike interface without importing @openmoq/browser.
      */
     function createCmafAssemblerFactory() {
       return (options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void }) => {
@@ -7260,7 +7299,7 @@ describe('MoqtPlayer', () => {
       const onTimeout = (wd as { onTimeout?: (e: unknown) => void }).onTimeout
         ?? ((wd as { config?: { onTimeout?: (e: unknown) => void } }).config?.onTimeout);
       expect(typeof onTimeout).toBe('function');
-      onTimeout!({ event: 'catalog_received', elapsedMs: 10_000, timeoutMs: 10_000 });
+      onTimeout!({ event: 'first_media_object', elapsedMs: 20_000, timeoutMs: 20_000 });
 
       expect(seenA).toEqual(seenB);
       expect(seenA).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
@@ -11841,9 +11880,9 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
-  it('starts on the configured initialView', async () => {
+  it('starts on the configured videoAltGroup', async () => {
     const adapter = createMockAdapter();
-    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'), { initialView: 2 });
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'), { videoAltGroup: 2 });
 
     expect(player.currentView).toBe(2);
     expect(subscribedNames(adapter)).toContain('video_portrait');

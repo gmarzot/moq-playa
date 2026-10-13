@@ -12,8 +12,8 @@
  * @module
  */
 
-import { createControlCodec } from '@moqt/transport';
-import type { ControlCodec, DecodedControlMessage } from '@moqt/transport';
+import { createControlCodec } from '@openmoq/transport';
+import type { ControlCodec, DecodedControlMessage } from '@openmoq/transport';
 
 /** Result of decoding a single framed message. */
 export interface FramedMessage {
@@ -49,6 +49,9 @@ export class ControlStreamFramer {
   constructor(codec?: ControlCodec) {
     this.codec = codec ?? createControlCodec();
   }
+
+  /** Bytes belonging to an incomplete trailing frame after drain(). */
+  get bufferedBytes(): number { return this.buffer.byteLength; }
 
   /**
    * Push a chunk of bytes into the accumulator.

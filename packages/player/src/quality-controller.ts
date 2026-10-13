@@ -1,5 +1,5 @@
 /**
- * QualityController — ABR track selection using @moqt/msf APIs.
+ * QualityController — ABR track selection using @openmoq/msf APIs.
  *
  * Selects initial video and audio tracks from the catalog.
  * Responds to `reduce_quality` recovery actions by stepping down
@@ -20,9 +20,9 @@
  * @module
  */
 
-import type { CatalogTrack, CatalogState, TrackConstraints } from '@moqt/msf';
-import { groupByAlt, selectTrack, isTrackPackagingSupported } from '@moqt/msf';
-import type { ClockSource } from '@moqt/playback';
+import type { CatalogTrack, CatalogState, TrackConstraints } from '@openmoq/msf';
+import { groupByAlt, selectTrack, isTrackPackagingSupported } from '@openmoq/msf';
+import type { ClockSource } from '@openmoq/playback';
 
 /** Configuration for the quality controller. */
 export interface QualityControllerConfig {
@@ -85,6 +85,7 @@ export interface VideoView {
 
 /** Selection constraints for initial track selection. */
 export interface SelectionConstraints {
+  readonly videoAltGroup?: number;
   readonly videoConstraints?: TrackConstraints;
   readonly audioConstraints?: TrackConstraints;
   readonly disableVideo?: boolean;
@@ -106,7 +107,8 @@ export class QualityController {
   private readonly capLevelToResolution: { readonly width: number; readonly height: number } | undefined;
   private readonly qualitySwitchCooldownMs: number;
   private readonly clock: ClockSource;
-  private readonly initialView: number | undefined;
+  private readonly configuredView: number | undefined;
+  private initialView: number | undefined;
   private readonly initialProgram: number | undefined;
   /**
    * Language to prefer when a program switch picks audio: the configured
@@ -145,7 +147,8 @@ export class QualityController {
     this.capLevelToResolution = config?.capLevelToResolution;
     this.qualitySwitchCooldownMs = config?.qualitySwitchCooldownMs ?? 0;
     this.clock = config?.clock ?? { now: () => performance.now() * 1000 };
-    this.initialView = config?.initialView;
+    this.configuredView = config?.initialView;
+    this.initialView = this.configuredView;
     this.initialProgram = config?.initialProgram;
     this.preferredLanguage = config?.preferredLanguage;
   }
@@ -176,6 +179,13 @@ export class QualityController {
     // support — exclude those tracks so an alternative packaging is chosen.
     const usable = catalog.tracks.filter(isTrackPackagingSupported);
 
+    // An explicit videoAltGroup never falls back to another view (msf-01 §5.2.12).
+    this.initialView = constraints?.videoAltGroup ?? this.configuredView;
+    if (constraints?.videoAltGroup !== undefined && !constraints.disableVideo
+      && !usable.some(t => t.role === 'video' && t.altGroup === constraints.videoAltGroup)) {
+      throw new Error(`Unknown video altGroup: ${constraints.videoAltGroup}`);
+    }
+
     this.usableTracks = usable;
     this.programList = programsOf(usable);
     this.allViews = viewsOf(usable.filter(t => t.role === 'video'));
@@ -199,7 +209,7 @@ export class QualityController {
       viewTracks = videoTracks;
     }
 
-    const videoAlts = this.cappedAlternatives(viewTracks);
+    const videoAlts = constraints?.disableVideo ? [] : this.cappedAlternatives(viewTracks);
 
     // Store ALL alternatives (for availableVideoTracks / manual selection)
     this.allVideoAlternatives = videoAlts;
