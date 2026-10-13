@@ -52,11 +52,12 @@ export const authority: string | undefined = (() => {
 /** `?warmStart=1`: LOC fetches the current group; CMAF/LOCMAF video asks for a new group. */
 export const warmStart: boolean = params.get('warmStart') === '1';
 
-/** Catalog retrieval mode override (?catalogBootstrap=auto|joining-fetch|strict|subscribe).
- *  For manual relay verification of the MSF-01 §5 bootstrap; unset = player default. */
-export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | undefined = (() => {
+/** Catalog retrieval mode override (?catalogBootstrap=auto|joining-fetch|strict|subscribe|fetch);
+ *  unset = player default. */
+export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | 'fetch' | undefined = (() => {
   const v = params.get('catalogBootstrap');
-  return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' ? v : undefined;
+  return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' || v === 'fetch'
+    ? v : undefined;
 })();
 
 /** A positive millisecond parameter, or undefined when absent or invalid. */
