@@ -747,6 +747,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   const CMAF_INIT_WAIT_MS = 5_000;
   const videoDescriptionReady = (): Promise<Uint8Array> => {
     if (videoDescription) return Promise.resolve(videoDescription);
+    // The description comes with a keyframe: ask for one rather than wait out the interval.
+    videoEncoder?.requestKeyframe();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         descriptionWaiters.delete(wake);
@@ -755,6 +757,14 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const wake = (description: Uint8Array): void => { clearTimeout(timer); resolve(description); };
       descriptionWaiters.add(wake);
     });
+  };
+  /** LOC H.264/HEVC: the encoder's description becomes the catalog's initialization
+   *  data. Not with Annex B, whose length-prefix-free payload a description would contradict. */
+  const locNeedsConfig = packaging === 'loc' && !annexb && /^(avc|hvc|hev)/.test(videoCodec);
+  const attachLocConfig = async (catalog: BroadcastCatalogParams): Promise<void> => {
+    if (catalog.locVideoConfig) return;
+    catalog.locVideoConfig = await videoDescriptionReady();
+    if (catalog === sessionCatalog) renderCatalogPanel(catalog);
   };
   /** CMAF: build both init segments once the video description exists. */
   const attachCmafInit = async (catalog: BroadcastCatalogParams): Promise<void> => {
@@ -1046,7 +1056,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
         catalog,
-        ...(packaging !== 'loc' ? { catalogReady: () => attachCmafInit(catalog) } : {}),
+        ...(packaging !== 'loc' ? { catalogReady: () => attachCmafInit(catalog) }
+          : locNeedsConfig ? { catalogReady: () => attachLocConfig(catalog) } : {}),
         ...(carriedCatalog ? { carriedCatalog } : {}),
         onCatalogGroup: (published) => {
           carriedCatalog = published;

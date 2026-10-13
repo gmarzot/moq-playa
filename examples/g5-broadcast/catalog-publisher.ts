@@ -113,6 +113,9 @@ export interface BroadcastCatalogParams {
     videoInit: Uint8Array;
     audioInit?: Uint8Array;
   };
+  /** LOC: the video decoder configuration (e.g. avcC), carried as the track's
+   *  initialization data (MSF-01 §5.1.7, §5.2.13). */
+  locVideoConfig?: Uint8Array;
 }
 
 /**
@@ -243,23 +246,25 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
   const cmaf = usesInit ? params.cmaf : undefined;
   if (usesInit && !cmaf) throw new Error('CMAF init segments are not ready yet');
   const locmaf = packaging === 'locmaf' ? { locmafVersion: LOCMAF_VERSION } : {};
+  const videoInit = cmaf ? cmaf.videoInit : packaging === 'loc' ? params.locVideoConfig : undefined;
   if (cmaf && params.audio && !cmaf.audioInit) {
     throw new Error('CMAF catalog has an audio track without an init segment');
   }
   return buildCatalog({
-    // CMSF-01 §3.1: init segments go in the root initDataList, referenced by initRef.
-    ...(cmaf ? {
+    // Initialization data goes in the root initDataList, referenced by initRef:
+    // CMAF init segments (CMSF-01 §3.1), or LOC's decoder configuration.
+    ...(videoInit ? {
       version: '1' as const,
       initDataList: [
-        { id: 'v0', type: 'inline', data: toBase64(cmaf.videoInit) },
-        ...(cmaf.audioInit ? [{ id: 'a0', type: 'inline', data: toBase64(cmaf.audioInit) }] : []),
+        { id: 'v0', type: 'inline', data: toBase64(videoInit) },
+        ...(cmaf?.audioInit ? [{ id: 'a0', type: 'inline', data: toBase64(cmaf.audioInit) }] : []),
       ],
     } : {}),
     tracks: [
       {
         name: 'video',
         packaging,
-        ...(cmaf ? { initRef: 'v0' } : {}),
+        ...(videoInit ? { initRef: 'v0' } : {}),
         ...locmaf,
         isLive: true,
         role: 'video',

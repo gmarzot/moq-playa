@@ -172,6 +172,19 @@ describe('broadcast catalog subscription lifecycle', () => {
       .toEqual([['v0', 'inline', 'AQID'], ['a0', 'inline', 'BAU=']]);
   });
 
+  it('LOC: the video decoder configuration is the track\'s initialization data (MSF-01 §5.1.7)', () => {
+    const catalog = parseCatalog(buildCatalogPayload({ ...PARAMS, locVideoConfig: new Uint8Array([1, 2, 3]) }));
+    expect(catalog.tracks.map((t) => [t.name, t.packaging, t.initRef]))
+      .toEqual([['video', 'loc', 'v0'], ['audio', 'loc', undefined]]);
+    expect(catalog.initDataList?.map((e) => [e.id, e.type, e.data])).toEqual([['v0', 'inline', 'AQID']]);
+  });
+
+  it('LOC: without a decoder configuration there is no initialization data', () => {
+    const catalog = parseCatalog(buildCatalogPayload(PARAMS));
+    expect(catalog.tracks.every((t) => t.initRef === undefined)).toBe(true);
+    expect(catalog.initDataList).toBeUndefined();
+  });
+
   it('CMAF: an audio track without an init segment is refused', () => {
     expect(() => buildCatalogPayload({ ...PARAMS, packaging: 'cmaf', cmaf: { videoInit: new Uint8Array([1]) } }))
       .toThrow(/audio track without an init/);
