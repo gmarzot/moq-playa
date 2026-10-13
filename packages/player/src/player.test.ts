@@ -8693,7 +8693,10 @@ describe('MoqtPlayer', () => {
       });
       // No "switched" event ever fires for the failed switch.
       expect(switchedFn).not.toHaveBeenCalled();
-      expect(selectCmafTrack).not.toHaveBeenCalled();
+      // The assembler was pinned to the new track for the re-type, then
+      // handed back to the old one when it failed.
+      expect(selectCmafTrack).toHaveBeenNthCalledWith(1, 'video', 'video_hevc');
+      expect(selectCmafTrack).toHaveBeenLastCalledWith('video', 'video_avc');
       // An `error` event also surfaces (PlayerErrorCode.VIDEO_DECODE_ERROR).
       expect(errorFn).toHaveBeenCalled();
 
@@ -11751,6 +11754,791 @@ describe('MSE gap-jump escalation and wiring', () => {
     expect(fatal).toHaveLength(1);
     expect(fatal[0].severity).toBe('fatal');
     expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});
+
+describe('MoqtPlayer — video views (altGroups)', () => {
+  /** Two views in one catalog, as the FFmpeg/OBS publishers emit them. */
+  function twoViewCatalog(packaging: 'loc' | 'cmaf'): string {
+    const init = (b: number) => (packaging === 'cmaf' ? { initData: btoa(String.fromCharCode(b, b, b, b)) } : {});
+    return JSON.stringify({
+      version: 1,
+      tracks: [
+        { name: 'video_main', packaging, isLive: true, role: 'video', altGroup: 1,
+          codec: 'avc1.64001f', width: 1280, height: 720, bitrate: 3_000_000, ...init(1) },
+        { name: 'video_portrait', packaging, isLive: true, role: 'video', altGroup: 2,
+          codec: 'avc1.64001f', width: 720, height: 1280, bitrate: 3_000_000, ...init(2) },
+        { name: 'audio', packaging, isLive: true, role: 'audio',
+          codec: packaging === 'cmaf' ? 'mp4a.40.2' : 'opus', samplerate: 48000, channelConfig: '2', ...init(3) },
+      ],
+    });
+  }
+
+  async function loadWithCatalog(
+    adapter: ReturnType<typeof createMockAdapter>,
+    catalogJson: string,
+    extra: Partial<MoqtPlayerConfig> = {},
+  ) {
+    const player = new MoqtPlayer({ ...createConfig(adapter), ...extra });
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+    ackCatalog(adapter);
+    adapter._triggerObject(0n, {
+      kind: 'data',
+      trackAlias: catalogReqId,
+      groupId: varint(0),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      payload: new TextEncoder().encode(catalogJson),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    return player;
+  }
+
+  const subscribedNames = (adapter: ReturnType<typeof createMockAdapter>): string[] =>
+    (adapter.subscribe as any).mock.calls.map((c: any) => new TextDecoder().decode(c[1]));
+
+  /** SUBSCRIBE_OK the latest subscription and deliver its first keyframe object. */
+  async function landLatestSubscription(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {
+    const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+    const newAlias = BigInt(newReqId) + 100n;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK',
+      requestId: varint(BigInt(newReqId)),
+      trackAlias: varint(newAlias),
+      parameters: new Map(),
+      trackExtensions: new Map(),
+    } as any);
+    adapter._triggerObject(newAlias, {
+      kind: 'data',
+      trackAlias: varint(newAlias),
+      groupId: varint(7),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      payload,
+      extensions: new Uint8Array(0),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  it('lists every view, plays the first, and keeps the other out of the ABR ladder', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+
+    expect(player.availableViews).toEqual([
+      { altGroup: 1, width: 1280, height: 720, tracks: ['video_main'] },
+      { altGroup: 2, width: 720, height: 1280, tracks: ['video_portrait'] },
+    ]);
+    expect(player.currentView).toBe(1);
+    expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video_main']);
+    expect(subscribedNames(adapter)).toContain('video_main');
+    expect(subscribedNames(adapter)).not.toContain('video_portrait');
+
+    await player.destroy();
+  });
+
+  it('starts on the configured initialView', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'), { initialView: 2 });
+
+    expect(player.currentView).toBe(2);
+    expect(subscribedNames(adapter)).toContain('video_portrait');
+    expect(subscribedNames(adapter)).not.toContain('video_main');
+
+    await player.destroy();
+  });
+
+  it('has no views for a single video track without altGroup', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, JSON.stringify({
+      version: 1,
+      tracks: [{ name: 'video', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', width: 1280, height: 720 }],
+    }));
+
+    expect(player.availableViews).toEqual([]);
+    expect(player.currentView).toBeUndefined();
+    await expect(player.selectView(1)).rejects.toThrow(/altGroup 1/);
+
+    await player.destroy();
+  });
+
+  it('joins a live view at its next group, not at the old view\'s currentGroup + 1', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = { currentGroupId: 42n };
+
+    await player.selectView(2);
+
+    const call = (adapter.subscribe as any).mock.calls.at(-1);
+    expect(new TextDecoder().decode(call[1])).toBe('video_portrait');
+    expect(call[2]?.subscriptionFilter?.type).toBe('NextGroupStart');
+
+    await player.destroy();
+  });
+
+  it('commits a LOC view switch: old view torn down, view_changed fired, ABR stays automatic', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    const viewChanged = vi.fn();
+    const switched = vi.fn();
+    player.on('view_changed', viewChanged);
+    player.on('quality_switched', switched);
+
+    await player.selectView(2);
+    expect(viewChanged).not.toHaveBeenCalled();
+    expect(player.currentView).toBe(1);
+    // A second request for the view being switched to is a no-op; another view is refused.
+    await player.selectView(2);
+    await expect(player.selectView(1)).rejects.toThrow(/in progress/);
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(1);
+
+    await landLatestSubscription(adapter, new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67]));
+
+    expect(adapter.unsubscribe).toHaveBeenCalled();
+    expect(switched).toHaveBeenCalledWith(expect.objectContaining({
+      fromTrackName: 'video_main', toTrackName: 'video_portrait', reason: 'view',
+    }));
+    expect(viewChanged).toHaveBeenCalledWith({
+      type: 'view_changed', fromView: 1, toView: 2, trackName: 'video_portrait',
+    });
+    expect(player.currentView).toBe(2);
+    expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video_portrait']);
+    expect((player as unknown as { qualityController: QualityController }).qualityController.isAutoQuality).toBe(true);
+
+    await player.destroy();
+  });
+
+  it('splices a LOC switch in at a real keyframe, not at a delta frame numbered object 0', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    const viewChanged = vi.fn();
+    player.on('view_changed', viewChanged);
+    const oldVideo = await requestIdOf(adapter, 'video_main');
+
+    await player.selectView(2);
+    // A relay joining mid-group delivered a P-slice (NAL type 1) as object 0.
+    await landSubscription(adapter, 'video_portrait', new Uint8Array([0, 0, 0, 2, 0x41, 0x9a]), 38);
+    expect(viewChanged).not.toHaveBeenCalled();
+    expect(unsubscribedIds(adapter)).not.toContain(oldVideo);
+
+    // The next group's IDR (NAL type 5) is the splice point.
+    const alias = (await requestIdOf(adapter, 'video_portrait')) + 100n;
+    adapter._triggerObject(alias, {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(39), subgroupId: varint(0),
+      objectId: varint(0), payload: new Uint8Array([0, 0, 0, 2, 0x65, 0x88]), extensions: new Uint8Array(0),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    expect(viewChanged).toHaveBeenCalledTimes(1);
+    expect(unsubscribedIds(adapter)).toContain(oldVideo);
+
+    await player.destroy();
+  });
+
+  it('splices a CMAF switch in at the first sync sample, not at a delta frame numbered object 0', async () => {
+    // A relay joining the new subscription mid-group can deliver a delta
+    // frame as object 0; the real IDR follows as the next group's object 0.
+    const u32 = (v: number) => [v >>> 24, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+    const box = (type: string, ...parts: number[][]) => {
+      const body = parts.flat();
+      return [...u32(8 + body.length), ...[...type].map(c => c.charCodeAt(0)), ...body];
+    };
+    const chunk = (sampleFlags: number) => new Uint8Array([
+      ...box('moof', box('traf',
+        box('tfhd', u32(0x020000), u32(1)),
+        box('trun', u32(0x000205), u32(1), u32(0), u32(sampleFlags), u32(4)))),
+      ...box('mdat', [0, 0, 0, 0]),
+    ]);
+    const adapter = createMockAdapter();
+    const mockMs = {
+      initialize: vi.fn(),
+      appendChunk: vi.fn(),
+      endOfStream: vi.fn(),
+      reset: vi.fn(),
+      destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn(() => Promise.resolve()),
+    };
+    const pushed: Array<[string, bigint, number]> = [];
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => ({
+        push: (_mt: string, track: string, group: bigint, payload: Uint8Array) => { pushed.push([track, group, payload[payload.length - 1]!]); },
+        selectTrack: vi.fn(),
+        setInitSegment: vi.fn(),
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    (player as unknown as { cmafVideoSynced: boolean }).cmafVideoSynced = true;
+    const viewChanged = vi.fn();
+    player.on('view_changed', viewChanged);
+
+    await player.selectView(2);
+    const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+    const newAlias = BigInt(newReqId) + 100n;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(BigInt(newReqId)), trackAlias: varint(newAlias),
+      parameters: new Map(), trackExtensions: new Map(),
+    } as any);
+    const deliver = (group: number, object: number, payload: Uint8Array) => adapter._triggerObject(newAlias, {
+      kind: 'data', trackAlias: varint(newAlias), groupId: varint(group), subgroupId: varint(0),
+      objectId: varint(object), payload, extensions: new Uint8Array(0),
+    } as MoqtObject);
+    const delta = chunk(0x01010000);
+    delta[delta.length - 1] = 0xd;
+    const idr = chunk(0x02000000);
+    idr[idr.length - 1] = 0x5;
+
+    deliver(38, 0, delta);
+    await new Promise(r => setTimeout(r, 10));
+    expect(mockMs.changeType).not.toHaveBeenCalled();
+    expect(viewChanged).not.toHaveBeenCalled();
+
+    deliver(39, 0, idr);
+    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 10));
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    expect(viewChanged).toHaveBeenCalledTimes(1);
+    // Only the IDR reaches the assembler for the new view.
+    expect(pushed.filter(([t]) => t === 'video_portrait')).toEqual([['video_portrait', 39n, 0x5]]);
+
+    await player.destroy();
+  });
+
+  it('re-inits MSE for a CMAF view switch even with an identical codec string', async () => {
+    const adapter = createMockAdapter();
+    const mockMs = {
+      initialize: vi.fn(),
+      appendChunk: vi.fn(),
+      endOfStream: vi.fn(),
+      reset: vi.fn(),
+      destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array, _opts?: unknown) => Promise.resolve()),
+    };
+    const setInitSegment = vi.fn();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => ({
+        push: vi.fn(),
+        selectTrack: vi.fn(),
+        setInitSegment,
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    const viewChanged = vi.fn();
+    player.on('view_changed', viewChanged);
+    setInitSegment.mockClear();
+
+    await player.selectView(2);
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    const [mt, codec, init, opts] = mockMs.changeType.mock.calls[0]!;
+    expect(mt).toBe('video');
+    expect(codec).toBe('avc1.64001f');
+    expect(Array.from(init)).toEqual([2, 2, 2, 2]);
+    expect(opts).toBeUndefined();
+    expect(setInitSegment).toHaveBeenCalledWith('video', init);
+    expect(viewChanged).toHaveBeenCalledWith(expect.objectContaining({ fromView: 1, toView: 2 }));
+
+    await player.destroy();
+  });
+
+  /** The handoff's booth + match catalog: two programs, two angles, two languages. */
+  function boothCatalog(packaging: 'loc' | 'cmaf'): string {
+    const init = (b: number) => (packaging === 'cmaf' ? { initData: btoa(String.fromCharCode(b, b, b, b)) } : {});
+    const video = (name: string, altGroup: number, renderGroup: number, label: string, b: number) => ({
+      name, packaging, isLive: true, role: 'video', codec: 'avc1.64001f', width: 1280, height: 720,
+      bitrate: 3_000_000, altGroup, renderGroup, label, ...init(b),
+    });
+    const audio = (name: string, extra: object, b: number) => ({
+      name, packaging, isLive: true, role: 'audio', codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '1',
+      ...extra, ...init(b),
+    });
+    return JSON.stringify({
+      version: 1,
+      tracks: [
+        video('video_booth', 4, 1, 'Commentator Booth', 1),
+        video('video_match_main', 1, 2, 'Main Camera', 2),
+        video('video_match_cam2', 2, 2, 'Tactical', 3),
+        audio('audio_booth', { renderGroup: 1 }, 4),
+        audio('audio_match_en', { altGroup: 3, renderGroup: 2, lang: 'en' }, 5),
+        audio('audio_match_es', { altGroup: 3, renderGroup: 2, lang: 'es' }, 6),
+      ],
+    });
+  }
+
+  /** Request id of the latest SUBSCRIBE for `name`. */
+  async function requestIdOf(adapter: ReturnType<typeof createMockAdapter>, name: string): Promise<bigint> {
+    const calls = (adapter.subscribe as any).mock.calls;
+    for (let i = calls.length - 1; i >= 0; i--) {
+      if (new TextDecoder().decode(calls[i][1]) === name) return BigInt(await (adapter.subscribe as any).mock.results[i].value);
+    }
+    throw new Error(`no SUBSCRIBE for ${name}`);
+  }
+
+  /** SUBSCRIBE_OK the latest subscription of `name` and deliver one object on it. */
+  async function landSubscription(adapter: ReturnType<typeof createMockAdapter>, name: string, payload: Uint8Array, group = 7) {
+    const reqId = await requestIdOf(adapter, name);
+    const alias = reqId + 100n;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(alias),
+      parameters: new Map(), trackExtensions: new Map(),
+    } as any);
+    adapter._triggerObject(alias, {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(group), subgroupId: varint(0),
+      objectId: varint(0), payload, extensions: new Uint8Array(0),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  const unsubscribedIds = (adapter: ReturnType<typeof createMockAdapter>): bigint[] =>
+    (adapter.unsubscribe as any).mock.calls.map((c: any) => BigInt(c[0]));
+
+  it('exposes programs, labels, languages and the current program\'s audio tracks', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'));
+
+    expect(player.availablePrograms).toEqual([
+      { renderGroup: 1, tracks: ['video_booth', 'audio_booth'] },
+      { renderGroup: 2,
+        tracks: ['video_match_main', 'video_match_cam2', 'audio_match_en', 'audio_match_es'] },
+    ]);
+    expect(player.currentProgram).toBe(1);
+    expect(player.availableViews).toEqual([
+      { altGroup: 4, renderGroup: 1, label: 'Commentator Booth', width: 1280, height: 720, tracks: ['video_booth'] },
+    ]);
+    expect(player.availableVideoTracks[0]).toMatchObject({ name: 'video_booth', label: 'Commentator Booth', altGroup: 4, renderGroup: 1 });
+    expect(player.availableAudioTracks.map(t => t.name)).toEqual(['audio_booth']);
+    expect(player.currentAudioTrack).toBe('audio_booth');
+    expect(subscribedNames(adapter)).toEqual(expect.arrayContaining(['video_booth', 'audio_booth']));
+
+    await player.destroy();
+  });
+
+  it('starts on initialProgram with the preferred language', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2, preferredLanguage: 'es' });
+
+    expect(player.currentProgram).toBe(2);
+    expect(player.availableAudioTracks.map(t => [t.name, t.lang])).toEqual([['audio_match_en', 'en'], ['audio_match_es', 'es']]);
+    expect(player.currentAudioTrack).toBe('audio_match_es');
+    expect(subscribedNames(adapter)).toEqual(expect.arrayContaining(['video_match_main', 'audio_match_es']));
+    expect(subscribedNames(adapter)).not.toContain('audio_match_en');
+
+    await player.destroy();
+  });
+
+  it('switches LOC audio language at the new track\'s first object, leaving video alone', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    const changed = vi.fn();
+    player.on('audio_track_changed', changed);
+    const oldAudio = await requestIdOf(adapter, 'audio_match_en');
+    const videoSubs = subscribedNames(adapter).filter(n => n.startsWith('video')).length;
+
+    await player.selectAudioTrack('audio_match_es');
+    const call = (adapter.subscribe as any).mock.calls.at(-1);
+    expect(new TextDecoder().decode(call[1])).toBe('audio_match_es');
+    expect(call[2]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(unsubscribedIds(adapter)).not.toContain(oldAudio);
+    await player.selectAudioTrack('audio_match_es'); // same target: no-op
+    await expect(player.selectAudioTrack('audio_match_en')).rejects.toThrow(/in progress/);
+
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0x21, 0x10, 0x05]));
+
+    expect(unsubscribedIds(adapter)).toContain(oldAudio);
+    expect(changed).toHaveBeenCalledWith({
+      type: 'audio_track_changed', fromTrackName: 'audio_match_en', toTrackName: 'audio_match_es', lang: 'es', reason: 'manual',
+    });
+    expect(player.currentAudioTrack).toBe('audio_match_es');
+    expect(subscribedNames(adapter).filter(n => n.startsWith('video'))).toHaveLength(videoSubs);
+    await expect(player.selectAudioTrack('nope')).rejects.toThrow(/Unknown audio track/);
+
+    await player.destroy();
+  });
+
+  function cmafHarness(changeType: () => Promise<void>) {
+    const mockMs = {
+      initialize: vi.fn(),
+      appendChunk: vi.fn(),
+      endOfStream: vi.fn(),
+      reset: vi.fn(),
+      destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array, _opts?: unknown) => changeType()),
+    };
+    const assembler = {
+      push: vi.fn(),
+      selectTrack: vi.fn(),
+      setInitSegment: vi.fn(),
+      getEpoch: () => null,
+      reset: vi.fn(),
+      destroy: vi.fn(),
+    };
+    return {
+      mockMs, assembler,
+      config: { createMediaSource: () => mockMs, createCmafAssembler: () => assembler } as Partial<MoqtPlayerConfig>,
+    };
+  }
+
+  it('switches CMAF audio language by re-typing the audio SourceBuffer, then dropping the old track', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.resolve());
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), { ...h.config, initialProgram: 2 });
+    const changed = vi.fn();
+    player.on('audio_track_changed', changed);
+    const oldAudio = await requestIdOf(adapter, 'audio_match_en');
+    h.assembler.push.mockClear();
+
+    await player.selectAudioTrack('audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(h.mockMs.changeType).toHaveBeenCalledTimes(1);
+    const [mt, codec, init, opts] = h.mockMs.changeType.mock.calls[0]!;
+    expect([mt, codec, Array.from(init), opts]).toEqual(['audio', 'mp4a.40.2', [6, 6, 6, 6], undefined]);
+    expect(h.assembler.selectTrack).toHaveBeenLastCalledWith('audio', 'audio_match_es');
+    expect(h.assembler.setInitSegment).toHaveBeenCalledWith('audio', init);
+    expect(h.assembler.push).toHaveBeenCalledWith('audio', 'audio_match_es', 7n, expect.any(Uint8Array));
+    expect(unsubscribedIds(adapter)).toContain(oldAudio);
+    expect(changed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'audio_match_es', lang: 'es' }));
+
+    await player.destroy();
+  });
+
+  it('rolls a CMAF audio switch back when changeType fails, keeping the old track', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.reject(new Error('no')));
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), { ...h.config, initialProgram: 2 });
+    const failed = vi.fn();
+    player.on('audio_track_switch_failed', failed);
+    player.on('error', () => {});
+    const oldAudio = await requestIdOf(adapter, 'audio_match_en');
+
+    await player.selectAudioTrack('audio_match_es');
+    const newAudio = await requestIdOf(adapter, 'audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ fromTrackName: 'audio_match_en', toTrackName: 'audio_match_es' }));
+    expect(h.assembler.selectTrack).toHaveBeenLastCalledWith('audio', 'audio_match_en');
+    expect(unsubscribedIds(adapter)).toContain(newAudio);
+    expect(unsubscribedIds(adapter)).not.toContain(oldAudio);
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+
+    await player.destroy();
+  });
+
+  it('switches program: video and audio together, then program_changed', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { preferredLanguage: 'es' });
+    const programChanged = vi.fn();
+    const viewChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    player.on('view_changed', viewChanged);
+    (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = { currentGroupId: 42n };
+
+    await player.selectProgram(2);
+    const videoCall = (adapter.subscribe as any).mock.calls.find((c: any) => new TextDecoder().decode(c[1]) === 'video_match_main');
+    // Programs are not time-aligned (msf#142): the new video joins at its own next group.
+    expect(videoCall[2]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(subscribedNames(adapter)).toContain('audio_match_es');
+    // Nothing committed yet: the old program plays on.
+    expect(player.currentProgram).toBe(1);
+    expect(programChanged).not.toHaveBeenCalled();
+    expect(viewChanged).not.toHaveBeenCalled();
+    await player.selectProgram(2); // same target in flight: no-op
+    await expect(player.selectProgram(9)).rejects.toThrow(/Unknown program/);
+    await player.destroy();
+  });
+
+  it('refuses an audio switch when audio is disabled', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2, disableAudio: true });
+    await expect(player.selectAudioTrack('audio_match_es')).rejects.toThrow(/not playing/);
+    expect(subscribedNames(adapter)).not.toContain('audio_match_es');
+    await player.destroy();
+  });
+
+  it('refuses a program switch while an audio switch is pending, without touching video', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    await player.selectAudioTrack('audio_match_es');
+    const before = subscribedNames(adapter).length;
+    await expect(player.selectProgram(1)).rejects.toThrow(/audio track switch is already in progress/);
+    expect(subscribedNames(adapter)).toHaveLength(before);
+    await player.destroy();
+  });
+
+  it('switches at once to a program that shares every playing track', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, JSON.stringify({
+      version: 1,
+      tracks: [
+        { name: 'video', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f' },
+        { name: 'audio', packaging: 'loc', isLive: true, role: 'audio', codec: 'opus', samplerate: 48000, channelConfig: '2' },
+        { name: 'subtitles_a', packaging: 'loc', isLive: true, role: 'subtitle', renderGroup: 1 },
+        { name: 'subtitles_b', packaging: 'loc', isLive: true, role: 'subtitle', renderGroup: 2 },
+      ],
+    }));
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    const before = subscribedNames(adapter).length;
+    expect(player.currentProgram).toBe(1);
+
+    await player.selectProgram(2);
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    expect(player.currentProgram).toBe(2);
+    expect(subscribedNames(adapter)).toHaveLength(before);
+    await player.destroy();
+  });
+
+  /** The relay refuses the latest SUBSCRIBE for `name`. */
+  async function refuseSubscription(adapter: ReturnType<typeof createMockAdapter>, name: string) {
+    adapter._triggerMessage({
+      type: 'REQUEST_ERROR', requestId: varint(await requestIdOf(adapter, name)),
+      errorCode: varint(0x10n), errorReason: 'Track not found',
+    } as any);
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  it('aborts an audio switch whose track the relay refuses, so the next one can run', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    player.on('error', () => {});
+    const failed = vi.fn();
+    player.on('audio_track_switch_failed', failed);
+
+    await player.selectAudioTrack('audio_match_es');
+    await refuseSubscription(adapter, 'audio_match_es');
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'audio_match_es' }));
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+
+    await player.selectAudioTrack('audio_match_es'); // not stuck "in progress"
+    expect(subscribedNames(adapter).filter(n => n === 'audio_match_es')).toHaveLength(2);
+    await player.destroy();
+  });
+
+  it('aborts a view switch whose track the relay refuses, so views and ABR work again', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    player.on('error', () => {});
+    const failed = vi.fn();
+    player.on('quality_switch_failed', failed);
+
+    await player.selectView(2);
+    await refuseSubscription(adapter, 'video_portrait');
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video_portrait' }));
+    expect(player.currentView).toBe(1);
+
+    await player.selectView(2);
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(2);
+    await player.destroy();
+  });
+
+  it('runs one video switch at a time', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    const view = player.selectView(2);
+    // A second switch racing the first through its awaits is refused.
+    await expect(player.selectVideoTrack('video_main')).rejects.toThrow(/already in progress/);
+    await view;
+    await expect(player.selectVideoTrack('video_main')).rejects.toThrow(/already in progress/);
+    await player.selectVideoTrack('video_portrait'); // same target: no-op
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(1);
+    await player.destroy();
+  });
+
+  it('commits a program switch through its audio when video is disabled', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { disableVideo: true });
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    expect(player.availableViews).toEqual([]);
+    expect(player.currentVideoTrack).toBeUndefined();
+
+    await player.selectProgram(2);
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0x21, 0x10, 0x05]));
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    expect(player.currentProgram).toBe(2);
+    expect(player.availableAudioTracks.map(t => t.name)).toEqual(['audio_match_en', 'audio_match_es']);
+    await expect(player.selectView(1)).rejects.toThrow(/video is not playing/);
+    await player.destroy();
+  });
+
+  it('keeps the program and puts the audio back when the program\'s video fails', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.resolve());
+    h.mockMs.changeType.mockImplementation((mt: string) =>
+      mt === 'video' ? Promise.reject(new Error('no video retype')) : Promise.resolve());
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), h.config);
+    player.on('error', () => {});
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+
+    await player.selectProgram(2);
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+    const before = subscribedNames(adapter).filter(n => n === 'audio_booth').length;
+    await landSubscription(adapter, 'video_match_main', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(programChanged).not.toHaveBeenCalled();
+    expect(player.currentProgram).toBe(1);
+    // The new program's language is rolled back to the old program's track.
+    expect(subscribedNames(adapter).filter(n => n === 'audio_booth')).toHaveLength(before + 1);
+    await player.destroy();
+  });
+
+  it('fires no view_changed for a switch inside one view\'s ABR ladder', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, JSON.stringify({
+      version: 1,
+      tracks: [
+        { name: 'hi', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', bitrate: 3e6, altGroup: 1 },
+        { name: 'lo', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', bitrate: 1e6, altGroup: 1 },
+      ],
+    }), { startLevel: 0 });
+    const viewChanged = vi.fn();
+    const switched = vi.fn();
+    player.on('view_changed', viewChanged);
+    player.on('quality_switched', switched);
+    await player.selectVideoTrack('lo');
+    await landSubscription(adapter, 'lo', new Uint8Array([0, 0, 0, 2, 0x65, 0x88]));
+    expect(switched).toHaveBeenCalledTimes(1);
+    expect(viewChanged).not.toHaveBeenCalled();
+    expect(player.currentVideoTrack).toBe('lo');
+    await player.destroy();
+  });
+
+  it('keeps the viewer\'s language across a detour through a program without it', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    await player.selectAudioTrack('audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0x21, 0x10, 0x05]));
+    await player.selectProgram(1);
+    await landSubscription(adapter, 'audio_booth', new Uint8Array([0x21, 0x10, 0x05]));
+    await landSubscription(adapter, 'video_booth', new Uint8Array([0, 0, 0, 2, 0x65, 0x88]));
+    expect(player.currentProgram).toBe(1);
+
+    await player.selectProgram(2);
+    // The booth audio has no language; the match picks Spanish again, not English.
+    expect(subscribedNames(adapter).filter(n => n === 'audio_match_es')).toHaveLength(2);
+    expect(subscribedNames(adapter).filter(n => n === 'audio_match_en')).toHaveLength(1);
+    await player.destroy();
+  });
+
+  it('does not let an aborted switch\'s staging timer complete the next switch', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    player.on('error', () => {});
+    const switched = vi.fn();
+    player.on('quality_switched', switched);
+    const oldVideo = await requestIdOf(adapter, 'video_main');
+
+    await player.selectView(2);
+    // One delta frame staged (arms the 3 s staging timer), then the track ends.
+    await landSubscription(adapter, 'video_portrait', new Uint8Array([0, 0, 0, 2, 0x41, 0x9a]));
+    adapter._triggerMessage({
+      type: 'PUBLISH_DONE', requestId: varint(await requestIdOf(adapter, 'video_portrait')),
+      statusCode: varint(0x2n), streamCount: varint(0n), errorReason: 'ended',
+    } as any);
+    await new Promise(r => setTimeout(r, 10));
+    await player.selectView(2); // retry; it delivers nothing yet
+    await new Promise(r => setTimeout(r, 3_300));
+
+    expect(switched).not.toHaveBeenCalled();
+    expect(unsubscribedIds(adapter)).not.toContain(oldVideo);
+    await player.destroy();
+  }, 10_000);
+
+  it('abandons a switch whose new track never delivers, so later switches run', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    player.on('error', () => {});
+    const failed = vi.fn();
+    player.on('quality_switch_failed', failed);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await player.selectView(2);
+      await expect(player.selectView(1)).rejects.toThrow(/already in progress/);
+      await vi.advanceTimersByTimeAsync(10_500);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video_portrait' }));
+    await player.selectView(2); // not stuck "in progress"
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(2);
+    await player.destroy();
+  });
+
+  it('settles a program switch whose audio leg joins an in-flight manual pick of the same track', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'));
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+
+    const program = player.selectProgram(2);
+    await player.selectAudioTrack('audio_match_en'); // manual pick of the leg's own target
+    await program;
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0x21, 0x10, 0x05]));
+    await landSubscription(adapter, 'video_match_main', new Uint8Array([0, 0, 0, 2, 0x65, 0x88]));
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    await player.selectProgram(1); // not stuck
+    await player.destroy();
+  });
+
+  it('keeps the program when every track it had to change failed', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { disableVideo: true });
+    player.on('error', () => {});
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    await player.selectProgram(2);
+    await refuseSubscription(adapter, 'audio_match_en');
+    expect(programChanged).not.toHaveBeenCalled();
+    expect(player.currentProgram).toBe(1);
+    expect(player.currentAudioTrack).toBe('audio_booth');
+    await player.selectProgram(2); // can try again
+    await player.destroy();
+  });
+
+  it('commits a program switch once its video lands', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'));
+    const programChanged = vi.fn();
+    const viewChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    player.on('view_changed', viewChanged);
+
+    await player.selectProgram(2);
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0x21, 0x10, 0x05]));
+    expect(programChanged).not.toHaveBeenCalled(); // audio alone does not move a program with video
+    await landSubscription(adapter, 'video_match_main', new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x65]));
+
+    expect(programChanged).toHaveBeenCalledTimes(1);
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    expect(viewChanged).toHaveBeenCalledWith(expect.objectContaining({ fromView: 4, toView: 1 }));
+    expect(player.currentProgram).toBe(2);
+    expect(player.availableViews.map(v => v.label)).toEqual(['Main Camera', 'Tactical']);
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+
     await player.destroy();
   });
 });

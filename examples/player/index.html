@@ -168,6 +168,18 @@
       font-family: 'SF Mono', 'Cascadia Code', monospace;
     }
     .track-dropdown-item.active .item-detail { color: rgba(96,165,250,0.6); }
+    .track-dropdown-item.pending { color: #fbbf24; cursor: default; }
+    .track-dropdown-item.pending .item-detail { color: rgba(251,191,36,0.7); }
+    .track-dropdown-item.disabled { opacity: 0.4; cursor: default; }
+    .track-dropdown-item.disabled:hover { background: none; }
+    .track-dropdown-item .item-name { overflow: hidden; text-overflow: ellipsis; }
+    .track-dropdown-header {
+      padding: 8px 10px 3px; font-size: 0.62rem; font-weight: 600;
+      letter-spacing: 0.08em; text-transform: uppercase; color: rgba(255,255,255,0.35);
+    }
+    .track-dropdown-header:first-child { padding-top: 4px; }
+    .track-dropdown-menu { overflow-y: auto; white-space: nowrap; max-width: min(320px, 80vw); }
+    .track-dropdown-item .item-detail { margin-left: 16px; }
 
     /* ─── Stats overlay ──────────────────────────── */
     .stats-overlay {

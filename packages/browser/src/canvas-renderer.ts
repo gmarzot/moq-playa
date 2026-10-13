@@ -51,6 +51,7 @@ export class CanvasRenderer implements VideoRendererLike {
   private readonly queue: QueuedFrame[] = [];
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
+  private readonly followFrameSize: boolean;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
   /**
@@ -90,7 +91,18 @@ export class CanvasRenderer implements VideoRendererLike {
 
   constructor(
     canvas: HTMLCanvasElement,
-    options?: { stallThresholdMs?: number; clock?: ClockSource },
+    options?: {
+      stallThresholdMs?: number;
+      clock?: ClockSource;
+      /**
+       * Resize the canvas backing store to each frame's display size, so a
+       * resolution or aspect change (e.g. a landscape → portrait view switch)
+       * is never stretched; CSS (`object-fit: contain`) then letterboxes the
+       * element. Default true. Pass false for a canvas whose size the caller
+       * owns: frames are then drawn stretched to the canvas.
+       */
+      followFrameSize?: boolean;
+    },
   ) {
     // Validate before acquiring any browser state, so an invalid option
     // cannot leave a half-constructed renderer holding a 2d context.
@@ -99,6 +111,7 @@ export class CanvasRenderer implements VideoRendererLike {
       : validateStallThresholdMs(options.stallThresholdMs);
     this.ctx = canvas.getContext('2d')!;
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
+    this.followFrameSize = options?.followFrameSize ?? true;
   }
 
   /**
@@ -154,7 +167,18 @@ export class CanvasRenderer implements VideoRendererLike {
         // Used for drift detection in the feedback path.
         const captureTimestampUs = BigInt(entry.frame.timestamp);
 
-        this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+        // Follow the frame's size so a resolution or aspect change (e.g. a
+        // switch from a landscape to a portrait view) is not stretched into
+        // the previous geometry; CSS object-fit letterboxes the element.
+        const canvas = this.ctx.canvas;
+        const { displayWidth, displayHeight } = entry.frame;
+        if (this.followFrameSize && displayWidth && displayHeight
+          && (canvas.width !== displayWidth || canvas.height !== displayHeight)) {
+          canvas.width = displayWidth;
+          canvas.height = displayHeight;
+        }
+
+        this.ctx.drawImage(entry.frame, 0, 0, canvas.width, canvas.height);
 
         // frame.close() is NON-NEGOTIABLE — GPU memory outside GC
         entry.frame.close();

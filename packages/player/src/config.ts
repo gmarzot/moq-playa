@@ -375,6 +375,33 @@ export interface QualityConfig {
   readonly startLevel?: number | 'lowest' | 'auto';
 
   /**
+   * altGroup of the video view to start on when the catalog carries several
+   * views (distinct altGroups, e.g. a landscape and a portrait canvas).
+   * Default: the first view in catalog order. An unknown value falls back to
+   * the default. Switch later with `selectView()`.
+   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+   */
+  readonly initialView?: number;
+
+  /**
+   * renderGroup of the program to start on when the catalog carries several
+   * (sets of tracks meant to be rendered together, e.g. a commentator booth
+   * and the match). Default: the program of the first video track in catalog
+   * order. `initialView` wins when it names a view of another program.
+   * Switch later with `selectProgram()`.
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  readonly initialProgram?: number;
+
+  /**
+   * Preferred audio language, e.g. `'es'` or `'en-US'`. Matched against the
+   * catalog's `lang` on the primary subtag, ignoring case. When no track
+   * matches, audio selection proceeds as if unset. Switch later with
+   * `selectAudioTrack()`.
+   */
+  readonly preferredLanguage?: string;
+
+  /**
    * Cap video quality to a maximum resolution.
    * Tracks exceeding this resolution are excluded from selection.
    * Useful for mobile devices or bandwidth-constrained environments.
@@ -876,6 +903,22 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // maxDecodeErrors: > 0
   if (config.maxDecodeErrors !== undefined && (config.maxDecodeErrors <= 0 || !Number.isInteger(config.maxDecodeErrors))) {
     throw new RangeError(`maxDecodeErrors must be a positive integer, got ${config.maxDecodeErrors}`);
+  }
+
+  // initialProgram: a renderGroup number (non-negative integer)
+  if (config.initialProgram !== undefined && (config.initialProgram < 0 || !Number.isInteger(config.initialProgram))) {
+    throw new RangeError(`initialProgram must be a non-negative integer renderGroup, got ${config.initialProgram}`);
+  }
+
+  // preferredLanguage: a non-empty language tag
+  if (config.preferredLanguage !== undefined
+    && (typeof config.preferredLanguage !== 'string' || config.preferredLanguage.trim() === '')) {
+    throw new RangeError('preferredLanguage must be a non-empty language tag');
+  }
+
+  // initialView: an altGroup number (non-negative integer)
+  if (config.initialView !== undefined && (config.initialView < 0 || !Number.isInteger(config.initialView))) {
+    throw new RangeError(`initialView must be a non-negative integer altGroup, got ${config.initialView}`);
   }
 
   // capLevelToResolution: both dimensions > 0

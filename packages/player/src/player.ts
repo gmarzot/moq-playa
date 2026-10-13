@@ -24,11 +24,12 @@ import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
 import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@moqt/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
+import { cmafChunkStartsWithSync } from './cmaf-sync.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
 import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, isKeyframePayload } from '@moqt/playback';
 import { BufferBasedController } from '@moqt/playback';
 import type { AbrTrack } from '@moqt/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
@@ -101,6 +102,13 @@ const SWITCH_STAGING_MAX_OBJECTS = 100;
 
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
+/**
+ * How long a track switch waits for the new track's FIRST object before it is
+ * abandoned (old track kept). The staging timeout only runs once objects
+ * flow; this one covers a track the relay accepted but never delivers (its
+ * encoder down), which would otherwise block every later switch.
+ */
+const SWITCH_NO_DATA_TIMEOUT_MS = 10_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -142,6 +150,85 @@ function encodeNamespace(
 /** Display form of a config namespace, joining tuple fields with `/`. */
 function namespaceDisplay(ns: string | readonly string[]): string {
   return typeof ns === 'string' ? ns : ns.join('/');
+}
+
+/** A video track of the current view, as listed by `MoqtPlayer.availableVideoTracks`. */
+export interface VideoTrackInfo {
+  readonly name: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly bitrate?: number;
+  readonly codec?: string;
+  readonly label?: string;
+  readonly lang?: string;
+  readonly altGroup?: number;
+  readonly renderGroup?: number;
+}
+
+/** A video view (altGroup) of the current program, as listed by `MoqtPlayer.availableViews`. */
+export interface VideoViewInfo {
+  readonly altGroup: number;
+  /** Program of the view; absent when the view is shared by every program. */
+  readonly renderGroup?: number;
+  /** Catalog label of the view's first labelled track. */
+  readonly label?: string;
+  /** Dimensions of the view's highest-bitrate track. */
+  readonly width?: number;
+  readonly height?: number;
+  /** Track names of the view, highest bitrate first. */
+  readonly tracks: readonly string[];
+}
+
+/** An audio track of the current program, as listed by `MoqtPlayer.availableAudioTracks`. */
+export interface AudioTrackInfo {
+  readonly name: string;
+  readonly codec?: string;
+  readonly bitrate?: number;
+  readonly samplerate?: number;
+  readonly channelConfig?: string;
+  /** Catalog language tag (e.g. "en", "es"). */
+  readonly lang?: string;
+  /** Catalog label, only where the publisher set one. */
+  readonly label?: string;
+  readonly altGroup?: number;
+  readonly renderGroup?: number;
+}
+
+/** A program (renderGroup), as listed by `MoqtPlayer.availablePrograms`. */
+export interface ProgramInfo {
+  readonly renderGroup: number;
+  /** Names of the program's tracks, shared ones included, in catalog order. */
+  readonly tracks: readonly string[];
+}
+
+/** An in-flight program switch (see `selectProgram`). */
+interface PendingProgramSwitch {
+  readonly target: number;
+  readonly from: number | undefined;
+  /** Audio track playing before the switch, to go back to if the video fails. */
+  readonly prevAudio: string | undefined;
+  /** The tracks that change, and how each one ended. */
+  readonly legs: Map<'video' | 'audio', 'pending' | 'ok' | 'failed'>;
+}
+
+/** An in-flight audio track switch (see `selectAudioTrack`). */
+interface PendingAudioSwitch {
+  readonly oldRequestId: bigint | null;
+  readonly oldTrackName: string;
+  readonly newTrackName: string;
+  newRequestId: bigint | null;
+  readonly reason: string;
+  /** CMAF (MSE) path: the SourceBuffer is re-typed with `initData`. */
+  readonly mse: boolean;
+  readonly initData?: Uint8Array;
+  /** MSE path: the commit has started (changeType in flight). */
+  committing: boolean;
+  /** MSE path: new-track objects held until the commit finishes. */
+  readonly staged: Array<{ trackName: string; groupId: bigint; payload: Uint8Array }>;
+  /** This switch is the audio leg of the pending program switch. */
+  programLeg?: boolean;
+  /** No-data guard (see SWITCH_NO_DATA_TIMEOUT_MS). */
+  noDataTimer?: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -706,7 +793,25 @@ export class MoqtPlayer {
     reason: string;
     /** ABR direction — set by ABR/recovery paths for deferred commit. */
     abrAction?: 'downshift' | 'upshift';
+    /** Set when the new track is in another view (altGroup) or program (renderGroup). */
+    viewChange?: { readonly from: number | undefined; readonly to: number | undefined };
+    /** This switch is the video leg of the pending program switch. */
+    programLeg?: boolean;
   } | null = null;
+
+  /**
+   * True while `selectVideoTrack` awaits (init prefetch, SUBSCRIBE) before its
+   * pending switch is recorded — a second switch must not start meanwhile.
+   */
+  private videoSwitchStarting = false;
+  /** Target of the switch `videoSwitchStarting` guards (a repeat request for it is a no-op). */
+  private videoSwitchStartingTarget: string | null = null;
+
+  /** In-flight audio track switch (`selectAudioTrack`), until its new track commits. */
+  private pendingAudioSwitch: PendingAudioSwitch | null = null;
+
+  /** In-flight program switch (`selectProgram`), until every track settles. */
+  private pendingProgramSwitch: PendingProgramSwitch | null = null;
 
   /**
    * Staging buffer for new-track objects during make-before-break switch.
@@ -714,7 +819,7 @@ export class MoqtPlayer {
    * then all are fed to the pipeline in order on switch completion.
    * LOC pipeline path.
    */
-  private switchStagingBuffer: Array<{ obj: MoqtObject; headers: LocHeaders | undefined }> = [];
+  private switchStagingBuffer: Array<{ obj: MoqtObject; headers: LocHeaders | undefined; keyframe: boolean }> = [];
 
   /**
    * Staging buffer for new-track CMAF objects during make-before-break.
@@ -731,6 +836,8 @@ export class MoqtPlayer {
 
   /** Timeout for keyframe arrival during make-before-break switch. */
   private switchStagingTimeout: ReturnType<typeof setTimeout> | null = null;
+  /** No-data guard of the pending video switch (see SWITCH_NO_DATA_TIMEOUT_MS). */
+  private switchNoDataTimeout: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * True from the moment `completePendingVideoSwitch` starts until its
@@ -1140,13 +1247,14 @@ export class MoqtPlayer {
   // ─── Track switching (§5.1.19 altGroup, §4.2 group boundaries) ───
 
   /**
-   * Available video tracks from the altGroup.
+   * Available video tracks: the quality alternatives of the current view
+   * (altGroup), or every video track when the catalog has no altGroups.
    * Sorted by bitrate descending (highest first).
    * Empty before catalog is received.
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
-  get availableVideoTracks(): Array<{ name: string; width?: number; height?: number; bitrate?: number; codec?: string }> {
-    if (!this.qualityController) return [];
+  get availableVideoTracks(): VideoTrackInfo[] {
+    if (!this.qualityController || this.config.disableVideo) return [];
     const alts = this.qualityController.allAlternatives;
     return [...alts].map(t => defined({
       name: t.name,
@@ -1154,7 +1262,16 @@ export class MoqtPlayer {
       height: t.height,
       bitrate: t.bitrate,
       codec: t.codec,
+      label: t.label,
+      lang: t.lang,
+      altGroup: t.altGroup,
+      renderGroup: t.renderGroup,
     }));
+  }
+
+  /** Whether automatic quality switching (ABR) is on — off after a manual `selectVideoTrack()`. */
+  get autoQuality(): boolean {
+    return this.qualityController?.isAutoQuality ?? this.config.autoQuality !== false;
   }
 
   /**
@@ -1168,6 +1285,529 @@ export class MoqtPlayer {
       this.qualityController.unlockAuto();
     } else {
       this.qualityController.lockManual();
+    }
+  }
+
+  /**
+   * Video views of the current program — one per altGroup, in catalog order.
+   * Distinct altGroups carry different content (e.g. camera angles, or
+   * landscape and portrait canvases); each view's tracks are its quality
+   * alternatives. Empty when the catalog has no altGroups (a single implicit
+   * view). `label` is the catalog label of the view's first track.
+   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+   */
+  get availableViews(): VideoViewInfo[] {
+    if (!this.qualityController || this.config.disableVideo) return [];
+    return this.qualityController.views.map(v => defined({
+      altGroup: v.altGroup,
+      renderGroup: v.renderGroup,
+      label: v.tracks.find(t => t.label !== undefined)?.label,
+      width: v.tracks[0]?.width,
+      height: v.tracks[0]?.height,
+      tracks: v.tracks.map(t => t.name),
+    }));
+  }
+
+  /** altGroup of the view being played, or undefined without altGroups or video. */
+  get currentView(): number | undefined {
+    return this.config.disableVideo ? undefined : this.qualityController?.currentView;
+  }
+
+  /**
+   * Switch to another video view (altGroup). Audio is untouched. ABR keeps
+   * running inside the new view, starting at the level closest to the current
+   * one. The switch is make-before-break: the old view keeps playing until
+   * the new view's next group starts, then `view_changed` fires.
+   *
+   * @throws If the view is unknown or has no playable track
+   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+   */
+  async selectView(altGroup: number): Promise<void> {
+    if (!this.qualityController) throw new Error('Cannot switch view: player not loaded');
+    if (this.config.disableVideo || this.activeTrackName('video') === undefined) {
+      throw new Error('Cannot switch view: video is not playing');
+    }
+    const pending = this.pendingVideoSwitch;
+    if (pending || this.switchInProgress || this.videoSwitchStarting) {
+      const target = pending?.newTrackName ?? this.videoSwitchStartingTarget;
+      if (target !== null && target !== undefined && this.qualityController.viewOf(target) === altGroup) return;
+      throw new Error('Cannot switch view: a video track switch is already in progress');
+    }
+    if (altGroup === this.qualityController.currentView) return;
+    const track = this.qualityController.peekViewTrack(altGroup);
+    if (!track) throw new Error(`Unknown or unplayable video view: altGroup ${altGroup}`);
+    await this.selectVideoTrack(track.name, 'view');
+  }
+
+  // ─── Audio tracks and programs (lang, §5.1.18 renderGroup) ───
+
+  /**
+   * Audio tracks of the current program, in catalog order. Several entries
+   * sharing an altGroup are usually languages, told apart by `lang`; `label`
+   * is present only where the publisher set one (a UI can fall back to
+   * `Intl.DisplayNames` on `lang`, then to the name).
+   */
+  get availableAudioTracks(): AudioTrackInfo[] {
+    if (!this.qualityController || this.config.disableAudio) return [];
+    return this.qualityController.audioTracks.map(t => defined({
+      name: t.name,
+      codec: t.codec,
+      bitrate: t.bitrate,
+      samplerate: t.samplerate,
+      channelConfig: t.channelConfig,
+      lang: t.lang,
+      label: t.label,
+      altGroup: t.altGroup,
+      renderGroup: t.renderGroup,
+    }));
+  }
+
+  /** Name of the video track being played (committed), or undefined before selection / without video. */
+  get currentVideoTrack(): string | undefined {
+    return this.config.disableVideo ? undefined : this.qualityController?.currentVideoTrack?.name;
+  }
+
+  /** Name of the audio track being played, or undefined before selection / without audio. */
+  get currentAudioTrack(): string | undefined {
+    return this.config.disableAudio ? undefined : this.qualityController?.currentAudioTrack?.name;
+  }
+
+  /**
+   * Programs of the catalog — one per renderGroup, in catalog order: sets of
+   * tracks meant to be rendered together (tracks without a renderGroup are
+   * part of every program). Empty when the catalog has no renderGroups.
+   * The catalog carries no program name, so naming them is up to the UI.
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  get availablePrograms(): ProgramInfo[] {
+    if (!this.qualityController) return [];
+    return this.qualityController.programs.map(p => ({
+      renderGroup: p.renderGroup,
+      tracks: p.tracks.map(t => t.name),
+    }));
+  }
+
+  /** renderGroup of the program being played, or undefined without renderGroups. */
+  get currentProgram(): number | undefined {
+    return this.qualityController?.currentProgram;
+  }
+
+  /**
+   * Switch to another program (renderGroup): video and audio together. The
+   * video goes to the program's first view at the current ABR level; audio
+   * keeps the current language when the program has it. `program_changed`
+   * fires once every track that changes has committed — at once when the
+   * program shares all playing tracks with the current one.
+   *
+   * @throws If the program is unknown or a video switch is already in progress
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  async selectProgram(renderGroup: number): Promise<void> {
+    const qc = this.qualityController;
+    if (!qc) throw new Error('Cannot switch program: player not loaded');
+    const next = qc.peekProgramTracks(renderGroup);
+    if (!next) throw new Error(`Unknown program: renderGroup ${renderGroup}`);
+    const pendingProgram = this.pendingProgramSwitch;
+    if (pendingProgram) {
+      if (pendingProgram.target === renderGroup) return;
+      throw new Error('Cannot switch program: a program switch is already in progress');
+    }
+    if (renderGroup === qc.currentProgram) return;
+    if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) {
+      throw new Error('Cannot switch program: a video track switch is already in progress');
+    }
+    if (this.pendingAudioSwitch) {
+      throw new Error('Cannot switch program: an audio track switch is already in progress');
+    }
+    // A leg replaces a playing track; without one there is nothing to switch.
+    const video = next.video && !this.config.disableVideo && this.activeTrackName('video') !== undefined
+      && next.video.name !== this.activeTrackName('video') ? next.video : undefined;
+    const audio = next.audio && !this.config.disableAudio && this.hasAudioOutput()
+      && next.audio.name !== (this.activeTrackName('audio') ?? qc.currentAudioTrack?.name) ? next.audio : undefined;
+    // Refuse up front what the audio leg would refuse, so a program is never
+    // left half-switched (new video, old audio) by a predictable error.
+    if (audio?.packaging === 'locmaf') {
+      throw new Error(`Cannot switch program: audio track switching is not supported for LOCMAF yet`);
+    }
+    const ps: PendingProgramSwitch = {
+      target: renderGroup,
+      from: qc.currentProgram,
+      prevAudio: this.activeTrackName('audio'),
+      legs: new Map(),
+    };
+    if (video) ps.legs.set('video', 'pending');
+    if (audio) ps.legs.set('audio', 'pending');
+    this.pendingProgramSwitch = ps;
+    if (ps.legs.size === 0) {
+      // The program shares every playing track with the current one.
+      this.settleProgramLeg(null, true);
+      return;
+    }
+    // Video first: if it cannot start (e.g. no init for the new codec), the
+    // audio stays put rather than leaving a half-switched program.
+    if (video) {
+      try {
+        await this.selectVideoTrack(video.name, 'program');
+      } catch (err) {
+        if (this.pendingProgramSwitch === ps) this.pendingProgramSwitch = null;
+        throw err;
+      }
+      this.adoptProgramLeg(ps, 'video', video.name);
+    }
+    if (audio) {
+      // The video leg may already have failed (e.g. refused); then the audio stays.
+      if (this.pendingProgramSwitch !== ps || ps.legs.get('video') === 'failed') {
+        this.settleProgramLeg('audio', false);
+        return;
+      }
+      try {
+        await this.selectAudioTrack(audio.name, 'program');
+      } catch (err) {
+        if (this.pendingProgramSwitch === ps) this.settleProgramLeg('audio', false);
+        throw err;
+      }
+      this.adoptProgramLeg(ps, 'audio', audio.name);
+    }
+  }
+
+  /**
+   * After a program leg's select call: tie the pending switch to the program
+   * (it may be a switch to the same track that was already in flight), or —
+   * when no switch is pending because the track already plays — settle it.
+   */
+  private adoptProgramLeg(ps: PendingProgramSwitch, leg: 'video' | 'audio', trackName: string): void {
+    if (this.pendingProgramSwitch !== ps || ps.legs.get(leg) !== 'pending') return;
+    const pending = leg === 'video' ? this.pendingVideoSwitch : this.pendingAudioSwitch;
+    if (pending?.newTrackName === trackName) {
+      pending.programLeg = true;
+      return;
+    }
+    this.settleProgramLeg(leg, this.activeTrackName(leg) === trackName);
+  }
+
+  /**
+   * One track of a program switch settled — committed (`ok`) or failed; `null`:
+   * no track had to change. Once all have settled: if the video moved (or had
+   * no need to), the controller moves to the target program and
+   * `program_changed` reports the switch (a failed audio leg was reported by
+   * its own event and leaves the old language playing). If the video failed,
+   * the program stays, and an audio track already moved goes back.
+   */
+  private settleProgramLeg(leg: 'video' | 'audio' | null, ok: boolean): void {
+    const ps = this.pendingProgramSwitch;
+    const qc = this.qualityController;
+    if (!ps || !qc) return;
+    if (leg) ps.legs.set(leg, ok ? 'ok' : 'failed');
+    if ([...ps.legs.values()].includes('pending')) return;
+    this.pendingProgramSwitch = null;
+    if (ps.legs.get('video') === 'failed') {
+      if (ps.legs.get('audio') === 'ok' && ps.prevAudio) {
+        this.selectAudioTrack(ps.prevAudio, 'program-rollback').catch((err: unknown) => {
+          this.log.warn('Program switch rollback to audio "%s" failed: %s', ps.prevAudio, err);
+        });
+      }
+      return;
+    }
+    // Every track that had to change failed: the program did not move.
+    const outcomes = [...ps.legs.values()];
+    if (outcomes.length > 0 && !outcomes.includes('ok')) return;
+    const fromProgram = qc.currentProgram;
+    qc.commitProgram(ps.target);
+    if (ps.from !== ps.target || fromProgram !== ps.target) {
+      this.emitter.emit('program_changed', { type: 'program_changed', fromProgram: ps.from, toProgram: ps.target });
+    }
+  }
+
+  /**
+   * A switch's new subscription was refused, ended or found malformed before
+   * the switch committed: abort it so the player does not wait forever, keep
+   * the old track, and report the failure.
+   */
+  private failSwitchForSubscription(requestId: bigint, trackName: string, cause: Error): void {
+    const video = this.pendingVideoSwitch;
+    if (video && !this.switchInProgress
+        && (video.newRequestId === requestId || video.newTrackName === trackName)) {
+      this.abortPendingVideoSwitch(video, cause);
+    }
+    const audio = this.pendingAudioSwitch;
+    if (audio && !audio.committing
+        && (audio.newRequestId === requestId || audio.newTrackName === trackName)) {
+      this.abortPendingAudioSwitch(audio, cause);
+    }
+  }
+
+  /** Name of the live media subscription of `mediaType` (the first one found). */
+  private activeTrackName(mediaType: 'video' | 'audio'): string | undefined {
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.mediaType === mediaType) return sub.trackName;
+    }
+    return undefined;
+  }
+
+  /**
+   * Switch to another audio track — typically another language. Video is
+   * untouched. A live switch joins the new track at its next group (audio
+   * groups are about 1 s); the old track keeps playing until then.
+   *
+   * LOC: commits on the first object of the new track — the old track is
+   * dropped, the decoder reconfigured and scheduled audio flushed, so the
+   * language cuts over cleanly. CMAF: the new track's init re-types the audio
+   * SourceBuffer (keeping the timeline) and the old track is dropped only
+   * once that succeeds; on failure it keeps playing.
+   *
+   * @throws If the track is unknown, unsupported, or another audio switch is in progress
+   */
+  async selectAudioTrack(trackName: string, reason: string = 'manual'): Promise<void> {
+    if (!this._catalogState || !this.connection || !this.subscriptionManager) {
+      throw new Error('Cannot switch audio track: player not loaded');
+    }
+    const target = this._catalogState.tracks.find((t: CatalogTrack) => t.name === trackName && t.role === 'audio');
+    if (!target) throw new Error(`Unknown audio track: "${trackName}"`);
+    if (!isTrackPackagingSupported(target)) {
+      throw new Error(`Cannot switch to "${trackName}": unsupported locmafVersion "${target.locmafVersion ?? ''}" (LOCMAF §5)`);
+    }
+    if (target.packaging === 'locmaf') {
+      throw new Error(`Cannot switch to "${trackName}": audio track switching is not supported for LOCMAF yet`);
+    }
+    const pending = this.pendingAudioSwitch;
+    if (pending) {
+      if (pending.newTrackName === trackName) return;
+      throw new Error('Cannot switch audio track: an audio track switch is already in progress');
+    }
+    // A switch replaces the playing track: without one there is no decoder
+    // or SourceBuffer to feed.
+    let oldRequestId: bigint | null = null;
+    let oldTrackName = '';
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      if (sub.mediaType === 'audio') { oldRequestId = requestId; oldTrackName = sub.trackName; break; }
+    }
+    // Without a live audio subscription (e.g. the language's publisher went
+    // away) a switch can still replace it, as long as audio output exists.
+    if (this.config.disableAudio || (oldRequestId === null && !this.hasAudioOutput())) {
+      throw new Error('Cannot switch audio track: audio is not playing');
+    }
+    if (oldTrackName === trackName) return;
+
+    // MSE re-types the audio SourceBuffer with the new track's init, so it
+    // must be in hand before the switch starts.
+    const mse = this.usesMse(target.packaging);
+    let initData: Uint8Array | undefined;
+    if (mse) {
+      initData = this.decodeResolvedInlineInitData(target)
+        ?? (target.initTrack ? await this.ensureInitTrack(target.initTrack) : undefined);
+      if (!initData) {
+        throw new Error(`Cannot switch to "${trackName}": catalog provides no inline init (initData/initRef) or initTrack`);
+      }
+      if (this.pendingAudioSwitch) throw new Error('Cannot switch audio track: an audio track switch is already in progress');
+    }
+
+    if (!oldTrackName) oldTrackName = this.qualityController?.currentAudioTrack?.name ?? '';
+    const sw: PendingAudioSwitch = {
+      oldRequestId, oldTrackName, newTrackName: trackName, newRequestId: null,
+      reason, mse, ...(initData ? { initData } : {}), committing: false, staged: [],
+      ...(reason === 'program' ? { programLeg: true } : {}),
+    };
+    this.pendingAudioSwitch = sw;
+    sw.noDataTimer = setTimeout(() => {
+      if (this.pendingAudioSwitch !== sw || sw.committing) return;
+      this.log.warn('[AUDIO-SWITCH] "%s" delivered nothing in %dms — abandoning the switch', trackName, SWITCH_NO_DATA_TIMEOUT_MS);
+      this.abortPendingAudioSwitch(sw, new Error(`no media from "${trackName}" within ${SWITCH_NO_DATA_TIMEOUT_MS} ms`));
+    }, SWITCH_NO_DATA_TIMEOUT_MS);
+    const subscribeOptions = buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(target.isLive === true);
+    this.log.info('[AUDIO-SWITCH] start: "%s" → "%s" (%s)', oldTrackName, trackName, reason);
+    try {
+      sw.newRequestId = await this.subscribeReplacementTrack(
+        trackName, 'audio', mediaTrackPackaging(target.packaging), subscribeOptions,
+        (id) => { sw.newRequestId = id; });
+    } catch (err) {
+      if (this.pendingAudioSwitch === sw) this.pendingAudioSwitch = null;
+      throw err;
+    }
+  }
+
+  /**
+   * LOC audio switch commit, on the first object of the new track: drop the
+   * old subscription, reset the audio pipeline to the new track's groups and
+   * reconfigure the decoder for its codec and config.
+   */
+  private commitLocAudioSwitch(sw: PendingAudioSwitch, firstGroupId: bigint): void {
+    this.pendingAudioSwitch = null;
+    clearTimeout(sw.noDataTimer);
+    this.retireOldAudioTrack(sw);
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'audio');
+    if (track && this.audioPipeline) {
+      const channels = track.channelConfig ? Number(track.channelConfig) : undefined;
+      this.audioPipeline.resetForTrackSwitch(firstGroupId);
+      this.commandDispatcher?.updateAudioCodec(track.codec ?? '', track.samplerate, channels);
+      configurePipelines(
+        {
+          videoPipeline: null,
+          audioPipeline: this.audioPipeline,
+          syncController: this.syncController!,
+          recoveryController: this.recoveryController!,
+          commandDispatcher: this.commandDispatcher!,
+          mediaSource: null,
+        },
+        {
+          video: undefined,
+          audio: defined({
+            codec: track.codec ?? '',
+            initData: this.pipelineInitData(track),
+            samplerate: track.samplerate,
+            channels,
+          }),
+        },
+      );
+    }
+    this.finishAudioSwitch(sw);
+  }
+
+  /**
+   * CMAF audio switch commit, on the first object of the new track: pin the
+   * assembler to it (late old-track objects are dropped from here on), re-type
+   * the SourceBuffer with its init keeping the timeline, then replay what was
+   * staged meanwhile. The old subscription goes only after that succeeds.
+   */
+  private commitMseAudioSwitch(sw: PendingAudioSwitch): void {
+    sw.committing = true;
+    clearTimeout(sw.noDataTimer);
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'audio');
+    this.cmafAssembler?.selectTrack?.('audio', sw.newTrackName);
+    const finish = (): void => {
+      if (this.pendingAudioSwitch !== sw) return; // destroyed meanwhile
+      this.pendingAudioSwitch = null;
+      if (sw.initData) this.cmafAssembler?.setInitSegment?.('audio', sw.initData);
+      this.retireOldAudioTrack(sw);
+      for (const { trackName, groupId, payload } of sw.staged) {
+        this.cmafAssembler?.push('audio', trackName, groupId, payload);
+      }
+      this.finishAudioSwitch(sw);
+    };
+    if (!this.mediaSource?.changeType || !sw.initData) {
+      finish();
+      return;
+    }
+    this.mediaSource.changeType('audio', track?.codec ?? '', sw.initData)
+      .then(finish)
+      .catch((err: unknown) => {
+        if (this.pendingAudioSwitch !== sw) return;
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.log.warn('[AUDIO-SWITCH] changeType failed: %s — old track stays active', error.message);
+        this.cmafAssembler?.selectTrack?.('audio', sw.oldTrackName);
+        this.abortPendingAudioSwitch(sw, error);
+      });
+  }
+
+  /**
+   * Roll an audio switch back before it committed: drop the new subscription,
+   * keep the old track, report the failure.
+   */
+  private abortPendingAudioSwitch(sw: PendingAudioSwitch, error: Error): void {
+    if (this.pendingAudioSwitch !== sw) return;
+    this.pendingAudioSwitch = null;
+    clearTimeout(sw.noDataTimer);
+    // A liveness / TOO_FAR_BEHIND renewal of the old track was held back for
+    // the switch; with the switch gone, bring the old track back if it lapsed.
+    const oldAlive = [...this.activeSubscriptions.values()]
+      .some(sub => sub.mediaType === 'audio' && sub.trackName === sw.oldTrackName);
+    if (!oldAlive && sw.oldTrackName) this.replaceSubscription(sw.oldTrackName, 'liveness');
+    if (sw.newRequestId !== null && this.connection) {
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
+    }
+    this.emitter.emit('audio_track_switch_failed', {
+      type: 'audio_track_switch_failed',
+      fromTrackName: sw.oldTrackName,
+      toTrackName: sw.newTrackName,
+      reason: sw.reason,
+      error,
+    });
+    this.emitError(createPlayerError(
+      'degraded', 'subscription', PlayerErrorCode.AUDIO_DECODE_ERROR,
+      `Audio track switch to "${sw.newTrackName}" failed: ${error.message}`,
+      { cause: error, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
+    ));
+    if (sw.programLeg) this.settleProgramLeg('audio', false);
+  }
+
+  /** Whether audio output exists (a LOC pipeline, or a CMAF audio SourceBuffer). */
+  private hasAudioOutput(): boolean {
+    return this.audioPipeline !== null
+      || (this.cmafInitialized && this.qualityController?.currentAudioTrack !== undefined);
+  }
+
+  /**
+   * Unsubscribe the old track of an audio switch — every subscription of it,
+   * in case a liveness or TOO_FAR_BEHIND replacement renewed it meanwhile.
+   */
+  private retireOldAudioTrack(sw: PendingAudioSwitch): void {
+    if (!this.connection || !this.subscriptionManager) return;
+    for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
+      if (sub.mediaType !== 'audio' || sub.trackName !== sw.oldTrackName || sub.trackName === sw.newTrackName) continue;
+      this.retireMediaSubscription(requestId, this.connection);
+      void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
+    }
+  }
+
+  /** Commit an audio switch to the controller and report it. */
+  private finishAudioSwitch(sw: PendingAudioSwitch): void {
+    this.qualityController?.commitAudioTrack(sw.newTrackName);
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'audio');
+    // A language the viewer picked follows them across program switches.
+    if (sw.reason === 'manual' && track?.lang) this.qualityController?.rememberLanguage(track.lang);
+    this.log.info('[AUDIO-SWITCH] complete: "%s" → "%s"', sw.oldTrackName, sw.newTrackName);
+    this.emitter.emit('audio_track_changed', {
+      type: 'audio_track_changed',
+      fromTrackName: sw.oldTrackName,
+      toTrackName: sw.newTrackName,
+      lang: track?.lang,
+      reason: sw.reason,
+    });
+    if (sw.programLeg) this.settleProgramLeg('audio', true);
+  }
+
+  /** Emit `program_changed` when the controller's program moved away from `fromProgram`. */
+  private emitProgramChange(fromProgram: number | undefined): void {
+    const toProgram = this.qualityController?.currentProgram;
+    if (toProgram === undefined || toProgram === fromProgram) return;
+    this.emitter.emit('program_changed', { type: 'program_changed', fromProgram, toProgram });
+  }
+
+  /**
+   * Subscribe a replacement media track during a switch. Pre-send ownership
+   * (§9.10): the pending entry (alias remap) and the activeSubscriptions
+   * record are installed inside onRequestId so a same-tick SUBSCRIBE_OK
+   * cannot miss them. Only SUBSCRIBE_OK binds routing; objects arriving
+   * before it remain parked by their wire alias.
+   */
+  private async subscribeReplacementTrack(
+    trackName: string,
+    mediaType: 'video' | 'audio',
+    packaging: TrackPackaging,
+    subscribeOptions: object,
+    onRegistered?: (requestId: bigint) => void,
+  ): Promise<bigint> {
+    const conn = this.connection!;
+    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nameBytes = this.enc.encode(trackName);
+    let registeredId: bigint | null = null;
+    const register = (id: bigint): void => {
+      if (registeredId !== null) return;
+      registeredId = id;
+      if (!this.subscriptionManager || this.connection !== conn) return;
+      this.pendingAliasBinds.add(id);
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
+      this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
+      onRegistered?.(id);
+    };
+    try {
+      const reqId = await conn.subscribe(nsBytes, nameBytes,
+        { ...subscribeOptions, onRequestId: (id: bigint) => register(BigInt(id)) } as never);
+      register(BigInt(reqId));
+      return BigInt(reqId);
+    } catch (err) {
+      if (registeredId !== null) this.retireMediaSubscription(registeredId, conn);
+      throw err;
     }
   }
 
@@ -1298,7 +1938,9 @@ export class MoqtPlayer {
         && trackName === this.pendingVideoSwitch.newTrackName) {
       this.cmafSwitchStagingBuffer.push({ trackName, mediaType, groupId, payload: decoded.bytes });
       if (this.switchStagingTimeout === null) {
+        const stagingFor = this.pendingVideoSwitch;
         this.switchStagingTimeout = setTimeout(() => {
+          if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
           this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
           this.completePendingVideoSwitch();
         }, SWITCH_STAGING_TIMEOUT_MS);
@@ -1417,6 +2059,81 @@ export class MoqtPlayer {
   }
 
   /** Whether a track of this packaging plays through MSE in this player (LOCMAF may take the frame path). */
+  /**
+   * (Re)build the buffer-based ABR controller from the controller's current
+   * ladder — at startup and whenever a view or program switch replaced it.
+   * A ladder of one track has nothing to switch between, so no controller.
+   */
+  private rebuildBufferAbr(): void {
+    const alts = this.qualityController?.alternatives ?? [];
+    if (alts.length <= 1) {
+      this.bufferAbrController = null;
+      return;
+    }
+    const ladder: AbrTrack[] = alts.map(t => ({
+      name: t.name,
+      bitrateKbps: (t.bitrate ?? 0) / 1000,
+    }));
+    this.bufferAbrController = new BufferBasedController({
+      clock: this.clock,
+      ladder,
+      initialIndex: this.qualityController!.currentIndex,
+      lowThresholdUs: 500_000,      // 0.5s → emergency downshift
+      highThresholdUs: 4_000_000,   // 4s → consider upshift
+    });
+  }
+
+  /**
+   * Adopt an updated catalog (delta, re-sent catalog or recovery adoption):
+   * cache it, let the controller follow its programs, views and tracks
+   * (keeping the current ones by name), and report it.
+   */
+  private applyCatalogUpdate(state: CatalogState): void {
+    this._catalogState = state;
+    if (this.qualityController?.updateCatalog(state)) this.rebuildBufferAbr();
+    this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+  }
+
+  /**
+   * When the controller is (re)built after media is already flowing — the
+   * knownTracks path, or a catalog re-received after a session migration —
+   * its own selection may differ from what plays: commit it to the playing
+   * tracks (else the configured known tracks) so its program, view, ABR
+   * ladder and getters tell the truth and the user's choices survive.
+   */
+  private alignControllerWithPlayingTracks(previous?: QualityController | null): void {
+    const qc = this.qualityController;
+    if (!qc) return;
+    if (previous) qc.adoptViewerChoices(previous);
+    const video = this.activeTrackName('video') ?? this.config.knownTracks?.video?.name;
+    const audio = this.activeTrackName('audio') ?? this.config.knownTracks?.audio?.name;
+    if (video) qc.commitVideoTrack(video);
+    if (audio) qc.commitAudioTrack(audio);
+    // Re-ladder buffer ABR where it runs; the knownTracks path never had it.
+    if (this.bufferAbrController) this.rebuildBufferAbr();
+  }
+
+  /**
+   * Whether a staged LOC object of a switch's new track can start decoding.
+   * Trusts the LOC frame marking, else the bitstream itself; object 0 is the
+   * last resort — a relay joining the subscription mid-group can number a
+   * delta frame 0.
+   * @see draft-ietf-moq-loc-04 §2.3.2.2 (Video Frame Marking)
+   */
+  private isLocSwitchKeyframe(trackName: string, obj: MoqtObject, headers: LocHeaders | undefined): boolean {
+    const marked = headers?.videoFrameMarking?.independent;
+    if (marked !== undefined) return marked;
+    const codec = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === trackName && t.role === 'video')?.codec;
+    if (codec && obj.kind === 'data' && obj.payload) {
+      const keyframe = isKeyframePayload(codec, obj.payload);
+      if (keyframe === true) return true;
+      // AV1 key frames need not repeat the sequence header the detector looks
+      // for, so a "no" is only trusted for H.264 / H.265 (IDR / IRAP NALs).
+      if (keyframe === false && !codec.startsWith('av01')) return false;
+    }
+    return BigInt(obj.objectId) === 0n;
+  }
+
   private usesMse(packaging: string | undefined): boolean {
     return usesMsePath(packaging, this.config.locmafDecoding);
   }
@@ -1588,9 +2305,11 @@ export class MoqtPlayer {
   private routeLocmafFrame(mediaType: 'video' | 'audio', trackName: string, frame: MoqtObject, headers: LocHeaders): void {
     if (this.pendingVideoSwitch && mediaType === 'video'
         && trackName === this.pendingVideoSwitch.newTrackName) {
-      this.switchStagingBuffer.push({ obj: frame, headers });
+      this.switchStagingBuffer.push({ obj: frame, headers, keyframe: headers.videoFrameMarking?.independent === true });
       if (this.switchStagingBuffer.length === 1) {
+        const stagingFor = this.pendingVideoSwitch;
         this.switchStagingTimeout = setTimeout(() => {
+          if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
           this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
           this.completePendingVideoSwitch();
         }, SWITCH_STAGING_TIMEOUT_MS);
@@ -1812,6 +2531,29 @@ export class MoqtPlayer {
     reason: string = 'manual',
     abrAction?: 'downshift' | 'upshift',
   ): Promise<void> {
+    // One video switch at a time: a second one (ABR, recovery, view, program,
+    // manual) racing the first through its awaits would overwrite the pending
+    // switch and orphan a subscription.
+    if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) {
+      if (this.pendingVideoSwitch?.newTrackName === trackName || this.videoSwitchStartingTarget === trackName) return;
+      throw new Error('Cannot switch video track: a video track switch is already in progress');
+    }
+    this.videoSwitchStarting = true;
+    this.videoSwitchStartingTarget = trackName;
+    try {
+      await this.startVideoSwitch(trackName, reason, abrAction);
+    } finally {
+      this.videoSwitchStarting = false;
+      this.videoSwitchStartingTarget = null;
+    }
+  }
+
+  /** Body of `selectVideoTrack`, serialized by it. */
+  private async startVideoSwitch(
+    trackName: string,
+    reason: string,
+    abrAction?: 'downshift' | 'upshift',
+  ): Promise<void> {
     if (!this._catalogState || !this.connection || !this.subscriptionManager) {
       throw new Error('Cannot switch track: player not loaded');
     }
@@ -1850,6 +2592,18 @@ export class MoqtPlayer {
     // No-op if already on the target track
     if (currentVideoTrackName === trackName) return;
 
+    // A track of another view (altGroup) is different content, not a quality
+    // alternative: §4.2 group alignment does not hold across views, and its
+    // init segment (resolution, aspect, SPS/PPS) always differs.
+    // A track of another program (renderGroup) is different content too.
+    const currentTrack = this._catalogState.tracks.find(
+      (t: CatalogTrack) => t.name === currentVideoTrackName && t.role === 'video',
+    );
+    const viewChange = currentTrack !== undefined
+      && (currentTrack.altGroup !== targetTrack.altGroup || currentTrack.renderGroup !== targetTrack.renderGroup)
+      ? { from: currentTrack.altGroup, to: targetTrack.altGroup }
+      : undefined;
+
     // For CMAF: if the switch crosses codec families, the SourceBuffer
     // needs to be retyped via changeType() with the new init segment.
     // Resolve the init source up-front so the actual switch — fired in
@@ -1870,7 +2624,8 @@ export class MoqtPlayer {
     const needsCodecChange = this.usesMse(targetTrack.packaging)
         && targetTrack.codec !== undefined
         && (this.currentVideoCodec === null
-            || !codecsCompatible(targetTrack.codec, this.currentVideoCodec));
+            || !codecsCompatible(targetTrack.codec, this.currentVideoCodec)
+            || viewChange !== undefined);
     if (needsCodecChange) {
       // Resolve the inline init once (track.initData or an initRef → root inline
       // initDataList entry); fall back to an initTrack subscription otherwise.
@@ -1923,11 +2678,11 @@ export class MoqtPlayer {
     // Using AbsoluteStart at currentGroup+1 avoids replaying the current
     // group (which was already rendered in the old resolution), preventing
     // visual backtrack and A/V desync from past-timestamp bursts.
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(trackName);
+    // Across views the group IDs are numbered independently, so a live view
+    // switch joins at the new track's next group boundary instead.
     const currentGroup = this.videoPipeline?.currentGroupId ?? -1n;
-    const nextGroup = currentGroup >= 0n ? currentGroup + 1n : undefined;
     const isLive = targetTrack?.isLive === true;
+    const nextGroup = currentGroup >= 0n && !(viewChange && isLive) ? currentGroup + 1n : undefined;
     const subscribeOptions = nextGroup !== undefined
       ? {
           subscriptionFilter: {
@@ -1940,34 +2695,15 @@ export class MoqtPlayer {
     this.log.info('[SWITCH] subscribing at group=%s (current=%s)', nextGroup ?? 'latest', currentGroup);
     // Determine packaging from catalog
     const packaging: TrackPackaging = mediaTrackPackaging(targetTrack.packaging);
-    // Pre-send ownership (§9.10): the pending entry (alias remap) and the
-    // activeSubscriptions record are installed inside onRequestId so a
-    // same-tick SUBSCRIBE_OK cannot miss them. Only SUBSCRIBE_OK binds
-    // routing; objects arriving before it remain parked by their wire alias.
     const switchConn = this.connection;
-    let switchRegisteredId: bigint | null = null;
-    const registerSwitchSub = (id: bigint): void => {
-      if (switchRegisteredId !== null) return;
-      switchRegisteredId = id;
-      if (!this.subscriptionManager || this.connection !== switchConn) return;
-      this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null });
-      this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging });
-    };
-    let reqIdBigInt: bigint;
-    try {
-      const reqId = await this.connection.subscribe(nsBytes, nameBytes,
-        { ...subscribeOptions, onRequestId: (id: bigint) => registerSwitchSub(BigInt(id)) } as never);
-      reqIdBigInt = BigInt(reqId);
-      registerSwitchSub(reqIdBigInt);
-    } catch (err) {
-      if (switchRegisteredId !== null) {
-        this.retireMediaSubscription(switchRegisteredId, switchConn);
-      }
-      throw err;
-    }
+    const reqIdBigInt = await this.subscribeReplacementTrack(trackName, 'video', packaging, subscribeOptions);
 
     if (!this.subscriptionManager) return; // destroyed during await
+    // Refused (REQUEST_ERROR) or superseded by a session migration while the
+    // SUBSCRIBE was being sent: there is nothing to switch to.
+    if (this.connection !== switchConn || !this.activeSubscriptions.has(reqIdBigInt)) {
+      throw new Error(`Cannot switch to "${trackName}": its subscription ended before the switch started`);
+    }
 
     this.log.info('[SWITCH] start: "%s" → "%s" (newReqId=%s, oldReqId=%s)',
       currentVideoTrackName, trackName, reqIdBigInt, currentVideoRequestId);
@@ -1985,7 +2721,18 @@ export class MoqtPlayer {
         newTrackPackaging: packaging,
         reason,
         ...(abrAction ? { abrAction } : {}),
+        ...(viewChange ? { viewChange } : {}),
+        ...(reason === 'program' ? { programLeg: true } : {}),
       };
+      const sw = this.pendingVideoSwitch;
+      if (this.switchNoDataTimeout !== null) clearTimeout(this.switchNoDataTimeout);
+      this.switchNoDataTimeout = setTimeout(() => {
+        this.switchNoDataTimeout = null;
+        if (this.pendingVideoSwitch !== sw || this.switchInProgress
+            || this.switchStagingBuffer.length > 0 || this.cmafSwitchStagingBuffer.length > 0) return;
+        this.log.warn('[SWITCH] "%s" delivered nothing in %dms — abandoning the switch', trackName, SWITCH_NO_DATA_TIMEOUT_MS);
+        this.abortPendingVideoSwitch(sw, new Error(`no media from "${trackName}" within ${SWITCH_NO_DATA_TIMEOUT_MS} ms`));
+      }, SWITCH_NO_DATA_TIMEOUT_MS);
     }
 
     // Emit "intent" event up-front so the UI can render a transitional
@@ -2020,11 +2767,8 @@ export class MoqtPlayer {
     if (!sw) return;
     this.switchInProgress = true;
 
-    // Clear safety timeout
-    if (this.switchStagingTimeout !== null) {
-      clearTimeout(this.switchStagingTimeout);
-      this.switchStagingTimeout = null;
-    }
+    // Clear the safety timeouts
+    this.clearVideoSwitchTimers();
 
     if (!this.connection || !this.subscriptionManager) {
       this.pendingVideoSwitch = null;
@@ -2049,7 +2793,8 @@ export class MoqtPlayer {
     const needsChangeType = newTrack !== undefined && this.usesMse(newTrack.packaging)
       && newTrack.codec !== undefined
       && (this.currentVideoCodec === null
-          || !codecsCompatible(newTrack.codec, this.currentVideoCodec));
+          || !codecsCompatible(newTrack.codec, this.currentVideoCodec)
+          || sw.viewChange !== undefined);
 
     if (needsChangeType && newTrack && this.mediaSource?.changeType) {
       // Inline init (`initData` or an `initRef` → root inline entry) is Base64
@@ -2078,20 +2823,32 @@ export class MoqtPlayer {
       }
       this.log.info('[SWITCH] codec change → calling MSE changeType: "%s" → "%s"',
         this.currentVideoCodec ?? '(unknown)', newTrack.codec);
-      this.mediaSource.changeType('video', newTrack.codec ?? '', initData)
+      // Pin the assembler to the new track first: old-track fragments that
+      // arrive while the SourceBuffer is re-typed must not be appended after
+      // the new init (an old keyframe would decode with the new parameter
+      // sets). New-track objects keep staging until the flush below.
+      const pinnedInit = initData;
+      this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
+      this.mediaSource.changeType('video', newTrack.codec ?? '', pinnedInit)
         .then(() => {
+          if (this.pendingVideoSwitch !== sw) return; // aborted or destroyed meanwhile
+          // The new track's timescale and trex defaults drive the rebase.
+          this.cmafAssembler?.setInitSegment?.('video', pinnedInit);
           // Pivot succeeded. NOW it's safe to tear down the old track
           // and flush the staged new-track segments into the retyped
           // SourceBuffer.
           this.unsubscribeOldVideoTrack(sw);
           this.currentVideoCodec = newTrack.codec ?? null;
           this.flushCmafStagedBuffer(sw);
-        })
-        .catch((err) => {
+        }, (err: unknown) => {
+          // Only the re-type itself fails the switch — never a throw from the
+          // commit above (e.g. an app's event listener), which already happened.
+          if (this.pendingVideoSwitch !== sw) return;
           // Pivot failed. The old SourceBuffer is still good for the
           // old codec — keep that subscription running, drop new.
           this.log.warn('[SWITCH] changeType failed: %s — aborting switch, old track stays active',
             err instanceof Error ? err.message : String(err));
+          this.cmafAssembler?.selectTrack?.('video', sw.oldTrackName);
           this.abortPendingVideoSwitch(sw,
             err instanceof Error ? err : new Error(String(err)));
         });
@@ -2102,11 +2859,9 @@ export class MoqtPlayer {
     this.unsubscribeOldVideoTrack(sw);
 
     // Find the keyframe group ID for resetForTrackSwitch — use the
-    // group that contains objectId=0, not the first staged object
+    // group that holds the staged keyframe, not the first staged object
     // (which might be a partial group from a mid-stream subscription).
-    const keyframeEntry = this.switchStagingBuffer.find(
-      s => BigInt(s.obj.objectId) === 0n,
-    );
+    const keyframeEntry = this.switchStagingBuffer.find(s => s.keyframe);
     const firstGroupId = keyframeEntry
       ? BigInt(keyframeEntry.obj.groupId)
       : (this.switchStagingBuffer.length > 0
@@ -2152,7 +2907,7 @@ export class MoqtPlayer {
     // would cause decode errors.
     const staged = this.switchStagingBuffer;
     this.switchStagingBuffer = [];
-    const keyframeIdx = staged.findIndex(s => BigInt(s.obj.objectId) === 0n);
+    const keyframeIdx = staged.findIndex(s => s.keyframe);
     const toFlush = keyframeIdx >= 0 ? staged.slice(keyframeIdx) : staged;
     for (const { obj: stagedObj, headers: stagedHeaders } of toFlush) {
       this.videoPipeline?.pushObject(stagedObj, stagedHeaders);
@@ -2178,7 +2933,7 @@ export class MoqtPlayer {
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     if (!this.connection || !this.subscriptionManager) return;
     this.retireMediaSubscription(sw.oldRequestId, this.connection);
-    this.connection.unsubscribe(varint(sw.oldRequestId));
+    void this.connection.unsubscribe(varint(sw.oldRequestId)).catch(() => { /* already gone */ });
   }
 
   /**
@@ -2222,10 +2977,15 @@ export class MoqtPlayer {
         height: newTrack.height,
       }));
     }
-    // Commit QualityController to the new track index.
+    // Commit QualityController to the new track index (and view / program).
+    const fromProgram = this.qualityController?.currentProgram;
+    const ladderBefore = this.qualityController?.alternatives;
     this.qualityController?.commitVideoTrack(sw.newTrackName);
-    // Commit BufferBasedController if this was an ABR-driven switch.
-    if (sw.abrAction === 'downshift') {
+    if (this.qualityController && this.qualityController.alternatives !== ladderBefore) {
+      // Another view or program: buffer-based ABR restarts on its ladder.
+      this.rebuildBufferAbr();
+    } else if (sw.abrAction === 'downshift') {
+      // Commit BufferBasedController if this was an ABR-driven switch.
       this.bufferAbrController?.commitDownshift();
     } else if (sw.abrAction === 'upshift') {
       this.bufferAbrController?.commitUpshift();
@@ -2236,6 +2996,18 @@ export class MoqtPlayer {
       toTrackName: sw.newTrackName,
       reason: sw.reason,
     });
+    if (sw.viewChange && (sw.viewChange.from !== undefined || sw.viewChange.to !== undefined)) {
+      this.log.info('[SWITCH] view %s → %s ("%s")',
+        sw.viewChange.from ?? '(none)', sw.viewChange.to ?? '(none)', sw.newTrackName);
+      this.emitter.emit('view_changed', {
+        type: 'view_changed',
+        fromView: sw.viewChange.from,
+        toView: sw.viewChange.to,
+        trackName: sw.newTrackName,
+      });
+    }
+    if (sw.programLeg) this.settleProgramLeg('video', true);
+    else this.emitProgramChange(fromProgram);
   }
 
   /**
@@ -2249,9 +3021,12 @@ export class MoqtPlayer {
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
     cause: Error,
   ): void {
+    if (this.pendingVideoSwitch === sw) this.clearVideoSwitchTimers();
     if (this.connection && this.subscriptionManager) {
       this.retireMediaSubscription(sw.newRequestId, this.connection);
-      try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
+      // Async: a sync try/catch would let the rejection escape (the relay may
+      // already have dropped a refused or ended subscription).
+      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
     }
     this.cmafSwitchStagingBuffer = [];
     this.switchStagingBuffer = [];
@@ -2274,6 +3049,15 @@ export class MoqtPlayer {
       `Track switch to "${sw.newTrackName}" failed: ${cause.message}`,
       { cause, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
     ));
+    if (sw.programLeg) this.settleProgramLeg('video', false);
+  }
+
+  /** Clear the staging and no-data timeouts of the pending video switch. */
+  private clearVideoSwitchTimers(): void {
+    if (this.switchStagingTimeout !== null) clearTimeout(this.switchStagingTimeout);
+    this.switchStagingTimeout = null;
+    if (this.switchNoDataTimeout !== null) clearTimeout(this.switchNoDataTimeout);
+    this.switchNoDataTimeout = null;
   }
 
   // ─── Event API ──────────────────────────────────────────
@@ -2344,6 +3128,9 @@ export class MoqtPlayer {
       autoQuality: this.config.autoQuality!,
       startLevel: this.config.startLevel!,
       ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+      ...(this.config.initialView !== undefined ? { initialView: this.config.initialView } : {}),
+      ...(this.config.initialProgram !== undefined ? { initialProgram: this.config.initialProgram } : {}),
+      ...(this.config.preferredLanguage !== undefined ? { preferredLanguage: this.config.preferredLanguage } : {}),
       qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
       clock: this.clock,
     });
@@ -2373,23 +3160,33 @@ export class MoqtPlayer {
       // proves the delivery path is alive — stamp before every early return.
       this.stampMediaArrival(BigInt(obj.trackAlias));
 
+      // Audio switch: every audio frame is a sync point, so the first object
+      // of the new track commits it; routing then continues as normal.
+      const audioSwitch = this.pendingAudioSwitch;
+      if (audioSwitch && !audioSwitch.mse && mediaType === 'audio' && trackName === audioSwitch.newTrackName) {
+        this.commitLocAudioSwitch(audioSwitch, BigInt(obj.groupId));
+      }
+
       // Make-before-break track switch: stage new-track objects until a
       // keyframe arrives, keeping the old track playing the entire time.
       // @see draft-ietf-moq-msf-00 §4.2 (seamless switch at group boundaries)
       if (this.pendingVideoSwitch && mediaType === 'video'
           && trackName === this.pendingVideoSwitch.newTrackName) {
-        this.switchStagingBuffer.push({ obj, headers });
+        const keyframe = this.isLocSwitchKeyframe(trackName, obj, headers);
+        this.switchStagingBuffer.push({ obj, headers, keyframe });
 
         // Start safety timeout on first staged object
         if (this.switchStagingBuffer.length === 1) {
+          const stagingFor = this.pendingVideoSwitch;
           this.switchStagingTimeout = setTimeout(() => {
+            if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
             this.log.warn('[SWITCH] keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
             this.completePendingVideoSwitch();
           }, SWITCH_STAGING_TIMEOUT_MS);
         }
 
-        // Complete when keyframe arrives (LOC: objectId 0 = keyframe)
-        if (obj.objectId === 0n) {
+        // Complete when a keyframe arrives
+        if (keyframe) {
           this.completePendingVideoSwitch();
         } else if (this.switchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
           this.log.warn('[SWITCH] staging overflow (%d objects) — force-completing', SWITCH_STAGING_MAX_OBJECTS);
@@ -2535,6 +3332,15 @@ export class MoqtPlayer {
         return;
       }
 
+      // Audio switch: the new track's first object commits it; its objects
+      // are staged until the SourceBuffer carries the new init.
+      const audioSwitch = this.pendingAudioSwitch;
+      if (audioSwitch?.mse && mediaType === 'audio' && trackName === audioSwitch.newTrackName) {
+        audioSwitch.staged.push({ trackName, groupId: BigInt(obj.groupId), payload: obj.payload });
+        if (!audioSwitch.committing) this.commitMseAudioSwitch(audioSwitch);
+        return;
+      }
+
       // Gate: video must start from a keyframe (group start, object 0/1).
       // After init, we may be mid-GOP — delta frames without a preceding
       // keyframe cause MSE decode errors. Skip until a new group starts.
@@ -2564,15 +3370,24 @@ export class MoqtPlayer {
         });
 
         if (this.switchStagingTimeout === null) {
+          const stagingFor = this.pendingVideoSwitch;
           this.switchStagingTimeout = setTimeout(() => {
+            if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
             this.log.warn('[SWITCH] CMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
             this.completePendingVideoSwitch();
           }, SWITCH_STAGING_TIMEOUT_MS);
         }
 
-        // CMAF: groupId boundary = keyframe. objectId 0 of a new group
-        // is the moof of a fresh GOP, suitable as a splice point.
-        if (BigInt(obj.objectId) === 0n) {
+        // CMAF: splice in at a sync sample. Object 0 of a group is the
+        // moof of a fresh GOP, but a relay joining this subscription
+        // mid-group can number a delta frame 0 — so trust the chunk's own
+        // sample flags when it carries them, and drop the delta frames
+        // staged before it (MSE cannot start a new init on them).
+        const sync = cmafChunkStartsWithSync(obj.payload) ?? BigInt(obj.objectId) === 0n;
+        if (sync) {
+          // Before the commit only — once it runs (changeType in flight) the
+          // staged keyframe group is already the splice and must be kept.
+          if (!this.switchInProgress) this.cmafSwitchStagingBuffer = this.cmafSwitchStagingBuffer.slice(-1);
           this.completePendingVideoSwitch();
         } else if (this.cmafSwitchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
           this.log.warn('[SWITCH] CMAF staging overflow (%d objects) — force-completing',
@@ -3497,6 +4312,9 @@ export class MoqtPlayer {
     // still be awaiting SUBSCRIBE_OK (its staged response replays after this).
     this.pendingAliasBinds.clear();
     this.pendingAliasBinds.add(catalogReqId);
+    // Audio and program switches in flight belong to the old session too.
+    this.pendingAudioSwitch = null;
+    this.pendingProgramSwitch = null;
     this.connection = newConnection;
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
 
@@ -4114,8 +4932,7 @@ export class MoqtPlayer {
       },
       onUpdated: (state) => {
         if (!live()) return;
-        this._catalogState = state;
-        this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+        this.applyCatalogUpdate(state);
       },
       requestLegacyResubscribe: () => {
         void (async () => {
@@ -4255,10 +5072,14 @@ export class MoqtPlayer {
     this.log.info('Catalog received (bootstrap): %d tracks', catalogState.tracks.length);
     if (this.pipelinesCreated) {
       // knownTracks path — pipelines already exist, media already subscribed.
+      const previousController = this.qualityController;
       this.qualityController = new QualityController({
         autoQuality: this.config.autoQuality!,
         startLevel: this.config.startLevel!,
         ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+        ...(this.config.initialView !== undefined ? { initialView: this.config.initialView } : {}),
+        ...(this.config.initialProgram !== undefined ? { initialProgram: this.config.initialProgram } : {}),
+        ...(this.config.preferredLanguage !== undefined ? { preferredLanguage: this.config.preferredLanguage } : {}),
         qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
         clock: this.clock,
       });
@@ -4269,6 +5090,7 @@ export class MoqtPlayer {
         ...(this.config.disableAudio ? { disableAudio: true } : {}),
       }));
       this.validateKnownTracks(catalogState);
+      this.alignControllerWithPlayingTracks(previousController);
     } else {
       this.subscribeToMediaTracks(catalogState).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
@@ -4526,8 +5348,7 @@ export class MoqtPlayer {
           return;
         }
         if (!ownedAsMain()) return;
-        this._catalogState = state;
-        this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+        this.applyCatalogUpdate(state);
       },
       requestLegacyResubscribe: () => {
         if (ownedAsCandidate()) failCandidate('fallback ladder exhausted');
@@ -4910,8 +5731,7 @@ export class MoqtPlayer {
     // Adoption is an ordinary catalog update: no second catalog_received, no
     // media churn (documented limitation: a removed currently-active track
     // keeps its old media subscription running until a later selection).
-    this._catalogState = state;
-    this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+    this.applyCatalogUpdate(state);
   }
 
   /**
@@ -5108,7 +5928,7 @@ export class MoqtPlayer {
     if (!this.bufferAbrController || !this.qualityController) return;
     // Don't trigger ABR while a switch is in flight — give the current
     // switch time to deliver data before deciding to switch again.
-    if (this.pendingVideoSwitch || this.switchInProgress) return;
+    if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) return;
 
     let effectiveBufferUs: number;
 
@@ -5237,7 +6057,12 @@ export class MoqtPlayer {
     this.pendingObjectsByAlias.clear();
     this.pendingStreamEvents.clear();
     // Clear make-before-break switch state
+    this.clearVideoSwitchTimers();
+    if (this.pendingAudioSwitch) clearTimeout(this.pendingAudioSwitch.noDataTimer);
     this.pendingVideoSwitch = null;
+    this.pendingAudioSwitch = null;
+    this.pendingProgramSwitch = null;
+    this.videoSwitchStarting = false;
     this.switchInProgress = false;
     this.switchStagingBuffer = [];
     this.cmafSwitchStagingBuffer = [];
@@ -6294,6 +7119,9 @@ export class MoqtPlayer {
           this.replaceSubscription(trackName, 'too_far_behind');
           return;
         }
+        // A switch target that ends before its first object can never commit.
+        this.failSwitchForSubscription(BigInt(_requestId), trackName,
+          new Error(`track "${trackName}" ended (PUBLISH_DONE ${statusCode}${errorReason ? `: ${errorReason}` : ''})`));
 
         this.emitter.emit('track_unsubscribed', {
           type: 'track_unsubscribed',
@@ -6306,6 +7134,8 @@ export class MoqtPlayer {
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode) => {
         this._mediaSubsFailed++;
+        this.failSwitchForSubscription(BigInt(requestId), trackName,
+          new Error(`track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`));
         this.emitter.emit('track_subscribe_failed', {
           type: 'track_subscribe_failed', trackName, mediaType, requestId, errorCode, reason,
         });
@@ -6660,10 +7490,14 @@ export class MoqtPlayer {
         if (this.pipelinesCreated) {
           // knownTracks path — pipelines already exist, media already subscribed.
           // Initialize QualityController for future ABR switches and validate.
+          const previousController = this.qualityController;
           this.qualityController = new QualityController({
             autoQuality: this.config.autoQuality!,
             startLevel: this.config.startLevel!,
             ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+            ...(this.config.initialView !== undefined ? { initialView: this.config.initialView } : {}),
+            ...(this.config.initialProgram !== undefined ? { initialProgram: this.config.initialProgram } : {}),
+            ...(this.config.preferredLanguage !== undefined ? { preferredLanguage: this.config.preferredLanguage } : {}),
             qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
             clock: this.clock,
           });
@@ -6674,6 +7508,7 @@ export class MoqtPlayer {
             ...(this.config.disableAudio ? { disableAudio: true } : {}),
           }));
           this.validateKnownTracks(catalogState);
+          this.alignControllerWithPlayingTracks(previousController);
         } else {
           // Standard path — catalog-first: create pipelines and subscribe
           this.subscribeToMediaTracks(catalogState).catch((err) => {
@@ -6689,12 +7524,8 @@ export class MoqtPlayer {
         // A delta (or a re-sent independent catalog) changed the catalog —
         // refresh the cached state so track selection and initRef resolution see
         // delta-added tracks and the preserved root initDataList / protections.
-        this._catalogState = catalogState;
         this.log.info('Catalog updated');
-        this.emitter.emit('catalog_updated', {
-          type: 'catalog_updated',
-          catalog: catalogState,
-        });
+        this.applyCatalogUpdate(catalogState);
       }
     } catch (err) {
       // First catalog failure = fatal (can't proceed without catalog).
@@ -6982,7 +7813,7 @@ export class MoqtPlayer {
         // first keyframe. Rapid cascading (4 switches in <2s) means no
         // track ever gets a chance to deliver — changeType() keeps wiping
         // the decoder before data arrives.
-        if (this.pendingVideoSwitch || this.switchInProgress) return;
+        if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) return;
 
         // Emergency downshift: non-mutating peek, deferred commit.
         if (this.qualityController && this.bufferAbrController) {
@@ -7408,20 +8239,7 @@ export class MoqtPlayer {
     }
 
     // Build buffer-based ABR controller from the quality ladder
-    const alts = this.qualityController!.alternatives;
-    if (alts.length > 1) {
-      const ladder: AbrTrack[] = alts.map(t => ({
-        name: t.name,
-        bitrateKbps: (t.bitrate ?? 0) / 1000,
-      }));
-      this.bufferAbrController = new BufferBasedController({
-        clock: this.clock,
-        ladder,
-        initialIndex: this.qualityController!.currentIndex,
-        lowThresholdUs: 500_000,      // 0.5s → emergency downshift
-        highThresholdUs: 4_000_000,   // 4s → consider upshift
-      });
-    }
+    this.rebuildBufferAbr();
 
     // Record initial quality info for stats
     this._stats.setTrackInfo(
@@ -8178,6 +8996,11 @@ export class MoqtPlayer {
         cause, trackName, this.pendingVideoSwitch.newTrackName);
       return;
     }
+    if (this.pendingAudioSwitch?.oldTrackName === trackName) {
+      this.log.info('Ignoring %s replacement for "%s" — pending audio switch to "%s"',
+        cause, trackName, this.pendingAudioSwitch.newTrackName);
+      return;
+    }
 
     const track = this._catalogState.tracks.find((t: CatalogTrack) => t.name === trackName);
     if (!track) {
@@ -8304,8 +9127,12 @@ export class MoqtPlayer {
     // staging timeout later "completes" the switch and unsubscribes the old,
     // working track, or the switch stays pending forever.
     const pendingSwitch = this.pendingVideoSwitch;
-    if (pendingSwitch && pendingSwitch.newTrackName === trackName) {
+    if (pendingSwitch && !this.switchInProgress && pendingSwitch.newTrackName === trackName) {
       this.abortPendingVideoSwitch(pendingSwitch, error);
+    }
+    const pendingAudio = this.pendingAudioSwitch;
+    if (pendingAudio && !pendingAudio.committing && pendingAudio.newTrackName === trackName) {
+      this.abortPendingAudioSwitch(pendingAudio, error);
     }
 
     // Find the requestId for this track alias in activeSubscriptions
