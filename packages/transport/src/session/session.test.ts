@@ -3098,6 +3098,34 @@ describe('Session', () => {
         const close = actions[0] as CloseConnectionAction;
         expect(close.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
       });
+
+      it('an UNSUBSCRIBE crossing our PUBLISH_DONE is accepted once; a second one still closes', () => {
+        session.handleControlMessage(incomingSubscribe(0n));
+        session.acceptSubscribe(varint(0n), varint(42n));
+        session.publishDone(varint(0n), varint(0x2n), 'Track ended');
+
+        const unsubscribe = { type: 'UNSUBSCRIBE', requestId: varint(0n) } as Unsubscribe;
+        expect(session.handleControlMessage(unsubscribe)).toEqual([]);
+        const again = session.handleControlMessage(unsubscribe);
+        expect((again[0] as CloseConnectionAction).error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
+      });
+
+      it('a PUBLISH_DONE racing the peer\'s UNSUBSCRIBE sends nothing and does not throw', () => {
+        session.handleControlMessage(incomingSubscribe(0n));
+        session.acceptSubscribe(varint(0n), varint(42n));
+        session.handleControlMessage({ type: 'UNSUBSCRIBE', requestId: varint(0n) } as Unsubscribe);
+
+        expect(session.publishDone(varint(0n), varint(0x2n), 'Track ended')).toEqual([]);
+        expect(() => session.publishDone(varint(0n), varint(0x2n), 'again')).toThrow(/Unknown/);
+      });
+
+      it('an UNSUBSCRIBE crossing our REQUEST_ERROR is accepted', () => {
+        session.handleControlMessage(incomingSubscribe(0n));
+        session.rejectSubscribe(varint(0n), varint(0x10n), 'Does not exist');
+
+        expect(session.handleControlMessage({ type: 'UNSUBSCRIBE', requestId: varint(0n) } as Unsubscribe))
+          .toEqual([]);
+      });
     });
 
     // ─── publishDone (§9.15) ─────────────────────────────────────────────

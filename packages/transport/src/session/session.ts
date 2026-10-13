@@ -549,6 +549,12 @@ export class Session {
 
   /** Incoming subscriptions (as publisher). */
   private readonly incomingSubscriptions = new Map<bigint, SubscriptionStateMachine>();
+  /** Subscriptions we ended (PUBLISH_DONE, REQUEST_ERROR) whose UNSUBSCRIBE may still
+   *  be in flight, and ones the peer UNSUBSCRIBEd that our PUBLISH_DONE may still race.
+   *  Bounded, oldest dropped first. */
+  private readonly endedByPublisher = new Set<bigint>();
+  private readonly endedBySubscriber = new Set<bigint>();
+  private static readonly ENDED_RACE_MAX = 64;
 
   /** Incoming fetches (as publisher). */
   private readonly incomingFetches = new Map<bigint, FetchStateMachine>();
@@ -1824,14 +1830,23 @@ export class Session {
       if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
       this.incomingSubscriptions.delete(msg.requestId as bigint);
     this.incomingJoiningLocations.delete(msg.requestId as bigint);
+      Session.noteEnded(this.endedBySubscriber, msg.requestId as bigint);
       return [];
     }
+
+    // An UNSUBSCRIBE crossing our own PUBLISH_DONE or REQUEST_ERROR names a valid request.
+    if (this.endedByPublisher.delete(msg.requestId as bigint)) return [];
 
     // §9.1: Unknown request ID
     return this.closeWithError(
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for UNSUBSCRIBE`,
     );
+  }
+
+  private static noteEnded(ended: Set<bigint>, requestId: bigint): void {
+    ended.add(requestId);
+    if (ended.size > Session.ENDED_RACE_MAX) ended.delete(ended.values().next().value as bigint);
   }
 
   /**
@@ -4787,6 +4802,7 @@ export class Session {
     // unique requests the application rejects). The adapter's stream teardown seals
     // the context, so its later close callback will not run this cleanup.
     this.incomingSubscriptions.delete(requestId as bigint);
+    Session.noteEnded(this.endedByPublisher, requestId as bigint);
     this.incomingJoiningLocations.delete(requestId as bigint);
 
     // PUBLISH-initiated subscriptions respond with a publish-rejection message:
@@ -4910,6 +4926,8 @@ export class Session {
     const sub = this.incomingSubscriptions.get(requestId as bigint)
       ?? this.outgoingPublishes.get(requestId as bigint);
     if (!sub) {
+      // The peer's UNSUBSCRIBE got there first: the subscription is over, nothing to send.
+      if (this.endedBySubscriber.delete(requestId as bigint)) return [];
       throw new SessionError(
         `Unknown incoming subscription ${requestId} for PUBLISH_DONE`,
         'INVALID_STATE',
@@ -4922,6 +4940,7 @@ export class Session {
     this.outgoingPublishes.delete(requestId as bigint);
     this.incomingSubscriptions.delete(requestId as bigint);
     this.incomingJoiningLocations.delete(requestId as bigint);
+    Session.noteEnded(this.endedByPublisher, requestId as bigint);
 
     const publishDoneMsg: PublishDone = {
       type: 'PUBLISH_DONE',
