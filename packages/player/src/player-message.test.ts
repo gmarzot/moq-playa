@@ -40,7 +40,6 @@ function createContext(overrides: Partial<ControlMessageContext> = {}): ControlM
     emitEvent: vi.fn(),
     setCatalogTrackAlias: vi.fn(),
     clearCatalogState: vi.fn(),
-    onGoaway: vi.fn(),
     ...overrides,
   };
   return ctx;
@@ -75,7 +74,13 @@ describe('handleControlMessage', () => {
     expect(unregisterTrack).not.toHaveBeenCalled();
   });
 
-  it('GOAWAY: unsubscribes all active subscriptions (§9.4)', () => {
+  // Raw control-message dispatch MUST NOT act on a GOAWAY. It cannot tell a
+  // control-stream GOAWAY (whole session) from one on a single request stream
+  // (that request only — draft-18 §10.4, draft-22 §6.6.1, §9.2). Acting here
+  // cancelled unrelated subscriptions all the way to the publisher. Session-wide
+  // teardown and migration now hang off the scoped notice and are asserted at
+  // the player level.
+  it('GOAWAY: raw dispatch takes no action — no unsubscribe, no event (§10.4)', () => {
     const ctx = createContext();
     ctx.activeSubscriptions.set(1n, { trackName: 'video', trackAlias: 1n });
     ctx.activeSubscriptions.set(2n, { trackName: 'audio', trackAlias: 2n });
@@ -83,27 +88,11 @@ describe('handleControlMessage', () => {
     const msg: ControlMessage = { type: 'GOAWAY', newSessionUri: 'https://new-relay.example.com' };
     handleControlMessage(msg, ctx);
 
-    expect(ctx.adapter!.unsubscribe).toHaveBeenCalledTimes(2);
-    expect(ctx.activeSubscriptions.size).toBe(0);
-  });
-
-  it('GOAWAY: emits session_goaway event (§9.4)', () => {
-    const ctx = createContext();
-    const msg: ControlMessage = { type: 'GOAWAY', newSessionUri: 'https://new.example.com' };
-    handleControlMessage(msg, ctx);
-
-    expect(ctx.emitEvent).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'session_goaway',
-      newSessionUri: 'https://new.example.com',
-    }));
-  });
-
-  it('GOAWAY: calls onGoaway callback (§3.5, §8.4.1)', () => {
-    const ctx = createContext();
-    const msg: ControlMessage = { type: 'GOAWAY', newSessionUri: 'https://new.example.com' };
-    handleControlMessage(msg, ctx);
-
-    expect(ctx.onGoaway).toHaveBeenCalledWith('https://new.example.com');
+    expect(ctx.adapter!.unsubscribe).not.toHaveBeenCalled();
+    expect(ctx.activeSubscriptions.size).toBe(2);
+    expect(ctx.emitEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session_goaway' }),
+    );
   });
 
   it('SUBSCRIBE_OK: stores catalog track alias (§9.10)', () => {

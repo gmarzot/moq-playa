@@ -28,13 +28,14 @@ import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } fro
 import { varint, ObjectStatus } from '@openmoq/transport';
 import { encodeLocHeaders } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
-import type { DataStreamTerminal } from '@openmoq/webtransport';
+import type { DataStreamTerminal, GoawayNotice } from '@openmoq/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
 /** Minimal mock of MoqtConnection for testing. */
 function createMockAdapter(): MoqtConnection & {
   _triggerMessage: (msg: ControlMessage) => void;
+  _triggerGoawayNotice: (notice: GoawayNotice) => void;
   _triggerObject: (streamId: bigint, obj: MoqtObject) => void;
   _triggerDatagram: (datagram: ObjectDatagram) => void;
   _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => void;
@@ -83,13 +84,25 @@ function createMockAdapter(): MoqtConnection & {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
 
     _triggerMessage(msg: ControlMessage) {
       adapter.onMessage?.(msg);
+    },
+    // Delivers an ACCEPTED, scoped notice — the player's GOAWAY entry point.
+    // Stated by the test, never synthesized from a raw message.
+    _triggerGoawayNotice(notice: GoawayNotice) {
+      adapter.onGoawayNotice?.(notice, adapter as unknown as MoqtConnection);
     },
     _triggerObject(streamId: bigint, obj: MoqtObject) {
       adapter.onObject?.(streamId, obj);
@@ -812,10 +825,7 @@ describe('MoqtPlayer', () => {
     player.load();
     await resolveConnect(adapter);
 
-    adapter._triggerMessage({
-      type: 'GOAWAY',
-      newSessionUri: 'https://new-relay.example.com/moq',
-    } as ControlMessage);
+    adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
     expect(fn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1457,10 +1467,7 @@ describe('MoqtPlayer', () => {
       await resolveConnect(adapter);
 
       // ControlMessage types are UPPERCASE per messages.ts
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       expect(fn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1513,10 +1520,7 @@ describe('MoqtPlayer', () => {
       } as ControlMessage);
 
       // Receive GOAWAY
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       // §9.4 SHOULD: UNSUBSCRIBE called for each active media subscription
       expect(adapter.unsubscribe).toHaveBeenCalledTimes(2);
@@ -1544,10 +1548,7 @@ describe('MoqtPlayer', () => {
 
       player.play();
 
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       (adapter.requestUpdate as any).mockClear();
       player.pause();
@@ -4040,10 +4041,7 @@ describe('MoqtPlayer', () => {
       const fn = vi.fn();
       player.on('session_goaway', fn);
 
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       expect(fn).toHaveBeenCalled();
       // No new connect should have happened
@@ -4085,10 +4083,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Trigger GOAWAY with new URI
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       // Resolve new adapter connect
       await resolveConnect(newAdapter);
@@ -4140,10 +4135,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Trigger GOAWAY with empty URI — should fall back to config.url
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       await resolveConnect(newAdapter);
       await new Promise(r => setTimeout(r, 0));
@@ -4204,10 +4196,7 @@ describe('MoqtPlayer', () => {
       player.on('error', (e) => errors.push(e));
 
       // Observed in the field: a relay putting its parser-error text in the field.
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter' });
       await new Promise((r) => setTimeout(r, 0));
 
       expect(createConnection.mock.calls.length).toBe(baseConnections); // no candidate
@@ -4223,10 +4212,7 @@ describe('MoqtPlayer', () => {
       const errors: any[] = [];
       player.on('error', (e) => errors.push(e));
 
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'http://insecure.example.com/moq', // WebTransport requires https
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'http://insecure.example.com/moq' }); // WebTransport requires https
       await new Promise((r) => setTimeout(r, 0));
 
       expect(createConnection.mock.calls.length).toBe(baseConnections);
@@ -4245,7 +4231,7 @@ describe('MoqtPlayer', () => {
         const errors: any[] = [];
         player.on('error', (e) => errors.push(e));
 
-        oldAdapter._triggerMessage({ type: 'GOAWAY', newSessionUri: uri } as ControlMessage);
+        oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: uri });
         await new Promise((r) => setTimeout(r, 0));
 
         expect(createConnection.mock.calls.length).toBe(baseConnections);
@@ -4260,10 +4246,7 @@ describe('MoqtPlayer', () => {
       const updated = vi.fn();
       player.on('catalog_updated', updated);
 
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'not a uri at all',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'not a uri at all' });
       await new Promise((r) => setTimeout(r, 0));
 
       // A parseable catalog object arriving on the GOAWAY'd session must not
@@ -4297,10 +4280,7 @@ describe('MoqtPlayer', () => {
 
       // The old session (still current until commit) sends its one GOAWAY,
       // carrying garbage — it is queued, not acted on.
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'definitely not a webtransport url',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'definitely not a webtransport url' });
       await new Promise((r) => setTimeout(r, 0));
       expect(createConnection.mock.calls.length).toBe(baseConnections); // nothing created for the GOAWAY
 
@@ -10982,7 +10962,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     player.on('session_error', errorFn);
 
     // GOAWAY → automatic migration to a2, whose connect() rejects.
-    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://new-relay.example.com/moq' } as unknown as ControlMessage);
+    a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
     await vi.waitFor(() => expect(a2.connect).toHaveBeenCalled());
     await vi.waitFor(() => expect(errorFn).toHaveBeenCalled()); // surfaced, not an unhandled rejection
 
@@ -11440,7 +11420,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // A GOAWAY arrives on the candidate DURING establishment → staged as a control
     // message, replayed during drain (when the slot is still held).
-    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
 
     sub.release(7n);
     await m; // first handoff completes → processes the queued GOAWAY
@@ -11448,6 +11428,45 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a3);
     await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
     expect(createTransport.mock.calls.some((c) => String(c[0]).includes('goaway-target'))).toBe(true);
+    await player.destroy();
+  });
+
+  it('staging a GOAWAY notice charges the notice only, never the connection', async () => {
+    // The notice callback also receives the connection. Charging the whole
+    // argument list would walk the adapter's own state — traversing its getters
+    // and billing unrelated session state against the staged-event budget.
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const createConnection = vi.fn(() => a1 as unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast', createTransport, createConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    // A tripwire the cost accounting must never read.
+    let getterReads = 0;
+    Object.defineProperty(a2, 'tripwire', {
+      enumerable: true,
+      get() { getterReads++; return 'x'.repeat(1_000_000); },
+    });
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // Staged while the candidate is uncommitted — the path that computes cost.
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
+    expect(getterReads).toBe(0);
+
+    sub.release(7n);
+    await m;
+    expect(getterReads).toBe(0);
     await player.destroy();
   });
 
@@ -11477,7 +11496,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled()); // parked in retirement
 
     // A LIVE GOAWAY from the committed session while the old close is pending.
-    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
     expect(cc).toBe(1); // NOT acted on yet — no replacement adapter created (no leak)
 
     releaseOldClose!(); // retirement finishes → the queued GOAWAY is processed
@@ -11512,7 +11531,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // The OLD session (a1, still current during a2's establishment) sends GOAWAY —
     // it passes the ownership guard and is queued, but its source is a1.
-    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://unwanted-target.example.com/moq' } as unknown as ControlMessage);
+    a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://unwanted-target.example.com/moq' });
 
     sub.release(7n);
     await m;

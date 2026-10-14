@@ -51,6 +51,29 @@ export interface SessionGoawayEvent {
 }
 
 /**
+ * GOAWAY received on ONE request stream — a per-request migration signal that
+ * leaves the rest of the session in place. Unrelated subscriptions keep
+ * delivering and the session does not drain, so this deliberately does NOT
+ * emit `session_goaway`: a listener on that event may reconnect the whole
+ * player, which is the wrong response to a single request migrating.
+ *
+ * Re-issuing the request is application policy; nothing is re-issued
+ * automatically.
+ *
+ * @see draft-ietf-moq-transport-18 §10.4
+ * @see draft-ietf-moq-transport-22 §9.2, §6.6.1
+ */
+export interface RequestGoawayEvent {
+  readonly type: 'request_goaway';
+  /** The request the peer asked to migrate, from its stream context. */
+  readonly requestId: bigint;
+  /** Where to re-issue it; empty means the current session. */
+  readonly newSessionUri: string;
+  /** Track name when the request was a known media or catalog subscription. */
+  readonly trackName?: string;
+}
+
+/**
  * Session migrated to a new relay after GOAWAY.
  * @see draft-ietf-moq-transport-16 §3.5 (Migration)
  * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
@@ -640,6 +663,7 @@ export interface PlayerEventMap {
   session_connecting: SessionConnectingEvent;
   session_established: SessionEstablishedEvent;
   session_goaway: SessionGoawayEvent;
+  request_goaway: RequestGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
   session_error: SessionErrorEvent;

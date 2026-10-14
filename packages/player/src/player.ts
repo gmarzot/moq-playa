@@ -25,7 +25,7 @@ import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openm
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
-import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
+import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
@@ -4149,12 +4149,20 @@ export class MoqtPlayer {
    */
   private createCatalogBootstrap(conn: MoqtConnection): CatalogBootstrap {
     const gen = this.bootstrapGeneration;
-    const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn;
+    // Liveness is OPERATION-LOCAL, not just session-local. `abort()` stops the
+    // coordinator's future work but cannot revoke an async call already in
+    // flight, and retiring one request deliberately no longer bumps the shared
+    // bootstrap generation (that token is also observed by unrelated media), so
+    // neither the generation nor the connection can tell a retired coordinator's
+    // late continuation from a live one. The installed-coordinator identity can:
+    // retirement clears the slot, so every continuation below becomes inert.
+    const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn
+      && this.catalogBootstrapCoord === coord;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     let pendingAttempt: number | null = null;
 
-    const coord = new CatalogBootstrap({
+    const coord: CatalogBootstrap = new CatalogBootstrap({
       applyAt: (loc, payload, opts) => this.catalogManager!.processCatalogObjectAt(loc, payload, opts),
       resetManager: () => this.catalogManager?.reset(),
       currentState: () => this.catalogManager?.currentState ?? null,
@@ -4267,6 +4275,11 @@ export class MoqtPlayer {
             await conn.unsubscribe(varint(oldReqId)).catch(() => { /* best effort */ });
           }
           if (!live()) return;
+          // Distinguishes a genuinely callback-less adapter from one whose
+          // callback DID fire and whose request was retired afterwards. A null
+          // current catalog ID cannot tell those apart, and treating the second
+          // as the first resurrects the dead request.
+          let callbackFired = false;
           try {
             // Pre-send ownership + terminal drain, exactly as the primary
             // catalog subscribe: a fast response must not beat registration,
@@ -4276,7 +4289,12 @@ export class MoqtPlayer {
                 type: 'AbsoluteStart', startGroup: varint(0n), startObject: varint(0n),
               },
               onRequestId: (id: bigint) => {
-                if (!live()) return;
+                // REFUSE emission rather than returning quietly: a silent
+                // return lets an unowned request reach the peer on behalf of a
+                // retired operation. Throwing here rolls the request back
+                // before any bytes go out (the hook's documented contract).
+                if (!live()) throw new Error('catalog bootstrap fallback retired before emission');
+                callbackFired = true;
                 this.catalogRequestId = id;
                 this.pendingAliasBinds.add(id);
               },
@@ -4290,13 +4308,16 @@ export class MoqtPlayer {
               },
             } as never);
             if (!live()) return;
-            if (this.catalogRequestId === null) {
+            if (!callbackFired) {
               this.catalogRequestId = BigInt(reqId); // callback-less adapter fallback
               this.pendingAliasBinds.add(BigInt(reqId));
             }
           } catch (err) {
-            if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
+            // Ownership is checked BEFORE any mutation: a retired operation must
+            // not settle parked ownership or raise a fatal error for a request
+            // that is no longer ours.
             if (!live()) return;
+            if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
             this.failCatalogPlayback(createPlayerError(
               'fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
               `catalog bootstrap fallback resubscribe failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -5270,12 +5291,60 @@ export class MoqtPlayer {
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(trackName);
 
-    const reqId = await this.connection.trackStatus(nsBytes, nameBytes);
-    const reqIdBigInt = BigInt(reqId);
+    const conn = this.connection;
 
-    return new Promise<TrackStatusResult>((resolve, reject) => {
-      this.pendingTrackStatuses.set(reqIdBigInt, { resolve, reject });
+    // ONE settlement promise for the whole operation, created and returned
+    // without awaiting the send. The send runs detached, so an early
+    // REQUEST_OK / REQUEST_ERROR / GOAWAY settles a promise the caller already
+    // holds — rather than rejecting an internal promise nobody is observing
+    // yet, which escapes as an unhandled rejection.
+    let settleResolve!: (result: TrackStatusResult) => void;
+    let settleReject!: (error: Error) => void;
+    const promise = new Promise<TrackStatusResult>((resolve, reject) => {
+      settleResolve = resolve;
+      settleReject = reject;
     });
+    const waiter = { resolve: settleResolve, reject: settleReject };
+    // Remove only OUR entry. Request IDs are per-session, so a replacement
+    // connection can legitimately register the same number; deleting by ID
+    // alone would drop a successor's waiter and leave its query pending.
+    const dropIfMine = (requestId: bigint): void => {
+      if (this.pendingTrackStatuses.get(requestId) === waiter) {
+        this.pendingTrackStatuses.delete(requestId);
+      }
+    };
+    const abandoned = (): Error => new Error('TRACK_STATUS abandoned: its session was replaced');
+
+    void (async () => {
+      let registered: bigint | null = null;
+      try {
+        // Register ownership BEFORE the request reaches the peer: a response or
+        // a GOAWAY on this very request stream can be handled before the send's
+        // own continuation runs.
+        await conn.trackStatus(nsBytes, nameBytes, {
+          onRequestId: (requestId) => {
+            // Teardown or a replacement between this call and the allocation
+            // means this query has no owner; throwing here rolls the request
+            // back before any bytes go out.
+            if (this._destroyed || conn !== this.connection) throw abandoned();
+            registered = requestId;
+            this.pendingTrackStatuses.set(requestId, waiter);
+          },
+        });
+      } catch (err) {
+        // The send failed, so no response can arrive — drop the waiter and
+        // settle the caller's promise rather than leaving it pending.
+        if (registered !== null) dropIfMine(registered);
+        settleReject(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      if (registered !== null && conn !== this.connection) {
+        dropIfMine(registered);
+        settleReject(abandoned());
+      }
+    })();
+
+    return promise;
   }
 
   /**
@@ -5579,6 +5648,7 @@ export class MoqtPlayer {
    */
   private detachConnectionCallbacks(conn: MoqtConnection): void {
     delete conn.onMessage;
+    delete conn.onGoawayNotice;
     delete conn.onObject;
     delete conn.onClose;
     delete conn.onError;
@@ -5862,6 +5932,20 @@ export class MoqtPlayer {
     const msgBytes = (a: unknown[]): number => estimateRetainedBytes(a);
     wireConnectionCallbacks(conn, {
       onControlMessage: stageable((msg) => this.handleControlMessage(msg, conn), 'control', msgBytes),
+
+      // Staged like any other candidate event: a GOAWAY the candidate
+      // receives before promotion must not act on the still-current session,
+      // and an abandoned candidate's notice stays permanently inert.
+      //
+      // The cost charges ONLY the notice. The callback also receives the
+      // connection, and charging the whole argument list would walk the
+      // adapter's own state — traversing its getters and billing unrelated
+      // session state against this event budget. `conn` is already owned here,
+      // so it is closed over rather than measured.
+      onGoawayNotice: stageable(
+        (notice: GoawayNotice) => this.handleGoawayNotice(notice, conn),
+        'control', (args) => estimateRetainedBytes([args[0]]),
+      ),
 
       onClose: (error, reason) => {
         this.log.info('[SESSION] closed: error=0x%s reason=%s',
@@ -6496,9 +6580,208 @@ export class MoqtPlayer {
   // handleControlMessage → extracted to player-message.ts
 
   /**
-   * Handle control messages for player-level events.
+   * An accepted GOAWAY, already validated by the session and carrying the scope
+   * the wire cannot express.
    *
-   * @see draft-ietf-moq-transport-16 §9.4 (GOAWAY)
+   * A control-stream GOAWAY drains the whole session; one on a single request
+   * stream migrates only that request and "leaves the rest of the session in
+   * place" (draft-22 §6.6.1, draft-18 §10.4). Routing both through one unscoped
+   * path cancelled unrelated subscriptions, so the scopes are handled apart.
+   *
+   * Session scope establishes a replacement session when connection factories
+   * are configured — our own policy, built on a behavior the drafts say an
+   * endpoint MAY implement (16 §8.4.1, 18 §9.4.1, 22 §7.4.1), not on a MUST.
+   * Request scope re-issues nothing; that remains application policy.
+   */
+  private handleGoawayNotice(notice: GoawayNotice, conn: MoqtConnection): void {
+    // A delayed GOAWAY from a superseded session must not touch the replacement's
+    // subscriptions, requests, or catalog state.
+    if (conn !== this.connection) {
+      this.log.info('Ignoring GOAWAY from a superseded session (scope=%s)', notice.scope);
+      return;
+    }
+    if (notice.scope === 'request') {
+      this.handleRequestGoaway(notice.requestId, notice.newSessionUri, conn);
+      return;
+    }
+    this.handleSessionGoaway(notice.newSessionUri, conn);
+  }
+
+  /**
+   * Settle the player-owned operations keyed by one request ID.
+   *
+   * `retireMediaSubscription` covers the subscription-general owners, but it
+   * keys dependent fetches by their SUBSCRIPTION's request ID — it does not
+   * reach an operation whose own request is the one being retired. Each of
+   * these owns a promise, a timer, or late-data routing that would otherwise
+   * stay live after the peer stopped serving the request: a FETCH left
+   * unquarantined, a one-shot catalog FETCH pending until its own timeout, a
+   * codec switch waiting forever for init data, or a TRACK_STATUS query that
+   * never settles.
+   *
+   * Each is routed through its existing lifecycle rather than a generic helper,
+   * and only the addressed request is touched. Re-issuing is application policy.
+   */
+  private retireOwnedRequest(requestId: bigint): void {
+    const why = 'its request stream received GOAWAY; re-issue is application policy';
+
+    // A media/warm-start FETCH this request owns: quarantine so its already-open
+    // data streams are dropped rather than routed to a retired request.
+    if (this.activeFetches.has(requestId)) this.quarantineFetchRequest(requestId);
+
+    // A one-shot fetchCatalog() promise. settleCatalogFetch owns the timer and
+    // stream-map cleanup, so it is used rather than repeated here.
+    this.settleCatalogFetch(requestId, {
+      ok: false,
+      error: new Error(`Catalog FETCH ${requestId} retired: ${why}`),
+    });
+
+    // A TRACK_STATUS query awaiting its response.
+    const trackStatus = this.pendingTrackStatuses.get(requestId);
+    if (trackStatus) {
+      trackStatus.reject(new Error(`TRACK_STATUS ${requestId} retired: ${why}`));
+      this.pendingTrackStatuses.delete(requestId);
+    }
+
+    // An init-track subscription a codec switch is waiting on. These are keyed
+    // by track name, with the request ID held separately, so both owners are
+    // cleared together.
+    for (const [name, initReqId] of this.initTrackRequestIds) {
+      if (initReqId !== requestId) continue;
+      this.initTrackRequestIds.delete(name);
+      const pending = this.pendingInitTrackSubs.get(name);
+      if (pending) {
+        pending.reject(new Error(`Init track "${name}" retired: ${why}`));
+        this.pendingInitTrackSubs.delete(name);
+      }
+    }
+  }
+
+  /**
+   * Control-stream GOAWAY: the session is draining, so every subscription is
+   * retired and a replacement session is established when factories allow it.
+   *
+   * @see draft-ietf-moq-transport-16 §9.4, §3.5
+   */
+  private handleSessionGoaway(newSessionUri: string, conn: MoqtConnection): void {
+    this.log.info('GOAWAY received, uri=%s', newSessionUri || '(none)');
+    // §9.4 SHOULD: "A subscriber SHOULD individually UNSUBSCRIBE for each
+    // existing subscription".
+    for (const [requestId] of this.activeSubscriptions) {
+      this.connection?.unsubscribe(varint(requestId));
+    }
+    this.activeSubscriptions.clear();
+    this.emitter.emit('session_goaway', { type: 'session_goaway', newSessionUri });
+
+    if (!this.config.createConnection) return;
+    // Catalog quarantine installs IMMEDIATELY at GOAWAY (not only on a
+    // going-away PUBLISH_DONE): the old generation may stay authoritative
+    // until the migration commits — and the migration may roll back — so
+    // late old-session catalog data must never mutate state from here on.
+    this.catalogQuarantinedConns.add(conn);
+    if (this.catalogTrackAlias !== null) {
+      this.quarantinedCatalogAliases.set(conn, this.catalogTrackAlias);
+    }
+    const uri = newSessionUri || this.config.url;
+    if (this.currentMigration) {
+      // A handoff is in flight (staged-event drain or old-session retirement
+      // still holds the single-flight slot). Starting a migration now would be
+      // rejected and the GOAWAY lost. QUEUE the target WITH its source session
+      // (do NOT create the replacement adapter yet — it would leak); it is
+      // acted on once the handoff finishes, only if `conn` is still current.
+      this.pendingGoaway = { uri, sourceConnection: conn };
+      return;
+    }
+    this.startGoawayMigration(uri);
+  }
+
+  /**
+   * Request-stream GOAWAY: retire ONLY the addressed request and report it.
+   *
+   * No unrelated subscription is cancelled, the session is not drained, and
+   * neither `session_goaway` nor `session_migrated` is emitted — a listener on
+   * those may reconnect the whole player, which is the wrong response to one
+   * request migrating. The subscription's own bookkeeping is retired so no
+   * apparently-active track is left behind.
+   *
+   * @see draft-ietf-moq-transport-18 §10.4
+   * @see draft-ietf-moq-transport-22 §9.2, §6.6.1
+   */
+  private handleRequestGoaway(requestId: bigint, newSessionUri: string, conn: MoqtConnection): void {
+    const trackName = this.activeSubscriptions.get(requestId)?.trackName;
+    this.log.info(
+      'GOAWAY on request %s (track=%s), uri=%s — re-issue is application policy',
+      String(requestId), trackName ?? '(unknown)', newSessionUri || '(current session)',
+    );
+    // The adapter has already settled its own request state. Retire the
+    // player's bookkeeping for this one request only; the peer is migrating it,
+    // so it is no longer being served on this session.
+    //
+    // `retireMediaSubscription` covers the subscription-general owners —
+    // activeSubscriptions, pendingMediaSubs, the subscription manager, parked
+    // alias ownership and fetches dependent on this request. The catalog and
+    // the timeline track their own request identity SEPARATELY, so they are
+    // cleared explicitly rather than assumed to be handled by it.
+    this.retireMediaSubscription(requestId, conn);
+    this.activeSubscriptions.delete(requestId);
+    this.retireOwnedRequest(requestId);
+    // The catalog's retrieval is addressed either through its SUBSCRIBE or
+    // through the bootstrap FETCH/FILL that feeds it.
+    const isCatalogSubscribe = this.catalogRequestId === requestId;
+    const isBootstrapFetch = this.bootstrapFetch?.reqId === requestId;
+    // A staged recovery candidate carries its OWN request identity, separate
+    // from the active catalog's, and has its own retirement lifecycle.
+    const recovery = this.catalogRecovery;
+    if (recovery && (recovery.reqId === requestId || recovery.fetch?.reqId === requestId)) {
+      this.retireCatalogRecovery();
+    }
+    if (isCatalogSubscribe || isBootstrapFetch) {
+      if (isCatalogSubscribe) {
+        // The wire route is dead: nothing is served on this request any more,
+        // and a retained alias would keep an authoritative routing identity for
+        // a subscription the peer is migrating away.
+        this.catalogRequestId = null;
+        this.catalogTrackAlias = null;
+      }
+      // Retire the RETRIEVAL too, not just its identity. The coordinator owns an
+      // inactivity timer and a legacy-resubscribe fallback: left running, it
+      // reissues the catalog SUBSCRIBE on the OLD session, which is neither the
+      // migration the peer asked for (§10.4 / §9.2 point it at the supplied URI)
+      // nor the no-automatic-reissue policy this path promises.
+      //
+      // Deliberately NOT cancelCatalogBootstrap(): its generation bump is a
+      // SHARED token, also observed by subscribeToMediaTracks and
+      // subscribeAuxTrackOwned, so using it here would abort unrelated pending
+      // media and init-track work. This signal is scoped to one request
+      // (§10.4 / §9.2), so the retirement is scoped to the catalog's own owners.
+      if (this.catalogSubscribeRetryTimer !== null) {
+        clearTimeout(this.catalogSubscribeRetryTimer);
+        this.catalogSubscribeRetryTimer = null;
+      }
+      this.catalogBootstrapCoord?.abort();
+      this.catalogBootstrapCoord = null;
+      this.bootstrapFetch = null;
+      this.bootstrapFetchStreams.clear();
+      this.retireCatalogRecovery();
+      // The PARSED catalog is left intact — tracks, codecs and selection stay
+      // valid; only the dead route and its retrieval machinery go.
+    }
+    if (this.timelineRequestId === requestId) {
+      this.timelineRequestId = null;
+    }
+    this.emitter.emit('request_goaway', {
+      type: 'request_goaway',
+      requestId,
+      newSessionUri,
+      ...(trackName !== undefined ? { trackName } : {}),
+    });
+  }
+
+  /**
+   * Handle control messages for player-level events. GOAWAY is handled by
+   * {@link handleGoawayNotice} instead, which carries the scope this channel
+   * cannot express.
+   *
    * @see draft-ietf-moq-transport-16 §9.10 (SUBSCRIBE_OK)
    * @see draft-ietf-moq-transport-16 §9.15 (PUBLISH_DONE)
    * @see draft-ietf-moq-transport-16 §9.7 (REQUEST_OK)
@@ -6539,30 +6822,6 @@ export class MoqtPlayer {
       },
       clearCatalogState: () => { this.catalogTrackAlias = null; this.catalogRequestId = null; },
       onAliasResolved: (alias) => { this.replayPendingObjects(alias, conn); },
-      onGoaway: (newSessionUri) => {
-        // Ignore a GOAWAY from a superseded session (migration overlap).
-        if (conn !== this.connection) return;
-        if (!this.config.createConnection) return;
-        // Catalog quarantine installs IMMEDIATELY at GOAWAY (not only on a
-        // going-away PUBLISH_DONE): the old generation may stay authoritative
-        // until the migration commits — and the migration may roll back — so
-        // late old-session catalog data must never mutate state from here on.
-        this.catalogQuarantinedConns.add(conn);
-        if (this.catalogTrackAlias !== null) {
-          this.quarantinedCatalogAliases.set(conn, this.catalogTrackAlias);
-        }
-        const uri = newSessionUri || this.config.url;
-        if (this.currentMigration) {
-          // A handoff is in flight (staged-event drain or old-session retirement
-          // still holds the single-flight slot). Starting a migration now would be
-          // rejected and the GOAWAY lost. QUEUE the target WITH its source session
-          // (do NOT create the replacement adapter yet — it would leak); it is
-          // acted on once the handoff finishes, only if `conn` is still current.
-          this.pendingGoaway = { uri, sourceConnection: conn };
-          return;
-        }
-        this.startGoawayMigration(uri);
-      },
       onPublishDone: (_requestId, trackName, _trackAlias, statusCode, errorReason) => {
         // TOO_FAR_BEHIND means the subscriber fell behind the live edge —
         // resubscribe from the current position instead of giving up; the relay

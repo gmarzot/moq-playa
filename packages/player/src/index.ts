@@ -29,6 +29,7 @@ export type {
   SessionConnectingEvent,
   SessionEstablishedEvent,
   SessionGoawayEvent,
+  RequestGoawayEvent,
   SessionClosedEvent,
   SessionErrorEvent,
   PlayerErrorEvent,

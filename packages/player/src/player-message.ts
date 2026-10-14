@@ -107,7 +107,6 @@ export interface ControlMessageContext {
   emitEvent: (event: Record<string, unknown>) => void;
   setCatalogTrackAlias: (alias: bigint) => void;
   clearCatalogState: () => void;
-  onGoaway: (newSessionUri: string | undefined) => void;
   /** Called when SUBSCRIBE_OK resolves an alias — replay buffered objects. */
   onAliasResolved?: (alias: bigint) => void;
   /** Called when SUBSCRIBE_OK matches a pending media subscription. @see §9.10 */
@@ -189,23 +188,12 @@ export function handleControlMessage(
     ctx.log.debug('[CTRL] %s reqId=%s%s%s', msg.type, reqStr, trackStr, extra);
   }
   switch (msg.type) {
-    case 'GOAWAY':
-      ctx.log.info('GOAWAY received, uri=%s', msg.newSessionUri ?? '(none)');
-      // §9.4 SHOULD: "A subscriber SHOULD individually UNSUBSCRIBE for
-      // each existing subscription"
-      for (const [requestId] of ctx.activeSubscriptions) {
-        ctx.adapter?.unsubscribe(varint(requestId));
-      }
-      ctx.activeSubscriptions.clear();
-
-      ctx.emitEvent({
-        type: 'session_goaway',
-        newSessionUri: msg.newSessionUri,
-      });
-
-      // §3.5, §8.4.1: Delegate migration to player
-      ctx.onGoaway(msg.newSessionUri);
-      break;
+    // GOAWAY is deliberately absent here. This dispatch cannot tell a
+    // control-stream GOAWAY (whole session) from one on a single request stream
+    // (that request only — draft-18 §10.4, draft-22 §6.6.1). The connection
+    // still delivers an accepted GOAWAY on its raw message channel, but the
+    // scope it needs arrives separately as a GoawayNotice, which the player
+    // acts on instead.
 
     case 'SUBSCRIBE_OK': {
       // §9.10: SUBSCRIBE_OK assigns the server's Track Alias for this subscription.

@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { CATALOG_BOOTSTRAP_INACTIVITY_MS } from './catalog-bootstrap.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { MoqtConnection } from '@openmoq/webtransport';
+import type { MoqtConnection, GoawayNotice } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject, DataStreamHeader } from '@openmoq/transport';
 import { varint } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
@@ -59,11 +59,22 @@ function createMockAdapter(draft: 14 | 16 | 18 = 16) {
         fetchCancel: vi.fn(async () => { /* noop */ }),
         unsubscribe: vi.fn(async () => { /* noop */ }),
         requestUpdate: vi.fn(async () => { /* noop */ }),
-        trackStatus: vi.fn(async () => varint(99n)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+        trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+          const requestId = varint(99n);
+          opts?.onRequestId?.(BigInt(requestId));
+          return requestId;
+        }),
         subscribeNamespace: vi.fn(async () => varint(98n)),
         cancelNamespace: vi.fn(async () => { /* noop */ }),
         publishDone: vi.fn(async () => { /* noop */ }),
         _triggerMessage: (msg: ControlMessage) => adapter.onMessage?.(msg),
+    // Delivers an ACCEPTED, scoped notice — the player's GOAWAY entry point.
+    // Stated by the test, never synthesized from a raw message.
+    _triggerGoawayNotice: (notice: GoawayNotice) =>
+      adapter.onGoawayNotice?.(notice, adapter as unknown as MoqtConnection),
         _triggerObject: (streamId: bigint, obj: MoqtObject) => adapter.onObject?.(streamId, obj),
         _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => adapter.onDataStream?.(streamId, header),
         /**
@@ -1792,7 +1803,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await flush();
         expect(events).toEqual(['catalog_received']);
 
-        adapter._triggerMessage({ type: 'GOAWAY', newSessionUri: '' } as unknown as ControlMessage);
+        adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
         await flush();
         // LATE catalog data on the GOAWAY'd session: quarantined, not applied
         // — regardless of how the in-flight migration ends.

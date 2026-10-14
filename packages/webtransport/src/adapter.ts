@@ -215,6 +215,52 @@ interface PendingAliasReplay {
 }
 
 /**
+ * A GOAWAY the session has ACCEPTED, with the scope the wire cannot express.
+ *
+ * A control-stream GOAWAY migrates the whole session; one on a request stream
+ * migrates only that request and "leaves the rest of the session in place"
+ * (draft-22 §6.6.1, draft-18 §10.4). Scope therefore comes from which stream
+ * carried the message, never from a wire field: draft-18's control-stream
+ * Request ID is a processing boundary (the smallest peer request that may not
+ * have been handled), not an affected request, and draft-22 removed the field
+ * entirely (§9.2).
+ *
+ * Delivered only after the message is validated and its protocol state applied,
+ * so an invalid or duplicate GOAWAY never reaches a migration decision.
+ *
+ * @see draft-ietf-moq-transport-16 §9.4
+ * @see draft-ietf-moq-transport-18 §10.4
+ * @see draft-ietf-moq-transport-22 §9.2
+ */
+export type GoawayNotice = {
+  /** Empty string means "reuse the current session URI". */
+  readonly newSessionUri: string;
+  /** Peer drain hint in ms (draft-18/22 only; absent on draft-14/16, which have
+   *  no Timeout field). A hint, not a lease — the peer MAY close earlier. */
+  readonly timeoutMs?: bigint;
+} & (
+  | { readonly scope: 'session'; readonly requestId?: never }
+  | { readonly scope: 'request'; readonly requestId: bigint }
+);
+
+/** Snapshot a session-scope notice from an accepted control-stream GOAWAY. The
+ *  draft-18 wire Request ID is deliberately NOT copied — it is a processing
+ *  boundary, not an affected request. */
+function sessionGoawayNotice(msg: Goaway): GoawayNotice {
+  return msg.timeout === undefined
+    ? { scope: 'session', newSessionUri: msg.newSessionUri }
+    : { scope: 'session', newSessionUri: msg.newSessionUri, timeoutMs: msg.timeout };
+}
+
+/** Snapshot a request-scope notice. `requestId` comes from the stream context
+ *  that carried the message, never from the wire. */
+function requestGoawayNotice(requestId: bigint, msg: Goaway): GoawayNotice {
+  return msg.timeout === undefined
+    ? { scope: 'request', requestId, newSessionUri: msg.newSessionUri }
+    : { scope: 'request', requestId, newSessionUri: msg.newSessionUri, timeoutMs: msg.timeout };
+}
+
+/**
  * A PUBLISH received from a peer publisher on a new inbound bidi stream
  * (draft-18 §10.10). Set `onObject` and `onSubgroupClosed` to receive the
  * track's data-plane lifecycle (delivered via the bound Track Alias), then
@@ -266,7 +312,8 @@ function protocolToDraftVersion(protocol: string | undefined): DraftVersion | un
 
 /**
  * Pre-send request-ownership option, accepted by {@link MoqtConnection.subscribe},
- * {@link MoqtConnection.fetch} and {@link MoqtConnection.joiningFetch}.
+ * {@link MoqtConnection.fetch}, {@link MoqtConnection.joiningFetch} and
+ * {@link MoqtConnection.trackStatus}.
  *
  * A response can legally arrive before the caller's `await` continuation runs,
  * so ownership must be registrable BEFORE any bytes go out. `onRequestId` is
@@ -537,6 +584,21 @@ export class MoqtConnection {
    * which observes every parsed control message including the ones suppressed here.
    */
   onMessage?: (msg: ControlMessage) => void;
+
+  /**
+   * Called for an ACCEPTED GOAWAY, carrying the scope the wire cannot express.
+   *
+   * Ordering, for GOAWAY only: the session validates the message and applies its
+   * protocol state first, then `onMessage` observes it, then this fires. A GOAWAY
+   * the session rejects (duplicate, a client's non-empty New Session URI at a
+   * server, draft-18 wrong-parity Request ID) reaches neither callback and stays
+   * visible on the qlog channel. A session-scope notice arrives after the session
+   * is DRAINING, so an observer that starts a request synchronously is refused.
+   *
+   * Migration is the owner's decision; the connection neither reconnects nor
+   * re-issues anything.
+   */
+  onGoawayNotice?: (notice: GoawayNotice, connection: MoqtConnection) => void;
 
   /**
    * Called after the Forward State of one of our live outbound PUBLISHes changes
@@ -1327,6 +1389,12 @@ export class MoqtConnection {
       // A GOAWAY on a request stream (§10.4) — a per-request migration signal,
       // surfaced for BOTH pending and already-established requests (empty queue).
       this.uniPair.onRequestGoaway = (err) => this.handleRequestStreamGoaway(err);
+      // A second GOAWAY on one request stream (§10.4) is session-fatal. It is
+      // still observed once on the raw channel before the session closes.
+      this.uniPair.onRequestGoawayViolation = (reason, message) => {
+        this.qlogGoaway(message as Goaway);
+        this.handleControlStreamViolation(reason);
+      };
       // A later control-stream message (draft-18 GOAWAY, §10.4): feed it to the
       // session (→ DRAINING, or close on a violation) and surface it to the app.
       this.uniPair.onControlMessage = (message) => this.handleControlStreamMessage(message);
@@ -1858,6 +1926,25 @@ export class MoqtConnection {
    * session/alias/fetch cleanup runs through onRequestClosed → handleOutboundRequestClosed.
    */
   private handleRequestStreamGoaway(err: RequestGoawayError): void {
+    const goaway = err.goaway as Goaway;
+    // Snapshot the notice before any observer sees the message, then record it
+    // raw. WebTransport does not expose QUIC stream IDs to JavaScript, so the
+    // record carries the same synthetic control-stream identity the adapter
+    // already uses for request-stream control messages.
+    const notice = requestGoawayNotice(err.requestId, goaway);
+    this.qlogGoaway(goaway);
+    // Validate BEFORE any application callback. A failure must CLOSE the session
+    // rather than throw: the topology marks the stream cancelled before invoking
+    // this hook and its catch suppresses every exception, so a thrown violation
+    // would be silently absorbed as a local cancellation.
+    const violation = this.requestGoawayViolation(goaway);
+    if (violation) {
+      this.handleControlStreamViolation(violation);
+      return;
+    }
+    // Per-request settlement. This is NOT a subscription-state change: §10.4 and
+    // §9.2 both state a GOAWAY does not impact subscription state, so only the
+    // addressed request's own pending machinery is settled here.
     const raw = this.rawSubscriptions.get(err.requestId);
     this.cancelPendingAliasReplaysForRequest(err.requestId);
     if (raw?.reject) {
@@ -1871,8 +1958,35 @@ export class MoqtConnection {
     }
     this.pendingGenericSubscriptions.delete(err.requestId);
     this.settlePendingAliasOwnership(err.requestId);
-    // Surface the GOAWAY to the application (same channel as control-stream GOAWAY).
-    this.onMessage?.(err.goaway as ControlMessage);
+    // Surface the GOAWAY to the application (same channel as control-stream
+    // GOAWAY), then the scoped notice.
+    this.containObserver(() => this.onMessage?.(err.goaway as ControlMessage));
+    this.deliverGoawayNotice(notice);
+  }
+
+  /**
+   * Role and wire-shape rules that apply to a GOAWAY on a REQUEST stream.
+   * Returns a violation reason, or undefined when the message is acceptable.
+   *
+   * The session's own GOAWAY validation is deliberately not used: it transitions
+   * the session to DRAINING, which a per-request migration must never do.
+   *
+   * @see draft-ietf-moq-transport-18 §10.4
+   * @see draft-ietf-moq-transport-22 §9.2
+   */
+  private requestGoawayViolation(goaway: Goaway): string | undefined {
+    // "If a server receives a GOAWAY with a non-zero New Session URI Length it
+    // MUST close the session with a PROTOCOL_VIOLATION." Not limited to the
+    // control stream: a client cannot direct a server's connections anywhere.
+    if (this.session.role === EndpointRole.SERVER && goaway.newSessionUri !== '') {
+      return 'Server received a request-stream GOAWAY with a non-empty New Session URI';
+    }
+    // "Request ID: Present only when sent on the control stream." draft-22
+    // removed the field outright, so it is never valid here on either draft.
+    if (goaway.requestId !== undefined) {
+      return 'Request-stream GOAWAY carries a control-stream-only Request ID';
+    }
+    return undefined;
   }
 
   /** Read a control message's Track Properties (canonical `trackProperties`, or
@@ -2376,7 +2490,7 @@ export class MoqtConnection {
    * (An inbound PUBLISH that ends is torn down the same bounded way — its routing
    * is early-discarded, not retained indefinitely; §11.1.)
    */
-  private async handleOutboundRequestClosed(requestId: bigint, disposition: 'fin' | 'reset'): Promise<void> {
+  private async handleOutboundRequestClosed(requestId: bigint, disposition: 'fin' | 'reset' | 'goaway'): Promise<void> {
     // §5.2 / §10.12: a FETCH's response (FETCH_OK) and its object data ride
     // INDEPENDENT streams with no cross-stream ordering, so a clean FIN of the request
     // stream AFTER FETCH_OK does NOT end the fetch — its data stream lives on. RETAIN
@@ -2390,7 +2504,11 @@ export class MoqtConnection {
     //   - a clean FIN BEFORE FETCH_OK — no response can arrive on a closed stream, so
     //     the fetch cannot complete (§11.4.1); leaving it PENDING would leak it;
     //   - a RESET at any point — a terminal stream error (§11.4.1); leaving it after a
-    //     post-FETCH_OK reset would leak it TRANSFERRING.
+    //     post-FETCH_OK reset would leak it TRANSFERRING;
+    //   - a GOAWAY on the request stream — the close is clean, but it is a LOCAL
+    //     cancellation for a request the peer is migrating, not a peer FIN that
+    //     leaves a live data stream behind. Retaining it would leak the fetch
+    //     TRANSFERRING forever when no data stream ever finishes it.
     // A locally cancelled/errored fetch is already reclaimed in the Session
     // (getFetch === undefined) and also falls through.
     const outgoingFetch = this.session.getFetch(requestId);
@@ -2442,18 +2560,92 @@ export class MoqtConnection {
 
   /**
    * Handle a draft-18 control-stream message received AFTER setup — currently
-   * GOAWAY (§10.4). Surface it to the application, feed it to the session, and act
-   * on the result: a valid GOAWAY transitions the session to DRAINING (no actions,
-   * so new local requests are refused); a violation (duplicate GOAWAY, server with
-   * a non-empty URI, or a missing/wrong-parity Request ID) returns a close, which
-   * closes the connection. This does NOT auto-migrate, reconnect, or start timers.
+   * GOAWAY (§10.4). The session validates FIRST and the state transition is
+   * applied before any application callback: a valid GOAWAY moves the session to
+   * DRAINING (no actions, so new local requests are refused) and is then observed
+   * once on `onMessage` and once as a session-scope {@link GoawayNotice}; a
+   * violation (duplicate GOAWAY, server receiving a non-empty URI, or a
+   * missing/wrong-parity Request ID) returns a close, closes the connection, and
+   * reaches NEITHER application callback — it stays visible on the qlog channel.
+   * This does NOT auto-migrate, reconnect, or start timers.
    */
   private async handleControlStreamMessage(message: DecodedControlMessage): Promise<void> {
-    this.onMessage?.(message as ControlMessage);
+    await this.handleSessionGoawayOrdered(message);
+  }
+
+  /**
+   * Control-stream GOAWAY with protocol state applied before any application
+   * callback. Shared by the draft-18/22 control stream and the draft-14/16
+   * control read loop so both drafts deliver a validated notice.
+   */
+  private async handleSessionGoawayOrdered(message: DecodedControlMessage): Promise<void> {
+    // Snapshot the notice FIRST, before any observer — diagnostic or
+    // application — holds a mutable reference to the message, then record it
+    // raw. Both happen ahead of validation so a rejected GOAWAY is still
+    // visible on the qlog channel.
+    const notice = message.type === 'GOAWAY'
+      ? sessionGoawayNotice(message as Goaway)
+      : undefined;
+    if (message.type === 'GOAWAY') this.qlogGoaway(message as Goaway);
     const actions = this.session.handleControlMessage(message as ControlMessage);
     const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
     await this.executeActions(actions);
-    if (closeAction) this.notifyClose(closeAction, 'control-stream GOAWAY violation');
+    if (closeAction) {
+      this.notifyClose(closeAction, 'control-stream GOAWAY violation');
+      return;
+    }
+    this.containObserver(() => this.onMessage?.(message as ControlMessage));
+    if (notice) this.deliverGoawayNotice(notice);
+  }
+
+  /**
+   * Deliver an accepted GOAWAY notice, re-checking terminal state first: an
+   * `onMessage` observer may have closed the connection reentrantly, and a
+   * notice must never launch migration work on a session that just died.
+   */
+  private deliverGoawayNotice(notice: GoawayNotice): void {
+    if (this._terminated) return;
+    this.containObserver(() => this.onGoawayNotice?.(notice, this));
+  }
+
+  /**
+   * Record one raw qlog entry for a parsed GOAWAY, whatever becomes of it: an
+   * accepted notice, a semantic rejection, or a fatal duplicate. `onMessage`
+   * withholds a rejected GOAWAY, so this is the only channel on which a consumer
+   * can see that one arrived.
+   *
+   * Two separate protections apply, guarding different things. A SHALLOW COPY is
+   * handed out so an observer cannot rewrite what VALIDATION then reads from the
+   * message — turning a legal GOAWAY into a rejected one, or the reverse. The
+   * fields the notice DELIVERS are protected independently, by snapshotting the
+   * notice before any observer runs. The call is also contained, so a throwing
+   * observer cannot abort validation, change its error code, or suppress the
+   * notice that follows.
+   */
+  private qlogGoaway(goaway: Goaway): void {
+    if (!this.onQlogEvent) return;
+    const snapshot: Goaway = { ...goaway };
+    this.containObserver(() => this.onQlogEvent?.({
+      type: 'control_message_parsed',
+      stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+      message: snapshot as ControlMessage,
+    }));
+  }
+
+  /**
+   * Run an application observer so a throw cannot interrupt protocol work.
+   * The failure is reported to `onError` and contained, matching the documented
+   * contract for the other observers. Without this, a throwing `onMessage` would
+   * swallow the GOAWAY notice that follows it, and on a request stream the
+   * topology's cancellation catch would absorb the exception silently.
+   */
+  private containObserver(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      try { this.onError?.(err instanceof Error ? err : new Error(String(err))); }
+      catch { /* an onError that throws is the application's own problem */ }
+    }
   }
 
   /**
@@ -4038,14 +4230,19 @@ export class MoqtConnection {
   async trackStatus(
     namespace: Uint8Array[],
     name: Uint8Array,
-    options?: AuthorizationOptions,
+    options?: AuthorizationOptions & RequestOwnershipOptions,
   ): Promise<bigint> {
     if (this.authorization) {
       namespace = namespace.map(field => Uint8Array.from(field));
       name = Uint8Array.from(name);
       options = await this.authorize({ operation: 'TRACK_STATUS', namespace, trackName: name }, options);
     }
-    const { requestId, actions } = this.session.trackStatus(namespace, name, options);
+    // A response — or a GOAWAY on this very request stream — can legally arrive
+    // before the caller's `await` continuation runs, so ownership must be
+    // registrable BEFORE any bytes go out, as for subscribe() and fetch().
+    const { sessionOptions, onRequestId } = splitOwnership(options);
+    const { requestId, actions } = this.session.trackStatus(namespace, name, sessionOptions);
+    this.invokeOwnershipCallback(requestId, onRequestId);
     if (isRequestStreamDraft(this.session.draftVersion)) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       await this.openD18Request(requestId, msg);
@@ -5817,6 +6014,15 @@ export class MoqtConnection {
               message,
             });
             await this.handleSubscribeOkOrdered(message, (message as { requestId: bigint }).requestId);
+            continue;
+          }
+          // GOAWAY, like SUBSCRIBE_OK above, is validated and applied BEFORE the
+          // application sees it, so a rejected GOAWAY cannot reach a migration
+          // decision. The shared handler emits its own raw qlog record, so none
+          // is emitted here — one record per parsed GOAWAY on every draft. No
+          // other message type's ordering changes.
+          if (message.type === 'GOAWAY') {
+            await this.handleSessionGoawayOrdered(message);
             continue;
           }
           this.onQlogEvent?.({
