@@ -16,6 +16,7 @@ import type { NamespaceState } from './events.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint } from '@openmoq/transport';
+import { withLocPrivateProperties } from '@openmoq/loc';
 
 function createMockAdapter() {
   let nextRequestId = 1n;
@@ -164,7 +165,7 @@ function namespaceMsg(
 function feedVideo(adapter: ReturnType<typeof createMockAdapter>): void {
   adapter._triggerObject(0n, {
     kind: 'data', trackAlias: varint(VIDEO_ALIAS), groupId: varint(0), subgroupId: varint(0),
-    objectId: varint(1), payload: new Uint8Array([0xaa]),
+    objectId: varint(1), payload: withLocPrivateProperties(new Uint8Array([0xaa])),
   } as MoqtObject);
 }
 

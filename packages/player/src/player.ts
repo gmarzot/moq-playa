@@ -2536,6 +2536,10 @@ export class MoqtPlayer {
     if (this.config.extensionParser) {
       this.subscriptionManager.extensionParser = this.config.extensionParser;
     }
+    if (this.config.compat?.includes('loc-bare')) {
+      this.subscriptionManager.locBare = true;
+      this.log.warn('LOC payloads read as bare frames, without the Private Properties block (compat loc-bare)');
+    }
 
     // Wire object delivery → media_object events + pipeline routing
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers) => {

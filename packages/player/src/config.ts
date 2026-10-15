@@ -70,7 +70,7 @@ export interface PlayerAuthorization extends Omit<ConnectionAuthorization, 'rela
 
 /** Connection options. */
 /** Opt-in interop behaviour for a non-conformant relay ({@link ConnectionConfig.compat}). */
-export type PlayerCompat = 'request-credit' | 'empty-objects';
+export type PlayerCompat = 'request-credit' | 'empty-objects' | 'loc-bare';
 
 export interface ConnectionConfig {
   /** WebTransport URL to the relay (e.g., "https://relay.example.com/moq"). */
@@ -172,6 +172,8 @@ export interface ConnectionConfig {
    *   requests uncapped until the relay sends one (draft-14/16).
    * - `empty-objects`: skip empty Normal objects on media tracks instead of
    *   passing them to the decoder.
+   * - `loc-bare`: LOC payloads are the bare frame, without the leading
+   *   Private Properties block (publishers predating LOC-04 §2.2).
    */
   readonly compat?: readonly PlayerCompat[];
 

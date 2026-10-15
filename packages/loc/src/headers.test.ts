@@ -19,10 +19,12 @@ import {
     encodeLocHeaders,
     toVideoChunkInit,
     toAudioChunkInit,
+    withLocPrivateProperties,
+    stripLocPrivateProperties,
 } from './headers.js';
 import { LocExtensionId } from './types.js';
 import type { LocHeaders } from './types.js';
-import { LocEncodeError } from './errors.js';
+import { LocEncodeError, LocHeaderError } from './errors.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -631,5 +633,57 @@ describe('encodeLocHeaders — unknown dedupe against the projection', () => {
         expect(back.timestamp).toBe(1n);
         expect(back.captureTimestamp).toBe(1n);
         expect(back.unknown).toBeUndefined();
+    });
+});
+
+// ─── Private Properties block (LOC-04 §2.2) ───────────────────────────
+
+describe('LOC Private Properties block', () => {
+    const frame = new Uint8Array([0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84]);
+
+    it('prefixes an empty block', () => {
+        expect(withLocPrivateProperties(frame))
+            .toEqual(new Uint8Array([0x0a, 0x00, ...frame]));
+    });
+
+    it('round-trips the frame', () => {
+        expect(stripLocPrivateProperties(withLocPrivateProperties(frame))).toEqual(frame);
+    });
+
+    it('strips a frame that itself starts with 0x0A (AV1 sequence header)', () => {
+        const av1 = new Uint8Array([0x0a, 0x01, 0xff]);
+        expect(stripLocPrivateProperties(withLocPrivateProperties(av1))).toEqual(av1);
+    });
+
+    it('skips non-empty contents', () => {
+        const payload = new Uint8Array([0x0a, 0x03, 0x10, 0x01, 0x02, 0xaa, 0xbb]);
+        expect(stripLocPrivateProperties(payload)).toEqual(new Uint8Array([0xaa, 0xbb]));
+    });
+
+    it('reads a two-byte varint length', () => {
+        const contents = new Uint8Array(64);
+        const payload = new Uint8Array([0x0a, 0x40, 0x40, ...contents, 0x77]);
+        expect(stripLocPrivateProperties(payload)).toEqual(new Uint8Array([0x77]));
+    });
+
+    it('returns a view, not a copy', () => {
+        const payload = withLocPrivateProperties(frame);
+        const out = stripLocPrivateProperties(payload);
+        expect(out.buffer).toBe(payload.buffer);
+        expect(out.byteOffset).toBe(2);
+    });
+
+    it('accepts an empty frame', () => {
+        expect(stripLocPrivateProperties(new Uint8Array([0x0a, 0x00])).length).toBe(0);
+    });
+
+    it.each([
+        ['bare frame', frame],
+        ['empty payload', new Uint8Array()],
+        ['type only', new Uint8Array([0x0a])],
+        ['length overruns', new Uint8Array([0x0a, 0x05, 0x01])],
+        ['truncated length varint', new Uint8Array([0x0a, 0x40])],
+    ])('rejects %s', (_name, payload) => {
+        expect(() => stripLocPrivateProperties(payload)).toThrow(LocHeaderError);
     });
 });

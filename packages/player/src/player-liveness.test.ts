@@ -21,6 +21,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/transport';
 import { varint } from '@openmoq/transport';
+import { withLocPrivateProperties } from '@openmoq/loc';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
@@ -151,7 +152,7 @@ let nextObjectId = 0n;
 function feedVideo(adapter: ReturnType<typeof createMockAdapter>, streamId = 0n): void {
   adapter._triggerObject(streamId, {
     kind: 'data', trackAlias: varint(VIDEO_ALIAS), groupId: varint(0), subgroupId: varint(0),
-    objectId: varint(nextObjectId++), payload: new Uint8Array([0xaa, 0xbb]),
+    objectId: varint(nextObjectId++), payload: withLocPrivateProperties(new Uint8Array([0xaa, 0xbb])),
   } as MoqtObject);
 }
 
@@ -212,7 +213,7 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
     adapter._triggerObject(0n, {
       kind: 'data', trackAlias: newReqId, groupId: varint(1), subgroupId: varint(0),
-      objectId: varint(0), payload: new Uint8Array([0xcc]),
+      objectId: varint(0), payload: withLocPrivateProperties(new Uint8Array([0xcc])),
     } as MoqtObject);
     await sleep(50);
     expect(player.state).toBe(PlayerState.PLAYING); // no fatal — recovered
@@ -262,7 +263,7 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
     adapter._triggerObject(0n, {
       kind: 'data', trackAlias: newReqId, groupId: varint(5), subgroupId: varint(0),
-      objectId: varint(0), payload: new Uint8Array([0xcc]),
+      objectId: varint(0), payload: withLocPrivateProperties(new Uint8Array([0xcc])),
     } as MoqtObject);
     await sleep(200);
     expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED && e.severity === 'fatal')).toBe(false);
@@ -469,7 +470,7 @@ describe('datagram arrivals', () => {
     const { player } = await startPlaying(adapter);
     adapter.onDatagram?.({
       trackAlias: varint(AUDIO_ALIAS), groupId: varint(1), objectId: varint(0),
-      publisherPriority: 64, payload: new Uint8Array([1, 2, 3]),
+      publisherPriority: 64, payload: withLocPrivateProperties(new Uint8Array([1, 2, 3])),
     });
     expect(player.datagramObjects).toEqual({ audio: 1, video: 0 });
     await player.destroy();

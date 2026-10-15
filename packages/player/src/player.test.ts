@@ -26,7 +26,7 @@ import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
-import { encodeLocHeaders } from '@openmoq/loc';
+import { encodeLocHeaders, withLocPrivateProperties } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 
@@ -2227,7 +2227,7 @@ describe('MoqtPlayer', () => {
         publisherPriority: 128,
         isEndOfGroup: false,
         extensions: undefined,
-        payload: new Uint8Array([0xAA, 0xBB]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB])),
         status: undefined,
       });
 
@@ -3051,7 +3051,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA, 0xBB, 0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB, 0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3090,7 +3090,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(1),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3200,7 +3200,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3253,7 +3253,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3263,7 +3263,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(1),
-        payload: new Uint8Array([0xBB]),
+        payload: withLocPrivateProperties(new Uint8Array([0xBB])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3273,7 +3273,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(2),
-        payload: new Uint8Array([0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3506,7 +3506,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA, 0xBB, 0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB, 0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3625,7 +3625,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA, 0xBB, 0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB, 0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -5330,7 +5330,7 @@ describe('MoqtPlayer', () => {
         objectId: varint(0n),
         publisherPriority: 0,
         extensions: new Uint8Array(0),
-        payload: new Uint8Array([1, 2, 3]),
+        payload: withLocPrivateProperties(new Uint8Array([1, 2, 3])),
       });
 
       // Video objects log at info level with [OBJ] prefix for debugging
@@ -5641,7 +5641,7 @@ describe('MoqtPlayer', () => {
         objectId: varint(0),
         publisherPriority: varint(0),
         extensions: new Uint8Array(0),
-        payload: new Uint8Array(512),
+        payload: withLocPrivateProperties(new Uint8Array(512)),
       } as MoqtObject);
 
       const snap = player.stats;
@@ -5758,7 +5758,7 @@ describe('MoqtPlayer', () => {
         objectId: varint(0),
         publisherPriority: varint(0),
         extensions: new Uint8Array(0),
-        payload: new Uint8Array(256),
+        payload: withLocPrivateProperties(new Uint8Array(256)),
       } as MoqtObject);
 
       const snap2 = player.stats;
@@ -6098,7 +6098,7 @@ describe('MoqtPlayer', () => {
         subgroupId: varint(0),
         objectId: varint(0),
         extensions: new Uint8Array([0x02, 0x00]),
-        payload: new Uint8Array([0xCA, 0xFE]),
+        payload: withLocPrivateProperties(new Uint8Array([0xCA, 0xFE])),
       } as MoqtObject);
 
       expect(player.readyState).toBeGreaterThanOrEqual(2); // HAVE_MEDIA or higher
@@ -6454,7 +6454,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xCA, 0xFE]),
+        payload: withLocPrivateProperties(new Uint8Array([0xCA, 0xFE])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -9456,7 +9456,7 @@ describe('MoqtPlayer', () => {
           adapter._triggerObject(BigInt(g + 1), {
             kind: 'data', trackAlias: videoAlias,
             groupId: varint(g), subgroupId: varint(0), objectId: varint(0),
-            payload: new Uint8Array(payloadSize), extensions: new Uint8Array(0),
+            payload: withLocPrivateProperties(new Uint8Array(payloadSize)), extensions: new Uint8Array(0),
           } as MoqtObject);
           adapter._triggerObject(BigInt(g + 1), {
             kind: 'gap', trackAlias: videoAlias,
@@ -10480,7 +10480,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     subgroupId: varint(0),
     objectId: varint(0),
     extensions: encodeLocHeaders({ captureTimestamp: TS }, { wireProfile }),
-    payload: new Uint8Array([0x00]),
+    payload: withLocPrivateProperties(new Uint8Array([0x00])),
   } as MoqtObject);
 
   type TestMgr = {

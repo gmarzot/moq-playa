@@ -17,7 +17,7 @@
 
 import type { MoqtObject } from '@openmoq/transport';
 import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
-import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
+import { parseLocHeaders, locWireProfileForDraft, stripLocPrivateProperties } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
 
 /**
@@ -81,6 +81,13 @@ export class SubscriptionManager {
    * @see draft-ietf-moq-loc-01 §2.3 (LOC default)
    */
   extensionParser: ((extensions: Uint8Array | undefined) => LocHeaders) | null = null;
+
+  /**
+   * LOC payloads arrive as the bare frame, without the leading Private
+   * Properties block (compat `loc-bare`).
+   * @see draft-ietf-moq-loc-04 §2.2
+   */
+  locBare = false;
 
   /**
    * Callback: LOC object routed to pipeline.
@@ -359,6 +366,12 @@ export class SubscriptionManager {
           const key = mediaType === 'video' ? 'videoConfig' : 'audioConfig';
           if (headers[key]) this.objectConfigSeen.add(alias);
           else if (!this.objectConfigSeen.has(alias)) headers = { ...headers, [key]: initConfig };
+        }
+        // The payload is the Private Properties block, then the frame (LOC-04 §2.2).
+        // An empty payload carries neither; a custom extensionParser means not LOC.
+        if (!this.locBare && !this.extensionParser
+            && transformed.kind === 'data' && transformed.payload.byteLength > 0) {
+          transformed = { ...transformed, payload: stripLocPrivateProperties(transformed.payload) };
         }
         this.onObject?.(mediaType, info.trackName, transformed, headers);
       }

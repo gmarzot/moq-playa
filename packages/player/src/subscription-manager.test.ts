@@ -17,7 +17,7 @@ import { SubscriptionManager } from './subscription-manager.js';
 import { varint } from '@openmoq/transport';
 import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
 import type { LocHeaders } from '@openmoq/loc';
-import { encodeLocHeaders } from '@openmoq/loc';
+import { encodeLocHeaders, withLocPrivateProperties } from '@openmoq/loc';
 import type { LocHeaderOptions } from '@openmoq/loc';
 
 /** Create a mock MoqtObjectData. */
@@ -30,7 +30,7 @@ function createMockObject(overrides?: Partial<MoqtObjectData>): MoqtObjectData {
     objectId: varint(0),
     publisherPriority: 0,
     extensions: new Uint8Array(0),
-    payload: new Uint8Array([0x01, 0x02, 0x03]),
+    payload: withLocPrivateProperties(new Uint8Array([0x01, 0x02, 0x03])),
     ...overrides,
   };
 }
@@ -68,7 +68,7 @@ describe('SubscriptionManager', () => {
     // Transform that modifies payload
     mgr.objectTransform = (obj) => ({
       ...obj,
-      payload: new Uint8Array([0xFF]),
+      payload: withLocPrivateProperties(new Uint8Array([0xFF])),
     });
 
     const obj = createMockObject({ trackAlias: varint(1) });
@@ -296,7 +296,7 @@ describe('SubscriptionManager', () => {
     // Async transform that modifies payload
     mgr.objectTransform = async (obj) => ({
       ...obj,
-      payload: new Uint8Array([0xDE, 0xAD]),
+      payload: withLocPrivateProperties(new Uint8Array([0xDE, 0xAD])),
     });
 
     const obj = createMockObject({ trackAlias: varint(1) });
@@ -356,7 +356,7 @@ describe('SubscriptionManager', () => {
     // Plain sync transform — backward compat
     mgr.objectTransform = (obj) => ({
       ...obj,
-      payload: new Uint8Array([0x42]),
+      payload: withLocPrivateProperties(new Uint8Array([0x42])),
     });
 
     const obj = createMockObject({ trackAlias: varint(1) });
@@ -883,6 +883,64 @@ describe('SubscriptionManager', () => {
       await mgr.routeObject(0n, obj);
       const fallback = callback.mock.calls[0]?.[3] as LocHeaders | undefined;
       expect(fallback?.captureTimestamp).not.toBe(TS);
+    });
+  });
+
+  // LOC-04 §2.2: Private Properties block, then the frame.
+  describe('LOC Private Properties block', () => {
+    const frame = new Uint8Array([0x0a, 0x01, 0xff]);
+
+    function setup(packaging: 'loc' | 'cmaf' = 'loc') {
+      const mgr = new SubscriptionManager();
+      const onObject = vi.fn();
+      const onCmafObject = vi.fn();
+      const onMalformedTrack = vi.fn();
+      mgr.registerTrack(1n, 'video', 'video', packaging);
+      mgr.onObject = onObject;
+      mgr.onCmafObject = onCmafObject;
+      mgr.onMalformedTrack = onMalformedTrack;
+      return { mgr, onObject, onCmafObject, onMalformedTrack };
+    }
+
+    it('delivers the frame after the block', async () => {
+      const { mgr, onObject } = setup();
+      await mgr.routeObject(0n, createMockObject({ payload: withLocPrivateProperties(frame) }));
+      expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
+    });
+
+    it('a payload without the block is a malformed track', async () => {
+      const { mgr, onObject, onMalformedTrack } = setup();
+      await mgr.routeObject(0n, createMockObject({ payload: new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x65]) }));
+      expect(onObject).not.toHaveBeenCalled();
+      expect(onMalformedTrack).toHaveBeenCalledTimes(1);
+    });
+
+    it('locBare passes the payload through', async () => {
+      const { mgr, onObject } = setup();
+      mgr.locBare = true;
+      await mgr.routeObject(0n, createMockObject({ payload: frame }));
+      expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
+    });
+
+    it('an empty payload passes through', async () => {
+      const { mgr, onObject, onMalformedTrack } = setup();
+      await mgr.routeObject(0n, createMockObject({ payload: new Uint8Array(0) }));
+      expect(onObject.mock.calls[0]![2].payload.length).toBe(0);
+      expect(onMalformedTrack).not.toHaveBeenCalled();
+    });
+
+    it('a custom extensionParser (not LOC) leaves the payload alone', async () => {
+      const { mgr, onObject } = setup();
+      mgr.extensionParser = () => ({});
+      await mgr.routeObject(0n, createMockObject({ payload: frame }));
+      expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
+    });
+
+    it('CMAF payloads are untouched', async () => {
+      const { mgr, onCmafObject } = setup('cmaf');
+      const payload = withLocPrivateProperties(frame);
+      await mgr.routeObject(0n, createMockObject({ payload }));
+      expect(onCmafObject.mock.calls[0]![2].payload).toEqual(payload);
     });
   });
 });

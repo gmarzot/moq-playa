@@ -25,6 +25,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint } from '@openmoq/transport';
+import { withLocPrivateProperties } from '@openmoq/loc';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
@@ -175,12 +176,12 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(4n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0xaa]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0xaa])),
     } as MoqtObject);
     // A live object on the real alias routes identically.
     adapter._triggerObject(1n, {
       kind: 'data', trackAlias: varint(videoReqId!), groupId: varint(4n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0xbb]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0xbb])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -209,7 +210,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     // The live subscription is untouched: live objects still accepted.
     adapter._triggerObject(1n, {
       kind: 'data', trackAlias: varint(videoReqId!), groupId: varint(0), subgroupId: varint(0),
-      objectId: varint(0), payload: new Uint8Array([0xcc]),
+      objectId: varint(0), payload: withLocPrivateProperties(new Uint8Array([0xcc])),
     } as MoqtObject);
     expect(player.state).not.toBe(PlayerState.ERROR);
     await player.destroy();
@@ -299,14 +300,14 @@ describe('warm start — alias remap and stream races', () => {
 
     adapter._triggerObject(streamA, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     // A stream that opens AFTER the remap must also map to the new alias.
     const streamB = 71n;
     adapter._triggerDataStream(streamB, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamB, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0x02]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0x02])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -344,11 +345,11 @@ describe('warm start — alias remap and stream races', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(3n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x0a]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x0a])),
     } as MoqtObject);
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(3n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0x0b]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0x0b])),
     } as MoqtObject);
     expect(routed).toEqual([]); // never routed as alias 0
 
@@ -380,7 +381,7 @@ describe('warm start — alias remap and stream races', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(1n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
     expect(routed).toEqual([{ alias: videoReqId, objectId: 0n }]);
@@ -388,7 +389,7 @@ describe('warm start — alias remap and stream races', () => {
     adapter._triggerStreamClosed(streamId); // FIN — pre-roll complete
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(1n), subgroupId: varint(0),
-      objectId: varint(9n), payload: new Uint8Array([0xff]),
+      objectId: varint(9n), payload: withLocPrivateProperties(new Uint8Array([0xff])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -428,11 +429,11 @@ describe('warm start — races against the joiningFetch() await window', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0x02]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0x02])),
     } as MoqtObject);
     adapter._triggerStreamClosed(streamId); // FIN before registration
     expect(routed).toEqual([]);
@@ -473,7 +474,7 @@ describe('warm start — races against the joiningFetch() await window', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -507,7 +508,7 @@ describe('warm start — races against the joiningFetch() await window', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -537,7 +538,7 @@ describe('warm start — lifecycle hardening', () => {
       adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(2000n + BigInt(i)) } });
       adapter._triggerObject(sid, {
         kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-        objectId: varint(BigInt(i)), payload: new Uint8Array([i]),
+        objectId: varint(BigInt(i)), payload: withLocPrivateProperties(new Uint8Array([i])),
       } as MoqtObject);
     }
     // The REAL fetch (request 2000, the FIRST/oldest) was evicted by the flood:
@@ -588,7 +589,7 @@ describe('warm start — lifecycle hardening', () => {
     // without a tombstone it would route INTO the video track.
     adapter._triggerObject(3000n, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     expect(routed.length).toBe(before); // swallowed, not misrouted
     await player.destroy();
@@ -648,7 +649,7 @@ describe('warm start — lifecycle hardening', () => {
     adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(sid, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
     expect(routed).toEqual([{ objectId: 0n }]); // routed — no stale tombstone swallowed it
@@ -671,7 +672,7 @@ describe('warm start — lifecycle hardening', () => {
       adapter._triggerDataStream(44n, { type: 'fetch', header: { requestId: varint(700n) } });
       adapter._triggerObject(44n, {
         kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-        objectId: varint(0n), payload: new Uint8Array([1]),
+        objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([1])),
       } as MoqtObject);
     }).not.toThrow();
   });
