@@ -132,12 +132,13 @@ const NEW_GROUP_REQUEST_PARAM = 0x32n;
 const packagingParam = params.get('packaging');
 const packaging: 'loc' | 'cmaf' | 'locmaf' =
   packagingParam === 'cmaf' || packagingParam === 'locmaf' ? packagingParam : 'loc';
-/** `?annexb=1`: LOC H.264 carries its parameter sets in each keyframe (LOC-04 §2.1.1)
- *  rather than the VIDEO_CONFIG property, which some relays drop. */
+/** `?annexb=1`: LOC H.264 as an Annex B bitstream: start codes instead of length
+ *  prefixes (LOC-04 §2.1.4), parameter sets in each keyframe instead of the
+ *  VIDEO_CONFIG property (§2.1.1), which some relays drop; catalog codec avc3. */
 const annexbParam = params.get('annexb') === '1';
 const annexb = annexbParam && packaging === 'loc' && videoCodec.startsWith('avc');
-/** `?selfDescribing=1`: every LOC object carries Timescale, codec string and decoder
- *  config, for players that read no catalog. Timestamps become media time. */
+/** `?selfDescribing=1`: every LOC object carries the codec string and decoder config,
+ *  for players that read no catalog. */
 const selfDescribing = params.get('selfDescribing') === '1';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
@@ -974,10 +975,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         ...(annexb ? { annexb: true } : {}),
       });
       log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`
-        + ` · ${bitrateMode ?? 'variable'} bitrate${annexb ? ' · parameter sets in keyframes (Annex B)' : ''}`);
+        + ` · ${bitrateMode ?? 'variable'} bitrate${annexb ? ' · Annex B (start codes, parameter sets in keyframes)' : ''}`);
       if (annexbParam && !annexb) log('Annex B applies to LOC H.264 only; off');
       if (packaging === 'loc' && selfDescribing) {
-        log('LOC objects self-describing: Timescale 1000000, codec string, decoder config on every object');
+        log('LOC objects self-describing: codec string and decoder config on every object');
       }
       if (audio) {
         const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });

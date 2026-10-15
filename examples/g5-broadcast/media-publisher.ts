@@ -184,9 +184,9 @@ export interface MediaPublisherOptions {
    */
   packaging?: 'loc' | 'cmaf' | 'locmaf';
   /**
-   * LOC objects for receivers without a catalog: each carries Timestamp with
-   * Timescale 1000000 (media time per LOC-04 §2.3.1.2), the codec string
-   * (0x11, not in LOC-04) and the audio config; video keeps its video config.
+   * LOC objects for receivers without a catalog: each also carries the codec
+   * string (0x11, not in LOC-04) and the audio config; video keeps its video
+   * config. Timestamps stay wall clock (no Timescale, LOC-04 §2.3.1.1).
    */
   selfDescribing?: { videoCodec: string; audioCodec?: string; audioConfig?: Uint8Array };
   /** The CMAF init segments, once built; `locmaf` encodes against them. */
@@ -206,7 +206,6 @@ const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
 
 /** Codec string property (proposed for LOC; odd id, bytes). */
 const LOC_PROP_CODECSTRING = 0x11n;
-const MICROS_PER_SECOND = 1_000_000n;
 
 /** Default Forward State 0 pause before one chunk is re-attempted. */
 const PAUSE_PROBE_MS = 1_000;
@@ -968,12 +967,11 @@ export class MediaPublisher {
     return { wireProfile: locWireProfileForDraft(this.draft), locVersion };
   }
 
-  /** Timestamp, Timescale and codec string of a self-describing object; else the capture time. */
+  /** Capture time, plus the codec string on a self-describing object. */
   private timing(captureUs: bigint, codec: string | undefined): LocHeaders {
     if (!this.selfDescribing || codec === undefined) return { captureTimestamp: captureUs };
     return {
-      timestamp: captureUs,
-      timescale: MICROS_PER_SECOND,
+      captureTimestamp: captureUs,
       unknown: new Map([[LOC_PROP_CODECSTRING, new TextEncoder().encode(codec)]]),
     };
   }

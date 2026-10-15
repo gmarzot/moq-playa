@@ -447,7 +447,7 @@ describe('MediaPublisher — self-describing LOC objects', () => {
   const codecOf = (h: ReturnType<typeof parseLocHeaders>) =>
     new TextDecoder().decode(h.unknown?.get(0x11n) as Uint8Array);
 
-  it.each([16, 18] as const)('draft-%i video and audio carry Timestamp, Timescale and codec string', async (draft) => {
+  it.each([16, 18] as const)('draft-%i video and audio carry a wall-clock Timestamp and codec string', async (draft) => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft, selfDescribing, wallClockUs: () => wall });
     pub.setVideoAlias(2n);
@@ -458,12 +458,12 @@ describe('MediaPublisher — self-describing LOC objects', () => {
     const profile = { wireProfile: locWireProfileForDraft(draft) };
     const [video, audio] = [1, 2].map((tag) =>
       parseLocHeaders(conn.sends.find((s) => s.frame![0] === tag)!.extensions!, profile));
-    expect(video!.timescale).toBe(1_000_000n);
-    expect(video!.timestamp).toBe(BigInt(wall));
+    expect(video!.timescale).toBeUndefined();
+    expect(video!.captureTimestamp).toBe(BigInt(wall));
     expect(codecOf(video!)).toBe('avc1.42001f');
     expect(video!.videoConfig).toEqual(new Uint8Array([7]));
     expect(video!.videoFrameMarking?.independent).toBe(true);
-    expect(audio!.timescale).toBe(1_000_000n);
+    expect(audio!.timescale).toBeUndefined();
     expect(codecOf(audio!)).toBe('opus');
     expect(audio!.audioConfig).toEqual(new Uint8Array([1, 2]));
   });
