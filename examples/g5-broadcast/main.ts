@@ -105,6 +105,8 @@ const AUDIO_CODECS = { opus: 'opus', aac: 'mp4a.40.2' } as const;
 /** `?height=`: camera capture height (16:9). Screen capture keeps its own size. */
 const captureHeight = [720, 480, 360, 240].includes(Number(params.get('height')))
   ? Number(params.get('height')) : 720;
+/** `?audio=0`: camera broadcasts video only. */
+const cameraAudio = params.get('audio') !== '0';
 /** `?audioBitrate=`: kbps. */
 const audioBitrateParam = parseInt(params.get('audioBitrate') ?? '', 10);
 const audioBitrate = (Number.isFinite(audioBitrateParam) && audioBitrateParam >= 6 ? audioBitrateParam : 128) * 1000;
@@ -269,6 +271,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sAudioCodec = document.getElementById('s-audio-codec') as HTMLSelectElement;
   const sHeight = document.getElementById('s-height') as HTMLSelectElement;
   const sAudioBitrate = document.getElementById('s-audio-bitrate') as HTMLInputElement;
+  const sNoAudio = document.getElementById('s-no-audio') as HTMLInputElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
   const sBitrateMode = document.getElementById('s-bitrate-mode') as HTMLSelectElement;
@@ -317,6 +320,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sAudioCodec.value = audioCodecParam;
     sHeight.value = String(captureHeight);
     sAudioBitrate.value = audioBitrate === 128_000 ? '' : String(audioBitrate / 1000);
+    sNoAudio.checked = !cameraAudio;
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
     sBitrateMode.value = bitrateMode ?? '';
@@ -389,6 +393,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sAudioCodec.value !== 'opus') np.set('audioCodec', sAudioCodec.value);
     if (sHeight.value !== '720') np.set('height', sHeight.value);
     if (sAudioBitrate.value && sAudioBitrate.value !== '128') np.set('audioBitrate', sAudioBitrate.value);
+    if (sNoAudio.checked) np.set('audio', '0');
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
     if (sBitrateMode.value) np.set('bitrateMode', sBitrateMode.value);
@@ -972,7 +977,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           width: Math.round((captureHeight * 16) / 9), height: captureHeight,
           // ideal only: a min is mandatory and hides devices that cannot meet it.
           frameRate: { ideal: captureFps },
-        })
+        }, cameraAudio)
         : await cap.startScreen({ video: { frameRate: { ideal: captureFps } }, audio: false });
       // The tracks only become real HERE — MediaCapture.stop() before this
       // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
