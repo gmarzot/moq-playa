@@ -32,7 +32,8 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
+import { encodeLocHeaders, locWireProfileForDraft, withLocPrivateProperties } from '@openmoq/loc';
+import type { LocHeaders } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
 import { buildChunk } from '../shared/browser/cmaf-mux.js';
 import {
@@ -182,6 +183,12 @@ export interface MediaPublisherOptions {
    * chunk as a LOCMAF Object (draft-einarsson-moq-locmaf-01); subgroups only.
    */
   packaging?: 'loc' | 'cmaf' | 'locmaf';
+  /**
+   * LOC objects for receivers without a catalog: each carries Timestamp with
+   * Timescale 1000000 (media time per LOC-04 §2.3.1.2), the codec string
+   * (0x11, not in LOC-04) and the audio config; video keeps its video config.
+   */
+  selfDescribing?: { videoCodec: string; audioCodec?: string; audioConfig?: Uint8Array };
   /** The CMAF init segments, once built; `locmaf` encodes against them. */
   cmafInit?: () => { videoInit: Uint8Array; audioInit?: Uint8Array } | undefined;
   /** Video needs a keyframe now: a new subscription or a resume. The page
@@ -196,6 +203,10 @@ export interface MediaPublisherOptions {
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
 const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+
+/** Codec string property (proposed for LOC; odd id, bytes). */
+const LOC_PROP_CODECSTRING = 0x11n;
+const MICROS_PER_SECOND = 1_000_000n;
 
 /** Default Forward State 0 pause before one chunk is re-attempted. */
 const PAUSE_PROBE_MS = 1_000;
@@ -257,6 +268,7 @@ export class MediaPublisher {
   private readonly cmaf: boolean;
   private readonly locmaf: boolean;
   private readonly cmafInit: MediaPublisherOptions['cmafInit'];
+  private readonly selfDescribing: MediaPublisherOptions['selfDescribing'];
   private readonly locmafEncoder = new LocmafEncoder();
   private readonly locmafContexts = new Map<'video' | 'audio', LocmafTrackContext>();
   /** LOCMAF chaining state of the open video group. */
@@ -378,6 +390,9 @@ export class MediaPublisher {
     this.locmaf = options.packaging === 'locmaf';
     this.cmaf = options.packaging === 'cmaf' || this.locmaf;
     this.cmafInit = options.cmafInit;
+    this.selfDescribing = options.packaging === undefined || options.packaging === 'loc'
+      ? options.selfDescribing
+      : undefined;
     // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
     // LOCMAF is carried on subgroups only.
     this.audioDatagrams = options.audioDatagrams === true && options.draft === 18 && !this.locmaf;
@@ -946,10 +961,23 @@ export class MediaPublisher {
     });
   }
 
-  /** Draft-18 gives LOC-01's 0x02/0x04 Track scope, so it carries LOC-04's ids. */
+  /** Draft-18 gives LOC-01's 0x02/0x04 Track scope, so it carries LOC-04's ids;
+   *  self-describing objects use LOC-04's ids on every draft. */
   private locOptions(): { wireProfile: ReturnType<typeof locWireProfileForDraft>; locVersion: 1 | 4 } {
-    return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.draft === 18 ? 4 : 1 };
+    const locVersion = this.draft === 18 || this.selfDescribing ? 4 : 1;
+    return { wireProfile: locWireProfileForDraft(this.draft), locVersion };
   }
+
+  /** Timestamp, Timescale and codec string of a self-describing object; else the capture time. */
+  private timing(captureUs: bigint, codec: string | undefined): LocHeaders {
+    if (!this.selfDescribing || codec === undefined) return { captureTimestamp: captureUs };
+    return {
+      timestamp: captureUs,
+      timescale: MICROS_PER_SECOND,
+      unknown: new Map([[LOC_PROP_CODECSTRING, new TextEncoder().encode(codec)]]),
+    };
+  }
+
 
   private videoExtensions(meta: VideoChunkMeta, captureUs: bigint): Uint8Array | undefined {
     // CMAF carries its own decode time and sync flags; only the capture time rides along.
@@ -957,7 +985,7 @@ export class MediaPublisher {
       return encodeLocHeaders({ captureTimestamp: captureUs }, this.locOptions());
     }
     return encodeLocHeaders({
-      captureTimestamp: captureUs,
+      ...this.timing(captureUs, this.selfDescribing?.videoCodec),
       videoFrameMarking: {
         independent: meta.isKeyframe,
         // No temporal layers, so every P-frame is a reference for the next.
@@ -1015,7 +1043,7 @@ export class MediaPublisher {
     const chunk = this.cmaf ? this.cmafVideoChunk(data, meta, captureUs) : data;
     const payload = this.locmaf
       ? this.toLocmaf('video', chunk, this.videoLocmafState, this.videoObjectId)
-      : chunk;
+      : this.cmaf ? chunk : withLocPrivateProperties(chunk);
     try {
       await this.connection.sendObject(
         this.videoStreamId, this.wrapInt(this.videoObjectId), payload, this.videoExtensions(meta, captureUs));
@@ -1038,8 +1066,10 @@ export class MediaPublisher {
 
   private async sendAudioChunk(chunk: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
     const captureUs = this.toWallClockUs('audio', meta.timestampUs);
+    const audioConfig = this.cmaf ? undefined : this.selfDescribing?.audioConfig;
     const extensions = encodeLocHeaders({
-      captureTimestamp: captureUs,
+      ...(this.cmaf ? { captureTimestamp: captureUs } : this.timing(captureUs, this.selfDescribing?.audioCodec)),
+      ...(audioConfig ? { audioConfig } : {}),
     }, this.locOptions());
     const data = this.cmaf
       ? buildChunk({
@@ -1051,7 +1081,8 @@ export class MediaPublisher {
         data: chunk,
       })
       : chunk;
-    const payload = this.locmaf ? this.toLocmaf('audio', data, new LocmafGroupState(), 0n) : data;
+    const payload = this.locmaf ? this.toLocmaf('audio', data, new LocmafGroupState(), 0n)
+      : this.cmaf ? data : withLocPrivateProperties(data);
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     if (this.audioDatagrams && this.connection.sendDatagram) {

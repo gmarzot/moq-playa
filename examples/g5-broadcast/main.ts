@@ -136,6 +136,9 @@ const packaging: 'loc' | 'cmaf' | 'locmaf' =
  *  rather than the VIDEO_CONFIG property, which some relays drop. */
 const annexbParam = params.get('annexb') === '1';
 const annexb = annexbParam && packaging === 'loc' && videoCodec.startsWith('avc');
+/** `?selfDescribing=1`: every LOC object carries Timescale, codec string and decoder
+ *  config, for players that read no catalog. Timestamps become media time. */
+const selfDescribing = params.get('selfDescribing') === '1';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
 const bitrateMode: 'constant' | 'variable' | undefined =
@@ -155,6 +158,19 @@ const congestionControl: 'low-latency' | 'throughput' | undefined =
 const AUTO_NAMESPACE_KEY = 'g5-broadcast.namespace';
 /** The automatic namespace a broadcast has already used. */
 const AUTO_NAMESPACE_USED_KEY = 'g5-broadcast.namespace-used';
+/** Opus identification header (RFC 7845 §5.1), the WebCodecs Opus description:
+ *  mapping family 0 (mono/stereo), libopus's 312-sample pre-skip at 48 kHz. */
+function opusHead(sampleRate: number, channels: number): Uint8Array {
+  const head = new Uint8Array(19);
+  const view = new DataView(head.buffer);
+  head.set(new TextEncoder().encode('OpusHead'));
+  head[8] = 1;
+  head[9] = channels;
+  view.setUint16(10, 312, true);
+  view.setUint32(12, sampleRate, true);
+  return head;
+}
+
 const mintNamespace = (): string => `g5-${crypto.randomUUID().slice(0, 8)}`;
 function tabNamespace(): string {
   const held = storageGet(() => sessionStorage, AUTO_NAMESPACE_KEY);
@@ -226,6 +242,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
   const sDynamicGroups = document.getElementById('s-dynamic-groups') as HTMLInputElement;
   const sAnnexb = document.getElementById('s-annexb') as HTMLInputElement;
+  const sSelfDescribing = document.getElementById('s-self-describing') as HTMLInputElement;
   const sMinGroup = document.getElementById('s-min-group') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
@@ -272,6 +289,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sPackaging.value = packaging;
     sDynamicGroups.checked = dynamicGroups;
     sAnnexb.checked = annexbParam;
+    sSelfDescribing.checked = selfDescribing;
     sMinGroup.value = String(minGroupMs);
     showApplicableFields();
   }
@@ -281,6 +299,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const annexbApplies = () => sPackaging.value === 'loc' && sCodec.value.startsWith('avc');
   function showApplicableFields() {
     document.getElementById('s-annexb-row')!.hidden = !annexbApplies();
+    document.getElementById('s-self-describing-row')!.hidden = sPackaging.value !== 'loc';
     document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
     document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
     document.getElementById('s-min-group-row')!.hidden = sVersion.value !== '18' || !sDynamicGroups.checked;
@@ -337,6 +356,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
     if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
+    if (sSelfDescribing.checked && sPackaging.value === 'loc') np.set('selfDescribing', '1');
     if (sDynamicGroups.checked && sVersion.value === '18') {
       np.set('dynamicGroups', '1');
       if (sMinGroup.value && sMinGroup.value !== '1000') np.set('minGroup', sMinGroup.value);
@@ -956,6 +976,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`
         + ` · ${bitrateMode ?? 'variable'} bitrate${annexb ? ' · parameter sets in keyframes (Annex B)' : ''}`);
       if (annexbParam && !annexb) log('Annex B applies to LOC H.264 only; off');
+      if (packaging === 'loc' && selfDescribing) {
+        log('LOC objects self-describing: Timescale 1000000, codec string, decoder config on every object');
+      }
       if (audio) {
         const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });
         ctx.onCancel(() => { try { ae.destroy(); } catch { /* already destroyed */ } });
@@ -1068,6 +1091,12 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           draft: negotiatedDraft,
           audioDatagrams,
           packaging,
+          ...(packaging === 'loc' && selfDescribing ? {
+            selfDescribing: {
+              videoCodec: catalog.videoCodec,
+              ...(audio ? { audioCodec: 'opus', audioConfig: opusHead(audio.sampleRate, audio.channels) } : {}),
+            },
+          } : {}),
           cmafInit: () => catalog.cmaf,
           // The anchor's measured error, once per track.
           onAnchor: ({ track, excessUs, timeOriginDeltaUs }) => log(
