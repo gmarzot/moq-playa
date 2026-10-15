@@ -189,6 +189,10 @@ export interface MediaPublisherOptions {
    * config. Timestamps stay wall clock (no Timescale, LOC-04 §2.3.1.1).
    */
   selfDescribing?: { videoCodec: string; audioCodec?: string; audioConfig?: Uint8Array };
+  /** LOC objects carry Timescale 1000000 with the Timestamp, for players that
+   *  require one. The stamps then read as media time (LOC-04 §2.3.1.2), so
+   *  receivers lose end-to-end latency. */
+  locTimescale?: boolean;
   /** The CMAF init segments, once built; `locmaf` encodes against them. */
   cmafInit?: () => { videoInit: Uint8Array; audioInit?: Uint8Array } | undefined;
   /** Video needs a keyframe now: a new subscription or a resume. The page
@@ -206,6 +210,7 @@ const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
 
 /** Codec string property (proposed for LOC; odd id, bytes). */
 const LOC_PROP_CODECSTRING = 0x11n;
+const MICROS_PER_SECOND = 1_000_000n;
 
 /** Default Forward State 0 pause before one chunk is re-attempted. */
 const PAUSE_PROBE_MS = 1_000;
@@ -268,6 +273,7 @@ export class MediaPublisher {
   private readonly locmaf: boolean;
   private readonly cmafInit: MediaPublisherOptions['cmafInit'];
   private readonly selfDescribing: MediaPublisherOptions['selfDescribing'];
+  private readonly locTimescale: boolean;
   private readonly locmafEncoder = new LocmafEncoder();
   private readonly locmafContexts = new Map<'video' | 'audio', LocmafTrackContext>();
   /** LOCMAF chaining state of the open video group. */
@@ -389,6 +395,8 @@ export class MediaPublisher {
     this.locmaf = options.packaging === 'locmaf';
     this.cmaf = options.packaging === 'cmaf' || this.locmaf;
     this.cmafInit = options.cmafInit;
+    this.locTimescale = options.locTimescale === true
+      && (options.packaging === undefined || options.packaging === 'loc');
     this.selfDescribing = options.packaging === undefined || options.packaging === 'loc'
       ? options.selfDescribing
       : undefined;
@@ -963,17 +971,17 @@ export class MediaPublisher {
   /** Draft-18 gives LOC-01's 0x02/0x04 Track scope, so it carries LOC-04's ids;
    *  self-describing objects use LOC-04's ids on every draft. */
   private locOptions(): { wireProfile: ReturnType<typeof locWireProfileForDraft>; locVersion: 1 | 4 } {
-    const locVersion = this.draft === 18 || this.selfDescribing ? 4 : 1;
+    const locVersion = this.draft === 18 || this.selfDescribing || this.locTimescale ? 4 : 1;
     return { wireProfile: locWireProfileForDraft(this.draft), locVersion };
   }
 
-  /** Capture time, plus the codec string on a self-describing object. */
+  /** Capture time (with Timescale if asked), plus the codec string on a self-describing object. */
   private timing(captureUs: bigint, codec: string | undefined): LocHeaders {
-    if (!this.selfDescribing || codec === undefined) return { captureTimestamp: captureUs };
-    return {
-      captureTimestamp: captureUs,
-      unknown: new Map([[LOC_PROP_CODECSTRING, new TextEncoder().encode(codec)]]),
-    };
+    const codecString = this.selfDescribing && codec !== undefined
+      ? { unknown: new Map([[LOC_PROP_CODECSTRING, new TextEncoder().encode(codec)]]) } : {};
+    return this.locTimescale
+      ? { timestamp: captureUs, timescale: MICROS_PER_SECOND, ...codecString }
+      : { captureTimestamp: captureUs, ...codecString };
   }
 
 

@@ -141,6 +141,9 @@ const annexb = annexbParam && packaging === 'loc' && videoCodec.startsWith('avc'
 /** `?selfDescribing=1`: every LOC object carries the codec string and decoder config,
  *  for players that read no catalog. */
 const selfDescribing = params.get('selfDescribing') === '1';
+/** `?timescale=1`: LOC objects carry Timescale 1000000, for players that require one.
+ *  Stamps then read as media time: viewers lose end-to-end latency. */
+const locTimescale = params.get('timescale') === '1';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
 const bitrateMode: 'constant' | 'variable' | undefined =
@@ -245,6 +248,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sDynamicGroups = document.getElementById('s-dynamic-groups') as HTMLInputElement;
   const sAnnexb = document.getElementById('s-annexb') as HTMLInputElement;
   const sSelfDescribing = document.getElementById('s-self-describing') as HTMLInputElement;
+  const sTimescale = document.getElementById('s-timescale') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
@@ -291,6 +295,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sDynamicGroups.checked = dynamicGroups;
     sAnnexb.checked = annexbParam;
     sSelfDescribing.checked = selfDescribing;
+    sTimescale.checked = locTimescale;
     showApplicableFields();
   }
 
@@ -300,6 +305,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   function showApplicableFields() {
     document.getElementById('s-annexb-row')!.hidden = !annexbApplies();
     document.getElementById('s-self-describing-row')!.hidden = sPackaging.value !== 'loc';
+    document.getElementById('s-timescale-row')!.hidden = sPackaging.value !== 'loc';
     document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
     document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
   }
@@ -355,6 +361,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
     if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
     if (sSelfDescribing.checked && sPackaging.value === 'loc') np.set('selfDescribing', '1');
+    if (sTimescale.checked && sPackaging.value === 'loc') np.set('timescale', '1');
     if (sDynamicGroups.checked && sVersion.value === '18') np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
@@ -978,6 +985,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       if (packaging === 'loc' && selfDescribing) {
         log('LOC objects self-describing: codec string and decoder config on every object');
       }
+      if (packaging === 'loc' && locTimescale) {
+        log('LOC objects carry Timescale 1000000: viewers read media time, no end-to-end latency');
+      }
       if (audio) {
         const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });
         ctx.onCancel(() => { try { ae.destroy(); } catch { /* already destroyed */ } });
@@ -1090,6 +1100,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           draft: negotiatedDraft,
           audioDatagrams,
           packaging,
+          ...(packaging === 'loc' && locTimescale ? { locTimescale: true } : {}),
           ...(packaging === 'loc' && selfDescribing ? {
             selfDescribing: {
               videoCodec: catalog.videoCodec,

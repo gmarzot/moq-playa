@@ -468,6 +468,23 @@ describe('MediaPublisher — self-describing LOC objects', () => {
     expect(audio!.audioConfig).toEqual(new Uint8Array([1, 2]));
   });
 
+  it.each([16, 18] as const)('draft-%i locTimescale adds Timescale 1000000', async (draft) => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { draft, selfDescribing, locTimescale: true, wallClockUs: () => wall });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    pub.publishVideo(chunk(1), kf());
+    pub.publishAudio(chunk(2), { timestampUs: 500 });
+    await settle();
+    const profile = { wireProfile: locWireProfileForDraft(draft) };
+    for (const tag of [1, 2]) {
+      const h = parseLocHeaders(conn.sends.find((s) => s.frame![0] === tag)!.extensions!, profile);
+      expect(h.timescale).toBe(1_000_000n);
+      expect(h.timestamp).toBe(BigInt(wall));
+      expect(codecOf(h)).toBe(tag === 1 ? 'avc1.42001f' : 'opus');
+    }
+  });
+
   it('applies to LOC only', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', selfDescribing, wallClockUs: () => wall });
