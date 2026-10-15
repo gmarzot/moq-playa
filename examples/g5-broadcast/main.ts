@@ -24,7 +24,9 @@ import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 import type { MediaPublisher } from './media-publisher.js';
 import { CMAF_AUDIO_TRACK_ID, CMAF_VIDEO_TRACK_ID } from './media-publisher.js';
-import { buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE } from '../shared/browser/cmaf-mux.js';
+import {
+  aacAudioSpecificConfig, buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE, opusHead,
+} from '../shared/browser/cmaf-mux.js';
 import { log } from '../shared/log.js';
 import { parseCertHashHex } from '../shared/relay-url.js';
 import { parseCompat } from '../shared/compat.js';
@@ -97,6 +99,18 @@ const certHash: ArrayBuffer | undefined = (() => {
 /** `?compat=`: opt-in interop for a non-conformant relay (shared/compat.ts). URL only. */
 const compatParam = parseCompat(params.get('compat'));
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
+/** `?audioCodec=aac`: AAC-LC instead of Opus. */
+const audioCodecParam: 'opus' | 'aac' = params.get('audioCodec') === 'aac' ? 'aac' : 'opus';
+const AUDIO_CODECS = { opus: 'opus', aac: 'mp4a.40.2' } as const;
+/** `?height=`: camera capture height (16:9). Screen capture keeps its own size. */
+const captureHeight = [720, 480, 360, 240].includes(Number(params.get('height')))
+  ? Number(params.get('height')) : 720;
+/** `?audioBitrate=`: kbps. */
+const audioBitrateParam = parseInt(params.get('audioBitrate') ?? '', 10);
+const audioBitrate = (Number.isFinite(audioBitrateParam) && audioBitrateParam >= 6 ? audioBitrateParam : 128) * 1000;
+/** Codecs this capture encodes: the requested ones, or the defaults when the browser cannot. */
+let activeVideoCodec = videoCodec;
+let activeAudioCodec: string = AUDIO_CODECS[audioCodecParam];
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
 /** Published in the catalog as the viewer's playout set point. Without it the
@@ -163,17 +177,33 @@ const congestionControl: 'low-latency' | 'throughput' | undefined =
 const AUTO_NAMESPACE_KEY = 'g5-broadcast.namespace';
 /** The automatic namespace a broadcast has already used. */
 const AUTO_NAMESPACE_USED_KEY = 'g5-broadcast.namespace-used';
-/** Opus identification header (RFC 7845 §5.1), the WebCodecs Opus description:
- *  mapping family 0 (mono/stereo), libopus's 312-sample pre-skip at 48 kHz. */
-function opusHead(sampleRate: number, channels: number): Uint8Array {
-  const head = new Uint8Array(19);
-  const view = new DataView(head.buffer);
-  head.set(new TextEncoder().encode('OpusHead'));
-  head[8] = 1;
-  head[9] = channels;
-  view.setUint16(10, 312, true);
-  view.setUint32(12, sampleRate, true);
-  return head;
+/** The audio decoder configuration for a codec: AudioSpecificConfig for AAC, else an OpusHead. */
+function audioConfigFor(codec: string, a: { sampleRate: number; channels: number }): Uint8Array {
+  return codec.startsWith('mp4a') ? aacAudioSpecificConfig(a.sampleRate, a.channels) : opusHead(a.sampleRate, a.channels);
+}
+
+/** The requested codec if this browser can encode it, else the default (logged). */
+async function supportedVideoCodec(
+  codec: string, width: number, height: number, framerate: number, bitrate: number,
+): Promise<string> {
+  const fallback = 'avc1.42001f';
+  if (codec === fallback) return codec;
+  try {
+    const { supported } = await VideoEncoder.isConfigSupported({ codec, width, height, framerate, bitrate });
+    if (supported) return codec;
+  } catch { /* unsupported */ }
+  log(`Video codec ${codec} is not supported by this browser's encoder; using ${fallback}`);
+  return fallback;
+}
+
+async function supportedAudioCodec(codec: string, sampleRate: number, numberOfChannels: number): Promise<string> {
+  if (codec === 'opus') return codec;
+  try {
+    const { supported } = await AudioEncoder.isConfigSupported({ codec, sampleRate, numberOfChannels, bitrate: audioBitrate });
+    if (supported) return codec;
+  } catch { /* unsupported */ }
+  log(`Audio codec ${codec} is not supported by this browser's encoder; using opus`);
+  return 'opus';
 }
 
 const mintNamespace = (): string => `g5-${crypto.randomUUID().slice(0, 8)}`;
@@ -236,6 +266,9 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sVersion = document.getElementById('s-version') as HTMLSelectElement;
   const sCc = document.getElementById('s-cc') as HTMLSelectElement;
   const sCodec = document.getElementById('s-codec') as HTMLSelectElement;
+  const sAudioCodec = document.getElementById('s-audio-codec') as HTMLSelectElement;
+  const sHeight = document.getElementById('s-height') as HTMLSelectElement;
+  const sAudioBitrate = document.getElementById('s-audio-bitrate') as HTMLInputElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
   const sBitrateMode = document.getElementById('s-bitrate-mode') as HTMLSelectElement;
@@ -281,6 +314,9 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sVersion.value = String(broadcastDraft);
     sCc.value = congestionControl ?? '';
     sCodec.value = videoCodec;
+    sAudioCodec.value = audioCodecParam;
+    sHeight.value = String(captureHeight);
+    sAudioBitrate.value = audioBitrate === 128_000 ? '' : String(audioBitrate / 1000);
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
     sBitrateMode.value = bitrateMode ?? '';
@@ -350,6 +386,9 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sVersion.value && sVersion.value !== String(DEFAULT_DRAFT)) np.set('v', sVersion.value);
     if (sCc.value) np.set('congestionControl', sCc.value);
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
+    if (sAudioCodec.value !== 'opus') np.set('audioCodec', sAudioCodec.value);
+    if (sHeight.value !== '720') np.set('height', sHeight.value);
+    if (sAudioBitrate.value && sAudioBitrate.value !== '128') np.set('audioBitrate', sAudioBitrate.value);
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
     if (sBitrateMode.value) np.set('bitrateMode', sBitrateMode.value);
@@ -655,7 +694,7 @@ for (const id of ['conn-relay', 'conn-ns']) {
   if (el) copyOnClick(el);
 }
 setText('conn-draft', String(broadcastDraft));
-log(`Draft: ${broadcastDraft} · codec ${videoCodec} · ${videoBitrate / 1000}kbps · `
+log(`Draft: ${broadcastDraft} · codec ${videoCodec} + ${AUDIO_CODECS[audioCodecParam]} · ${videoBitrate / 1000}kbps · `
   + `keyframe every ${keyframeInterval} · target ${targetLatencyMs}ms`);
 
 // ─── Catalog panel controls ──────────────────────────────────────────
@@ -786,7 +825,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   };
   /** LOC H.264/HEVC: the encoder's description becomes the catalog's initialization
    *  data. Not with Annex B, whose length-prefix-free payload a description would contradict. */
-  const locNeedsConfig = packaging === 'loc' && !annexb && /^(avc|hvc|hev)/.test(videoCodec);
+  const locNeedsConfig = (): boolean => packaging === 'loc' && !annexb && /^(avc|hvc|hev)/.test(activeVideoCodec);
   const attachLocConfig = async (catalog: BroadcastCatalogParams): Promise<void> => {
     if (catalog.locVideoConfig) return;
     catalog.locVideoConfig = await videoDescriptionReady();
@@ -795,7 +834,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   /** CMAF: build both init segments once the video description exists. */
   const attachCmafInit = async (catalog: BroadcastCatalogParams): Promise<void> => {
     if (catalog.cmaf) return;
-    const description = await videoDescriptionReady();
+    // VP9 has no decoder description; its vpcC comes from the codec string.
+    const description = catalog.videoCodec.startsWith('vp09') ? new Uint8Array() : await videoDescriptionReady();
     catalog.cmaf = {
       videoInit: buildVideoInit({
         trackId: CMAF_VIDEO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, codec: catalog.videoCodec,
@@ -805,6 +845,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         audioInit: buildAudioInit({
           trackId: CMAF_AUDIO_TRACK_ID, timescale: MICROSECOND_TIMESCALE,
           sampleRate: catalog.audio.sampleRate, channels: catalog.audio.channels,
+          ...(catalog.audio.codec ? { codec: catalog.audio.codec } : {}),
         }),
       } : {}),
     };
@@ -928,7 +969,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       capture = cap;
       const stream = source === 'camera'
         ? await cap.startCamera({
-          width: 1280, height: 720,
+          width: Math.round((captureHeight * 16) / 9), height: captureHeight,
           // ideal only: a min is mandatory and hides devices that cannot meet it.
           frameRate: { ideal: captureFps },
         })
@@ -958,6 +999,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       } else {
         log('Audio: no audio track in this capture');
       }
+      activeVideoCodec = await supportedVideoCodec(videoCodec, width, height, fps, videoBitrate);
+      if (audio) activeAudioCodec = await supportedAudioCodec(AUDIO_CODECS[audioCodecParam], audio.sampleRate, audio.channels);
+      ctx.throwIfCancelled();
       return { stop: () => cap.stop() };
     },
 
@@ -971,7 +1015,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // encoded while the session drains.
       ctx.onCancel(() => { try { ve.destroy(); } catch { /* already destroyed */ } });
       videoEncoder = ve;
-      ve.configure(videoCodec, width, height, {
+      ve.configure(activeVideoCodec, width, height, {
         bitrate: videoBitrate,
         framerate: fps,
         keyframeInterval,
@@ -979,7 +1023,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         ...(bitrateMode ? { bitrateMode } : {}),
         ...(annexb ? { annexb: true } : {}),
       });
-      log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`
+      log(`Video encoder: ${activeVideoCodec} @ ${videoBitrate / 1000}kbps`
         + ` · ${bitrateMode ?? 'variable'} bitrate${annexb ? ' · Annex B (start codes, parameter sets in keyframes)' : ''}`);
       if (annexbParam && !annexb) log('Annex B applies to LOC H.264 only; off');
       if (packaging === 'loc' && selfDescribing) {
@@ -992,8 +1036,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });
         ctx.onCancel(() => { try { ae.destroy(); } catch { /* already destroyed */ } });
         audioEncoder = ae;
-        ae.configure('opus', audio.sampleRate, audio.channels, { bitrate: 128_000 });
-        log(`Audio encoder: opus @ 128kbps (${audio.sampleRate}Hz, ${audio.channels}ch)`);
+        ae.configure(activeAudioCodec, audio.sampleRate, audio.channels, { bitrate: audioBitrate });
+        log(`Audio encoder: ${activeAudioCodec} @ ${audioBitrate / 1000}kbps (${audio.sampleRate}Hz, ${audio.channels}ch)`);
       }
       // Disposal is handled per-encoder by the adoptions above.
       return { destroy: () => { /* owned by the attempt registry */ } };
@@ -1076,20 +1120,21 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
 
       const catalog: BroadcastCatalogParams = {
         // avc3: parameter sets may be carried in-band.
-        videoCodec: annexb ? videoCodec.replace(/^avc1/, 'avc3') : videoCodec,
+        videoCodec: annexb ? activeVideoCodec.replace(/^avc1/, 'avc3') : activeVideoCodec,
         width,
         height,
         fps,
         videoBitrate,
         targetLatencyMs,
         packaging,
-        ...(audio ? { audio } : {}),
+        ...(audio ? { audio: { ...audio, codec: activeAudioCodec, bitrate: audioBitrate } } : {}),
+        ...(audio && packaging === 'loc' ? { locAudioConfig: audioConfigFor(activeAudioCodec, audio) } : {}),
       };
       sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
         catalog,
         ...(packaging !== 'loc' ? { catalogReady: () => attachCmafInit(catalog) }
-          : locNeedsConfig ? { catalogReady: () => attachLocConfig(catalog) } : {}),
+          : locNeedsConfig() ? { catalogReady: () => attachLocConfig(catalog) } : {}),
         ...(carriedCatalog ? { carriedCatalog } : {}),
         onCatalogGroup: (published) => {
           carriedCatalog = published;
@@ -1104,7 +1149,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           ...(packaging === 'loc' && selfDescribing ? {
             selfDescribing: {
               videoCodec: catalog.videoCodec,
-              ...(audio ? { audioCodec: 'opus', audioConfig: opusHead(audio.sampleRate, audio.channels) } : {}),
+              ...(audio ? { audioCodec: activeAudioCodec, audioConfig: audioConfigFor(activeAudioCodec, audio) } : {}),
             },
           } : {}),
           cmafInit: () => catalog.cmaf,

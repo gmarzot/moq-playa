@@ -2,7 +2,8 @@
  * The CMAF muxer's output, read back through the player's own MP4 parsers.
  */
 import { describe, it, expect } from 'vitest';
-import { buildAudioInit, buildChunk, buildVideoInit, opusPreSkip } from './cmaf-mux.js';
+import { aacAudioSpecificConfig, buildAudioInit, buildChunk, buildVideoInit, opusHead, opusPreSkip } from './cmaf-mux.js';
+import { codecDescriptionFromInit } from '@openmoq/locmaf';
 import {
   filterInitSegment, readBaseMediaDecodeTime, readMdhdTimescale, readSegmentTimeRanges, readTrexDefaults,
 } from '../../../packages/browser/src/mp4-box.js';
@@ -56,8 +57,46 @@ describe('cmaf-mux', () => {
 
   it('refuses a video codec it cannot describe', () => {
     expect(() => buildVideoInit({
-      trackId: 1, timescale: TS, codec: 'vp09.00.10.08', width: 640, height: 360, description: AVCC,
+      trackId: 1, timescale: TS, codec: 'vp8', width: 640, height: 360, description: AVCC,
     })).toThrow(/does not support/);
+  });
+
+  it('carries an HEVC hvcC', () => {
+    const hvcc = new Uint8Array([0x01, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x5d]);
+    const init = buildVideoInit({
+      trackId: 1, timescale: TS, codec: 'hvc1.1.6.L93.B0', width: 1280, height: 720, description: hvcc,
+    });
+    expect(codecDescriptionFromInit(init)).toEqual(hvcc);
+  });
+
+  it('builds a VP9 vpcC from the codec string', () => {
+    const init = buildVideoInit({
+      trackId: 1, timescale: TS, codec: 'vp09.00.31.08', width: 1280, height: 720, description: new Uint8Array(),
+    });
+    const vpcc = codecDescriptionFromInit(init)!;
+    // version 1, flags, profile 0, level 31, 8-bit 4:2:0, BT.709, no init data.
+    expect([...vpcc]).toEqual([1, 0, 0, 0, 0, 31, 0x82, 1, 1, 1, 0, 0]);
+  });
+
+  it('builds an AAC audio init whose esds carries the AudioSpecificConfig', () => {
+    const init = buildAudioInit({ trackId: 2, timescale: TS, codec: 'mp4a.40.2', sampleRate: 48_000, channels: 1 });
+    expect(filterInitSegment(init, 'soun').byteLength).toBeGreaterThan(0);
+    expect(codecDescriptionFromInit(init)).toEqual(new Uint8Array([0x11, 0x88]));
+  });
+
+  it.each([
+    [48_000, 1, [0x11, 0x88]],
+    [44_100, 2, [0x12, 0x10]],
+    [48_000, 2, [0x11, 0x90]],
+  ])('AAC-LC AudioSpecificConfig for %i Hz, %i ch', (rate, ch, bytes) => {
+    expect([...aacAudioSpecificConfig(rate, ch)]).toEqual(bytes);
+  });
+
+  it('writes an OpusHead the Opus pre-skip reader agrees with', () => {
+    const head = opusHead(48_000, 2);
+    expect(head.byteLength).toBe(19);
+    expect(head[9]).toBe(2);
+    expect(opusPreSkip(head)).toBe(312);
   });
 
   it('reads the Opus pre-skip from an OpusHead', () => {

@@ -179,6 +179,15 @@ describe('broadcast catalog subscription lifecycle', () => {
     expect(catalog.initDataList?.map((e) => [e.id, e.type, e.data])).toEqual([['v0', 'inline', 'AQID']]);
   });
 
+  it('LOC: the audio codec and its decoder configuration reach the audio track', () => {
+    const catalog = parseCatalog(buildCatalogPayload({
+      ...PARAMS, audio: { ...PARAMS.audio!, codec: 'mp4a.40.2' }, locAudioConfig: new Uint8Array([0x11, 0x88]),
+    }));
+    const audio = catalog.tracks.find((t) => t.name === 'audio')!;
+    expect([audio.codec, audio.initRef]).toEqual(['mp4a.40.2', 'a0']);
+    expect(catalog.initDataList?.map((e) => [e.id, e.data])).toEqual([['a0', 'EYg=']]);
+  });
+
   it('LOC: without a decoder configuration there is no initialization data', () => {
     const catalog = parseCatalog(buildCatalogPayload(PARAMS));
     expect(catalog.tracks.every((t) => t.initRef === undefined)).toBe(true);

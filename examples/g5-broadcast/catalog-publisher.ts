@@ -104,6 +104,10 @@ export interface BroadcastCatalogParams {
   audio?: {
     sampleRate: number;
     channels: number;
+    /** WebCodecs codec string. Default `opus`. */
+    codec?: string;
+    /** Bits per second. Default 128000. */
+    bitrate?: number;
   };
   /** Object packaging. Default `loc`. */
   packaging?: 'loc' | 'cmaf' | 'locmaf';
@@ -116,6 +120,8 @@ export interface BroadcastCatalogParams {
   /** LOC: the video decoder configuration (e.g. avcC), carried as the track's
    *  initialization data (MSF-01 §5.1.7, §5.2.13). */
   locVideoConfig?: Uint8Array;
+  /** LOC: the audio decoder configuration (OpusHead, AudioSpecificConfig). */
+  locAudioConfig?: Uint8Array;
 }
 
 /**
@@ -250,14 +256,16 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
   if (cmaf && params.audio && !cmaf.audioInit) {
     throw new Error('CMAF catalog has an audio track without an init segment');
   }
+  const audioInit = !params.audio ? undefined
+    : cmaf ? cmaf.audioInit : packaging === 'loc' ? params.locAudioConfig : undefined;
   return buildCatalog({
     // Initialization data goes in the root initDataList, referenced by initRef:
     // CMAF init segments (CMSF-01 §3.1), or LOC's decoder configuration.
-    ...(videoInit ? {
+    ...(videoInit || audioInit ? {
       version: '1' as const,
       initDataList: [
-        { id: 'v0', type: 'inline', data: toBase64(videoInit) },
-        ...(cmaf?.audioInit ? [{ id: 'a0', type: 'inline', data: toBase64(cmaf.audioInit) }] : []),
+        ...(videoInit ? [{ id: 'v0', type: 'inline', data: toBase64(videoInit) }] : []),
+        ...(audioInit ? [{ id: 'a0', type: 'inline', data: toBase64(audioInit) }] : []),
       ],
     } : {}),
     tracks: [
@@ -279,14 +287,14 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
       ...(params.audio ? [{
         name: 'audio',
         packaging,
-        ...(cmaf ? { initRef: 'a0' } : {}),
+        ...(audioInit ? { initRef: 'a0' } : {}),
         ...locmaf,
         isLive: true as const,
         role: 'audio' as const,
-        codec: 'opus',
+        codec: params.audio.codec ?? 'opus',
         samplerate: params.audio.sampleRate,
         channelConfig: String(params.audio.channels),
-        bitrate: 128_000,
+        bitrate: params.audio.bitrate ?? 128_000,
         targetLatency: params.targetLatencyMs,
         renderGroup: 1,
       }] : []),

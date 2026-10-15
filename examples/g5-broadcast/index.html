@@ -379,7 +379,26 @@
         <option value="avc1.42001f">H.264 Baseline</option>
         <option value="avc1.640028">H.264 High</option>
         <option value="av01.0.04M.08">AV1 Main</option>
+        <option value="hvc1.1.6.L93.B0">HEVC Main</option>
+        <option value="vp09.00.31.08">VP9 Profile 0</option>
       </select>
+
+      <label for="s-audio-codec">Audio codec</label>
+      <select id="s-audio-codec">
+        <option value="opus">Opus</option>
+        <option value="aac">AAC-LC</option>
+      </select>
+
+      <label for="s-height">Camera resolution</label>
+      <select id="s-height">
+        <option value="720">720p</option>
+        <option value="480">480p</option>
+        <option value="360">360p</option>
+        <option value="240">240p</option>
+      </select>
+
+      <label for="s-audio-bitrate">Audio bitrate (kbps)</label>
+      <input id="s-audio-bitrate" type="number" min="6" placeholder="128">
 
       <label for="s-bitrate-mode">Bitrate mode</label>
       <select id="s-bitrate-mode">

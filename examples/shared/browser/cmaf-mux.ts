@@ -3,12 +3,13 @@
  * (ftyp + moov with mvex) and one CMAF chunk (moof + mdat) per encoded frame.
  * Repackaging only — the encoded bitstream is carried unchanged.
  *
- * Video: H.264 in the AVC layout WebCodecs emits by default (length-prefixed
- * NAL units, avcC as the decoder description), or AV1 with its av1C.
- * Audio: Opus with a dOps box.
+ * Video: H.264 or HEVC in the length-prefixed layout WebCodecs emits by
+ * default (avcC / hvcC as the decoder description), AV1 with its av1C, or VP9
+ * with a vpcC built from the codec string. Audio: Opus (dOps) or AAC (esds).
  *
  * @see draft-ietf-moq-cmsf-01 §3 (CMAF packaging)
- * @see ISO/IEC 14496-12 (ISO BMFF), ISO/IEC 14496-15 (avcC), AV1-ISOBMFF, Opus-in-ISOBMFF
+ * @see ISO/IEC 14496-12 (ISO BMFF), ISO/IEC 14496-15 (avcC, hvcC), AV1-ISOBMFF,
+ *   VP-codec-ISOBMFF (vpcC), Opus-in-ISOBMFF, ISO/IEC 14496-14 (esds)
  * @module
  */
 
@@ -67,11 +68,11 @@ const NON_SYNC_SAMPLE_FLAGS = 0x01010000;
 export interface CmafVideoTrack {
   readonly trackId: number;
   readonly timescale: number;
-  /** WebCodecs codec string; `avc1.*` or `av01.*`. */
+  /** WebCodecs codec string: `avc1.*`, `hvc1.*`/`hev1.*`, `av01.*` or `vp09.*`. */
   readonly codec: string;
   readonly width: number;
   readonly height: number;
-  /** The encoder's decoder description: avcC for H.264, av1C for AV1. */
+  /** The encoder's decoder description: avcC, hvcC or av1C. Unused for VP9. */
   readonly description: Uint8Array;
 }
 
@@ -80,8 +81,12 @@ export interface CmafAudioTrack {
   readonly timescale: number;
   readonly sampleRate: number;
   readonly channels: number;
+  /** WebCodecs codec string: `opus` (default) or `mp4a.40.*`. */
+  readonly codec?: string;
   /** Opus pre-skip in 48 kHz samples. Default 0. */
   readonly preSkip?: number;
+  /** AAC: the AudioSpecificConfig. Default: AAC-LC for the rate and channels. */
+  readonly config?: Uint8Array;
 }
 
 function ftyp(): Uint8Array {
@@ -136,13 +141,19 @@ function initSegment(trackId: number, trak: Uint8Array): Uint8Array {
 /** Init segment for a video track. Throws for a codec it cannot describe. */
 export function buildVideoInit(t: CmafVideoTrack): Uint8Array {
   let entryType: string;
-  let configType: string;
+  let config: Uint8Array;
   if (t.codec.startsWith('avc1')) {
     entryType = 'avc1';
-    configType = 'avcC';
+    config = box('avcC', t.description);
+  } else if (t.codec.startsWith('hvc1') || t.codec.startsWith('hev1')) {
+    entryType = t.codec.slice(0, 4);
+    config = box('hvcC', t.description);
   } else if (t.codec.startsWith('av01')) {
     entryType = 'av01';
-    configType = 'av1C';
+    config = box('av1C', t.description);
+  } else if (t.codec.startsWith('vp09')) {
+    entryType = 'vp09';
+    config = vpcC(t.codec);
   } else {
     throw new Error(`CMAF packaging does not support video codec ${t.codec}`);
   }
@@ -153,7 +164,7 @@ export function buildVideoInit(t: CmafVideoTrack): Uint8Array {
     u32(0x00480000), u32(0x00480000),       // 72 dpi
     u32(0), u16(1), zeros(32),              // reserved, frame_count, compressorname
     u16(0x0018), u16(0xffff),               // depth, pre_defined
-    box(configType, t.description));
+    config);
   const trak = box('trak',
     tkhd(t.trackId, false, t.width, t.height),
     box('mdia', mdhd(t.timescale), hdlr('vide'),
@@ -161,15 +172,39 @@ export function buildVideoInit(t: CmafVideoTrack): Uint8Array {
   return initSegment(t.trackId, trak);
 }
 
-/** Init segment for an Opus audio track. */
+/** VP9 configuration (vpcC v1) from a `vp09.PP.LL.DD[.CC.cp.tc.mc.FF]` codec string. */
+function vpcC(codec: string): Uint8Array {
+  const f = codec.split('.').slice(1).map((v) => parseInt(v, 10));
+  const [profile = 0, level = 10, bitDepth = 8, chroma = 1, primaries = 1, transfer = 1, matrix = 1, fullRange = 0] = f;
+  return fullBox('vpcC', 1, 0,
+    u8(profile), u8(level), u8((bitDepth << 4) | (chroma << 1) | (fullRange & 1)),
+    u8(primaries), u8(transfer), u8(matrix), u16(0));
+}
+
+/** An MPEG-4 descriptor with a 4-byte length. */
+function descriptor(tag: number, ...children: Uint8Array[]): Uint8Array {
+  const body = concat(children);
+  const n = body.byteLength;
+  return concat([u8(tag), new Uint8Array([0x80 | (n >> 21), 0x80 | ((n >> 14) & 0x7f), 0x80 | ((n >> 7) & 0x7f), n & 0x7f]), body]);
+}
+
+/** Init segment for an Opus or AAC audio track. */
 export function buildAudioInit(t: CmafAudioTrack): Uint8Array {
-  const dOps = box('dOps',
-    u8(0), u8(t.channels), u16(t.preSkip ?? 0), u32(t.sampleRate), u16(0), u8(0));
-  const sampleEntry = box('Opus',
+  const aac = t.codec?.startsWith('mp4a') ?? false;
+  const config = aac
+    ? fullBox('esds', 0, 0,
+      descriptor(0x03, u16(t.trackId), u8(0),             // ES_Descriptor
+        descriptor(0x04, u8(0x40), u8(0x15), zeros(3),   // MPEG-4 audio, audio stream, buffer size
+          u32(0), u32(0),                                  // max, avg bitrate
+          descriptor(0x05, t.config ?? aacAudioSpecificConfig(t.sampleRate, t.channels))),
+        descriptor(0x06, u8(0x02))))                       // SLConfig: MP4
+    : box('dOps', u8(0), u8(t.channels), u16(t.preSkip ?? 0), u32(t.sampleRate), u16(0), u8(0));
+  const sampleRate = aac ? t.sampleRate : 48000;           // Opus: 48 kHz
+  const sampleEntry = box(aac ? 'mp4a' : 'Opus',
     zeros(6), u16(1),                       // reserved, data_reference_index
     zeros(8), u16(t.channels), u16(16),     // reserved, channelcount, samplesize
-    u16(0), u16(0), u32(48000 * 65536),     // pre_defined, reserved, samplerate (Opus: 48 kHz)
-    dOps);
+    u16(0), u16(0), u32(sampleRate * 65536), // pre_defined, reserved, samplerate
+    config);
   const trak = box('trak',
     tkhd(t.trackId, true, 0, 0),
     box('mdia', mdhd(t.timescale), hdlr('soun'),
@@ -205,6 +240,34 @@ export function buildChunk(c: CmafChunkFields): Uint8Array {
         u32(c.keyframe ? SYNC_SAMPLE_FLAGS : NON_SYNC_SAMPLE_FLAGS))));
   if (moof.byteLength !== MOOF_SIZE) throw new Error(`moof is ${moof.byteLength} bytes, expected ${MOOF_SIZE}`);
   return concat([moof, box('mdat', c.data)]);
+}
+
+/** MPEG-4 sampling frequency indexes (ISO/IEC 14496-3 Table 1.18). */
+const AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+/** AAC-LC AudioSpecificConfig, the WebCodecs AAC description. */
+export function aacAudioSpecificConfig(sampleRate: number, channels: number): Uint8Array {
+  const index = AAC_RATES.indexOf(sampleRate);
+  if (index < 0) {
+    // Index 15: the 24-bit rate follows.
+    const bits = (2n << 35n) | (15n << 31n) | (BigInt(sampleRate) << 7n) | (BigInt(channels) << 3n);
+    return new Uint8Array([0, 1, 2, 3, 4].map((i) => Number((bits >> BigInt(32 - i * 8)) & 0xffn)));
+  }
+  const bits = (2 << 11) | (index << 7) | (channels << 3);
+  return new Uint8Array([bits >> 8, bits & 0xff]);
+}
+
+/** Opus identification header (RFC 7845 §5.1), the WebCodecs Opus description:
+ *  mapping family 0 (mono/stereo), libopus's 312-sample pre-skip at 48 kHz. */
+export function opusHead(sampleRate: number, channels: number): Uint8Array {
+  const head = new Uint8Array(19);
+  const view = new DataView(head.buffer);
+  head.set(enc.encode('OpusHead'));
+  head[8] = 1;
+  head[9] = channels;
+  view.setUint16(10, 312, true);
+  view.setUint32(12, sampleRate, true);
+  return head;
 }
 
 /** Opus pre-skip from an OpusHead decoder description, if one was given. */
