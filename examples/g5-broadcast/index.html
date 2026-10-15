@@ -35,6 +35,13 @@
       background: #2a2f3a; color: #cfd6e4; font-size: .7rem; font-weight: 500;
       white-space: nowrap; pointer-events: none;
     }
+    /* Shown when the site serves a newer build than this page. */
+    .build-update {
+      margin-left: 16px; padding: 1px 8px; border: 1px solid #fb3; border-radius: 4px;
+      color: #fb3; font-size: .75rem; font-weight: 600; text-decoration: none; vertical-align: middle;
+    }
+    .build-update[hidden] { display: none; }
+    .build-line { margin-top: 12px; color: #666; font-size: .75rem; }
     .attrib-note {
       color: #666; font-size: .75rem; margin-top: 18px;
       padding-top: 10px; border-top: 1px solid #222;
@@ -249,7 +256,7 @@
 </head>
 <body>
   <div class="wrapper">
-    <h1>G<span class="five">5</span> Broadcast<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span></h1>
+    <h1>G<span class="five">5</span> Broadcast<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span><a id="build-update" class="build-update" href="#" hidden></a></h1>
 
     <div class="layout" id="layout">
       <div class="main-col">
@@ -306,7 +313,7 @@
       <div class="diag-grid" id="adv-grid"></div>
     </details>
 
-    <footer class="attrib-note">Built on <a href="https://github.com/openmoq/moq-playa" target="_blank" rel="noopener noreferrer">openmoq/moq-playa</a>.</footer>
+    <footer class="attrib-note">Built on <a href="https://github.com/openmoq/moq-playa" target="_blank" rel="noopener noreferrer">openmoq/moq-playa</a> · build <span data-build></span></footer>
   </div>
 
   <!-- Share modal -->
@@ -438,6 +445,7 @@
           verbose logging</label>
       </div>
 
+      <div class="build-line">build <span data-build></span></div>
       <div class="btn-row">
         <button id="settings-cancel" type="button">Cancel</button>
         <button id="settings-apply" type="button">Apply &amp; reload</button>

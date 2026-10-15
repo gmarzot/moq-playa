@@ -8,6 +8,7 @@
  */
 
 import { Player } from '@openmoq/playa';
+import { initBuildInfo } from '../shared/build-info.js';
 import {
   namespace, certHash, draftVersion, catalogBootstrap, warmStart,
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
@@ -240,6 +241,7 @@ function formatTime(ms: number): string {
 // and stops — no rethrow, no unhandled page error.
 
 async function main(): Promise<void> {
+  initBuildInfo(log);
   log('Discovering relay endpoint...');
   onDiscoveryAttempt((url, outcome) => log(`  probe ${url}: ${outcome}`));
   let relayUrl: string;

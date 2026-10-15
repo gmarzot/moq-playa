@@ -14,6 +14,7 @@
  */
 
 import { MoqtConnection } from '@openmoq/webtransport';
+import { initBuildInfo } from '../shared/build-info.js';
 import { varint } from '@openmoq/transport';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection, CarriedCatalog, TrackStatus } from './broadcast-session.js';
@@ -639,6 +640,7 @@ function logSnapshot(): void {
 
 // The log is the durable record of what a soak ran with: echo the whole
 // configuration before anything starts.
+initBuildInfo(log);
 log(`Namespace: ${namespace}${namedNamespace === null ? ' (this tab)' : ''}`);
 log(`Settings: ${params.toString() || 'defaults'}`);
 if (compatParam.unknown.length) log(`Ignoring unknown compat: ${compatParam.unknown.join(', ')}`);
