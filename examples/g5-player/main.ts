@@ -44,6 +44,7 @@ import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
 import type { SubscriptionStatus } from '@openmoq/playa';
+import { ClockDriftEstimator } from '../shared/clock-drift.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 
@@ -103,7 +104,7 @@ const CELL_TIPS: Record<string, string> = {
   'bitrate a/v': 'Received kbps, audio/video.',
   'reorder a/v': 'Out-of-order arrivals, audio/video. Small: slowest to settle.',
   'lag': 'Worst page stall. Hundreds of ms: page blocked or throttled.',
-  'clk drift': 'Publisher clock vs this browser, ms/min. Removed from the latency chart.',
+  'clk drift': 'Publisher clock vs this browser, ms/min. Removed from the latency chart once steady.',
   'slowest t/a/d': 'Slowest object: transfer / assembly / dispatch ms. Small: its size.',
   'resyncs': 'A/V sync reference re-anchored.',
   'underruns': 'Audio ran dry. Small: total silence.',
@@ -481,9 +482,11 @@ async function main(): Promise<void> {
     log(`Stall detected after ${durationMs.toFixed(0)}ms${where}${describeBuffers()}`);
     stallStartSnap = '';
     stallMarks.push(performance.now());
+    clockDrift.disturb(performance.now());
   });
 
   player.on('stall_recovered', ({ durationMs }) => {
+    clockDrift.disturb(performance.now());
     log(`Stall recovered — outage ${(durationMs / 1000).toFixed(2)}s${describeBuffers()}`);
   });
 
@@ -538,6 +541,7 @@ async function main(): Promise<void> {
     if (syncResets > lastSyncResets) {
       log(`Sync reference re-anchored (${syncResets} total)`);
       lastSyncResets = syncResets;
+      clockDrift.disturb(performance.now());
     }
     // `unit` renders small and muted after the value; `tone` colours the value
     // by health, so a non-zero fault counter is visible without reading labels.
@@ -649,6 +653,12 @@ async function main(): Promise<void> {
   const LAT_WINDOW_MS = 4_000;
   /** Clock divergence rate from the drift fit, in ms per minute. */
   let clockDriftMsPerMin: number | null = null;
+  /** Fitted from the latency floor; stalls, re-anchors and returns to view unsettle it. */
+  const clockDrift = new ClockDriftEstimator();
+  let clockDriftApplied = false;
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) clockDrift.disturb(performance.now());
+  });
   // Both curves are the printed p50 and p95 over the same window, so the lines
   // and the numbers cannot disagree. Max stays a readout: as a curve it is one
   // sample wide and reads as noise.
@@ -787,43 +797,6 @@ async function main(): Promise<void> {
   const worstDeliveryLocalMs = (): number => {
     const s = worstSpan();
     return s === null ? 0 : s.assemblyMs + s.decodeMs;
-  };
-
-  /** Per-tick latency floor [time ms, floor ms], visible ticks only. */
-  const driftSamples: Array<[number, number]> = [];
-  /** Long enough to see a slope, short enough that a clock step ages out. */
-  const DRIFT_WINDOW_MS = 10 * 60_000;
-  /** Below this span the slope is fitting jitter. */
-  const DRIFT_MIN_SPAN_MS = 60_000;
-  /** Fitted floor when the fit first became usable: the level corrections return to. */
-  let driftRefFloorMs: number | null = null;
-  /** Last usable estimate, held while the window refills after a hidden stretch. */
-  let lastDrift: { msPerMin: number; correctionMs: number } | null = null;
-  const addDriftSample = (atMs: number, floorMs: number): void => {
-    driftSamples.push([atMs, floorMs]);
-    while (atMs - driftSamples[0]![0] > DRIFT_WINDOW_MS) driftSamples.shift();
-  };
-  /**
-   * Least-squares line through the recent floor samples against time: its slope
-   * is the clock divergence, and the distance of its value at `atMs` from the
-   * reference level is what the latency series subtract.
-   */
-  const driftEstimate = (atMs: number): { msPerMin: number; correctionMs: number } | null => {
-    const n = driftSamples.length;
-    if (n < 2 || driftSamples[n - 1]![0] - driftSamples[0]![0] < DRIFT_MIN_SPAN_MS) return lastDrift;
-    const t0 = driftSamples[0]![0];
-    let sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (const [t, y] of driftSamples) {
-      const x = t - t0;
-      sx += x; sy += y; sxx += x * x; sxy += x * y;
-    }
-    const denom = n * sxx - sx * sx;
-    if (denom === 0) return lastDrift;
-    const slope = (n * sxy - sx * sy) / denom;
-    const fittedMs = (sy - slope * sx) / n + slope * (atMs - t0);
-    driftRefFloorMs ??= fittedMs;
-    lastDrift = { msPerMin: slope * 60_000, correctionMs: fittedMs - driftRefFloorMs };
-    return lastDrift;
   };
 
   // Per-track object continuity. Arrival order is not delivery order: LOC audio
@@ -1307,9 +1280,10 @@ async function main(): Promise<void> {
     const latRaw = latWindow.map(([, v]) => v);
     // Remove the clock divergence. The constant offset stays: one-way delay
     // cannot separate it from transit.
-    if (sampling && latRaw.length) addDriftSample(tickNowMs, Math.min(...latRaw));
-    const drift = driftEstimate(tickNowMs);
+    if (sampling && latRaw.length) clockDrift.addSample(tickNowMs, Math.min(...latRaw));
+    const drift = clockDrift.estimate(tickNowMs);
     clockDriftMsPerMin = drift?.msPerMin ?? null;
+    clockDriftApplied = drift?.applied ?? false;
     const driftCorrectionMs = drift?.correctionMs ?? 0;
     const latVals = driftCorrectionMs
       ? latRaw.map((v) => v - driftCorrectionMs) : latRaw;
@@ -1427,8 +1401,9 @@ async function main(): Promise<void> {
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
       : clockDriftMsPerMin !== null
-      ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; ${driftCorrectionMs.toFixed(0)} ms removed. `
-        + 'Constant offset remains.'
+      ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; `
+        + (clockDriftApplied ? `${driftCorrectionMs.toFixed(0)} ms removed. Constant offset remains.`
+          : 'not applied until it holds steadily across the window.')
       : '';
     jitVal.textContent = lastFinite(jitSamples)?.toFixed(1) ?? '—';
   }, TICK_MS);
