@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { parseSiteVersion, watchSiteBuild, PAGE_BUILD } from './build-info.js';
+import { describeBuild, parseSiteVersion, watchSiteBuild, PAGE_BUILD } from './build-info.js';
 
 const response = (body: string, ok = true) => ({ ok, text: async () => body }) as Response;
 
@@ -41,5 +41,18 @@ describe('watchSiteBuild', () => {
     stop();
     expect(onNewer).not.toHaveBeenCalled();
     expect(fetchFn.mock.calls.length).toBeGreaterThanOrEqual(4);
+  });
+});
+
+describe('describeBuild', () => {
+  it('adds the build time when known', () => {
+    const text = describeBuild('0.5.9+abcdef1', '2026-10-15T23:10:00.000Z');
+    expect(text.startsWith('0.5.9+abcdef1 · built ')).toBe(true);
+    expect(text).toMatch(/2026/);
+  });
+
+  it('is the bare build without a usable time', () => {
+    expect(describeBuild('0.5.9+abcdef1', null)).toBe('0.5.9+abcdef1');
+    expect(describeBuild('0.5.9+abcdef1', 'not a date')).toBe('0.5.9+abcdef1');
   });
 });

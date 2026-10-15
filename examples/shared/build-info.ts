@@ -5,8 +5,19 @@
  */
 
 declare const __PLAYA_BUILD__: string;
+declare const __PLAYA_BUILT_AT__: string;
 
 export const PAGE_BUILD: string = typeof __PLAYA_BUILD__ === 'string' ? __PLAYA_BUILD__ : 'unknown';
+/** When this page was built (ISO 8601), or null outside a Vite build. */
+export const PAGE_BUILT_AT: string | null = typeof __PLAYA_BUILT_AT__ === 'string' ? __PLAYA_BUILT_AT__ : null;
+
+/** The build and, when known, its build time in the viewer's locale. */
+export function describeBuild(build = PAGE_BUILD, builtAt = PAGE_BUILT_AT): string {
+  if (!builtAt) return build;
+  const when = new Date(builtAt);
+  if (Number.isNaN(when.getTime())) return build;
+  return `${build} · built ${when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`;
+}
 
 const BUILD_PATTERN = /^\d+\.\d+\.\d+[^\s+]*\+[0-9a-f]{7,}(-dirty)?$/;
 
@@ -18,7 +29,7 @@ export function parseSiteVersion(text: string): string | null {
 
 /** Fill every `[data-build]` element with this page's build. */
 export function showBuild(root: ParentNode = document): void {
-  for (const el of root.querySelectorAll<HTMLElement>('[data-build]')) el.textContent = PAGE_BUILD;
+  for (const el of root.querySelectorAll<HTMLElement>('[data-build]')) el.textContent = describeBuild();
 }
 
 export interface WatchSiteBuildOptions {
@@ -60,7 +71,7 @@ export function watchSiteBuild(
  */
 export function initBuildInfo(log: (msg: string) => void): void {
   showBuild();
-  log(`Build ${PAGE_BUILD}`);
+  log(`Build ${describeBuild()}`);
   const notice = document.getElementById('build-update');
   watchSiteBuild((site) => {
     log(`New build ${site} deployed; this page runs ${PAGE_BUILD}. Reload to update.`);

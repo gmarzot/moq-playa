@@ -30,6 +30,7 @@ const BUILD = buildId();
 export default defineConfig({
   define: {
     __PLAYA_BUILD__: JSON.stringify(BUILD),
+    __PLAYA_BUILT_AT__: JSON.stringify(new Date().toISOString()),
   },
   plugins: [{
     // Deployed pages poll /VERSION to notice a newer build.
