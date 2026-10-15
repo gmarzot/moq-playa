@@ -122,7 +122,7 @@ const audioDatagrams = params.get('audioDatagram') === '1';
 let audioOnDatagrams = false;
 /** `?dynamicGroups=1`: video honours NEW_GROUP_REQUEST (§10.2.13). draft-18 only. */
 const dynamicGroups = params.get('dynamicGroups') === '1';
-/** `?minGroup=ms`: youngest video group a NEW_GROUP_REQUEST may end. */
+/** `?minGroup=ms`: youngest video group a NEW_GROUP_REQUEST may end. URL only. */
 const minGroupParam = parseInt(params.get('minGroup') ?? '', 10);
 const minGroupMs = Number.isFinite(minGroupParam) && minGroupParam >= 0 ? minGroupParam : 1000;
 /** Dynamic groups in effect: asked for and draft-18. */
@@ -245,7 +245,6 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sDynamicGroups = document.getElementById('s-dynamic-groups') as HTMLInputElement;
   const sAnnexb = document.getElementById('s-annexb') as HTMLInputElement;
   const sSelfDescribing = document.getElementById('s-self-describing') as HTMLInputElement;
-  const sMinGroup = document.getElementById('s-min-group') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
@@ -292,7 +291,6 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sDynamicGroups.checked = dynamicGroups;
     sAnnexb.checked = annexbParam;
     sSelfDescribing.checked = selfDescribing;
-    sMinGroup.value = String(minGroupMs);
     showApplicableFields();
   }
 
@@ -304,11 +302,9 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     document.getElementById('s-self-describing-row')!.hidden = sPackaging.value !== 'loc';
     document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
     document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
-    document.getElementById('s-min-group-row')!.hidden = sVersion.value !== '18' || !sDynamicGroups.checked;
   }
   sVersion.addEventListener('change', showApplicableFields);
   sPackaging.addEventListener('change', showApplicableFields);
-  sDynamicGroups.addEventListener('change', showApplicableFields);
   sCodec.addEventListener('change', showApplicableFields);
 
   /** The blank interval's value: the selected draft's default. */
@@ -359,21 +355,21 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
     if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
     if (sSelfDescribing.checked && sPackaging.value === 'loc') np.set('selfDescribing', '1');
-    if (sDynamicGroups.checked && sVersion.value === '18') {
-      np.set('dynamicGroups', '1');
-      if (sMinGroup.value && sMinGroup.value !== '1000') np.set('minGroup', sMinGroup.value);
-    }
+    if (sDynamicGroups.checked && sVersion.value === '18') np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
     // them; where storage is refused, the URL carries them instead. `compat`
-    // is URL-only and stays.
+    // and `minGroup` are URL-only and stay.
     const qs = np.toString();
     // An empty string, not removal: this tab chose the defaults.
     const saved = storageSet(() => sessionStorage, SETTINGS_KEY, qs);
     storageSet(() => localStorage, SETTINGS_KEY, qs || null);
     const next = new URLSearchParams(saved ? '' : qs);
-    const compat = new URLSearchParams(window.location.search).get('compat');
-    if (compat) next.set('compat', compat);
+    const current = new URLSearchParams(window.location.search);
+    for (const key of ['compat', 'minGroup']) {
+      const value = current.get(key);
+      if (value) next.set(key, value);
+    }
     const query = next.toString();
     window.location.assign(window.location.pathname + (query ? '?' + query : ''));
   });
