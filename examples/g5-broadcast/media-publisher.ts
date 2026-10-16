@@ -187,6 +187,8 @@ export interface MediaPublisherOptions {
    * LOC objects for receivers without a catalog: each also carries the codec
    * string (0x11, not in LOC-04) and the audio config; video keeps its video
    * config. Timestamps stay wall clock (no Timescale, LOC-04 §2.3.1.1).
+   * With CMAF packaging, the CMAF header (init segment) instead rides the first
+   * object of a group, at most once a second per track.
    */
   selfDescribing?: { videoCodec: string; audioCodec?: string; audioConfig?: Uint8Array };
   /** LOC objects carry Timescale 1000000 with the Timestamp, for players that
@@ -211,6 +213,8 @@ const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
 /** Codec string property (proposed for LOC; odd id, bytes). */
 const LOC_PROP_CODECSTRING = 0x11n;
 const MICROS_PER_SECOND = 1_000_000n;
+/** Shortest gap between in-band CMAF headers on one track. */
+const CMAF_HEADER_REPEAT_US = 1_000_000n;
 
 /** Default Forward State 0 pause before one chunk is re-attempted. */
 const PAUSE_PROBE_MS = 1_000;
@@ -273,6 +277,9 @@ export class MediaPublisher {
   private readonly locmaf: boolean;
   private readonly cmafInit: MediaPublisherOptions['cmafInit'];
   private readonly selfDescribing: MediaPublisherOptions['selfDescribing'];
+  private readonly cmafHeaderInBand: boolean;
+  /** Capture time of each track's last in-band CMAF header. */
+  private readonly cmafHeaderSentUs: { video: bigint | null; audio: bigint | null } = { video: null, audio: null };
   private readonly locTimescale: boolean;
   private readonly locmafEncoder = new LocmafEncoder();
   private readonly locmafContexts = new Map<'video' | 'audio', LocmafTrackContext>();
@@ -400,6 +407,7 @@ export class MediaPublisher {
     this.selfDescribing = options.packaging === undefined || options.packaging === 'loc'
       ? options.selfDescribing
       : undefined;
+    this.cmafHeaderInBand = options.packaging === 'cmaf' && options.selfDescribing !== undefined;
     // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
     // LOCMAF is carried on subgroups only.
     this.audioDatagrams = options.audioDatagrams === true && options.draft === 18 && !this.locmaf;
@@ -1046,7 +1054,9 @@ export class MediaPublisher {
     if (this.videoStreamId === null) return;
 
     const captureUs = this.toWallClockUs('video', meta.timestampUs);
-    const chunk = this.cmaf ? this.cmafVideoChunk(data, meta, captureUs) : data;
+    const chunk = !this.cmaf ? data
+      : meta.isKeyframe ? this.withCmafHeader('video', this.cmafVideoChunk(data, meta, captureUs), captureUs)
+      : this.cmafVideoChunk(data, meta, captureUs);
     const payload = this.locmaf
       ? this.toLocmaf('video', chunk, this.videoLocmafState, this.videoObjectId)
       : this.cmaf ? chunk : withLocPrivateProperties(chunk);
@@ -1078,14 +1088,14 @@ export class MediaPublisher {
       ...(audioConfig ? { audioConfig } : {}),
     }, this.locOptions());
     const data = this.cmaf
-      ? buildChunk({
+      ? this.withCmafHeader('audio', buildChunk({
         trackId: CMAF_AUDIO_TRACK_ID,
         sequence: ++this.cmafAudioSequence,
         baseDecodeTime: captureUs,
         duration: meta.durationUs && meta.durationUs > 0 ? meta.durationUs : DEFAULT_AUDIO_FRAME_US,
         keyframe: true,
         data: chunk,
-      })
+      }), captureUs)
       : chunk;
     const payload = this.locmaf ? this.toLocmaf('audio', data, new LocmafGroupState(), 0n)
       : this.cmaf ? data : withLocPrivateProperties(data);
@@ -1118,6 +1128,21 @@ export class MediaPublisher {
    * Without an encoder duration, a frame lasts the median recent capture
    * interval: one odd interval (a skipped frame, a burst) is not a frame's length.
    */
+  /** Self-describing CMAF: the track's init segment before a group's first
+   *  object, at most once a second, so players without a catalog can start. */
+  private withCmafHeader(track: 'video' | 'audio', chunk: Uint8Array, captureUs: bigint): Uint8Array {
+    if (!this.cmafHeaderInBand) return chunk;
+    const init = this.cmafInit?.();
+    const header = track === 'video' ? init?.videoInit : init?.audioInit;
+    const last = this.cmafHeaderSentUs[track];
+    if (!header || (last !== null && captureUs - last < CMAF_HEADER_REPEAT_US)) return chunk;
+    this.cmafHeaderSentUs[track] = captureUs;
+    const out = new Uint8Array(header.byteLength + chunk.byteLength);
+    out.set(header, 0);
+    out.set(chunk, header.byteLength);
+    return out;
+  }
+
   private cmafVideoChunk(data: Uint8Array, meta: VideoChunkMeta, captureUs: bigint): Uint8Array {
     const last = this.lastVideoCaptureUs;
     this.lastVideoCaptureUs = captureUs;

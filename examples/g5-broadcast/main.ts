@@ -174,8 +174,8 @@ const packaging: 'loc' | 'cmaf' | 'locmaf' =
  *  VIDEO_CONFIG property (§2.1.1), which some relays drop; catalog codec avc3. */
 const annexbParam = params.get('annexb') === '1';
 const annexb = annexbParam && packaging === 'loc' && videoCodec.startsWith('avc');
-/** `?selfDescribing=1`: every LOC object carries the codec string and decoder config,
- *  for players that read no catalog. */
+/** `?selfDescribing=1`: objects carry what a player without a catalog needs: LOC, the
+ *  codec string and decoder config; CMAF, the CMAF header at group starts. */
 const selfDescribing = params.get('selfDescribing') === '1';
 /** `?timescale=1`: LOC objects carry Timescale 1000000, for players that require one.
  *  Stamps then read as media time: viewers lose end-to-end latency. */
@@ -385,7 +385,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const annexbApplies = () => sPackaging.value === 'loc' && sCodec.value.startsWith('avc');
   function showApplicableFields() {
     document.getElementById('s-annexb-row')!.hidden = !annexbApplies();
-    document.getElementById('s-self-describing-row')!.hidden = sPackaging.value !== 'loc';
+    document.getElementById('s-self-describing-row')!.hidden = sPackaging.value === 'locmaf';
     document.getElementById('s-timescale-row')!.hidden = sPackaging.value !== 'loc';
     document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
     document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
@@ -444,7 +444,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
     if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
-    if (sSelfDescribing.checked && sPackaging.value === 'loc') np.set('selfDescribing', '1');
+    if (sSelfDescribing.checked && sPackaging.value !== 'locmaf') np.set('selfDescribing', '1');
     if (sTimescale.checked && sPackaging.value === 'loc') np.set('timescale', '1');
     if (sDynamicGroups.checked && sVersion.value === '18') np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
@@ -1074,6 +1074,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       if (packaging === 'loc' && selfDescribing) {
         log('LOC objects self-describing: codec string and decoder config on every object');
       }
+      if (packaging === 'cmaf' && selfDescribing) {
+        log('CMAF objects self-describing: CMAF header on a group\'s first object, at most once a second');
+      }
       if (packaging === 'loc' && locTimescale) {
         log('LOC objects carry Timescale 1000000: viewers read media time, no end-to-end latency');
       }
@@ -1191,7 +1194,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           audioDatagrams,
           packaging,
           ...(packaging === 'loc' && locTimescale ? { locTimescale: true } : {}),
-          ...(packaging === 'loc' && selfDescribing ? {
+          ...((packaging === 'loc' || packaging === 'cmaf') && selfDescribing ? {
             selfDescribing: {
               videoCodec: catalog.videoCodec,
               ...(audio ? { audioCodec: activeAudioCodec, audioConfig: audioConfigFor(activeAudioCodec, audio) } : {}),

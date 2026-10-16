@@ -440,9 +440,9 @@
       </div>
 
       <div class="check" id="s-self-describing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Every object also carries the codec string and decoder config, for players that read no catalog.">
+           title="For players that read no catalog. LOC: every object also carries the codec string and decoder config. CMAF: the CMAF header (init segment) rides the first object of a group, at most once a second per track.">
         <input id="s-self-describing" type="checkbox" style="width:auto">
-        <label for="s-self-describing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">self-describing LOC objects (catalog-less players)</label>
+        <label for="s-self-describing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">self-describing objects (catalog-less players)</label>
       </div>
 
       <div class="check" id="s-timescale-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"

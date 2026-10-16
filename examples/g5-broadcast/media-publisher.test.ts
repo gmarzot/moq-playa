@@ -441,6 +441,49 @@ describe('MediaPublisher — CMAF packaging', () => {
   });
 });
 
+describe('MediaPublisher — self-describing CMAF objects', () => {
+  const VINIT = new Uint8Array([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]); // an ftyp box
+  const AINIT = new Uint8Array([0, 0, 0, 8, 0x66, 0x72, 0x65, 0x65]);
+  const startsWith = (b: Uint8Array, p: Uint8Array) => p.every((v, i) => b[i] === v);
+  const sd = { videoCodec: 'avc1.42001f' };
+
+  it('prepends the CMAF header to a group\'s first object, at most once a second per track', async () => {
+    let wall = 1_700_000_000_000_000;
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, {
+      packaging: 'cmaf', selfDescribing: sd, cmafInit: () => ({ videoInit: VINIT, audioInit: AINIT }),
+      wallClockUs: () => wall,
+    });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 0 });
+    pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 41_700 });
+    pub.publishAudio(chunk(3), { timestampUs: 0 });
+    await settle();
+    wall += 500_000;
+    pub.publishVideo(chunk(4), { isKeyframe: true, timestampUs: 500_000 });
+    pub.publishAudio(chunk(5), { timestampUs: 500_000 });
+    await settle();
+    wall += 600_000;
+    pub.publishVideo(chunk(6), { isKeyframe: true, timestampUs: 1_100_000 });
+    await settle();
+    // The frame's tag is the chunk's last byte (the mdat payload).
+    const headed = Object.fromEntries(conn.sends.map((s) =>
+      [s.payload[s.payload.length - 1]!, startsWith(s.payload, VINIT) || startsWith(s.payload, AINIT)]));
+    // 1 key, 2 delta, 3 audio, 4 key 0.5 s on, 5 audio 0.5 s on, 6 key 1.1 s on.
+    expect(headed).toEqual({ 1: true, 2: false, 3: true, 4: false, 5: false, 6: true });
+  });
+
+  it('sends no header without self-describing', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { packaging: 'cmaf', cmafInit: () => ({ videoInit: VINIT, audioInit: AINIT }) });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(1), kf());
+    await settle();
+    expect(startsWith(conn.sends[0]!.payload, VINIT)).toBe(false);
+  });
+});
+
 describe('MediaPublisher — self-describing LOC objects', () => {
   const wall = 1_700_000_000_000_000;
   const selfDescribing = { videoCodec: 'avc1.42001f', audioCodec: 'opus', audioConfig: new Uint8Array([1, 2]) };
