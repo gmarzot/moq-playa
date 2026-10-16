@@ -103,8 +103,10 @@ const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (
 const audioCodecParam: 'opus' | 'aac' = params.get('audioCodec') === 'aac' ? 'aac' : 'opus';
 const AUDIO_CODECS = { opus: 'opus', aac: 'mp4a.40.2' } as const;
 /** `?height=`: camera capture height (16:9). Screen capture keeps its own size. */
-const captureHeight = [720, 480, 360, 240].includes(Number(params.get('height')))
+const captureHeight = [1080, 720, 480, 360, 240].includes(Number(params.get('height')))
   ? Number(params.get('height')) : 720;
+/** Default video bitrate (kbps) for each camera height. */
+const DEFAULT_KBPS_BY_HEIGHT: Readonly<Record<number, number>> = { 1080: 4500, 720: 2000, 480: 1000, 360: 600, 240: 300 };
 /** `?audio=0`: camera broadcasts video only. */
 const cameraAudio = params.get('audio') !== '0';
 /** `?audioBitrate=`: kbps. */
@@ -113,8 +115,21 @@ const audioBitrate = (Number.isFinite(audioBitrateParam) && audioBitrateParam >=
 /** Codecs this capture encodes: the requested ones, or the defaults when the browser cannot. */
 let activeVideoCodec = videoCodec;
 let activeAudioCodec: string = AUDIO_CODECS[audioCodecParam];
-const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
-const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
+/** `?bitrate=` kbps; unset follows the camera height. */
+const bitrateParam = parseInt(params.get('bitrate') ?? '', 10);
+const videoBitrate = (Number.isFinite(bitrateParam) && bitrateParam > 0
+  ? bitrateParam : DEFAULT_KBPS_BY_HEIGHT[captureHeight]!) * 1000;
+/** `?keyframeSec=`: seconds between keyframes (default 2). `?keyframe=` (frames) is still read. */
+const keyframeSecParam = parseFloat(params.get('keyframeSec') ?? '');
+const keyframeSec = Number.isFinite(keyframeSecParam) && keyframeSecParam > 0 ? keyframeSecParam : null;
+const keyframeFramesParam = parseInt(params.get('keyframe') ?? '', 10);
+const keyframeFrames = keyframeSec === null && Number.isFinite(keyframeFramesParam) && keyframeFramesParam > 0
+  ? keyframeFramesParam : null;
+const DEFAULT_KEYFRAME_SEC = 2;
+const keyframeIntervalFor = (framerate: number): number =>
+  keyframeFrames ?? Math.max(1, Math.round((keyframeSec ?? DEFAULT_KEYFRAME_SEC) * framerate));
+const describeKeyframes = (): string =>
+  keyframeFrames !== null ? `${keyframeFrames} frames` : `${keyframeSec ?? DEFAULT_KEYFRAME_SEC} s`;
 /** Published in the catalog as the viewer's playout set point. Without it the
  *  player has no target and runs with no cushion policy or chase at all. */
 const targetLatencyMs = parseInt(params.get('target') ?? '200', 10);
@@ -182,6 +197,18 @@ const AUTO_NAMESPACE_USED_KEY = 'g5-broadcast.namespace-used';
 /** The audio decoder configuration for a codec: AudioSpecificConfig for AAC, else an OpusHead. */
 function audioConfigFor(codec: string, a: { sampleRate: number; channels: number }): Uint8Array {
   return codec.startsWith('mp4a') ? aacAudioSpecificConfig(a.sampleRate, a.channels) : opusHead(a.sampleRate, a.channels);
+}
+
+/** An H.264 codec string whose level covers `height` at `framerate`: above 720p
+ *  it rises to 4.0 (1080p30), 4.2 (1080p60) or 5.1, never lower. */
+function h264LevelFor(codec: string, height: number, framerate: number): string {
+  const m = /^(avc[13]\.[0-9a-f]{4})([0-9a-f]{2})$/i.exec(codec);
+  if (!m || height <= 720) return codec;
+  const needed = height > 1088 ? 0x33 : framerate > 30 ? 0x2a : 0x28;
+  if (parseInt(m[2]!, 16) >= needed) return codec;
+  const raised = m[1] + needed.toString(16);
+  log(`H.264 level raised for ${height}p${Math.round(framerate)}: ${codec} → ${raised}`);
+  return raised;
 }
 
 /** The requested codec if this browser can encode it, else the default (logged). */
@@ -270,8 +297,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sCodec = document.getElementById('s-codec') as HTMLSelectElement;
   const sAudioCodec = document.getElementById('s-audio-codec') as HTMLSelectElement;
   const sHeight = document.getElementById('s-height') as HTMLSelectElement;
-  const sAudioBitrate = document.getElementById('s-audio-bitrate') as HTMLInputElement;
-  const sNoAudio = document.getElementById('s-no-audio') as HTMLInputElement;
+  const sAdvanced = document.getElementById('s-advanced') as HTMLDetailsElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
   const sBitrateMode = document.getElementById('s-bitrate-mode') as HTMLSelectElement;
@@ -318,11 +344,14 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sCc.value = congestionControl ?? '';
     sCodec.value = videoCodec;
     sAudioCodec.value = audioCodecParam;
+    // A URL-only height (360, 240) still shows as chosen.
+    if (![...sHeight.options].some((o) => o.value === String(captureHeight))) {
+      sHeight.add(new Option(`${captureHeight}p`, String(captureHeight)));
+    }
     sHeight.value = String(captureHeight);
-    sAudioBitrate.value = audioBitrate === 128_000 ? '' : String(audioBitrate / 1000);
-    sNoAudio.checked = !cameraAudio;
-    sBitrate.value = String(videoBitrate / 1000);
-    sKeyframe.value = String(keyframeInterval);
+    sBitrate.value = Number.isFinite(bitrateParam) && bitrateParam > 0 ? String(bitrateParam) : '';
+    sKeyframe.value = keyframeSec !== null ? String(keyframeSec)
+      : keyframeFrames !== null ? String(Math.round((keyframeFrames / captureFps) * 10) / 10) : '';
     sBitrateMode.value = bitrateMode ?? '';
     sFps.value = String(captureFps);
     sTarget.value = String(targetLatencyMs);
@@ -336,6 +365,11 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sAnnexb.checked = annexbParam;
     sSelfDescribing.checked = selfDescribing;
     sTimescale.checked = locTimescale;
+    // Advanced opens when anything in it is set, so no change is hidden.
+    sAdvanced.open = broadcastDraft !== DEFAULT_DRAFT || packaging !== 'loc' || keyframeSec !== null
+      || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
+      || catalogIntervalMs !== null || params.get('hash') !== null || dynamicGroups || audioDatagrams
+      || selfDescribing || locTimescale || annexbParam || debug || !showStatus;
     showApplicableFields();
   }
 
@@ -392,10 +426,8 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
     if (sAudioCodec.value !== 'opus') np.set('audioCodec', sAudioCodec.value);
     if (sHeight.value !== '720') np.set('height', sHeight.value);
-    if (sAudioBitrate.value && sAudioBitrate.value !== '128') np.set('audioBitrate', sAudioBitrate.value);
-    if (sNoAudio.checked) np.set('audio', '0');
-    if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
-    if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
+    if (sBitrate.value) np.set('bitrate', sBitrate.value);
+    if (sKeyframe.value && Number(sKeyframe.value) !== DEFAULT_KEYFRAME_SEC) np.set('keyframeSec', sKeyframe.value);
     if (sBitrateMode.value) np.set('bitrateMode', sBitrateMode.value);
     if (sFps.value && sFps.value !== '60') np.set('fps', sFps.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
@@ -409,15 +441,15 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sDynamicGroups.checked && sVersion.value === '18') np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
-    // them; where storage is refused, the URL carries them instead. `compat`
-    // and `minGroup` are URL-only and stay.
+    // them; where storage is refused, the URL carries them instead. URL-only
+    // settings stay.
     const qs = np.toString();
     // An empty string, not removal: this tab chose the defaults.
     const saved = storageSet(() => sessionStorage, SETTINGS_KEY, qs);
     storageSet(() => localStorage, SETTINGS_KEY, qs || null);
     const next = new URLSearchParams(saved ? '' : qs);
     const current = new URLSearchParams(window.location.search);
-    for (const key of ['compat', 'minGroup']) {
+    for (const key of ['compat', 'minGroup', 'audioBitrate', 'audio']) {
       const value = current.get(key);
       if (value) next.set(key, value);
     }
@@ -700,7 +732,7 @@ for (const id of ['conn-relay', 'conn-ns']) {
 }
 setText('conn-draft', String(broadcastDraft));
 log(`Draft: ${broadcastDraft} · codec ${videoCodec} + ${AUDIO_CODECS[audioCodecParam]} · ${videoBitrate / 1000}kbps · `
-  + `keyframe every ${keyframeInterval} · target ${targetLatencyMs}ms`);
+  + `keyframe every ${describeKeyframes()} · target ${targetLatencyMs}ms`);
 
 // ─── Catalog panel controls ──────────────────────────────────────────
 
@@ -1004,7 +1036,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       } else {
         log('Audio: no audio track in this capture');
       }
-      activeVideoCodec = await supportedVideoCodec(videoCodec, width, height, fps, videoBitrate);
+      activeVideoCodec = await supportedVideoCodec(h264LevelFor(videoCodec, height, fps), width, height, fps, videoBitrate);
       if (audio) activeAudioCodec = await supportedAudioCodec(AUDIO_CODECS[audioCodecParam], audio.sampleRate, audio.channels);
       ctx.throwIfCancelled();
       return { stop: () => cap.stop() };
@@ -1023,7 +1055,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ve.configure(activeVideoCodec, width, height, {
         bitrate: videoBitrate,
         framerate: fps,
-        keyframeInterval,
+        keyframeInterval: keyframeIntervalFor(fps),
         latencyMode: 'realtime',
         ...(bitrateMode ? { bitrateMode } : {}),
         ...(annexb ? { annexb: true } : {}),

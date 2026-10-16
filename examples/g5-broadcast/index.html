@@ -336,46 +336,21 @@
   <div id="settings-backdrop" class="modal-backdrop">
     <div class="modal">
       <h2>Broadcast settings</h2>
-      <div class="lede">Persistent settings overridden by URL params</div>
+      <div class="lede">Persistent settings overridden by URL params. Hover a field for details.</div>
 
-      <label for="s-url">Relay WebTransport URL</label>
-      <input id="s-url" type="text" placeholder="default: moqx-main">
+      <label for="s-url" title="The MoQ relay to publish to. Blank uses moqx-main.">Relay WebTransport URL</label>
+      <input id="s-url" type="text" placeholder="default: moqx-main" title="The MoQ relay to publish to. Blank uses moqx-main.">
 
-      <label for="s-ns">Namespace</label>
+      <label for="s-ns" title="The MoQ namespace viewers subscribe to. Automatic: a new one per broadcast.">Namespace</label>
       <div style="display:flex;gap:8px;align-items:center">
-        <input id="s-ns" type="text" placeholder="auto (new per broadcast)" style="flex:1;min-width:0">
+        <input id="s-ns" type="text" placeholder="auto (new per broadcast)" style="flex:1;min-width:0"
+               title="The MoQ namespace viewers subscribe to. Automatic: a new one per broadcast.">
         <button id="s-ns-new" type="button" title="Mint a new automatic namespace; the viewer link changes">New</button>
       </div>
       <div class="hint">Blank or automatic: a new one each broadcast. A typed name is kept.</div>
 
-      <label for="s-version">Draft version</label>
-      <select id="s-version">
-        <option value="18">Draft 18 (default)</option>
-        <option value="16">Draft 16</option>
-        <option value="14">Draft 14</option>
-      </select>
-
-      <label for="s-packaging">Packaging</label>
-      <select id="s-packaging">
-        <option value="loc">LOC/MSF (default)</option>
-        <option value="cmaf">CMAF/CMSF</option>
-        <option value="locmaf">LOCMAF/CMSF</option>
-      </select>
-      <div class="hint">LOC: encode/decode via WebCodecs. CMAF: fMP4 fragments, render via MSE. LOCMAF: CMAF with compact headers; audio on streams.</div>
-
-      <label for="s-catalog-interval">Catalog refresh interval (ms)</label>
-      <input id="s-catalog-interval" type="number" min="0" placeholder="0">
-      <div class="hint">0 = never re-sent.</div>
-
-      <label for="s-cc">Congestion control (hint)</label>
-      <select id="s-cc">
-        <option value="">Browser default</option>
-        <option value="low-latency">Low latency</option>
-        <option value="throughput">Throughput</option>
-      </select>
-
-      <label for="s-codec">Video codec</label>
-      <select id="s-codec">
+      <label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
+      <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
         <option value="avc1.42001f">H.264 Baseline</option>
         <option value="avc1.640028">H.264 High</option>
         <option value="av01.0.04M.08">AV1 Main</option>
@@ -383,95 +358,110 @@
         <option value="vp09.00.31.08">VP9 Profile 0</option>
       </select>
 
-      <label for="s-audio-codec">Audio codec</label>
-      <select id="s-audio-codec">
+      <label for="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">Camera resolution</label>
+      <select id="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">
+        <option value="1080">1080p</option>
+        <option value="720">720p (default)</option>
+        <option value="480">480p</option>
+      </select>
+
+      <label for="s-bitrate" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">Video bitrate (kbps)</label>
+      <input id="s-bitrate" type="number" min="1" placeholder="by resolution" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">
+
+      <label for="s-fps" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">Capture frame rate</label>
+      <input id="s-fps" type="number" min="1" placeholder="60" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">
+
+      <label for="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">Audio codec</label>
+      <select id="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
         <option value="opus">Opus</option>
         <option value="aac">AAC-LC</option>
       </select>
 
-      <label for="s-height">Camera resolution</label>
-      <select id="s-height">
-        <option value="720">720p</option>
-        <option value="480">480p</option>
-        <option value="360">360p</option>
-        <option value="240">240p</option>
+      <label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
+      <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200).">
+
+      <details class="adv" id="s-advanced" style="margin-top:14px">
+        <summary>Advanced</summary>
+
+      <label for="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">Draft version</label>
+      <select id="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">
+        <option value="18">Draft 18 (default)</option>
+        <option value="16">Draft 16</option>
+        <option value="14">Draft 14</option>
       </select>
 
-      <label for="s-audio-bitrate">Audio bitrate (kbps)</label>
-      <input id="s-audio-bitrate" type="number" min="6" placeholder="128">
+      <label for="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">Packaging</label>
+      <select id="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">
+        <option value="loc">LOC/MSF (default)</option>
+        <option value="cmaf">CMAF/CMSF</option>
+        <option value="locmaf">LOCMAF/CMSF</option>
+      </select>
 
-      <label for="s-bitrate-mode">Bitrate mode</label>
-      <select id="s-bitrate-mode">
+      <label for="s-keyframe" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">Keyframe interval (s)</label>
+      <input id="s-keyframe" type="number" min="0.1" step="0.1" placeholder="2" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">
+
+      <label for="s-bitrate-mode" title="Constant holds output near the target; variable lets complex frames and keyframes burst. Default: the encoder decides.">Bitrate mode</label>
+      <select id="s-bitrate-mode" title="Constant holds output near the target; variable lets complex frames and keyframes burst. Default: the encoder decides.">
         <option value="">Encoder default</option>
         <option value="constant">Constant</option>
         <option value="variable">Variable</option>
       </select>
 
-      <label for="s-bitrate">Video bitrate (kbps)</label>
-      <input id="s-bitrate" type="number" min="1" value="2000">
+      <label for="s-cc" title="A hint to the browser QUIC congestion controller. Browsers may ignore it.">Congestion control (hint)</label>
+      <select id="s-cc" title="A hint to the browser QUIC congestion controller. Browsers may ignore it.">
+        <option value="">Browser default</option>
+        <option value="low-latency">Low latency</option>
+        <option value="throughput">Throughput</option>
+      </select>
 
-      <label for="s-fps">Capture frame rate</label>
-      <input id="s-fps" type="number" min="1" placeholder="60">
+      <label for="s-catalog-interval" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">Catalog refresh interval (ms)</label>
+      <input id="s-catalog-interval" type="number" min="0" placeholder="0" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">
 
-      <label for="s-keyframe">Keyframe interval (frames)</label>
-      <input id="s-keyframe" type="number" min="1" value="60">
+      <label for="s-hash" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">Certificate hash</label>
+      <input id="s-hash" type="text" placeholder="(none)" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">
 
-      <label for="s-target">Target playback latency (ms)</label>
-      <input id="s-target" type="number" min="1" placeholder="200">
-
-      <label for="s-hash">Certificate hash</label>
-      <input id="s-hash" type="text" placeholder="(none)">
-
-      <div class="check" id="s-annexb-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Start codes instead of length prefixes, parameter sets in keyframes instead of the video config property (for relays that drop object properties). Catalog codec avc3.">
-        <input id="s-annexb" type="checkbox" style="width:auto">
-        <label for="s-annexb" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          H.264 Annex B (start codes, parameter sets in keyframes)</label>
+      <div class="check" id="s-dynamic-groups-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
+           title="A joining viewer can ask for a new group (NEW_GROUP_REQUEST), so it starts at once instead of waiting for the next keyframe. Draft 18 only.">
+        <input id="s-dynamic-groups" type="checkbox" style="width:auto">
+        <label for="s-dynamic-groups" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">dynamic groups: a joining viewer may request a keyframe</label>
       </div>
 
-      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
-        <input id="s-no-audio" type="checkbox" style="width:auto">
-        <label for="s-no-audio" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          no audio (camera video only)</label>
+      <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
+           title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
+        <input id="s-audio-datagram" type="checkbox" style="width:auto">
+        <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">audio over datagrams</label>
       </div>
 
       <div class="check" id="s-self-describing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Codec string and decoder config on every object, for players that read no catalog.">
+           title="Every object also carries the codec string and decoder config, for players that read no catalog.">
         <input id="s-self-describing" type="checkbox" style="width:auto">
-        <label for="s-self-describing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          self-describing LOC objects (catalog-less players)</label>
+        <label for="s-self-describing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">self-describing LOC objects (catalog-less players)</label>
       </div>
 
       <div class="check" id="s-timescale-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Timescale 1000000 on every object, for players that require one. Timestamps then read as media time, so viewers lose end-to-end latency.">
+           title="Adds Timescale 1000000 to every object. Timestamps then read as media time, so viewers lose end-to-end latency.">
         <input id="s-timescale" type="checkbox" style="width:auto">
-        <label for="s-timescale" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          Timescale on LOC objects (players that require one)</label>
+        <label for="s-timescale" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">Timescale on LOC objects (players that require one)</label>
       </div>
 
-      <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin-top:12px">
-        <input id="s-audio-datagram" type="checkbox" style="width:auto">
-        <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          audio over datagrams</label>
+      <div class="check" id="s-annexb-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
+           title="Start codes instead of length prefixes, parameter sets in keyframes instead of the video config property. Only for relays that drop object properties with players that ignore catalog init data. Catalog codec avc3.">
+        <input id="s-annexb" type="checkbox" style="width:auto">
+        <label for="s-annexb" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">H.264 Annex B (start codes, parameter sets in keyframes)</label>
       </div>
 
-      <div class="check" id="s-dynamic-groups-row" style="display:flex;align-items:center;gap:8px;margin-top:12px">
-        <input id="s-dynamic-groups" type="checkbox" style="width:auto">
-        <label for="s-dynamic-groups" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          dynamic groups: a joining viewer may request a keyframe</label>
-      </div>
-
-      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px"
+           title="The state badge over the preview.">
         <input id="s-status" type="checkbox" style="width:auto">
-        <label for="s-status" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          status overlay</label>
+        <label for="s-status" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">status overlay</label>
       </div>
 
-      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px"
+           title="Per-second ingest snapshots and catalog re-emissions in the log.">
         <input id="s-debug" type="checkbox" style="width:auto">
-        <label for="s-debug" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">
-          verbose logging</label>
+        <label for="s-debug" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">verbose logging</label>
       </div>
+      </details>
 
       <div class="build-line">build <span data-build></span></div>
       <div class="btn-row">
