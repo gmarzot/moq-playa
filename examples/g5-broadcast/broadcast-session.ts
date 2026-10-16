@@ -69,6 +69,13 @@ export interface BroadcastSessionOptions {
   /** Catalog re-emission period, a cache refresh only (MSF-01 §5): late
    *  viewers get the latest catalog by FETCH. Default 0, disabled. */
   catalogIntervalMs?: number;
+  /**
+   * How viewers get the catalog. `both` (default): the current catalog goes
+   * out on each catalog subscription, and FETCH is served too. `fetch`: the
+   * subscription carries nothing; FETCH only (draft-16/18). `subscribe`: on
+   * the subscription only; catalog FETCH is refused.
+   */
+  catalogDelivery?: 'both' | 'fetch' | 'subscribe';
   /** Each successful re-emission, for a verbose UI. Not called for the first
    *  catalog, which reports through onCatalogPublished. */
   onCatalogReemitted?: (bytes: number) => void;
@@ -280,8 +287,12 @@ export class BroadcastSession {
 
     if (trackName === 'catalog') {
       this.whenCatalogReady(requestId, report, () => {
-        if (this.opts.publisher.draft === 18) this.acceptCatalogAtLargest(requestId, alias, report);
-        else this.acceptCatalogWithObject(requestId, alias, report);
+        const draft = this.opts.publisher.draft;
+        if (draft === 18 || (draft === 16 && this.catalogDelivery === 'fetch')) {
+          this.acceptCatalogAtLargest(requestId, alias, report);
+        } else {
+          this.acceptCatalogWithObject(requestId, alias, report);
+        }
       });
     } else if (trackName === 'video') {
       this.connection.acceptSubscribe(
@@ -366,10 +377,15 @@ export class BroadcastSession {
     this.trackWork(work);
   }
 
+  private get catalogDelivery(): 'both' | 'fetch' | 'subscribe' {
+    return this.opts.catalogDelivery ?? 'both';
+  }
+
   /**
-   * Draft-18 catalog SUBSCRIBE: accept with the current catalog as the Largest
-   * Location (§10.2.11). Nothing is sent on the subscription; viewers retrieve
-   * the catalog with a Joining FETCH (MSF-01 §5).
+   * Draft-18 (or FETCH-only draft-16) catalog SUBSCRIBE: accept with the current
+   * catalog as the Largest Location (§10.2.11), then, unless FETCH-only, publish
+   * it on the subscription so relays that serve later viewers from their own
+   * subscription hold it. FETCH retrieves the same group (MSF-01 §5).
    */
   private acceptCatalogAtLargest(requestId: bigint, alias: bigint, report: (err: unknown) => void): void {
     let bytes: number;
@@ -385,11 +401,14 @@ export class BroadcastSession {
     const work = this.connection.acceptSubscribe(
       this.wrapInt(requestId), this.wrapInt(alias), this.subscribeOkOptions(largest))
       .then(() => {
-        this.safeLog(`catalog: SUBSCRIBE_OK (Largest ${largest.group}/0, served by FETCH)`);
+        const fetchOnly = this.catalogDelivery === 'fetch';
+        this.safeLog(`catalog: SUBSCRIBE_OK (Largest ${largest.group}/0, `
+          + `${fetchOnly ? 'served by FETCH' : 'sent on the subscription'})`);
         this.noteAccepted(requestId, alias);
         if (!this.retired) {
           this.opts.onCatalogPublished?.(bytes);
           this.startCatalogReemission(alias);
+          if (!fetchOnly) this.resendCatalog(alias);
         }
       })
       .catch(report);
@@ -455,6 +474,10 @@ export class BroadcastSession {
     if (trackName !== 'catalog') {
       const known = trackName === 'video' || (trackName === 'audio' && !!this.opts.catalog.audio);
       reject(known ? E.NOT_SUPPORTED : E.DOES_NOT_EXIST, `FETCH of "${trackName}" is not served`);
+      return;
+    }
+    if (this.catalogDelivery === 'subscribe') {
+      reject(E.NOT_SUPPORTED, 'catalog FETCH is off (catalog delivery: subscribe only)');
       return;
     }
     let range: { startLocation: { group: bigint; object: bigint }; endLocation: { group: bigint; object: bigint } };
@@ -619,8 +642,11 @@ export class BroadcastSession {
     } else if (!forward) {
       this.stopCatalogReemission();
     } else if (this.catalogAlias !== null) {
-      if (this.opts.publisher.draft === 18) this.startCatalogReemission(this.catalogAlias);
-      else this.resendCatalog(this.catalogAlias);
+      if (this.opts.publisher.draft === 18 && this.catalogDelivery === 'fetch') {
+        this.startCatalogReemission(this.catalogAlias);
+      } else {
+        this.resendCatalog(this.catalogAlias);
+      }
     }
   }
 
@@ -645,6 +671,7 @@ export class BroadcastSession {
       this.connection as never, alias, payload, { draft: this.opts.publisher.draft, groupId },
     ).then(() => {
       this.noteCatalogGroup(groupId);
+      if (this.opts.publisher.draft === 18 && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
       if (!this.retired && this.catalogAlias === alias) this.startCatalogReemission(alias);
     }).catch((err: unknown) => {
       this.safeLog(`Catalog resend failed: ${(err as Error)?.message ?? err}`);

@@ -706,13 +706,17 @@ describe('BroadcastSession — per-track MoQT status', () => {
   });
 });
 
-/** A session on the given draft with the default catalog interval. */
-function fetchSession(conn: BroadcastSessionConnection, draft: 14 | 16 | 18 = 18) {
+/** A session on the given draft with the default catalog interval, FETCH-only unless told. */
+function fetchSession(
+  conn: BroadcastSessionConnection, draft: 14 | 16 | 18 = 18,
+  catalogDelivery: 'both' | 'fetch' | 'subscribe' = 'fetch',
+) {
   const lines: string[] = [];
   const session = new BroadcastSession(conn, {
     catalog: CATALOG,
     publisher: { wrapInt, draft },
     log: (m) => lines.push(m),
+    catalogDelivery,
   });
   return { session, lines };
 }
@@ -742,6 +746,42 @@ function joiningFetch(joiningRequestId: bigint): Fetch {
     parameters: new Map(),
   } as never;
 }
+
+describe('BroadcastSession — catalog delivery modes', () => {
+  it('both (default): draft-18 SUBSCRIBE_OK reports the current catalog, then a newer group goes out on the subscription', async () => {
+    const conn = recordingConnection();
+    const session = new BroadcastSession(conn, { catalog: CATALOG, publisher: { wrapInt, draft: 18 }, log: () => {} });
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    const g = conn.largests[0]!.group;
+    expect(conn.calls).toContain('openSubgroup');
+    expect(conn.groups).toEqual([g + 1n]);
+    // FETCH serves the group just sent.
+    session.handleFetch(9n, standaloneFetch('catalog', [g + 1n, 0n], [g + 1n, 1n]));
+    await settle();
+    expect(conn.fetchObjects.map((o) => o.groupId)).toEqual([g + 1n]);
+  });
+
+  it('subscribe: the catalog goes out on the subscription and a catalog FETCH is refused', async () => {
+    const conn = recordingConnection();
+    const { session, lines } = fetchSession(conn, 18, 'subscribe');
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    expect(conn.calls).toContain('openSubgroup');
+    session.handleFetch(9n, standaloneFetch('catalog', [0n, 0n], [1n << 62n, 0n]));
+    await settle();
+    expect(conn.fetchObjects).toEqual([]);
+    expect(lines.some((l) => l.includes('catalog FETCH is off'))).toBe(true);
+  });
+
+  it('fetch on draft-16: accepted at the current catalog with nothing sent', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn, 16, 'fetch');
+    session.handleSubscribe(1n, 'catalog');
+    await settle();
+    expect(conn.calls).not.toContain('openSubgroup');
+  });
+});
 
 describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
   async function published() {
@@ -899,7 +939,7 @@ describe('BroadcastSession — FETCH (§5.2, MSF-01 §5)', () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(5_000);
     try {
       const conn = recordingConnection();
-      const { session } = fetchSession(conn, 16);
+      const { session } = fetchSession(conn, 16, 'both');
       session.handleSubscribe(1n, 'catalog');
       await settle();
       session.handleForwardChange(1n, false);
@@ -971,6 +1011,7 @@ describe('BroadcastSession — catalog group across sessions of one broadcast', 
       catalog: opts.catalog ?? CATALOG,
       publisher: { wrapInt, draft: 18 },
       log: () => {},
+      catalogDelivery: 'fetch',
       ...(opts.carriedCatalog ? { carriedCatalog: opts.carriedCatalog } : {}),
       ...(opts.onCatalogGroup ? { onCatalogGroup: opts.onCatalogGroup } : {}),
     });

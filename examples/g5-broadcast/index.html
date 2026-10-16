@@ -417,6 +417,13 @@
       <label for="s-catalog-interval" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">Catalog refresh interval (ms)</label>
       <input id="s-catalog-interval" type="number" min="0" placeholder="0" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">
 
+      <label for="s-catalog-delivery" title="How viewers get the catalog. Both: sent on each catalog subscription and served by FETCH. FETCH only: nothing on the subscription (relays that only FETCH). Subscribe only: catalog FETCH refused.">Catalog delivery</label>
+      <select id="s-catalog-delivery" title="How viewers get the catalog. Both: sent on each catalog subscription and served by FETCH. FETCH only: nothing on the subscription (relays that only FETCH). Subscribe only: catalog FETCH refused.">
+        <option value="both">Subscribe + FETCH (default)</option>
+        <option value="fetch">FETCH only</option>
+        <option value="subscribe">Subscribe only</option>
+      </select>
+
       <label for="s-hash" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">Certificate hash</label>
       <input id="s-hash" type="text" placeholder="(none)" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">
 

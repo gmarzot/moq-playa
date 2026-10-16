@@ -140,6 +140,11 @@ const catalogIntervalMs = catalogIntervalParam === null ? null : parseInt(catalo
 /** Draft-18 viewers FETCH the latest catalog; draft-14/16 viewers, which
  *  this page cannot serve by FETCH, need it re-published. */
 const catalogIntervalFor = (draft: 14 | 16 | 18): number => catalogIntervalMs ?? (draft === 18 ? 0 : 1000);
+/** `?catalogDelivery=fetch|subscribe`: catalog by FETCH only, or on the subscription
+ *  only. Default both. */
+const catalogDeliveryParam = params.get('catalogDelivery');
+const catalogDelivery: 'both' | 'fetch' | 'subscribe' =
+  catalogDeliveryParam === 'fetch' || catalogDeliveryParam === 'subscribe' ? catalogDeliveryParam : 'both';
 /** `?debug=1`: per-second ingest snapshots and catalog re-emissions. */
 const debug = params.get('debug') === '1';
 /** `?status=0` hides the state overlay, which is on by default on this page. */
@@ -304,6 +309,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sFps = document.getElementById('s-fps') as HTMLInputElement;
   const sTarget = document.getElementById('s-target') as HTMLInputElement;
   const sCatalogInterval = document.getElementById('s-catalog-interval') as HTMLInputElement;
+  const sCatalogDelivery = document.getElementById('s-catalog-delivery') as HTMLSelectElement;
   const sStatus = document.getElementById('s-status') as HTMLInputElement;
   const sDebug = document.getElementById('s-debug') as HTMLInputElement;
   const sAudioDatagram = document.getElementById('s-audio-datagram') as HTMLInputElement;
@@ -357,6 +363,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sTarget.value = String(targetLatencyMs);
     sCatalogInterval.value = catalogIntervalMs === null ? '' : String(catalogIntervalMs);
     showCatalogIntervalDefault();
+    sCatalogDelivery.value = catalogDelivery;
     sStatus.checked = showStatus;
     sDebug.checked = debug;
     sAudioDatagram.checked = audioDatagrams;
@@ -368,7 +375,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     // Advanced opens when anything in it is set, so no change is hidden.
     sAdvanced.open = broadcastDraft !== DEFAULT_DRAFT || packaging !== 'loc' || keyframeSec !== null
       || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
-      || catalogIntervalMs !== null || params.get('hash') !== null || dynamicGroups || audioDatagrams
+      || catalogIntervalMs !== null || catalogDelivery !== 'both' || params.get('hash') !== null || dynamicGroups || audioDatagrams
       || selfDescribing || locTimescale || annexbParam || debug || !showStatus;
     showApplicableFields();
   }
@@ -432,6 +439,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sFps.value && sFps.value !== '60') np.set('fps', sFps.value);
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     if (sCatalogInterval.value) np.set('catalogInterval', sCatalogInterval.value);
+    if (sCatalogDelivery.value !== 'both') np.set('catalogDelivery', sCatalogDelivery.value);
     if (!sStatus.checked) np.set('status', '0');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
@@ -1211,6 +1219,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         dynamicGroups: videoDynamicGroups,
         log,
         catalogIntervalMs: catalogIntervalFor(negotiatedDraft),
+        catalogDelivery,
         ...(debug ? { onCatalogReemitted: (bytes: number) => log(`Catalog re-emitted (${bytes} bytes)`) } : {}),
         onCatalogPublished: () => {
           setState('live', 'live');
