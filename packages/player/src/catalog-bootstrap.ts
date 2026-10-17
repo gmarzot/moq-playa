@@ -43,8 +43,8 @@
  * @module
  */
 
-import type { DataStreamTerminal } from '@moqt/webtransport';
-import type { CatalogState } from '@moqt/msf';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
+import type { CatalogState } from '@openmoq/msf';
 
 /** Inactivity/progress deadline for an ACTIVE attempt (ms). Re-armed on every
  *  fetch object / FETCH_OK, and — in the waiting states — on live catalog
@@ -111,8 +111,11 @@ export interface CatalogBootstrapCallbacks {
   onUpdated(state: CatalogState): void;
   /** Rung 2: unsubscribe + fresh AbsoluteStart{0,0} subscribe. */
   requestLegacyResubscribe(): void;
-  /** Terminal failure (pre-first-catalog severity model: fatal). */
-  onFatal(reason: string): void;
+  /**
+   * Terminal failure (pre-first-catalog severity model: fatal).
+   * `subscriptionEnded`: the catalog subscription ended before a base arrived.
+   */
+  onFatal(reason: string, subscriptionEnded?: boolean): void;
   /** Post-readiness catalog fault (degraded, matching the legacy model). */
   onDegraded(reason: string): void;
   /**
@@ -187,6 +190,11 @@ export class CatalogBootstrap {
   /** SUBSCRIBE_OK largest location; null = explicitly none (empty track);
    *  undefined = not yet known. */
   private largest: { group: bigint; object: bigint } | null | undefined = undefined;
+  /** The joining fetch failed before SUBSCRIBE_OK; its Largest picks the next rung. */
+  private awaitingSubscribeOk = false;
+  private deferredJoinError: 'invalid-range' | 'refused' | 'timeout' | null = null;
+  /** The join was re-sent once after SUBSCRIBE_OK. */
+  private joinRetried = false;
 
   /** The group whose independent base is currently applied, and per-group
    *  applied-head bookkeeping for the group-aware delta rule. */
@@ -277,6 +285,28 @@ export class CatalogBootstrap {
   onSubscribeOk(largest: { group: bigint; object: bigint } | null): void {
     if (this.inert()) return;
     this.largest = largest;
+    if (this.awaitingSubscribeOk) {
+      this.awaitingSubscribeOk = false;
+      const deferred = this.deferredJoinError;
+      this.deferredJoinError = null;
+      if (this._phase === 'joining' && !this.attempt) {
+        if (deferred === 'invalid-range' && largest === null) {
+          this.enterEmptyWait();
+          this.replayHeldLive();
+        } else if (deferred === 'refused' && largest === null && !this.subscriptionOver()) {
+          this.awaitFirstLiveBase();
+        } else if (largest !== null && !this.joinRetried) {
+          // Streams are unordered: the relay may see the join before the SUBSCRIBE
+          // it references. It knows the subscription now, so join again.
+          this.cb.log('[catalog-bootstrap] joining fetch %s before SUBSCRIBE_OK; joining again', deferred);
+          this.joinRetried = true;
+          this.beginAttempt('joining');
+        } else {
+          this.nextRungAfterJoin('joining', 'joining fetch failed before SUBSCRIBE_OK');
+        }
+      }
+      return;
+    }
     if (this.draft === 14 && this._phase === 'joining' && !this.attempt) {
       this.beginAttempt('joining');
     }
@@ -344,25 +374,51 @@ export class CatalogBootstrap {
     if (this.inert()) return;
     const attempt = this.attempt;
     if (!attempt || attempt.id !== attemptId || attempt.cancelled) return;
-    if (kind === 'invalid-range') {
-      // Track empty: the FETCH ATTEMPT IS RESOLVED (there is no prefix to
-      // fetch) but the catalog is NOT ready. Hold the LargestObject
-      // subscription and wait — intentionally INDEFINITE (a viewer joining
-      // before the publisher starts is legitimate and open-ended; the player's
-      // catalog watchdog provides diagnostics, not recovery). The first live
-      // object resolves it via first-payload classification.
-      // Exception: with the subscription already DONE+drained, nothing can
-      // ever arrive — fatal.
-      this.attempt = null;
-      if (this.doneReason !== null && this.drained) {
-        this.fatal('catalog track empty and its subscription ended — nothing to play');
-        return;
-      }
-      this._phase = 'empty-wait';
-      this.disarmInactivity();
+    if (kind === 'invalid-range' && this.largest === null) {
+      this.enterEmptyWait();
       return;
     }
+    if (attempt.kind === 'joining' && this.largest === undefined && !this.strict) {
+      // A join sent ahead of SUBSCRIBE_OK can fail before it arrives (a relay
+      // still subscribing upstream). Wait for its Largest rather than dropping
+      // to subscription-only retrieval, which a publisher serving its catalog
+      // only by FETCH never satisfies. Bounded by the inactivity timer.
+      this.cb.log('[catalog-bootstrap] joining fetch %s before SUBSCRIBE_OK; awaiting it', kind);
+      this.rungTransaction();
+      this.awaitingSubscribeOk = true;
+      this.deferredJoinError = kind;
+      this._phase = 'joining';
+      this.armInactivity();
+      return;
+    }
+    if (kind === 'refused' && attempt.kind === 'joining' && this.largest === null
+        && !this.strict && !this.subscriptionOver()) {
+      this.rungTransaction();
+      this.awaitFirstLiveBase();
+      return;
+    }
+    // INVALID_RANGE after a SUBSCRIBE_OK that reported a Largest: the track
+    // has content, so the join failed rather than found it empty.
     this.failAttempt(`fetch ${kind}`);
+  }
+
+  /**
+   * Track empty: the FETCH ATTEMPT IS RESOLVED (there is no prefix to fetch)
+   * but the catalog is NOT ready. Hold the LargestObject subscription and
+   * wait — intentionally INDEFINITE (a viewer joining before the publisher
+   * starts is legitimate and open-ended; the player's catalog watchdog
+   * provides diagnostics, not recovery). The first live object resolves it
+   * via first-payload classification. Exception: with the subscription
+   * already DONE+drained, nothing can ever arrive — fatal.
+   */
+  private enterEmptyWait(): void {
+    this.attempt = null;
+    if (this.doneReason !== null && this.drained) {
+      this.fatal('catalog track empty and its subscription ended — nothing to play', true);
+      return;
+    }
+    this._phase = 'empty-wait';
+    this.disarmInactivity();
   }
 
   // ─── LIVE side ────────────────────────────────────────────────────
@@ -371,6 +427,11 @@ export class CatalogBootstrap {
     if (this.inert()) return;
     this.bumpInactivity();
     if (event.kind === 'gap') return; // accounting only on the live side too
+    // Before SUBSCRIBE_OK's history boundary, live data is held, not classified.
+    if (this.awaitingSubscribeOk) {
+      this.bufferSuffix(event.location, event.payload!, streamId);
+      return;
+    }
 
     switch (this._phase) {
       case 'ready':
@@ -488,7 +549,7 @@ export class CatalogBootstrap {
         return;
       case 'empty-wait':
         // No history (INVALID_RANGE proved it), no future (DONE proved it).
-        this.fatal('catalog track empty and its subscription ended');
+        this.fatal('catalog track empty and its subscription ended', true);
         return;
       case 'await-first-payload':
       case 'await-newer-head':
@@ -501,7 +562,7 @@ export class CatalogBootstrap {
         // arrived: nothing further can come — the rung has failed. (For a
         // legacy-mode recovery CANDIDATE, onFatal fails the transaction and
         // the active snapshot is retained.)
-        this.fatal('catalog subscription ended before a base was received');
+        this.fatal('catalog subscription ended before a base was received', true);
         return;
       case 'joining':
       case 'fetching':
@@ -805,6 +866,7 @@ export class CatalogBootstrap {
     this._phase = 'ready';
     this.disarmInactivity();
     this.cb.onReady(state);
+    if (this.inert()) return;
     this._phase = 'live';
     // Release the held suffix in ascending location order through the dedup.
     const held = this.suffix.sort((a, b) => locCmp(a.location, b.location));
@@ -822,7 +884,7 @@ export class CatalogBootstrap {
     // examined. A staged-recovery candidate must adopt here, not at onReady: a
     // malformed suffix delta between the two must abort the transaction, never
     // degrade an already-adopted snapshot.
-    this.cb.onReadySettled?.();
+    if (!this.inert()) this.cb.onReadySettled?.();
   }
 
   private bufferSuffix(location: { group: bigint; object: bigint }, payload: Uint8Array, streamId: bigint): void {
@@ -875,6 +937,40 @@ export class CatalogBootstrap {
       return;
     }
     this.rungTransaction();
+    this.nextRungAfterJoin(kind, reason);
+  }
+
+  /** The subscription ended and drained: nothing further can arrive on it. */
+  private subscriptionOver(): boolean {
+    return this.doneReason !== null && this.drained;
+  }
+
+  /**
+   * A refused join on an empty track does not prove the live subscription
+   * failed: the first live base resolves it. Replays what was held meanwhile;
+   * silence still advances the bounded failure ladder.
+   */
+  private awaitFirstLiveBase(): void {
+    this._phase = 'await-first-payload';
+    this.armInactivity();
+    this.replayHeldLive();
+  }
+
+  /** Live objects held for the history boundary, applied in order to the waiting phase. */
+  private replayHeldLive(): void {
+    const waiting = this._phase;
+    // The suffix stays owned until reachReady() drains it before settlement.
+    const held = [...this.suffix].sort((a, b) => locCmp(a.location, b.location));
+    for (const entry of held) {
+      if (this.inert() || this._phase !== waiting) break;
+      this.onLiveCatalogObject({ location: entry.location, kind: 'payload', payload: entry.payload }, entry.streamId);
+    }
+  }
+
+  /** Rung 1 when SUBSCRIBE_OK reported a Largest, else rung 2. */
+  private nextRungAfterJoin(kind: Attempt['kind'], reason: string): void {
+    this.awaitingSubscribeOk = false;
+    this.deferredJoinError = null;
     if (kind === 'joining' && this.largest != null) {
       // Rung 1: emulate the join with a standalone FETCH bounded by the
       // SUBSCRIBE_OK Largest — the live subscription is RETAINED (no churn).
@@ -934,7 +1030,7 @@ export class CatalogBootstrap {
     }
   }
 
-  private fatal(reason: string): void {
+  private fatal(reason: string, subscriptionEnded = false): void {
     if (this._phase === 'fatal') return;
     this._phase = 'fatal';
     this.disarmInactivity();
@@ -943,7 +1039,7 @@ export class CatalogBootstrap {
       this.cb.cancelFetch();
     }
     this.attempt = null;
-    this.cb.onFatal(reason);
+    this.cb.onFatal(reason, subscriptionEnded);
   }
 
   // ─── Inactivity (progress) timer ──────────────────────────────────

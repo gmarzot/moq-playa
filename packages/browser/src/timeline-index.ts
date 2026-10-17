@@ -111,6 +111,19 @@ export class TimelineIndex {
     for (const k of kept) this.ranges.push(k);
   }
 
+  /**
+   * Forget everything before `t`: ranges ending at or before it are dropped
+   * and one straddling it now starts at `t`. Called when the SourceBuffer
+   * evicts that media, so the index spans only what is still buffered.
+   */
+  dropBefore(t: bigint): void {
+    let n = 0;
+    while (n < this.ranges.length && this.ranges[n]!.end <= t) n++;
+    if (n > 0) this.ranges.splice(0, n);
+    const first = this.ranges[0];
+    if (first && first.start < t) first.start = t;
+  }
+
   /** Read-only snapshot of the indexed ranges, left → right. */
   getRanges(): readonly TimeRange[] {
     return this.ranges.map((r) => ({ start: r.start, end: r.end }));

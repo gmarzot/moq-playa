@@ -11,7 +11,8 @@
  *   - INITIAL TUNE-IN ONLY: the ABR switch path (selectVideoTrack) never
  *     issues a joining FETCH.
  *   - FETCH failure is non-fatal: warn + clean up + live-only.
- *   - CMAF and non-live tracks are skipped (LOC-only slice).
+ *   - CMAF and LOCMAF live video asks for a new group instead; non-live
+ *     tracks are skipped.
  *   - Default behavior (warm start off) keeps NextGroupStart untouched.
  *
  * @module
@@ -21,10 +22,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
+import { withLocPrivateProperties } from '@openmoq/loc';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -135,6 +137,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
       const call = subscribeCalls().find(([n]: [string, unknown]) => n === name);
       expect(call, `subscribe(${name})`).toBeDefined();
       expect(call![1]?.subscriptionFilter?.type).toBe('LargestObject');
+      expect(call![1]?.newGroupRequest).toBeUndefined();
     }
 
     expect(adapter.joiningFetch).toHaveBeenCalledTimes(2);
@@ -166,18 +169,19 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     const videoJoinCall = adapter.joiningFetch.mock.calls.findIndex(
       (c: any[]) => BigInt(c[0].joiningRequestId) === videoReqId);
     const fetchReqId = BigInt(await adapter.joiningFetch.mock.results[videoJoinCall]?.value);
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
 
     // FETCH data stream announces itself, then delivers alias-0 objects.
     const streamId = 77n;
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(4n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0xaa]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0xaa])),
     } as MoqtObject);
     // A live object on the real alias routes identically.
     adapter._triggerObject(1n, {
       kind: 'data', trackAlias: varint(videoReqId!), groupId: varint(4n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0xbb]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0xbb])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -206,7 +210,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     // The live subscription is untouched: live objects still accepted.
     adapter._triggerObject(1n, {
       kind: 'data', trackAlias: varint(videoReqId!), groupId: varint(0), subgroupId: varint(0),
-      objectId: varint(0), payload: new Uint8Array([0xcc]),
+      objectId: varint(0), payload: withLocPrivateProperties(new Uint8Array([0xcc])),
     } as MoqtObject);
     expect(player.state).not.toBe(PlayerState.ERROR);
     await player.destroy();
@@ -225,7 +229,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     await player.destroy();
   });
 
-  it('CMAF tracks are skipped (LOC-only slice): no joining FETCH, NextGroupStart preserved', async () => {
+  it('CMAF video asks for a new group instead: no joining FETCH, NextGroupStart preserved', async () => {
     const cmafCatalog = locCatalog([
       { name: 'video', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
         codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000 },
@@ -236,6 +240,22 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     expect(adapter.joiningFetch).not.toHaveBeenCalled();
     const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
     expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(call![1]?.newGroupRequest).toBe(0n);
+    await player.destroy();
+  });
+
+  it('LOCMAF video asks for a new group like CMAF (MSE path): no joining FETCH, NextGroupStart preserved', async () => {
+    const locmafCatalog = locCatalog([
+      { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', renderGroup: 1,
+        codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000 },
+    ]);
+    const { player, adapter, subscribeCalls } = await bootPlayer(
+      locmafCatalog, { warmStartCurrentGroup: true });
+
+    expect(adapter.joiningFetch).not.toHaveBeenCalled();
+    const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
+    expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(call![1]?.newGroupRequest).toBe(0n);
     await player.destroy();
   });
 
@@ -280,14 +300,14 @@ describe('warm start — alias remap and stream races', () => {
 
     adapter._triggerObject(streamA, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     // A stream that opens AFTER the remap must also map to the new alias.
     const streamB = 71n;
     adapter._triggerDataStream(streamB, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamB, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0x02]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0x02])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -318,17 +338,18 @@ describe('warm start — alias remap and stream races', () => {
       });
     const videoReqId = (await reqIdFor('video'))!;
     expect(adapter.joiningFetch).toHaveBeenCalled(); // request sent, promise pending
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
 
     // Data stream + objects land BEFORE the player learns the request ID.
     const streamId = 80n;
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(3n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x0a]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x0a])),
     } as MoqtObject);
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(3n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0x0b]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0x0b])),
     } as MoqtObject);
     expect(routed).toEqual([]); // never routed as alias 0
 
@@ -356,10 +377,11 @@ describe('warm start — alias remap and stream races', () => {
     const fetchReqId = BigInt(await adapter.joiningFetch.mock.results[0]?.value);
 
     const streamId = 90n;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(1n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
     expect(routed).toEqual([{ alias: videoReqId, objectId: 0n }]);
@@ -367,7 +389,7 @@ describe('warm start — alias remap and stream races', () => {
     adapter._triggerStreamClosed(streamId); // FIN — pre-roll complete
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(1n), subgroupId: varint(0),
-      objectId: varint(9n), payload: new Uint8Array([0xff]),
+      objectId: varint(9n), payload: withLocPrivateProperties(new Uint8Array([0xff])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -402,15 +424,16 @@ describe('warm start — races against the joiningFetch() await window', () => {
 
     // Fast cached fetch: stream opens, delivers everything, and FINs — all
     // before the joiningFetch() promise continuation registers the request.
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
     const streamId = 88n;
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(1n), payload: new Uint8Array([0x02]),
+      objectId: varint(1n), payload: withLocPrivateProperties(new Uint8Array([0x02])),
     } as MoqtObject);
     adapter._triggerStreamClosed(streamId); // FIN before registration
     expect(routed).toEqual([]);
@@ -451,7 +474,7 @@ describe('warm start — races against the joiningFetch() await window', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -485,7 +508,7 @@ describe('warm start — races against the joiningFetch() await window', () => {
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -515,7 +538,7 @@ describe('warm start — lifecycle hardening', () => {
       adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(2000n + BigInt(i)) } });
       adapter._triggerObject(sid, {
         kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-        objectId: varint(BigInt(i)), payload: new Uint8Array([i]),
+        objectId: varint(BigInt(i)), payload: withLocPrivateProperties(new Uint8Array([i])),
       } as MoqtObject);
     }
     // The REAL fetch (request 2000, the FIRST/oldest) was evicted by the flood:
@@ -566,7 +589,7 @@ describe('warm start — lifecycle hardening', () => {
     // without a tombstone it would route INTO the video track.
     adapter._triggerObject(3000n, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     expect(routed.length).toBe(before); // swallowed, not misrouted
     await player.destroy();
@@ -626,7 +649,7 @@ describe('warm start — lifecycle hardening', () => {
     adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(sid, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-      objectId: varint(0n), payload: new Uint8Array([0x01]),
+      objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([0x01])),
     } as MoqtObject);
     await new Promise((r) => setTimeout(r, 10));
     expect(routed).toEqual([{ objectId: 0n }]); // routed — no stale tombstone swallowed it
@@ -649,7 +672,7 @@ describe('warm start — lifecycle hardening', () => {
       adapter._triggerDataStream(44n, { type: 'fetch', header: { requestId: varint(700n) } });
       adapter._triggerObject(44n, {
         kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
-        objectId: varint(0n), payload: new Uint8Array([1]),
+        objectId: varint(0n), payload: withLocPrivateProperties(new Uint8Array([1])),
       } as MoqtObject);
     }).not.toThrow();
   });
@@ -697,6 +720,54 @@ describe('warm start OFF (default)', () => {
       const call = subscribeCalls().find(([n]: [string, unknown]) => n === name);
       expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
     }
+    await player.destroy();
+  });
+});
+
+describe('warm start on MSE packagings asks for a new group (§10.2.13)', () => {
+  const CMAF_VIDEO = {
+    name: 'video', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+    codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000,
+  };
+  const CMAF_AUDIO = {
+    name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio', renderGroup: 1,
+    codec: 'opus', samplerate: 48000, channelConfig: '2', bitrate: 128_000,
+  };
+  const opts = (calls: Array<[string, any]>, name: string) => calls.find(([n]) => n === name)?.[1];
+
+  it('only the video SUBSCRIBE carries NEW_GROUP_REQUEST 0', async () => {
+    const { player, subscribeCalls } = await bootPlayer(
+      locCatalog([CMAF_VIDEO, CMAF_AUDIO]), { warmStartCurrentGroup: true });
+    expect(opts(subscribeCalls(), 'video')?.newGroupRequest).toBe(0n);
+    expect(opts(subscribeCalls(), 'audio')).toBeDefined();
+    expect(opts(subscribeCalls(), 'audio')?.newGroupRequest).toBeUndefined();
+    await player.destroy();
+  });
+
+  it('is not sent without warm start, nor on draft-14, which has no NEW_GROUP_REQUEST', async () => {
+    const off = await bootPlayer(locCatalog([CMAF_VIDEO]));
+    const d14 = await bootPlayer(locCatalog([CMAF_VIDEO]), { warmStartCurrentGroup: true },
+      (adapter) => { adapter.draftVersion = 14; });
+    for (const { player, subscribeCalls } of [off, d14]) {
+      expect(opts(subscribeCalls(), 'video')).toBeDefined();
+      expect(opts(subscribeCalls(), 'video')?.newGroupRequest).toBeUndefined();
+      await player.destroy();
+    }
+  });
+});
+
+describe('LOC decoder configuration from the catalog (MSF §5.1.7, §5.2.13)', () => {
+  it('a LOC track\'s initRef resolves to its pending subscription\'s initConfig', async () => {
+    const avcc = new Uint8Array([1, 0x42, 0xc0, 0x1f, 0xff, 0xe1]);
+    const catalog = JSON.stringify({
+      version: '1',
+      tracks: [{ ...VIDEO_LOC, initRef: 'v0' }, AUDIO_LOC],
+      initDataList: [{ id: 'v0', type: 'inline', data: btoa(String.fromCharCode(...avcc)) }],
+    });
+    const { player } = await bootPlayer(catalog);
+    const pending = [...(player as any).pendingMediaSubs.values()] as Array<{ trackName: string; initConfig?: Uint8Array }>;
+    expect(Array.from(pending.find((p) => p.trackName === 'video')?.initConfig ?? [])).toEqual(Array.from(avcc));
+    expect(pending.find((p) => p.trackName === 'audio')?.initConfig).toBeUndefined();
     await player.destroy();
   });
 });

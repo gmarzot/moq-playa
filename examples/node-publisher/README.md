@@ -81,6 +81,18 @@ pnpm --filter @moqt/example-node-publisher publish-fixture --loop --catalog-form
   https://127.0.0.1:4433/moq fixtures/test-pattern
 ```
 
+`--packaging locmaf` (alias `--locmaf`) sends every media chunk as a **LOCMAF**
+Object (draft-einarsson-moq-locmaf-01) instead of raw CMAF: same groups and object
+IDs, a full header on each group's first object, deltas after it, and the catalog
+signals `packaging: "locmaf"` with `locmafVersion`. The init is carried as in CMAF
+mode. It combines with either catalog format and needs a real fixture (the
+synthetic one has no CMAF Header).
+
+```bash
+pnpm --filter @moqt/example-node-publisher publish-fixture --loop --catalog-format cmsf-01 --packaging locmaf \
+  https://127.0.0.1:4433/moq fixtures/test-pattern
+```
+
 Open Playa exactly as in §4 (local relay ⇒ `?v=18`). **No synthetic catalog or
 injected init-segment workaround is needed** — Playa loads the real wire catalog and
 resolves each track's `initRef` against the root `initDataList`.
@@ -149,7 +161,7 @@ Troubleshooting:
 publishes a catalog + 5 **synthetic** tracks (fake bytes, same shapes/IDs as a real
 fixture — not decodable by MSE), then verifies the parsed catalog and every chunk's
 payload + group/object IDs through the relay. Useful as a fast end-to-end protocol
-check with no FFmpeg involved. `probe` prints which `@moqt/*` capabilities the
+check with no FFmpeg involved. `probe` prints which `@openmoq/*` capabilities the
 publisher uses; `typecheck` runs `tsc --noEmit`.
 
 ## Limitations / development notes

@@ -17,7 +17,9 @@ export interface CatalogBuilderTrack {
   /** Track name (unique within namespace). @see §5.1.11 */
   readonly name: string;
   /** Packaging format. @see §5.1.12 */
-  readonly packaging: 'loc' | 'cmaf' | 'mediatimeline' | 'eventtimeline';
+  readonly packaging: 'loc' | 'cmaf' | 'locmaf' | 'mediatimeline' | 'eventtimeline';
+  /** LOCMAF packaging version; present iff packaging is "locmaf". @see draft-einarsson-moq-locmaf-01 §5 */
+  readonly locmafVersion?: string;
   /** Whether this is a live track. @see §5.1.15 */
   readonly isLive: boolean;
   /** Track role. @see §5.1.14 */
@@ -38,6 +40,9 @@ export interface CatalogBuilderTrack {
   readonly channelConfig?: string;
   /** Render group for A/V sync. @see §5.1.18 */
   readonly renderGroup?: number;
+  /** Playout set point in ms. Must match across a renderGroup, and must be
+   *  absent when isLive is false. @see §5.1.16 */
+  readonly targetLatency?: number;
   /** Base64-encoded initialization data (MSF-00 inline form). @see §5.1.20 */
   readonly initData?: string;
   /** Reference to a root {@link BuildCatalogOptions.initDataList} id (MSF-01 init-by-reference). @see draft-ietf-moq-msf-01 §5.2.13 */
@@ -91,6 +96,7 @@ export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
       packaging: t.packaging,
       isLive: t.isLive,
     };
+    if (t.locmafVersion !== undefined) track.locmafVersion = t.locmafVersion;
     if (t.role !== undefined) track.role = t.role;
     if (t.codec !== undefined) track.codec = t.codec;
     if (t.width !== undefined) track.width = t.width;
@@ -100,6 +106,7 @@ export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
     if (t.samplerate !== undefined) track.samplerate = t.samplerate;
     if (t.channelConfig !== undefined) track.channelConfig = t.channelConfig;
     if (t.renderGroup !== undefined) track.renderGroup = t.renderGroup;
+    if (t.targetLatency !== undefined) track.targetLatency = t.targetLatency;
     if (t.initData !== undefined) track.initData = t.initData;
     if (t.initRef !== undefined) track.initRef = t.initRef;
     tracks.push(track);

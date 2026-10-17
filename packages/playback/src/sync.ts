@@ -100,6 +100,16 @@ export class SyncController {
     /** Accumulated drift measurement. */
     private _currentDriftUs = 0;
 
+    /** Shift added by bounded re-anchors and not yet walked back. Diagnostic. */
+    private _baselineDebtUs = 0;
+
+    /** Largest shift one bounded re-anchor may add. */
+    private static readonly MAX_REANCHOR_STEP_US = 100_000;
+
+    /** Largest shift one observation may lower the reference by, so a single
+     *  early stamp cannot collapse it. */
+    private static readonly MAX_LOWER_STEP_US = 20_000;
+
     /**
      * Video join offset — shifts video render times forward during live join.
      *
@@ -140,6 +150,11 @@ export class SyncController {
     /** Whether a sync reference has been established. */
     get hasReference(): boolean {
         return this.localBaselineUs !== undefined;
+    }
+
+    /** Lateness beyond which a frame is considered late (µs). */
+    get lateThresholdUs(): number {
+        return this.dropThresholdUs;
     }
 
     /** Current drift magnitude in microseconds. */
@@ -205,6 +220,49 @@ export class SyncController {
         this.localBaselineUs = this.clock.now();
         this.captureBaselineUs = captureTimestampUs;
         this._currentDriftUs = 0;
+        this._baselineDebtUs = 0;
+    }
+
+    /** Reference delay added by late audio and not yet walked back. */
+    get baselineDebtUs(): number {
+        return this._baselineDebtUs;
+    }
+
+    /**
+     * Shift the reference later for late audio, by at most MAX_REANCHOR_STEP_US.
+     * The excess stays visible as lead and is retired by {@link lowerReference}.
+     *
+     * @param lateByUs how far behind its render time the frame is (positive)
+     * @returns the shift applied
+     */
+    reanchorAudioBounded(lateByUs: number): number {
+        if (this.localBaselineUs === undefined) return 0;
+        const step = Math.min(Math.max(0, lateByUs), SyncController.MAX_REANCHOR_STEP_US);
+        if (step <= 0) return 0;
+        this.localBaselineUs += step;
+        this._baselineDebtUs += step;
+        this._currentDriftUs = 0;
+        return step;
+    }
+
+    /**
+     * Walk the reference down toward a frame that arrived ahead of its render
+     * time, by at most MAX_LOWER_STEP_US per call. Late frames never move it, so
+     * it converges on the best delivery observed rather than the first.
+     *
+     * @param offsetUs how far ahead of its render time the frame arrived
+     * @param toleranceUs lookahead to leave in place rather than retire
+     * @returns the shift applied
+     */
+    lowerReference(offsetUs: number, toleranceUs = 0): number {
+        if (this.localBaselineUs === undefined) return 0;
+        const excess = offsetUs - toleranceUs;
+        if (excess <= 0) return 0;
+        const step = Math.min(excess, SyncController.MAX_LOWER_STEP_US);
+        this.localBaselineUs -= step;
+        // Lowering retires re-anchor debt too.
+        this._baselineDebtUs = Math.max(0, this._baselineDebtUs - step);
+        return step;
     }
 
     /**
@@ -331,17 +389,21 @@ export class SyncController {
     // ─── Live Catch-Up ──────────────────────────────────────────────
 
     /**
-     * Measure end-to-end latency from CaptureTimestamp.
+     * Measure end-to-end latency from a wall-clock timestamp.
      *
-     * Compares publisher wall-clock (CaptureTimestamp) to subscriber
-     * wall-clock (Date.now()). Both in Unix epoch microseconds.
+     * Compares the publisher's wall-clock timestamp to the subscriber's
+     * wall clock, both in Unix epoch microseconds. A media-time timestamp
+     * (LOC-04 with Timescale) has no wall-clock meaning, so latency is
+     * unmeasurable and this returns null.
      *
-     * @param captureTimestampUs CaptureTimestamp in microseconds (Unix epoch)
-     * @returns Latency in microseconds, or null if timestamp is missing/zero
+     * @param captureTimestampUs Timestamp in microseconds
+     * @param isWallClock False when the timestamp is media time. Undefined means wall clock.
+     * @returns Latency in microseconds, or null if unmeasurable
      * @see draft-ietf-moq-loc-01 §2.3.1.1
+     * @see draft-ietf-moq-loc-04 §2.3.1.2
      */
-    measureLatency(captureTimestampUs: bigint): number | null {
-        if (captureTimestampUs === 0n) return null;
+    measureLatency(captureTimestampUs: bigint, isWallClock?: boolean): number | null {
+        if (captureTimestampUs === 0n || isWallClock === false) return null;
         return this.wallClock.now() - Number(captureTimestampUs);
     }
 
@@ -357,9 +419,9 @@ export class SyncController {
      * @returns CatchUpState if evaluated, null if catch-up is disabled or no timestamp
      * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
      */
-    evaluateCatchUp(captureTimestampUs: bigint): CatchUpState | null {
+    evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean): CatchUpState | null {
         // Measure latency
-        const latencyUs = this.measureLatency(captureTimestampUs);
+        const latencyUs = this.measureLatency(captureTimestampUs, isWallClock);
         if (latencyUs === null) return null;
 
         this._lastLatencyUs = latencyUs;
@@ -405,6 +467,7 @@ export class SyncController {
         this.localBaselineUs = undefined;
         this.captureBaselineUs = undefined;
         this._currentDriftUs = 0;
+        this._baselineDebtUs = 0;
         this._videoJoinOffsetUs = 0;
         this._catchUpActive = false;
         this._currentRate = 1.0;

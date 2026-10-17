@@ -12,19 +12,23 @@
  * @module
  */
 
-import type { MoqtObject, MoqtObjectData } from '@moqt/transport';
-import { ObjectStatus } from '@moqt/transport';
-import type { LocHeaders, VideoFrameMarking } from '@moqt/loc';
-import { toVideoChunkInit, toAudioChunkInit } from '@moqt/loc';
+import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
+import { ObjectStatus } from '@openmoq/transport';
+import type { LocHeaders, VideoFrameMarking } from '@openmoq/loc';
+import { toVideoChunkInit, toAudioChunkInit } from '@openmoq/loc';
 
 import { isKeyframePayload } from './keyframe-validator.js';
 import { JitterBuffer } from './jitter-buffer.js';
 import { GapDetector, GapAction } from './gap-detector.js';
 import { DecoderStateMachine } from './decoder-state.js';
 import { SyncController } from './sync.js';
+import type { RenderTiming } from './sync.js';
 import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from './adaptive-tolerance.js';
 import type { RecoveryController } from './recovery.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
+
+/** Ticks' worth of release a single late pass may absorb. */
+const MAX_LATE_TICK_CATCHUP = 64;
 
 // ─── Pipeline ────────────────────────────────────────────────────────
 
@@ -44,6 +48,11 @@ export interface PipelineOptions {
     readonly videoOnly?: boolean;
     /** Live stream: enables bounded release + backlog shedding. Default: true. */
     readonly isLive?: boolean;
+    /**
+     * Playout cushion added downstream (µs). Audio lateness is judged after
+     * it: a frame the cushion still covers plays on time.
+     */
+    readonly getPlaybackDelayUs?: () => number;
 }
 
 /**
@@ -108,6 +117,26 @@ export class PlaybackPipeline {
     private _lastEmittedRate = 1.0;
 
     /**
+ * Audio lateness run: clock time of the first late-dropped audio frame in
+ * the current run (null when the last frame was on time), and when the
+ * sync reference was last re-anchored from audio.
+ */
+    private _lateAudioSinceUs: number | null = null;
+    private _lastAudioReanchorUs = Number.NEGATIVE_INFINITY;
+    private _lateAudioDrops = 0;
+    private readonly getPlaybackDelayUs: (() => number) | undefined;
+    /** Sustained audio lateness before re-anchoring (one jittery frame must not). */
+    /** How long video waits on an advertised audio track to anchor the shared
+     *  reference before anchoring itself. */
+    private static readonly SYNC_REFERENCE_FALLBACK_US = 2_000_000;
+    private static readonly AUDIO_REANCHOR_AFTER_US = 250_000;
+    /** Minimum spacing between audio re-anchors. */
+    private static readonly AUDIO_REANCHOR_MIN_INTERVAL_US = 2_000_000;
+    /** Lookahead left in place when the reference walks down, so ordinary
+     *  jitter does not make frames late. */
+    private static readonly REFERENCE_TOLERANCE_US = 20_000;
+
+    /**
  * Throttle flag — set by decoder feedback when queue depth is high.
  * While true, tick() evaluates gaps but does NOT drain the buffer.
  * Objects still enter the jitter buffer (needed for gap detection).
@@ -119,12 +148,16 @@ export class PlaybackPipeline {
 
     /** Max objects to release per tick (video only). 0 = unlimited. */
     private readonly maxReleasePerTick: number;
+    /** Clock reading of the previous release pass. */
+    private lastReleaseUs = 0;
     /** Max groups before shedding old ones. 0 = unlimited. */
     private readonly maxBacklogGroups: number;
 
     /** Video codec string from catalog (e.g., 'avc1.42c01f'). Used for keyframe validation. */
     private _videoCodec: string | undefined;
     private _videoOnly: boolean;
+    /** When video first held a frame waiting on audio to anchor the reference. */
+    private videoRefWaitStartUs: number | null = null;
 
     constructor(opts: PipelineOptions) {
         this.mediaType = opts.mediaType;
@@ -134,6 +167,7 @@ export class PlaybackPipeline {
         this.onEvent = opts.onEvent;
         this.recovery = opts.recovery;
         this._videoOnly = opts.videoOnly ?? false;
+        this.getPlaybackDelayUs = opts.getPlaybackDelayUs;
 
         // Bounded release: live video defaults to 5 objects/tick + 3 max
         // backlog groups. VOD/non-live and audio are unlimited — shedding
@@ -262,9 +296,9 @@ export class PlaybackPipeline {
     /**
  * Provide codec configuration (from catalog or initial headers).
  *
- * For video, this is also triggered automatically when a videoConfig
- * LOC extension is encountered. For audio, this must be called
- * externally since audio config comes from the MSF catalog.
+ * This is also triggered automatically when a LOC object carries the
+ * matching config property: Video Config for video, Audio Config for
+ * audio.
  *
  * @param config Codec-specific configuration bytes
  */
@@ -333,7 +367,8 @@ export class PlaybackPipeline {
             });
         }
 
-        // Feed adaptive tolerance controller
+        // Interarrival jitter uses transit differences, so the timestamp epoch
+        // cancels out. Media time is suitable here, but not for latency/catch-up.
         if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined) {
             const nowMs = this.clock.now() / 1000; // µs → ms
             const captureUs = Number(headers.captureTimestamp);
@@ -395,6 +430,41 @@ export class PlaybackPipeline {
         this.emitFsmDecision(decision);
     }
 
+    /**
+ * Whether a late audio frame should re-anchor the sync reference instead of
+ * being dropped: only after lateness has persisted for
+ * AUDIO_REANCHOR_AFTER_US, and not more often than
+ * AUDIO_REANCHOR_MIN_INTERVAL_US.
+ */
+    /** Audio frames dropped before decode for lateness. */
+    get lateAudioDrops(): number {
+        return this._lateAudioDrops;
+    }
+
+    /**
+ * Late beyond the threshold. Audio plays at render time plus the playout
+ * cushion added downstream, so it is judged after the cushion; video is
+ * judged without it and decided again at decoder output.
+ */
+    private isLate(timing: RenderTiming): boolean {
+        if (!timing.shouldDrop || this.mediaType !== 'audio') return timing.shouldDrop;
+        const cushionUs = this.getPlaybackDelayUs?.() ?? 0;
+        return timing.offsetUs + cushionUs < -this.sync.lateThresholdUs;
+    }
+
+    private shouldReanchorAudio(): boolean {
+        const now = this.clock.now();
+        if (this._lateAudioSinceUs === null) {
+            this._lateAudioSinceUs = now;
+            return false;
+        }
+        if (now - this._lateAudioSinceUs < PlaybackPipeline.AUDIO_REANCHOR_AFTER_US) return false;
+        if (now - this._lastAudioReanchorUs < PlaybackPipeline.AUDIO_REANCHOR_MIN_INTERVAL_US) return false;
+        this._lateAudioSinceUs = null;
+        this._lastAudioReanchorUs = now;
+        return true;
+    }
+
     reset(targetGroupId?: bigint): void {
         this.buffer.clear();
         this.headerMap.clear();
@@ -408,6 +478,7 @@ export class PlaybackPipeline {
         this._trackEnded = false;
         this.endedGroups.clear();
         this.activeGroupWaitStartUs = null;
+        this._lateAudioSinceUs = null;
         this.gapDetector.reset();
         this.adaptiveTolerance?.reset();
         const decision = this.decoderState.notifyGap();
@@ -446,6 +517,11 @@ export class PlaybackPipeline {
             this.lastConsumedGroupId = top.groupId - 1n;
             this.endedGroups.add(this.lastConsumedGroupId);
             this.resetPending = false;
+        }
+
+        // END_OF_GROUP marks below the consumed group are never read again.
+        for (const g of this.endedGroups) {
+            if (g < this.lastConsumedGroupId) this.endedGroups.delete(g);
         }
 
         // 1. Evaluate gap state
@@ -564,7 +640,7 @@ export class PlaybackPipeline {
         // Wait for the missing object (QUIC delivers in-order per stream)
         // or let the gap detector timeout and skip the group.
         let released = 0;
-        const budget = this.maxReleasePerTick;
+        const budget = this.releaseBudget();
 
         while (this.buffer.size > 0) {
             // Bounded release: stop after budget objects (0 = unlimited).
@@ -737,19 +813,42 @@ export class PlaybackPipeline {
         }
     }
 
+    /**
+     * Objects this tick may release.
+     *
+     * The cap is per TICK, but a hidden tab clamps timers to ~1Hz — at which
+     * point a fixed cap drains far slower than media arrives and the backlog
+     * grows without bound. Scale it by elapsed time so a late tick does the
+     * work of the ticks it replaced.
+     */
+    private releaseBudget(): number {
+        const cap = this.maxReleasePerTick;
+        if (cap <= 0) return cap; // unlimited
+        const now = this.clock.now();
+        const elapsedUs = this.lastReleaseUs > 0 ? now - this.lastReleaseUs : 0;
+        this.lastReleaseUs = now;
+        // The cap is sized for a ~16ms tick; a longer one earns proportionally
+        // more, bounded so a single pass cannot monopolise the main thread.
+        const ticks = Math.max(1, Math.min(MAX_LATE_TICK_CATCHUP, elapsedUs / 16_000));
+        return Math.ceil(cap * ticks);
+    }
+
     private processDataObject(obj: MoqtObjectData): void {
         const key = `${obj.groupId}:${obj.objectId}`;
         const headers = this.headerMap.get(key) ?? {};
         this.headerMap.delete(key);
 
-        // 1. Configure decoder if videoConfig present
-        if (headers.videoConfig) {
-            const configDecision = this.decoderState.configure(headers.videoConfig);
+        // 1. Configure decoder if the object carries codec config for this
+        //    media type. DecoderStateMachine.configure dedupes equal bytes.
+        //    @see draft-ietf-moq-loc-04 §2.3.2.1 (Video Config), §2.3.3.1 (Audio Config)
+        const config = this.mediaType === 'video' ? headers.videoConfig : headers.audioConfig;
+        if (config) {
+            const configDecision = this.decoderState.configure(config);
             if (configDecision.action === 'configure') {
                 this.onCommand({
                     type: 'configure',
                     mediaType: this.mediaType,
-                    config: headers.videoConfig,
+                    config,
                 });
             }
         }
@@ -762,6 +861,17 @@ export class PlaybackPipeline {
                 this.sync.setAudioReference(headers.captureTimestamp);
             } else if (this._videoOnly) {
                 this.sync.setVideoReference(headers.captureTimestamp);
+            } else {
+                // Audio-master, but advertised audio may never deliver a
+                // referenceable frame, and video is held until one does.
+                // Anchor on video past the bound; setVideoReference defers
+                // if audio lands first.
+                this.videoRefWaitStartUs ??= this.clock.now();
+                const waitedUs = this.clock.now() - this.videoRefWaitStartUs;
+                if (waitedUs >= PlaybackPipeline.SYNC_REFERENCE_FALLBACK_US) {
+                    this.sync.setVideoReference(headers.captureTimestamp);
+                    this.onEvent({ type: 'sync_reference_fallback', waitedUs });
+                }
             }
         }
 
@@ -787,7 +897,7 @@ export class PlaybackPipeline {
                 // No reference yet — use placeholder. CommandDispatcher will
                 // hold this frame and recompute when the reference is ready.
                 renderTimeUs = 0;
-            } else if (timing.shouldDrop) {
+            } else if (this.isLate(timing)) {
                 if (timing.offsetUs < -5_000_000) {
                     renderTimeUs = this.clock.now();
                 } else if (this.mediaType === 'video' && !this.isPreDecodeDroppable(videoMarking)) {
@@ -799,12 +909,30 @@ export class PlaybackPipeline {
                     // recomputes timing at decoder output and CanvasRenderer
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = this.clock.now();
+                } else if (this.mediaType === 'audio' && this.shouldReanchorAudio()) {
+                    // The reference was set once, from the first audio frame's
+                    // transit. Audio that stays later than that by more than
+                    // the drop threshold would otherwise be dropped for the
+                    // rest of the session while video keeps rendering.
+                    // Bounded step; early frames walk it back via lowerReference.
+                    const lateByUs = -timing.offsetUs;
+                    this.sync.reanchorAudioBounded(lateByUs);
+                    this.onEvent({ type: 'audio_reanchored', lateByUs });
+                    renderTimeUs = this.clock.now();
                 } else {
+                    if (this.mediaType === 'audio') this._lateAudioDrops++;
                     return; // Genuinely late and safe to discard — skip
                 }
             } else if (timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
             } else {
+                if (this.mediaType === 'audio') {
+                    this._lateAudioSinceUs = null;
+                    // Only audio lowers the shared reference, so video cannot pull
+                    // it past what audio sustains. The shift applies from the next frame.
+                    this.sync.lowerReference(
+                        timing.offsetUs, PlaybackPipeline.REFERENCE_TOLERANCE_US);
+                }
                 renderTimeUs = timing.renderTimeUs;
             }
         } else {
@@ -815,7 +943,7 @@ export class PlaybackPipeline {
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
         // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
         if (headers.captureTimestamp !== undefined) {
-            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp);
+            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock);
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;
                 this.onEvent({ type: 'catch_up_changed', state: catchUp });

@@ -440,6 +440,73 @@ describe('the hidden-tab loop matches the rAF contract', () => {
   });
 });
 
+describe('Canvas stall clock across a hidden page', () => {
+  let now: number;
+  let onVisibility: (() => void) | null;
+  let doc: { hidden: boolean; addEventListener: (t: string, fn: () => void) => void; removeEventListener(): void };
+  let renderer: CanvasRenderer;
+  let detected: number[];
+  let recovered: number[];
+  const frame = (ts: number) => ({ timestamp: ts, close() {} }) as unknown as VideoFrame;
+  const tick = () => (renderer as any).renderTick(now * 1000);
+  const setHidden = (hidden: boolean) => { doc.hidden = hidden; onVisibility!(); };
+
+  beforeEach(() => {
+    now = 1_000;
+    onVisibility = null;
+    doc = {
+      hidden: false,
+      addEventListener: (_t, fn) => { onVisibility = fn; },
+      removeEventListener() {},
+    };
+    vi.stubGlobal('document', doc);
+    vi.stubGlobal('requestAnimationFrame', () => 1);
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    vi.stubGlobal('setInterval', () => 7);
+    vi.stubGlobal('clearInterval', () => {});
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const ctx = { canvas: { width: 2, height: 2 }, drawImage() {} };
+    renderer = new CanvasRenderer(
+      { getContext: () => ctx } as unknown as HTMLCanvasElement,
+      { stallThresholdMs: THRESHOLD },
+    );
+    detected = [];
+    recovered = [];
+    renderer.onStall = (ms) => detected.push(ms);
+    renderer.onStallRecovered = (ms) => recovered.push(ms);
+    renderer.enqueue(frame(0), 0);
+    renderer.start();
+    tick();                                   // baseline frame at 1_000
+  });
+
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it('does not count the throttled paint gap as a stall on return', () => {
+    setHidden(true);
+    now = 1_900;                              // last paint 900 ms ago
+    setHidden(false);
+    tick();
+    expect(detected).toEqual([]);
+
+    now = 1_900 + THRESHOLD + 10;             // a real stall while visible still counts
+    tick();
+    expect(detected).toEqual([THRESHOLD + 10]);
+  });
+
+  it('keeps a stall detected before the page was hidden', () => {
+    now = 1_000 + THRESHOLD + 10;
+    tick();
+    expect(detected).toHaveLength(1);
+
+    setHidden(true);
+    now = 3_000;
+    setHidden(false);
+    renderer.enqueue(frame(1_000), 0);
+    tick();
+    expect(recovered).toEqual([2_000]);
+  });
+});
+
 describe('Canvas validates before acquiring browser state', () => {
   it('rejects an invalid threshold without calling getContext', () => {
     const getContext = vi.fn(() => ({ canvas: { width: 2, height: 2 }, drawImage() {} }));

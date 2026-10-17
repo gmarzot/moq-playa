@@ -11,7 +11,7 @@
  * Patches tfdt.baseMediaDecodeTime to zero-based for MSE compatibility.
  * Pure data transformation — no MSE or DOM dependency. Testable in Node.js.
  *
- * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging — moof+mdat)
+ * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  * @see ISO/IEC 14496-12 §8.8.12 (Track Fragment Decode Time Box)
  * @module
  */
@@ -28,6 +28,7 @@ import {
   isHevcRaslNalType,
   readMdhdTimescale,
   readTrexDefaults,
+  readSegmentTimeRanges,
   type TrexDefaults,
   type TrunSample,
 } from './mp4-box.js';
@@ -67,10 +68,19 @@ export interface CmafAssemblerOptions {
   ) => void;
   /**
    * Called when a decode-time discontinuity is detected (bmd went
-   * backward). The MseMediaSource should clear its per-track timeline
-   * so old ranges don't cause overlap drops on the new epoch.
+   * backward). The MseMediaSource should clear its per-track replay index;
+   * the assembler maps the new epoch after the prior emitted epoch so MSE
+   * still sees one monotonic presentation timeline.
    */
   readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+  /**
+   * Audio buffered ahead of the playhead (ms), or null when unknown. Held
+   * audio may wait until that depth falls to the release margin; without it
+   * the wait is one frame.
+   */
+  readonly audioAheadMs?: () => number | null;
+  /** Video buffered ahead of the playhead (ms), or null when unknown; as for audio. */
+  readonly videoAheadMs?: () => number | null;
   /**
    * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
    * Construction-time so it cannot change once an epoch is established.
@@ -78,6 +88,31 @@ export interface CmafAssemblerOptions {
    */
   readonly epochMode?: 'shared' | 'legacy';
 }
+
+interface HeldSegment {
+  segment: Uint8Array;
+  trackName: string;
+  groupId: bigint;
+  start: bigint;
+  end: bigint;
+}
+
+interface DecodeOrder {
+  readonly held: HeldSegment[];
+  timer: ReturnType<typeof setTimeout> | null;
+  readonly stats: { restored: number; missing: number; late: number; worstLateMs: number };
+  /** The next segment follows a deliberate pause: its gap is not missing media. */
+  resumed: boolean;
+  /** Group of the newest segment emitted. */
+  lastGroup: bigint | null;
+  /** Latest decode start emitted. */
+  lastStart: bigint | null;
+}
+
+const newDecodeOrder = (): DecodeOrder => ({
+  held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0 }, resumed: false, lastGroup: null,
+  lastStart: null,
+});
 
 /**
  * Pairs moof+mdat MoQ objects into complete CMAF segments.
@@ -89,15 +124,17 @@ export interface CmafAssemblerOptions {
  * });
  *
  * // In onCmafObject callback:
- * assembler.push(mediaType, obj.payload);
+ * assembler.push(mediaType, trackName, groupId, obj.payload);
  * ```
  */
 export class CmafAssembler {
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
+  private readonly audioAheadMs: CmafAssemblerOptions['audioAheadMs'];
+  private readonly videoAheadMs: CmafAssemblerOptions['videoAheadMs'];
 
   /**
-   * Pending moofs keyed by "mediaType:groupId".
+   * Pending moofs keyed by "mediaType:trackName:groupId".
    * Multiple groups can have data in-flight simultaneously on different
    * QUIC streams — keying by groupId prevents cross-group contamination.
    */
@@ -130,6 +167,38 @@ export class CmafAssembler {
   private sharedEpochTimescale: number | null = null;
 
   /**
+   * Output position assigned to raw time zero of the current shared epoch.
+   * Initial playback uses zero. A later publisher restart uses the exact end
+   * of the first track that detects the restart, then scales that one origin
+   * into the other track's timescale. This preserves A/V alignment while
+   * preventing a looping source from overwriting presentation time zero.
+   */
+  private sharedOutputOffsetBmd: bigint | null = null;
+  private sharedOutputOffsetTimescale: number | null = null;
+  private videoOutputOffset = 0n;
+  private audioOutputOffset = 0n;
+
+  /** High-water marks of bytes actually emitted to MSE, in track ticks. */
+  private lastVideoOutputBmd: bigint | null = null;
+  private lastAudioOutputBmd: bigint | null = null;
+  private lastVideoOutputEnd: bigint | null = null;
+  private lastAudioOutputEnd: bigint | null = null;
+
+  /**
+   * Segments held for decode order, per media type. Audio usually travels one
+   * frame per group and a group's video tail can trail the next group's
+   * keyframe, each group on its own stream, so adjacent frames race. MSE never
+   * plays audio appended after its successor, and after a video append that
+   * goes back in decode time it drops video until the next keyframe. A segment
+   * that starts past the emitted end waits for the gap to fill, until the
+   * playhead would reach the gap.
+   */
+  private readonly order: Record<'video' | 'audio', DecodeOrder> = {
+    video: newDecodeOrder(),
+    audio: newDecodeOrder(),
+  };
+
+  /**
    * Restart generation of the shared epoch. Bumped when a discontinuity
    * re-establishes the shared epoch; per-track generations record which
    * shared epoch a track's rebase derives from, so the second track to
@@ -143,20 +212,40 @@ export class CmafAssembler {
   /** Last raw bmd seen per media type — detects backward jumps (discontinuity). */
   private lastVideoBmd: bigint | null = null;
   private lastAudioBmd: bigint | null = null;
+  private highestVideoGroupId: bigint | null = null;
+  private highestAudioGroupId: bigint | null = null;
+
+  /**
+   * First Group ID accepted in the current source epoch. CMSF inherits MSF's
+   * requirement that Group IDs increase monotonically, including across a
+   * publisher restart. Once a timestamp restart is observed, a later-arriving
+   * lower Group ID therefore belongs to the retired epoch and must not alter
+   * timestamp state.
+   */
+  private videoEpochGroupFloor: bigint | null = null;
+  private audioEpochGroupFloor: bigint | null = null;
+
+  /** Discontinuities committed but not yet reported to the sink. */
+  private pendingDiscontinuities: Array<{
+    mediaType: 'video' | 'audio';
+    trackName: string;
+  }> = [];
 
   /** Track name associated with the current epoch, for scoped timeline clear. */
   private videoTrackName: string | null = null;
   private audioTrackName: string | null = null;
 
+  /** Track identities explicitly committed by the player after a switch. */
+  private selectedVideoTrackName: string | null = null;
+  private selectedAudioTrackName: string | null = null;
+
   /**
-   * Trex defaults parsed from the video init segment. Used by the
-   * strip path so {@link iterateTrunSamples} can resolve sample
-   * defaults for streams that don't carry them in tfhd. Without these,
-   * the rewriter would emit zero-duration samples on streams that rely
-   * on trex defaults exclusively. Audio is intentionally not stored —
-   * the strip path skips audio tracks entirely.
+   * Trex defaults parsed from each init segment. Video uses them for the
+   * RASL strip path; both tracks use them to record the exact emitted decode
+   * end that becomes the continuation point after a source restart.
    */
   private videoTrex: TrexDefaults | null = null;
+  private audioTrex: TrexDefaults | null = null;
 
   /** Enable diagnostic logging. */
   debug = false;
@@ -196,12 +285,16 @@ export class CmafAssembler {
 
   /** How many startup fragments per media type carry a debug timing log. */
   private static readonly STARTUP_DIAG_COUNT = 5;
+  /** Buffered depth at which a hold gives up: Chrome reports `waiting` with ~100 ms still ahead. */
+  private static readonly HOLD_RELEASE_MARGIN_MS = 150;
   private diagVideoCount = 0;
   private diagAudioCount = 0;
 
   constructor(options: CmafAssemblerOptions) {
     this.onSegment = options.onSegment;
     this.onDiscontinuity = options.onDiscontinuity;
+    this.audioAheadMs = options.audioAheadMs;
+    this.videoAheadMs = options.videoAheadMs;
     this.epochMode = options.epochMode ?? 'shared';
   }
 
@@ -209,9 +302,8 @@ export class CmafAssembler {
    * Parse the init segment for trex defaults so the strip path can
    * fall back to them when tfhd doesn't carry sample defaults.
    *
-   * Only the video init is consumed today (the strip path skips audio).
-   * Single-track init segments (one trex per init) are the common
-   * CMAF case — picks the first trex if multiple are present.
+   * Single-track init segments (one trex per init) are the common CMAF
+   * case, so this picks the first trex if multiple are present.
    *
    * **Always overwrites** the stored trex (to the parsed value, or to
    * `null` if the new init has no mvex/trex). A new init means a new
@@ -228,9 +320,24 @@ export class CmafAssembler {
     } else {
       this.audioTimescale = timescale;
     }
-    if (mediaType !== 'video') return;
     const trexMap = readTrexDefaults(initBytes);
-    this.videoTrex = trexMap.size > 0 ? trexMap.values().next().value! : null;
+    const trex = trexMap.size > 0 ? trexMap.values().next().value! : null;
+    if (mediaType === 'video') this.videoTrex = trex;
+    else this.audioTrex = trex;
+  }
+
+  /**
+   * Commit the track that may feed one media type.
+   *
+   * Track streams can overlap during a quality switch. Once the player has
+   * committed the replacement, late objects from the retired track must not
+   * be allowed to switch the assembler back. Pending half-pairs are discarded
+   * at the same boundary so an old moof cannot pair with a later mdat.
+   */
+  selectTrack(mediaType: 'video' | 'audio', trackName: string): void {
+    if (mediaType === 'video') this.selectedVideoTrackName = trackName;
+    else this.selectedAudioTrackName = trackName;
+    this.clearPending(mediaType);
   }
 
   /**
@@ -247,7 +354,7 @@ export class CmafAssembler {
    *                  same track (contained replay candidates).
    * @param groupId MoQ group ID — ensures moof+mdat from different groups
    *                don't cross-contaminate when streams interleave
-   * @param payload Raw MoQ object payload (a single MP4 box: moof or mdat)
+   * @param payload Raw MoQ object payload (moof, mdat, or combined CMAF chunks)
    */
   push(
     mediaType: 'video' | 'audio',
@@ -255,6 +362,10 @@ export class CmafAssembler {
     groupId: bigint,
     payload: Uint8Array,
   ): void {
+    const selectedTrackName = mediaType === 'video'
+      ? this.selectedVideoTrackName
+      : this.selectedAudioTrackName;
+    if (selectedTrackName !== null && trackName !== selectedTrackName) return;
     if (payload.byteLength < 8) return;
 
     // CMAF segments may have prefix boxes before the moof: styp (Segment Type),
@@ -294,19 +405,23 @@ export class CmafAssembler {
       const moofEnd = moofOffset + moofSize;
 
       if (payload.byteLength > moofEnd) {
-        // §3.3 compliant: [styp+]moof+mdat combined in a single object.
-        // Copy the moof for safe in-place tfdt patching, then reassemble
-        // with original styp prefix (if present) and trailing mdat.
-        const moof = new Uint8Array(moofSize);
-        moof.set(payload.subarray(moofOffset, moofEnd));
-        const rest = payload.subarray(moofEnd);
-
-        this.patchEpoch(mediaType, trackName, moof, groupId);
-
-        const segment = moofOffset > 0
-          ? concatBuffers(concatBuffers(payload.subarray(0, moofOffset), moof), rest)
-          : concatBuffers(moof, rest);
-        this.onSegment(mediaType, this.maybeStripRaslSamples(mediaType, segment), trackName, groupId);
+        // §3.3 compliant: [styp+]moof+mdat, optionally followed by more
+        // successive CMAF chunks in the same Object. Patch every moof in a
+        // private copy; leaving a later chunk on the publisher's raw epoch
+        // would create a gap and corrupt the recorded output horizon.
+        const segment = new Uint8Array(payload.byteLength);
+        segment.set(payload);
+        let pos = moofOffset;
+        while (pos + 8 <= segment.byteLength) {
+          const size = boxSize(segment, pos);
+          if (size < 8 || pos + size > segment.byteLength) break;
+          if (boxType(segment, pos) === 'moof') {
+            const chunkMoof = segment.subarray(pos, pos + size);
+            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId)) return;
+          }
+          pos += size;
+        }
+        this.emitInOrder(mediaType, segment, trackName, groupId);
         this.flushStartupGeometry();
         return;
       }
@@ -325,11 +440,11 @@ export class CmafAssembler {
       if (!pending) return; // Orphaned mdat — drop
       this.pendingMoofs.delete(key);
 
-      this.patchEpoch(mediaType, trackName, pending, groupId);
+      if (!this.patchEpoch(mediaType, trackName, pending, groupId)) return;
 
       // Concatenate moof + mdat
       const segment = concatBuffers(pending, payload);
-      this.onSegment(mediaType, this.maybeStripRaslSamples(mediaType, segment), trackName, groupId);
+      this.emitInOrder(mediaType, segment, trackName, groupId);
       this.flushStartupGeometry();
       return;
     }
@@ -422,6 +537,171 @@ export class CmafAssembler {
   }
 
   /**
+   * Audio decode-order repair: gaps filled by a segment that arrived late,
+   * frames given up as missing when a hold expired, segments that arrived
+   * entirely behind the emitted audio end, and the furthest behind one was
+   * (ms of audio already emitted past its start).
+   */
+  get audioOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
+    return { ...this.order.audio.stats };
+  }
+
+  /** Video decode-order repair, as for audio; late video is dropped, not appended. */
+  get videoOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
+    return { ...this.order.video.stats };
+  }
+
+  private emitInOrder(
+    mediaType: 'video' | 'audio',
+    segment: Uint8Array,
+    trackName: string,
+    groupId: bigint,
+  ): void {
+    const o = this.order[mediaType];
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    const span = this.segmentSpan(mediaType, segment);
+    const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+    if (span === null || emittedEnd === null || !timescale || o.resumed) {
+      o.resumed = false;
+      this.emitSegment(mediaType, segment, trackName, groupId);
+      return;
+    }
+    // Video is late when it starts before the latest start emitted (MSE would
+    // drop video to the next keyframe); in-order video ending early only overlaps.
+    const late = mediaType === 'audio'
+      ? span.end <= emittedEnd
+      : o.lastStart !== null && span.start < o.lastStart;
+    if (late) {
+      o.stats.late++;
+      const lateMs = (Number(emittedEnd - span.start) * 1000) / timescale;
+      if (lateMs > o.stats.worstLateMs) o.stats.worstLateMs = lateMs;
+      if (mediaType === 'audio') this.emitSegment(mediaType, segment, trackName, groupId);
+      return;
+    }
+    // Half a segment of slack: timestamp rounding is not a missing frame. A
+    // group's video arrives in order on one stream, so a gap inside the group
+    // is a skipped frame; only a newer group can be ahead of a late tail.
+    const gap = span.start - emittedEnd > (span.end - span.start) / 2n;
+    const mayFill = mediaType === 'audio' || o.lastGroup === null || groupId > o.lastGroup;
+    if (gap && mayFill) {
+      o.held.push({ segment, trackName, groupId, ...span });
+      o.held.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+      this.armHeldTimer(mediaType);
+      return;
+    }
+    if (o.held.length > 0) o.stats.restored++;
+    this.emitSegment(mediaType, segment, trackName, groupId);
+    this.releaseHeld(mediaType, false);
+  }
+
+  /** Emit held segments that are now contiguous; on expiry, skip the gap ahead of the first. */
+  private releaseHeld(mediaType: 'video' | 'audio', expired: boolean): void {
+    const o = this.order[mediaType];
+    let skipGap = expired;
+    while (o.held.length > 0) {
+      const head = o.held[0]!;
+      const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+      const duration = head.end - head.start;
+      const gap = emittedEnd === null ? 0n : head.start - emittedEnd;
+      if (gap > duration / 2n) {
+        if (!skipGap) break;
+        skipGap = false;
+        o.stats.missing += duration > 0n ? Math.max(1, Math.round(Number(gap) / Number(duration))) : 1;
+      }
+      o.held.shift();
+      this.emitSegment(mediaType, head.segment, head.trackName, head.groupId);
+    }
+    if (o.timer !== null) {
+      clearTimeout(o.timer);
+      o.timer = null;
+    }
+    this.armHeldTimer(mediaType);
+  }
+
+  /**
+   * The head of the held segments waits until the buffered depth ahead of the
+   * playhead falls to the release margin; at least one frame, and one frame
+   * when the depth is unknown.
+   */
+  private armHeldTimer(mediaType: 'video' | 'audio'): void {
+    const o = this.order[mediaType];
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (o.timer !== null || o.held.length === 0 || !timescale) return;
+    const head = o.held[0]!;
+    const frameMs = (Number(head.end - head.start) * 1000) / timescale;
+    const aheadMs = (mediaType === 'video' ? this.videoAheadMs : this.audioAheadMs)?.() ?? null;
+    const ms = aheadMs === null
+      ? frameMs
+      : Math.max(frameMs, aheadMs - CmafAssembler.HOLD_RELEASE_MARGIN_MS);
+    o.timer = setTimeout(() => {
+      o.timer = null;
+      this.releaseHeld(mediaType, true);
+    }, ms);
+  }
+
+  /** Emit everything held for one media type, skipping its gaps. */
+  private flushHeld(mediaType: 'video' | 'audio'): void {
+    while (this.order[mediaType].held.length > 0) this.releaseHeld(mediaType, true);
+  }
+
+  /** Drop held segments and their timers (state reset). */
+  private dropHeld(): void {
+    for (const o of Object.values(this.order)) {
+      if (o.timer !== null) clearTimeout(o.timer);
+      o.timer = null;
+      o.held.length = 0;
+    }
+  }
+
+  /** Decode-time extent of a segment, in track ticks. */
+  private segmentSpan(mediaType: 'video' | 'audio', segment: Uint8Array): { start: bigint; end: bigint } | null {
+    const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
+    const ranges = readSegmentTimeRanges(segment, trex ?? undefined);
+    if (ranges === null || ranges.length === 0) return null;
+    let start = ranges[0]!.startTime;
+    let end = ranges[0]!.endTime;
+    for (const r of ranges) {
+      if (r.startTime < start) start = r.startTime;
+      if (r.endTime > end) end = r.endTime;
+    }
+    return end > start ? { start, end } : null;
+  }
+
+  /** Deliver one final segment and retain its emitted decode-time extent. */
+  private emitSegment(
+    mediaType: 'video' | 'audio',
+    segment: Uint8Array,
+    trackName: string,
+    groupId: bigint,
+  ): void {
+    const output = this.maybeStripRaslSamples(mediaType, segment);
+    const o = this.order[mediaType];
+    if (o.lastGroup === null || groupId > o.lastGroup) o.lastGroup = groupId;
+    const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
+    const ranges = readSegmentTimeRanges(output, trex ?? undefined);
+    this.onSegment(mediaType, output, trackName, groupId);
+    if (ranges !== null && ranges.length > 0) {
+      const start = ranges.reduce(
+        (min, range) => range.startTime < min ? range.startTime : min,
+        ranges[0]!.startTime,
+      );
+      if (o.lastStart === null || start > o.lastStart) o.lastStart = start;
+      const end = ranges.reduce(
+        (max, range) => range.endTime > max ? range.endTime : max,
+        ranges[0]!.endTime,
+      );
+      if (mediaType === 'video') {
+        if (this.lastVideoOutputEnd === null || end > this.lastVideoOutputEnd) {
+          this.lastVideoOutputEnd = end;
+        }
+      } else if (this.lastAudioOutputEnd === null || end > this.lastAudioOutputEnd) {
+        this.lastAudioOutputEnd = end;
+      }
+    }
+    this.flushDiscontinuities();
+  }
+
+  /**
    * Drop pending half-pairs (moof without mdat) for one media type.
    *
    * Used by the player's media-liveness restart: a delivery restart can
@@ -433,22 +713,57 @@ export class CmafAssembler {
     for (const key of [...this.pendingMoofs.keys()]) {
       if (key.startsWith(`${mediaType}:`)) this.pendingMoofs.delete(key);
     }
+    // Held segments are complete media: deliver them rather than wait across the boundary.
+    this.flushHeld(mediaType);
+  }
+
+  /**
+   * Delivery is resuming after a deliberate pause: drop pending half-pairs and
+   * held segments, and emit the next of each without waiting on its gap.
+   */
+  resumeAfterPause(): void {
+    this.pendingMoofs.clear();
+    this.dropHeld();
+    this.order.video.resumed = true;
+    this.order.audio.resumed = true;
   }
 
   /** Clear all pending moofs, epoch state, and parsed init defaults. */
   reset(): void {
     this.pendingMoofs.clear();
+    this.dropHeld();
+    for (const o of Object.values(this.order)) {
+      o.resumed = false;
+      o.lastGroup = null;
+      o.lastStart = null;
+    }
     this.videoEpoch = null;
     this.audioEpoch = null;
     this.lastVideoBmd = null;
     this.lastAudioBmd = null;
+    this.highestVideoGroupId = null;
+    this.highestAudioGroupId = null;
+    this.videoEpochGroupFloor = null;
+    this.audioEpochGroupFloor = null;
+    this.pendingDiscontinuities = [];
     this.videoTrackName = null;
     this.audioTrackName = null;
+    this.selectedVideoTrackName = null;
+    this.selectedAudioTrackName = null;
     this.videoTrex = null;
+    this.audioTrex = null;
     this.videoTimescale = null;
     this.audioTimescale = null;
     this.sharedEpochBmd = null;
     this.sharedEpochTimescale = null;
+    this.sharedOutputOffsetBmd = null;
+    this.sharedOutputOffsetTimescale = null;
+    this.videoOutputOffset = 0n;
+    this.audioOutputOffset = 0n;
+    this.lastVideoOutputBmd = null;
+    this.lastAudioOutputBmd = null;
+    this.lastVideoOutputEnd = null;
+    this.lastAudioOutputEnd = null;
     this.sharedEpochGen = 0;
     this.startupGeometryState = {};
     this.pendingStartupGeometry = null;
@@ -472,6 +787,62 @@ export class CmafAssembler {
     return (this.sharedEpochBmd * BigInt(timescale)) / BigInt(this.sharedEpochTimescale);
   }
 
+  /** Scale the current epoch's shared output origin into one track's ticks. */
+  private scaledSharedOutputOffset(timescale: number): bigint | null {
+    if (this.sharedOutputOffsetBmd === null || this.sharedOutputOffsetTimescale === null) return null;
+    if (this.sharedOutputOffsetTimescale === timescale) return this.sharedOutputOffsetBmd;
+    return (this.sharedOutputOffsetBmd * BigInt(timescale))
+      / BigInt(this.sharedOutputOffsetTimescale);
+  }
+
+  /**
+   * Start a new output epoch where the detecting track's prior emitted epoch
+   * ended. If the fragment duration was unscorable, overlap the prior final
+   * fragment rather than creating a hole; MSE's coded-frame replacement is
+   * explicitly allowed to absorb that bounded overlap.
+   */
+  private reestablishOutputOrigin(mediaType: 'video' | 'audio'): void {
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    const scoredEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+    const latestBmd = mediaType === 'video' ? this.lastVideoOutputBmd : this.lastAudioOutputBmd;
+    this.sharedOutputOffsetBmd = scoredEnd !== null && scoredEnd > (latestBmd ?? 0n)
+      ? scoredEnd
+      : (latestBmd ?? scoredEnd ?? 0n);
+    this.sharedOutputOffsetTimescale = timescale;
+  }
+
+  /** Resolve an offset that maps this fragment at or beyond committed media. */
+  private outputOffsetFor(
+    mediaType: 'video' | 'audio',
+    bmd: bigint,
+    epoch: bigint,
+  ): bigint {
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    const lastOutputBmd = mediaType === 'video' ? this.lastVideoOutputBmd : this.lastAudioOutputBmd;
+    let offset = timescale !== null
+      ? (this.scaledSharedOutputOffset(timescale) ?? 0n)
+      : (lastOutputBmd ?? 0n);
+    const scoredEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+    const reliableEnd = scoredEnd !== null && scoredEnd >= (lastOutputBmd ?? 0n)
+      ? scoredEnd
+      : null;
+    if (reliableEnd !== null) {
+      const mappedStart = offset + bmd - epoch;
+      if (mappedStart < reliableEnd) offset += reliableEnd - mappedStart;
+    }
+    return offset;
+  }
+
+  /** Publish committed discontinuities after their triggering segment. */
+  private flushDiscontinuities(): void {
+    while (this.pendingDiscontinuities.length > 0) {
+      const event = this.pendingDiscontinuities.shift()!;
+      try {
+        this.onDiscontinuity?.(event.mediaType, event.trackName);
+      } catch { /* diagnostic callback is contained */ }
+    }
+  }
+
   /**
    * Compute a track's rebase epoch from the shared cross-track epoch,
    * establishing or re-establishing the shared epoch as needed.
@@ -480,8 +851,9 @@ export class CmafAssembler {
    * - Shared epoch unset (or being re-established after a restart this
    *   track saw first) → this track's bmd becomes the shared epoch.
    * - Otherwise → adopt the shared epoch scaled to this track's units,
-   *   clamped to the track's own bmd so a track whose content starts
-   *   before the epoch track never rebases negative.
+   *   clamped to the track's own bmd only when the resulting output would
+   *   be negative. A later restart has a positive output origin, so a track
+   *   that detects the epoch second may retain an earlier raw start.
    */
   private anchorEpoch(
     mediaType: 'video' | 'audio',
@@ -500,6 +872,8 @@ export class CmafAssembler {
     } else if (this.sharedEpochBmd === null) {
       this.sharedEpochBmd = bmd;
       this.sharedEpochTimescale = timescale;
+      this.sharedOutputOffsetBmd ??= 0n;
+      this.sharedOutputOffsetTimescale ??= timescale;
     }
     if (mediaType === 'video') {
       this.videoEpochGen = this.sharedEpochGen;
@@ -508,7 +882,9 @@ export class CmafAssembler {
     }
 
     const shared = this.scaledSharedEpoch(timescale)!;
-    return shared <= bmd ? shared : bmd;
+    if (shared <= bmd) return shared;
+    const outputOffset = this.scaledSharedOutputOffset(timescale) ?? 0n;
+    return outputOffset >= shared - bmd ? shared : bmd;
   }
 
   /**
@@ -560,30 +936,58 @@ export class CmafAssembler {
     try { this.onStartupGeometry?.(geometry); } catch { /* contained */ }
   }
 
-  /** Record epoch from first moof, detect discontinuity, rebase tfdt. */
-  private patchEpoch(mediaType: 'video' | 'audio', trackName: string, moof: Uint8Array, groupId?: bigint): void {
+  /** Record epoch from first moof, detect discontinuity, and rebase tfdt. */
+  private patchEpoch(
+    mediaType: 'video' | 'audio',
+    trackName: string,
+    moof: Uint8Array,
+    groupId: bigint,
+  ): boolean {
     const bmd = readBaseMediaDecodeTime(moof);
-    if (bmd === null) return;
+    if (bmd === null) return true;
 
     const currentTrackName = mediaType === 'video' ? this.videoTrackName : this.audioTrackName;
     const isTrackSwitch = currentTrackName !== null && currentTrackName !== trackName;
+    const epochGroupFloor = mediaType === 'video'
+      ? this.videoEpochGroupFloor
+      : this.audioEpochGroupFloor;
+    if (!isTrackSwitch && epochGroupFloor !== null && groupId < epochGroupFloor) {
+      if (this.debug) {
+        console.warn(
+          '[CMAF] ignored late %s segment on "%s": group=%s belongs to epoch before group=%s',
+          mediaType,
+          trackName,
+          String(groupId),
+          String(epochGroupFloor),
+        );
+      }
+      return false;
+    }
     const lastBmd = mediaType === 'video' ? this.lastVideoBmd : this.lastAudioBmd;
     const epoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
 
     if (isTrackSwitch) {
-      // Track switch (ABR splice) — re-anchor to this track's own bmd
-      // without touching the shared epoch: variant timelines may be
-      // unrelated to the timeline the shared epoch was anchored on.
+      // Track switch (ABR splice): variants in a switching set are media-time
+      // aligned. Keep the shared raw/output epochs so a switch cannot jump
+      // back to presentation time zero after a source restart.
+      this.flushHeld(mediaType);
+      const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
-        this.videoEpoch = bmd;
+        this.videoEpoch = anchored;
         this.videoTrackName = trackName;
         this.lastVideoBmd = null;
         this.videoEpochGen = this.sharedEpochGen;
+        this.highestVideoGroupId = null;
+        this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
+        this.videoEpochGroupFloor = null;
       } else {
-        this.audioEpoch = bmd;
+        this.audioEpoch = anchored;
         this.audioTrackName = trackName;
         this.lastAudioBmd = null;
         this.audioEpochGen = this.sharedEpochGen;
+        this.highestAudioGroupId = null;
+        this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
+        this.audioEpochGroupFloor = null;
       }
     } else if (epoch === null) {
       // First segment — anchor against the shared cross-track epoch so
@@ -593,10 +997,12 @@ export class CmafAssembler {
         this.videoEpoch = anchored;
         this.videoTrackName = trackName;
         this.lastVideoBmd = null;
+        this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
       } else {
         this.audioEpoch = anchored;
         this.audioTrackName = trackName;
         this.lastAudioBmd = null;
+        this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
       }
     } else if (lastBmd !== null && bmd < lastBmd) {
       // Same track, bmd went backward.
@@ -607,23 +1013,36 @@ export class CmafAssembler {
       const jumpBack = lastBmd - bmd;
       const audioReorderWindow = BigInt(this.audioTimescale ?? 48000);
       const isSmallAudioReorder = mediaType === 'audio' && jumpBack <= audioReorderWindow;
-      if (!isSmallAudioReorder) {
+      const highestGroupId = mediaType === 'video'
+        ? this.highestVideoGroupId
+        : this.highestAudioGroupId;
+      const isOutOfOrderGroup = highestGroupId !== null && groupId <= highestGroupId;
+      if (!isSmallAudioReorder && !isOutOfOrderGroup) {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
-        this.onDiscontinuity?.(mediaType, trackName);
+        // Both tracks re-base from what they emitted: held segments go out first.
+        this.flushHeld('video');
+        this.flushHeld('audio');
         // A restart affects both tracks. The first track to detect it
         // re-establishes the shared epoch (generation bump); the second
         // track sees its generation is behind and adopts the new epoch
         // instead of zero-basing independently.
         const trackGen = mediaType === 'video' ? this.videoEpochGen : this.audioEpochGen;
-        const anchored = this.anchorEpoch(mediaType, bmd, trackGen === this.sharedEpochGen);
+        const reestablish = trackGen === this.sharedEpochGen;
+        if (reestablish) this.reestablishOutputOrigin(mediaType);
+        const anchored = this.anchorEpoch(mediaType, bmd, reestablish);
         if (mediaType === 'video') {
           this.videoEpoch = anchored;
           this.lastVideoBmd = bmd;
+          this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
+          this.videoEpochGroupFloor = groupId;
         } else {
           this.audioEpoch = anchored;
           this.lastAudioBmd = bmd;
+          this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
+          this.audioEpochGroupFloor = groupId;
         }
+        this.pendingDiscontinuities.push({ mediaType, trackName });
       }
     }
 
@@ -632,13 +1051,28 @@ export class CmafAssembler {
     // to look like a forward jump past the reordered one.
     if (mediaType === 'video') {
       if (this.lastVideoBmd === null || bmd > this.lastVideoBmd) this.lastVideoBmd = bmd;
+      if (this.highestVideoGroupId === null || groupId > this.highestVideoGroupId) {
+        this.highestVideoGroupId = groupId;
+      }
     } else {
       if (this.lastAudioBmd === null || bmd > this.lastAudioBmd) this.lastAudioBmd = bmd;
+      if (this.highestAudioGroupId === null || groupId > this.highestAudioGroupId) {
+        this.highestAudioGroupId = groupId;
+      }
     }
 
     const currentEpoch = mediaType === 'video' ? this.videoEpoch! : this.audioEpoch!;
-    const patchedBmd = bmd - currentEpoch;
+    const outputOffset = mediaType === 'video' ? this.videoOutputOffset : this.audioOutputOffset;
+    const patchedBmd = outputOffset + bmd - currentEpoch;
+    if (patchedBmd < 0n) return false;
     patchBaseMediaDecodeTime(moof, patchedBmd);
+    if (mediaType === 'video') {
+      if (this.lastVideoOutputBmd === null || patchedBmd > this.lastVideoOutputBmd) {
+        this.lastVideoOutputBmd = patchedBmd;
+      }
+    } else if (this.lastAudioOutputBmd === null || patchedBmd > this.lastAudioOutputBmd) {
+      this.lastAudioOutputBmd = patchedBmd;
+    }
     this.recordStartupGeometry(mediaType, bmd, patchedBmd);
 
     // Startup timing diagnostic (debug-only, first N fragments per media type).
@@ -652,16 +1086,17 @@ export class CmafAssembler {
       if (seen < CmafAssembler.STARTUP_DIAG_COUNT) {
         if (mediaType === 'video') this.diagVideoCount++; else this.diagAudioCount++;
         const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
-        const patched = bmd - currentEpoch;
+        const patched = patchedBmd;
         const sec = (t: bigint) => (timescale ? `${(Number(t) / timescale).toFixed(3)}s` : 'n/a');
         console.log(
           '[CMAF] startup#%d %s "%s" group=%s timescale=%s rawBmd=%s (%s) epoch=%s sharedEpoch=%s/%s patched=%s (%s)',
-          seen + 1, mediaType, trackName, String(groupId ?? 'n/a'), String(timescale ?? 'unknown'),
+          seen + 1, mediaType, trackName, String(groupId), String(timescale ?? 'unknown'),
           String(bmd), sec(bmd), String(currentEpoch),
           String(this.sharedEpochBmd ?? 'unset'), String(this.sharedEpochTimescale ?? 'unset'),
           String(patched), sec(patched),
         );
       }
     }
+    return true;
   }
 }

@@ -21,7 +21,7 @@ import {
   type ControlCodec,
   type DataCodec,
   type DraftVersion,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 
 /** The per-version codec bundle for a single-bidi-control-stream topology. */

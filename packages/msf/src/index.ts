@@ -1,5 +1,5 @@
 /**
- * @moqt/msf — MOQT Streaming Format catalog parsing, track selection,
+ * @openmoq/msf — MOQT Streaming Format catalog parsing, track selection,
  * delta updates, and timeline parsing.
  *
  * Implements the JSON catalog format defined in draft-ietf-moq-msf-00.
@@ -39,7 +39,7 @@ export type {
     Msf01DeltaOpKind,
 } from './types.js';
 
-export { MSF_VERSION, CATALOG_TRACK_NAME, CMSF_SAP_EVENT_TYPE } from './types.js';
+export { MSF_VERSION, CATALOG_TRACK_NAME, CMSF_SAP_EVENT_TYPE, LOCMAF_VERSION, SUPPORTED_LOCMAF_VERSIONS } from './types.js';
 
 // ─── Catalog parsing ─────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ export { parseDeltaUpdate, applyCatalogUpdate } from './delta.js';
 
 // ─── Track selection ─────────────────────────────────────────────────
 
-export { groupByRender, groupByAlt, selectTrack, resolveDependencies } from './selection.js';
+export { groupByRender, groupByAlt, selectTrack, resolveDependencies, isTrackPackagingSupported } from './selection.js';
 
 // ─── Timeline parsing ────────────────────────────────────────────────
 

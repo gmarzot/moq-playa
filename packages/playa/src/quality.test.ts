@@ -1,5 +1,5 @@
 /**
- * Tests for @playa/player quality switching API.
+ * Tests for @openmoq/playa quality switching API.
  *
  * Uses a real Player instance with stubbed engine to verify
  * setQuality() public behavior end-to-end.
@@ -11,7 +11,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Player } from './player.js';
 import { mapLevels } from './level-mapper.js';
 import type { Level } from './types.js';
-import type { CatalogState } from '@moqt/msf';
+import type { CatalogState } from '@openmoq/msf';
 
 // ─── DOM / global mocks ──────────────────────────────────────────────
 
@@ -22,6 +22,7 @@ function mockElement(): any {
     appendChild: vi.fn(),
     removeChild: vi.fn(),
     addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
     getContext: vi.fn(() => ({ drawImage: vi.fn() })),
     width: 0, height: 0,
     hidden: false, muted: false, volume: 1, playsInline: false,
@@ -59,6 +60,27 @@ beforeEach(() => {
 });
 
 // ─── mapLevels ───────────────────────────────────────────────────────
+
+describe('late renderer creation', () => {
+  for (const state of ['idle', 'playing', 'paused'] as const) {
+    it(`creates a renderer matching the ${state} playback state`, async () => {
+      const player = new Player(mockElement(), {
+        url: 'https://relay.example.com/moq', namespace: 'test',
+      });
+      const engine = (player as any).engine;
+      engine.play = vi.fn();
+      engine.pause = vi.fn();
+      engine.destroy = vi.fn(async () => {});
+      if (state !== 'idle') player.play();
+      if (state === 'paused') player.pause();
+
+      const renderer = engine.config.createRenderer();
+      expect((renderer as any).running).toBe(state === 'playing');
+      await player.destroy();
+      expect((renderer as any).running).toBe(false);
+    });
+  }
+});
 
 describe('mapLevels', () => {
   const catalog: CatalogState = {
@@ -163,5 +185,73 @@ describe('Player.setQuality', () => {
     });
 
     expect(player.currentLevel).toBe(1); // NOW updated
+  });
+});
+
+// ─── Render sink choice on catalog_received ───────────────────────────
+
+describe('Player authorization options', () => {
+  it('passes the credential provider and trust options to its engine', async () => {
+    const authorization = { getTokens: vi.fn(async () => [{ tokenType: 1n, value: new Uint8Array([1]) }]),
+      timeoutMs: 500, allowedRelayOrigins: ['https://trusted.example'] };
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'live/test', authorization });
+    try {
+      expect((player as any).engine.config.authorization).toBe(authorization);
+      expect(authorization.getTokens).not.toHaveBeenCalled();
+    } finally { await player.destroy(); }
+  });
+
+  it('does not discard an explicitly invalid credential configuration', () => {
+    expect(() => new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'live/test',
+      authorization: null as unknown as import('./types.js').PlayerOptions['authorization'],
+    })).toThrow('authorization');
+  });
+});
+
+describe('Player sink choice (MSE <video> vs <canvas>)', () => {
+  it('keeps the canvas visible for LOCMAF frame decoding', async () => {
+    const player = new Player(mockElement(), {
+      url: 'https://relay.example.com/moq', namespace: 'test',
+      moqtPlayerConfig: { locmafDecoding: 'frame' },
+    });
+    try {
+      (player as any).engine.emitter.emit('catalog_received', {
+        type: 'catalog_received',
+        catalog: {
+          tracks: [{
+            name: 'v', packaging: 'locmaf', locmafVersion: '0.3',
+            role: 'video', codec: 'avc1.640028', isLive: true,
+          }],
+        },
+      });
+      expect((player as any).canvas.hidden).toBe(false);
+      expect((player as any)._activeMediaType).toBe('canvas');
+    } finally {
+      await player.destroy();
+    }
+  });
+
+  function receiveCatalog(packaging: string, extra: Record<string, unknown> = {}): Player {
+    const container = mockElement();
+    container.parentNode = { removeChild: vi.fn() };
+    const player = new Player(container, { url: 'https://relay.example.com/moq', namespace: 'test', autoplay: false });
+    const catalog = {
+      version: 1,
+      tracks: [
+        { name: 'video', packaging, isLive: true, role: 'video', codec: 'avc1.640028', width: 1280, height: 720, bitrate: 2_000_000, ...extra },
+        { name: 'audio', packaging: 'loc', isLive: true, role: 'audio', codec: 'opus', samplerate: 48000, channelConfig: '2' },
+      ],
+    } as unknown as CatalogState;
+    (player as any).engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog });
+    return player;
+  }
+
+  it('a locmaf video track selects the <video> (MSE) sink, like cmaf', () => {
+    expect((receiveCatalog('locmaf', { locmafVersion: '0.3' }) as any)._activeMediaType).toBe('video');
+    expect((receiveCatalog('cmaf') as any)._activeMediaType).toBe('video');
+  });
+
+  it('a LOC-only catalog keeps the <canvas> sink', () => {
+    expect((receiveCatalog('loc') as any)._activeMediaType).toBe('canvas');
   });
 });
