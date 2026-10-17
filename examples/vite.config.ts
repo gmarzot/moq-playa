@@ -26,18 +26,19 @@ function buildId(): string {
  * source, save, Vite hot-reloads via esbuild.
  */
 const BUILD = buildId();
+const BUILT_AT = new Date().toISOString();
 
 export default defineConfig({
   define: {
     __PLAYA_BUILD__: JSON.stringify(BUILD),
-    __PLAYA_BUILT_AT__: JSON.stringify(new Date().toISOString()),
+    __PLAYA_BUILT_AT__: JSON.stringify(BUILT_AT),
   },
   plugins: [{
     // Deployed pages poll /VERSION to notice a newer build.
     name: 'playa-version-file',
     apply: 'build',
     generateBundle() {
-      this.emitFile({ type: 'asset', fileName: 'VERSION', source: `moq-playa ${BUILD}\n` });
+      this.emitFile({ type: 'asset', fileName: 'VERSION', source: `moq-playa ${BUILD} ${BUILT_AT}\n` });
     },
   }],
   server: {
