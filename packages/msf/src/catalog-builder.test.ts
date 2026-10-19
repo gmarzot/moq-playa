@@ -181,6 +181,15 @@ describe('buildCatalog — MSF-01/CMSF-01 init-by-reference emission', () => {
     expect(cat.tracks[0]!.locmafVersion).toBe('0.3');
   });
 
+  it('emits the version "draft-01" as given and parses it as version 1 (MSF-01 §5.1.1)', () => {
+    const payload = buildCatalog({
+      version: 'draft-01',
+      tracks: [{ name: 'v', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.640028' }],
+    });
+    expect(JSON.parse(new TextDecoder().decode(payload)).version).toBe('draft-01');
+    expect(parseCatalogAuto(payload).version).toBe(1);
+  });
+
   it('the numeric MSF-00 default is unchanged (version 1, inline initData, no initDataList)', () => {
     const json = JSON.parse(new TextDecoder().decode(buildCatalog({
       tracks: [{ name: 'v', packaging: 'cmaf', isLive: true, role: 'video', codec: 'avc1.640028', initData: 'AAAB' }],

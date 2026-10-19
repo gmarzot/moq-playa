@@ -64,9 +64,10 @@ export interface BuildCatalogOptions {
    * Catalog version to emit. `1` (default) writes the numeric MSF-00 form; the
    * string `"1"` writes the MSF-01/CMSF-01 form, which a compliant parser reads
    * identically but which pairs with the init-by-reference fields below.
+   * `"draft-01"` is MSF-01's spelling for use against that draft release.
    * @see draft-ietf-moq-msf-00 §5.1.1 / draft-ietf-moq-msf-01 §5.1.1
    */
-  readonly version?: 1 | '1';
+  readonly version?: 1 | '1' | 'draft-01';
   /**
    * Root Initialization Data List (MSF-01/CMSF-01). When present it is emitted at
    * the catalog root and tracks reference entries by `initRef` instead of
