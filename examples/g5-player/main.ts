@@ -7,7 +7,8 @@
  * theirs, the instrument is not.
  */
 
-import { Player } from '@openmoq/playa';
+import { Player, pickCaptureTime } from '@openmoq/playa';
+import type { CaptureTimeSource } from '@openmoq/playa';
 import { initBuildInfo } from '../shared/build-info.js';
 import {
   namespace, certHash, draftVersion, catalogBootstrap, warmStart,
@@ -744,6 +745,40 @@ async function main(): Promise<void> {
   /** Media-time stamps carry no capture clock: delay is drawn above its lowest value. */
   let relativeDelay = false;
   let relativeBaseMs: number | null = null;
+  /** Where the video capture time behind the latency chart comes from. */
+  let latencySource: CaptureTimeSource | null = null;
+  const SOURCE_SHORT: Record<CaptureTimeSource, string> = { property: 'moq-ts', loc: 'loc', prft: 'prft' };
+  const SOURCE_TIP: Record<CaptureTimeSource, string> = {
+    property: 'Capture time from the MOQT timestamp properties.',
+    loc: 'Capture time from the LOC Timestamp.',
+    prft: 'Capture time from CMAF prft, once per group.',
+  };
+  /** Per track: each other capture-time source minus the one in use, ms. */
+  const timingDiffs = new Map<string, { n: number; min: number; max: number; sum: number }>();
+  const timingErrorsSeen = new Set<string>();
+  let timingLogAtMs = performance.now();
+  const noteTiming = (e: any, picked: { source: CaptureTimeSource; us: number } | undefined): void => {
+    if (e.timingError && !timingErrorsSeen.has(`${e.trackName}: ${e.timingError}`)) {
+      timingErrorsSeen.add(`${e.trackName}: ${e.timingError}`);
+      log(`timing ${e.trackName}: ${e.timingError}; its timestamp properties are ignored`);
+    }
+    if (!picked) return;
+    for (const [source, us] of Object.entries(e.captureTimes ?? {}) as [CaptureTimeSource, number][]) {
+      if (source === picked.source) continue;
+      const key = `${e.mediaType} ${source} − ${picked.source}`;
+      const d = (us - picked.us) / 1000;
+      const st = timingDiffs.get(key);
+      if (!st) timingDiffs.set(key, { n: 1, min: d, max: d, sum: d });
+      else { st.n++; st.sum += d; st.min = Math.min(st.min, d); st.max = Math.max(st.max, d); }
+    }
+    const nowMs = performance.now();
+    if (timingDiffs.size && nowMs - timingLogAtMs >= 30_000) {
+      timingLogAtMs = nowMs;
+      for (const [key, st] of timingDiffs) {
+        log(`timing ${key} min/mean/max ${st.min.toFixed(1)}/${(st.sum / st.n).toFixed(1)}/${st.max.toFixed(1)} ms (n=${st.n})`);
+      }
+    }
+  };
   (window as any).__player = player;
   const chartSeries = [sampleAtMs, latP50Samples, latP95Samples, latTickMaxSamples,
     jitSamples, queuedASamples, queuedVSamples];
@@ -1037,15 +1072,18 @@ async function main(): Promise<void> {
       lastArrivalMs[e.mediaType as 'video' | 'audio'] = nowMs;
     }
     noteObject(e);
-    if (e.mediaType === 'audio' && e.kind === 'data' && e.captureTimestamp && e.captureTimestamp > 0n) {
-      const audioLatencyMs = Date.now() - Number(e.captureTimestamp) / 1000;
+    const picked = e.kind === 'data' ? pickCaptureTime(e.captureTimes) : undefined;
+    if (e.kind === 'data') noteTiming(e, picked);
+    if (e.mediaType === 'audio' && picked) {
+      const audioLatencyMs = Date.now() - picked.us / 1000;
       if (Math.abs(audioLatencyMs) < 120_000) audioLatWindow.push([performance.now(), audioLatencyMs]);
     }
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
     const arrivalMs = performance.now();
-    const captureMs = e.captureTimestamp && e.captureTimestamp > 0n
-      ? Number(e.captureTimestamp) / 1000
+    // Without a wall-clock source, the stamp is media time.
+    const captureMs = picked ? picked.us / 1000
+      : e.captureTimestamp && e.captureTimestamp > 0n ? Number(e.captureTimestamp) / 1000
       : 0;
 
     if (captureMs && prevCaptureMs) {
@@ -1063,8 +1101,9 @@ async function main(): Promise<void> {
     if (captureMs) {
       prevCaptureMs = captureMs;
       let latencyMs = Date.now() - captureMs;
-      if (e.timestampIsWallClock === false) {
-        relativeDelay = true;
+      latencySource = picked?.source ?? null;
+      relativeDelay = !picked;
+      if (relativeDelay) {
         // A lower value, or a jump past any plausible delay, rebases.
         if (relativeBaseMs === null || latencyMs < relativeBaseMs || latencyMs - relativeBaseMs > 120_000) {
           relativeBaseMs = latencyMs;
@@ -1394,7 +1433,8 @@ async function main(): Promise<void> {
 
     latVal.textContent = latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
     latP95.textContent = latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
-    latKind.textContent = relativeDelay ? 'relative delay' : 'latency';
+    latKind.textContent = relativeDelay ? 'relative delay'
+      : latencySource ? `latency (${SOURCE_SHORT[latencySource]})` : 'latency';
     latScreen.textContent = relativeDelay ? '—'
       : screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
       : cmafPlayoutMs != null ? `≈${cmafPlayoutMs.toFixed(0)}` : '—';
@@ -1402,11 +1442,11 @@ async function main(): Promise<void> {
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
-      : clockDriftMsPerMin !== null
-      ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; `
-        + (clockDriftApplied ? `${driftCorrectionMs.toFixed(0)} ms removed. Constant offset remains.`
-          : 'not applied until it holds steadily across the window.')
-      : '';
+      : [latencySource ? SOURCE_TIP[latencySource] : '', clockDriftMsPerMin !== null
+        ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; `
+          + (clockDriftApplied ? `${driftCorrectionMs.toFixed(0)} ms removed. Constant offset remains.`
+            : 'not applied until it holds steadily across the window.')
+        : ''].filter(Boolean).join(' ');
     jitVal.textContent = lastFinite(jitSamples)?.toFixed(1) ?? '—';
   }, TICK_MS);
 

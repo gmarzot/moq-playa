@@ -1414,6 +1414,7 @@ export class MoqtPlayer {
       ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
       ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
       ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
+      ...this.subscriptionManager?.captureTimeFields(obj, headers),
     });
 
     if (this.stateMachine.state === PlayerState.PAUSED) return;
@@ -2624,6 +2625,7 @@ export class MoqtPlayer {
         ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
         ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
         ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
+        ...this.subscriptionManager?.captureTimeFields(obj, headers),
       });
 
       // After switch commit starts (switchInProgress), drop old-track
@@ -2692,6 +2694,7 @@ export class MoqtPlayer {
         ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
         ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
         ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
+        ...this.subscriptionManager?.captureTimeFields(obj, headers),
       });
 
       if (obj.kind !== 'data' || !obj.payload) return;

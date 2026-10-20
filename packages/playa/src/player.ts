@@ -729,6 +729,8 @@ export class Player {
         captureTimestamp: e.captureTimestamp,
         timestampIsWallClock: e.timestampIsWallClock,
         isKeyframe: e.isKeyframe,
+        captureTimes: e.captureTimes,
+        timingError: e.timingError,
       });
     });
 

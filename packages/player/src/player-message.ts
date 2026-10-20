@@ -17,6 +17,7 @@ import { varint, readLocation, MessageParam } from '@openmoq/transport';
 import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LoggerLike } from './logger.js';
 import type { TrackContext, TrackPackaging } from './subscription-manager.js';
+import { parseTimestampTrack } from './capture-time.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -247,10 +248,13 @@ export function handleControlMessage(
       if (pending && active) {
         ctx.pendingMediaSubs.delete(okReqId);
         active.trackAlias = alias;
+        const props = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties;
         // Draft-18 TIMESCALE track property (0x08): the units of the track's object Timestamps.
-        const timescale = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties?.get(0x08n)?.[0];
+        const timescale = props?.get(0x08n)?.[0];
+        const timestamps = parseTimestampTrack(props);
         const context: TrackContext = {
           ...(typeof timescale === 'bigint' && timescale > 0n ? { timescale } : {}),
+          ...(timestamps ? { timestamps } : {}),
           ...(pending.initConfig ? { initConfig: pending.initConfig } : {}),
         };
         const declared: [] | [TrackContext] = Object.keys(context).length > 0 ? [context] : [];

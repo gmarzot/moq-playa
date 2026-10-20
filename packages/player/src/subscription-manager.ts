@@ -19,6 +19,8 @@ import type { MoqtObject } from '@openmoq/transport';
 import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
 import { parseLocHeaders, locWireProfileForDraft, stripLocPrivateProperties } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
+import type { CaptureTimes, TimestampTrackResult } from './capture-time.js';
+import { propertyCaptureUs, readObjectTimestamp, readPrftUs, undeclaredTimestampError } from './capture-time.js';
 
 /**
  * Packaging type for container format dispatch.
@@ -42,6 +44,8 @@ export interface TrackContext {
   readonly timescale?: bigint;
   /** LOC decoder configuration from the catalog's initialization data (MSF §5.1.7). */
   readonly initConfig?: Uint8Array;
+  /** MOQT timestamp Track Properties, or why they are malformed. */
+  readonly timestamps?: TimestampTrackResult;
 }
 
 /**
@@ -52,6 +56,8 @@ export class SubscriptionManager {
   private readonly tracks = new Map<bigint, TrackInfo>();
   /** LOC tracks whose objects carry their own decoder configuration. */
   private readonly objectConfigSeen = new Set<bigint>();
+  /** Tracks whose timestamp properties proved malformed; ignored until re-registered. */
+  private readonly timingErrors = new Map<bigint, string>();
 
   /**
    * Object transform: applied to every MoqtObject before routing.
@@ -227,6 +233,7 @@ export class SubscriptionManager {
   ): void {
     this.tracks.set(trackAlias, { trackName, mediaType, packaging, ...(context ? { context } : {}) });
     this.objectConfigSeen.delete(trackAlias);
+    this.timingErrors.delete(trackAlias);
   }
 
   /**
@@ -236,6 +243,7 @@ export class SubscriptionManager {
   unregisterTrack(trackAlias: bigint): void {
     this.tracks.delete(trackAlias);
     this.objectConfigSeen.delete(trackAlias);
+    this.timingErrors.delete(trackAlias);
   }
 
   /**
@@ -244,6 +252,47 @@ export class SubscriptionManager {
    */
   getMediaType(trackAlias: bigint): 'video' | 'audio' | 'mediatimeline' | 'eventtimeline' | undefined {
     return this.tracks.get(trackAlias)?.mediaType;
+  }
+
+  /**
+   * Capture times for a routed object, as `media_object` event fields.
+   * Malformed timestamp properties are reported and ignored; playout never uses them.
+   */
+  captureTimeFields(obj: MoqtObject, headers: LocHeaders): { captureTimes?: CaptureTimes; timingError?: string } {
+    const alias = BigInt(obj.trackAlias);
+    const info = this.tracks.get(alias);
+    if (!info || obj.kind !== 'data') return {};
+
+    let property: bigint | undefined;
+    let error = this.timingErrors.get(alias);
+    if (error === undefined) {
+      const declared = info.context?.timestamps;
+      if (!declared) {
+        error = undeclaredTimestampError(headers.unknown);
+      } else if ('error' in declared) {
+        error = declared.error;
+      } else {
+        const read = readObjectTimestamp(obj.properties ?? obj.extensions,
+          locWireProfileForDraft(this.draftVersion ?? 18));
+        const r = read.error !== undefined ? read
+          : propertyCaptureUs(declared, BigInt(obj.groupId), BigInt(obj.objectId), read.value);
+        error = r.error;
+        property = r.value;
+      }
+      if (error !== undefined) this.timingErrors.set(alias, error);
+    }
+
+    const prft = info.packaging === 'cmaf' && BigInt(obj.objectId) === 0n ? readPrftUs(obj.payload) : undefined;
+    const captureTimes: CaptureTimes = {
+      ...(property !== undefined ? { property: Number(property) } : {}),
+      ...(headers.timestampIsWallClock && headers.captureTimestamp !== undefined
+        ? { loc: Number(headers.captureTimestamp) } : {}),
+      ...(prft !== undefined ? { prft: Number(prft) } : {}),
+    };
+    return {
+      ...(Object.keys(captureTimes).length > 0 ? { captureTimes } : {}),
+      ...(error !== undefined ? { timingError: error } : {}),
+    };
   }
 
   /**

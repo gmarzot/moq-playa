@@ -10,7 +10,7 @@
  */
 
 import type { CatalogState } from '@openmoq/msf';
-import type { NamespaceState } from '@openmoq/player';
+import type { NamespaceState, CaptureTimes } from '@openmoq/player';
 import type { Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 
 /** Event map for Player.on() / Player.off(). */
@@ -110,6 +110,10 @@ export interface MediaObjectEvent {
   /** False when captureTimestamp is media time, not wall clock. */
   readonly timestampIsWallClock?: boolean | undefined;
   readonly isKeyframe?: boolean | undefined;
+  /** Wall-clock capture times by source, for latency measurement only. */
+  readonly captureTimes?: CaptureTimes | undefined;
+  /** Why the track's timestamp properties are not used. */
+  readonly timingError?: string | undefined;
 }
 
 export interface ReadyEvent {

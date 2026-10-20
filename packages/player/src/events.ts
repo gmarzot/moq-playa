@@ -19,6 +19,7 @@ import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
 import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
 import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
+import type { CaptureTimes } from './capture-time.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
 
@@ -329,6 +330,10 @@ export interface MediaObjectEvent {
   /** False when captureTimestamp is media time under a declared timescale, not wall clock. */
   readonly timestampIsWallClock?: boolean;
   readonly isKeyframe?: boolean;
+  /** Wall-clock capture times by source, for latency measurement only. */
+  readonly captureTimes?: CaptureTimes;
+  /** Why the track's timestamp properties are not used. */
+  readonly timingError?: string;
 }
 
 // ─── Rendering Events ────────────────────────────────────────────────

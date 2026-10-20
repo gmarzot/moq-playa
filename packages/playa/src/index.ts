@@ -37,5 +37,7 @@ export type {
   StatechangeEvent,
 } from './events.js';
 export type { SubscriptionStatus, NamespaceState, BootstrapPhase } from '@openmoq/player';
+export { pickCaptureTime } from '@openmoq/player';
+export type { CaptureTimes, CaptureTimeSource } from '@openmoq/player';
 export { detectStrategy } from './auto-detect.js';
 export type { DecoderStrategy } from './auto-detect.js';
