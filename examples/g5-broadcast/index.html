@@ -451,6 +451,12 @@
         <label for="s-timescale" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">Timescale on LOC objects (players that require one)</label>
       </div>
 
+      <div class="check" id="s-voice-processing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
+           title="Keeps the browser's call processing on camera audio: echo cancellation, noise suppression, automatic gain. For speech from a microphone; on music or film it pumps the level and gates sound out.">
+        <input id="s-voice-processing" type="checkbox" style="width:auto">
+        <label for="s-voice-processing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">voice processing (calls)</label>
+      </div>
+
       <div class="check" id="s-annexb-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
            title="Start codes instead of length prefixes, parameter sets in keyframes instead of the video config property. Only for relays that drop object properties with players that ignore catalog init data. Catalog codec avc3.">
         <input id="s-annexb" type="checkbox" style="width:auto">

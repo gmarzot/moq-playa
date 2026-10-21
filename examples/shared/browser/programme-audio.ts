@@ -16,3 +16,10 @@ export const PROGRAMME_AUDIO: MediaTrackConstraints = {
 export function programmeAudio(audio: boolean | MediaTrackConstraints): boolean | MediaTrackConstraints {
   return audio === true ? PROGRAMME_AUDIO : audio;
 }
+
+/** The browser's call processing, for speech from a microphone. */
+export const VOICE_AUDIO: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};

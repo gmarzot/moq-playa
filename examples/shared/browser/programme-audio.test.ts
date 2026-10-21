@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MediaCapture } from './media-capture.js';
-import { PROGRAMME_AUDIO } from './programme-audio.js';
+import { PROGRAMME_AUDIO, VOICE_AUDIO } from './programme-audio.js';
 
 const stream = { getVideoTracks: () => [], getAudioTracks: () => [], getTracks: () => [] };
 const getUserMedia = vi.fn(async () => stream);
@@ -18,6 +18,12 @@ describe('MediaCapture — programme audio', () => {
     await new MediaCapture().startCamera({ width: 1280 });
     expect(getUserMedia).toHaveBeenCalledWith({ video: { width: 1280 }, audio: PROGRAMME_AUDIO });
     expect(PROGRAMME_AUDIO).toEqual({ echoCancellation: false, noiseSuppression: false, autoGainControl: false });
+  });
+
+  it('passes explicit camera audio constraints through, e.g. voice processing', async () => {
+    await new MediaCapture().startCamera(undefined, VOICE_AUDIO);
+    expect(getUserMedia).toHaveBeenCalledWith({ video: true, audio: VOICE_AUDIO });
+    expect(VOICE_AUDIO).toEqual({ echoCancellation: true, noiseSuppression: true, autoGainControl: true });
   });
 
   it('leaves camera audio off when not asked for', async () => {

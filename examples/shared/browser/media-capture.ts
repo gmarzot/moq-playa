@@ -48,7 +48,7 @@ export class MediaCapture {
    * @param constraints Video constraints (width, height, frameRate, etc.)
    * @returns The MediaStream (assign to <video>.srcObject for preview)
    */
-  async startCamera(constraints?: MediaTrackConstraints, audio = true): Promise<MediaStream> {
+  async startCamera(constraints?: MediaTrackConstraints, audio: boolean | MediaTrackConstraints = true): Promise<MediaStream> {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: constraints ?? true,
       audio: programmeAudio(audio),
