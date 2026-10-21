@@ -46,6 +46,7 @@ import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
 import type { SubscriptionStatus } from '@openmoq/playa';
+import type { Level } from '@openmoq/playa';
 import { ClockDriftEstimator } from '../shared/clock-drift.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
@@ -56,6 +57,9 @@ const timeDisplay = document.getElementById('time')!;
 const volumeBar = document.getElementById('volume') as HTMLInputElement;
 const muteBtn = document.getElementById('mute-btn') as HTMLButtonElement;
 const qualitySelect = document.getElementById('quality') as HTMLSelectElement;
+const programSelect = document.getElementById('program') as HTMLSelectElement;
+const viewSelect = document.getElementById('view') as HTMLSelectElement;
+const langSelect = document.getElementById('lang') as HTMLSelectElement;
 const stateBadge = document.getElementById('state')!;
 stateBadge.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
@@ -393,6 +397,12 @@ async function main(): Promise<void> {
     playBtn.disabled = false;
     muteBtn.disabled = false;
     qualitySelect.disabled = false;
+    fillQuality(levels);
+    fillTrackPickers();
+  });
+
+  // The quality ladder is the current view's; a view switch replaces it.
+  function fillQuality(levels: readonly Level[]): void {
     qualitySelect.innerHTML = '<option value="auto">Auto</option>';
     for (const level of levels) {
       const opt = document.createElement('option');
@@ -400,6 +410,50 @@ async function main(): Promise<void> {
       opt.textContent = `${level.label} (${Math.round(level.bitrate / 1000)}k)`;
       qualitySelect.appendChild(opt);
     }
+    qualitySelect.value = player.autoQuality || player.currentLevel < 0 ? 'auto' : String(player.currentLevel);
+  }
+  player.on('levelsloaded', ({ levels }) => fillQuality(levels));
+
+  // Program / View / Language pickers, shown only when the catalog offers a choice.
+  function fillPicker(sel: HTMLSelectElement, options: ReadonlyArray<[string, string]>, current: string | undefined): void {
+    sel.replaceChildren(...options.map(([value, label]) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      return opt;
+    }));
+    if (current !== undefined) sel.value = current;
+    sel.hidden = options.length < 2;
+  }
+  function fillTrackPickers(): void {
+    const str = (v: number | undefined): string | undefined => (v === undefined ? undefined : String(v));
+    fillPicker(programSelect,
+      player.availablePrograms.map((p) => [String(p.renderGroup), `Program ${p.renderGroup}`]),
+      str(player.currentProgram));
+    fillPicker(viewSelect,
+      player.availableViews.map((v) => [String(v.altGroup),
+        v.label ?? (v.width && v.height ? `${v.width}×${v.height}` : `View ${v.altGroup}`)]),
+      str(player.currentView));
+    fillPicker(langSelect,
+      player.availableAudioTracks.map((t) => [t.name, t.label ?? t.lang ?? t.name]),
+      player.currentAudioTrackName);
+  }
+  player.on('catalog_updated', () => fillTrackPickers());
+  player.on('view_changed', ({ fromView, toView, trackName }) => {
+    log(`View: ${fromView ?? '—'} → ${toView ?? '—'} (${trackName})`);
+    fillTrackPickers();
+  });
+  player.on('program_changed', ({ fromProgram, toProgram }) => {
+    log(`Program: ${fromProgram ?? '—'} → ${toProgram}`);
+    fillTrackPickers();
+  });
+  player.on('audio_track_changed', ({ toTrackName, lang }) => {
+    log(`Audio: ${toTrackName}${lang ? ` (${lang})` : ''}`);
+    fillTrackPickers();
+  });
+  player.on('audio_track_switch_failed', ({ toTrackName, error }) => {
+    log(`Audio switch to ${toTrackName} failed: ${error.message}`);
+    fillTrackPickers();
   });
 
   // Each milestone is ms from load(), so the gaps between them say which
@@ -1597,6 +1651,18 @@ async function main(): Promise<void> {
     void player.setQuality(val === 'auto' ? 'auto' : Number(val))
       .catch((err: unknown) => log(`Quality switch failed: ${(err as Error).message}`));
   });
+  // A switch commits at the new track's next group; a refused one is rolled back.
+  const switchFrom = (sel: HTMLSelectElement, what: string, run: () => Promise<void>): void => {
+    sel.addEventListener('change', () => {
+      void run().catch((err: unknown) => {
+        log(`${what} switch failed: ${(err as Error).message}`);
+        fillTrackPickers();
+      });
+    });
+  };
+  switchFrom(programSelect, 'Program', () => player.selectProgram(Number(programSelect.value)));
+  switchFrom(viewSelect, 'View', () => player.selectView(Number(viewSelect.value)));
+  switchFrom(langSelect, 'Audio', () => player.selectAudioTrack(langSelect.value));
 
   // ── Load ──────────────────────────────────────────────────────────
 
