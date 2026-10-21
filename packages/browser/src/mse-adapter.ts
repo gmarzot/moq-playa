@@ -1267,26 +1267,23 @@ export class MseMediaSource implements MediaSourceLike {
       if (mediaType === 'video') this.videoInitSummary = summary;
       else this.audioInitSummary = summary;
 
-      // Set timestampOffset so the new track's segments (rebased to ~0
-      // by the assembler's per-track epoch) land at the current playback
-      // position. Only video changes — audio stays on its original offset
-      // since the audio track doesn't switch.
-      if (!buffer.updating) {
-        buffer.timestampOffset = this.video.currentTime;
-        this.logDebug('[MSE] changeType timestampOffset set to %.2f', this.video.currentTime);
-      }
+      // timestampOffset stays as it is: the CmafAssembler keeps its shared
+      // output epoch across a track switch, so the new track's fragments
+      // already continue the running timeline. Re-basing to currentTime would
+      // push them that many seconds into the future (playback stalls, and
+      // audio/video drift apart when only one of them switches).
 
-      // Clear all video timeline entries — the overlap index records raw
-      // tfdt values, but timestampOffset has changed. Old entries would
+      // Clear the overlap index: it describes the previous track's
+      // fragments, which the new track's splice replaces. Old entries would
       // cause false overlap drops on the new track's segments.
       const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
       timelines.clear();
     } finally {
       this.changingType[mediaType] = false;
+      // Resume the append flow for anything queued during the change — on
+      // failure too, or the queue would stay parked behind the gate forever.
+      this.drainQueue(mediaType);
     }
-
-    // Resume normal append flow for anything queued during the change.
-    this.drainQueue(mediaType);
 
     // changeType() can pause the video element (browser behavior varies).
     // Re-trigger play through the owned lifecycle so a late codec switch cannot

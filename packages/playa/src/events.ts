@@ -85,6 +85,15 @@ export interface PlayerEventMap {
    * diagnostics only; playback needs none of it.
    */
   'media_object': MediaObjectEvent;
+
+  /** A switch to another video view (altGroup) committed. */
+  'view_changed': ViewChangedEvent;
+  /** The current program (renderGroup) changed. */
+  'program_changed': ProgramChangedEvent;
+  /** A switch to another audio track (typically another language) committed. */
+  'audio_track_changed': AudioTrackChangedEvent;
+  /** An audio track switch was rolled back; the old track keeps playing. */
+  'audio_track_switch_failed': AudioTrackSwitchFailedEvent;
 }
 
 export interface CatalogEvent {
@@ -207,4 +216,32 @@ export interface ErrorEvent {
 
 export interface StatechangeEvent {
   readonly state: PlayerState;
+}
+
+export interface ViewChangedEvent {
+  readonly fromView: number | undefined;
+  /** Undefined for a program without altGroups. */
+  readonly toView: number | undefined;
+  /** Track of the new view now playing. */
+  readonly trackName: string;
+}
+
+export interface ProgramChangedEvent {
+  readonly fromProgram: number | undefined;
+  readonly toProgram: number;
+}
+
+export interface AudioTrackChangedEvent {
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  /** Catalog `lang` of the new track, when it has one. */
+  readonly lang: string | undefined;
+  readonly reason: string;
+}
+
+export interface AudioTrackSwitchFailedEvent {
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  readonly reason: string;
+  readonly error: Error;
 }

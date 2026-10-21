@@ -301,6 +301,9 @@ export interface MediaSourceLike {
    * @param codec Codec string for the new mime type
    *              (e.g. `"hvc1.1.6.L93.90"`).
    * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
+   *
+   * The SourceBuffer keeps its timestampOffset: the player's CMAF assembler
+   * already places the new track's fragments on the running timeline.
    */
   changeType?(
     mediaType: 'video' | 'audio',

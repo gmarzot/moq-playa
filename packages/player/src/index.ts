@@ -14,7 +14,7 @@
 // ─── Player ──────────────────────────────────────────────────────────
 
 export { MoqtPlayer } from './player.js';
-export type { SubscribeIntent, QualitySwitchIntent, SubscriptionStatus } from './player.js';
+export type { SubscribeIntent, QualitySwitchIntent, SubscriptionStatus, VideoTrackInfo, VideoViewInfo, AudioTrackInfo, ProgramInfo } from './player.js';
 
 // ─── Capability Detection ─────────────────────────────────────────────
 
@@ -52,6 +52,10 @@ export type {
   StallEvent,
   GapJumpEvent,
   QualitySwitchedEvent,
+  ViewChangedEvent,
+  AudioTrackChangedEvent,
+  AudioTrackSwitchFailedEvent,
+  ProgramChangedEvent,
   CatchUpChangedEvent,
   StateChangedEvent,
   NamespaceState,
@@ -151,7 +155,7 @@ export { CatalogManager } from './catalog-manager.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { QualityController } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
-export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
+export type { QualityControllerConfig, SelectionConstraints, SelectedTracks, VideoView, CatalogProgram } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
 export { pickCaptureTime, parseTimestampTrack, TIMESTAMP_PROPERTY } from './capture-time.js';
