@@ -619,15 +619,17 @@ async function main(): Promise<void> {
     const NUM = 'num';
     // Amber only once a counter has something to report; white at zero.
     const FAULT = (n: number) => (n > 0 ? 'fault' : '');
-    const fmtKbps = (v: number | null): string => (v == null ? '—' : v.toFixed(0));
+    const fmtKbps = (v: number | null): string => (v == null ? '…' : v.toFixed(0));
     // Session-long counters: exact below 10k, then compact (12.3K, 1.20M).
     const fmtCount = (n: number): string => {
       if (n < 10_000) return String(n);
       if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`;
       return `${(n / 1_000_000).toFixed(2)}M`;
     };
-    // The LOC gauges (render cushion, skew, audio underruns/late/snap) do not
-    // exist on the MSE path, and a column of em-dashes is worse than no column.
+    // One row shape on every path: the LOC gauges (render cushion, skew, audio
+    // underruns/late/snap) read n/a on the MSE path; "…" is still measuring.
+    const NA = 'na';
+    const naTip = (label: string) => `${CELL_TIPS[label]} Not on this stream's path: it plays through MSE.`;
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
     // Interruptions: playback stalls, plus on MSE the video holes played through
@@ -648,7 +650,7 @@ async function main(): Promise<void> {
     const lagWorst = Math.max(0, ...lagSamples.map(([, d]) => d));
     const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
     diagGrid.innerHTML = [
-      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '—', 'ms', NUM, '',
+      cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '…', 'ms', NUM, '',
         connectMs != null ? `${CELL_TIPS['ttff']} Connect: ${connectMs.toFixed(0)} ms.` : CELL_TIPS['ttff']),
       cell('bitrate a/v', `${fmtKbps(trackKbps('audio'))}/${fmtKbps(trackKbps('video'))}`, 'kbps', NUM),
       // Cross-stream arrival order, not a fault: LOC audio is one group per frame
@@ -661,15 +663,19 @@ async function main(): Promise<void> {
         `&le;${settleMs.toFixed(0)}ms`, NUM, settleTone),
       // Worst event-loop lag in the window. Tens of ms is ordinary scheduling;
       // hundreds means the thread is blocked or the tab is being throttled.
-      cell('lag', lagSamples.length ? lagWorst.toFixed(0) : '—', 'ms',
+      cell('lag', lagSamples.length ? lagWorst.toFixed(0) : '…', 'ms',
         lagWorst > 100 ? 'fault' : NUM),
       // Clock divergence removed from the latency chart; amber past 10 ms/min.
       cell('clk drift',
-        clockDriftMsPerMin != null ? clockDriftMsPerMin.toFixed(1) : '—', 'ms/min',
-        clockDriftMsPerMin != null && Math.abs(clockDriftMsPerMin) > 10 ? 'fault' : NUM),
+        clockDriftMsPerMin != null ? clockDriftMsPerMin.toFixed(1) : '…', 'ms/min',
+        clockDriftMsPerMin != null && Math.abs(clockDriftMsPerMin) > 10 ? 'fault' : NUM, '',
+        clockDriftMsPerMin != null ? CELL_TIPS['clk drift']
+          : `${CELL_TIPS['clk drift']} Measuring: needs a few undisturbed minutes; hiding the page restarts it.`),
       // Worst object in the window: transit / reassembly / routing ms, then its size.
       cell('slowest t/a/d', worstDelivery(), worstDeliverySize(),
-        worstDeliveryLocalMs() > 50 ? 'fault' : NUM),
+        worstDeliveryLocalMs() > 50 ? 'fault' : NUM, '',
+        worstSpan() !== null ? CELL_TIPS['slowest t/a/d']
+          : `${CELL_TIPS['slowest t/a/d']} No object measured yet.`),
       // Queue depths are on the queued chart; this row is facts and fault counts.
       ...(locPath ? [
         cell('resyncs', fmtCount(syncResets), '', FAULT(syncResets)),
@@ -683,7 +689,11 @@ async function main(): Promise<void> {
           + `/${fmtCount((player as any).audioOutput?.liveEdgeSnapCount ?? 0)}`, '',
           FAULT(((player as any).engine?.stats?.loc?.audioLateDrops ?? 0)
             + ((player as any).audioOutput?.liveEdgeSnapCount ?? 0))),
-      ] : []),
+      ] : [
+        cell('resyncs', 'n/a', '', NA, '', naTip('resyncs')),
+        cell('underruns', 'n/a', '', NA, '', naTip('underruns')),
+        cell('late/snap', 'n/a', '', NA, '', naTip('late/snap')),
+      ]),
       cell('dropped', fmtCount(s.framesDropped ?? 0), '', FAULT(s.framesDropped ?? 0)),
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.
@@ -885,7 +895,7 @@ async function main(): Promise<void> {
   };
   const worstDelivery = (): string => {
     const s = worstSpan();
-    return s === null ? '—'
+    return s === null ? '…'
       : `${s.transferMs.toFixed(0)}/${s.assemblyMs.toFixed(0)}/${s.decodeMs.toFixed(0)}`;
   };
   /** The worst object's size, shown in the unit slot. */
