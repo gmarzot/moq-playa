@@ -82,6 +82,7 @@ const catSize = document.getElementById('cat-size')!;
 const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
+const catView = document.getElementById('cat-view') as HTMLButtonElement;
 const setupBadge = document.getElementById('setup-badge')!;
 const nsBadge = document.getElementById('ns-badge')!;
 const catBadge = document.getElementById('cat-badge')!;
@@ -1504,8 +1505,51 @@ async function main(): Promise<void> {
       return row;
     }));
 
-    catJson.textContent = JSON.stringify(orderCatalogForDisplay(cat), null, 2);
+    parsedCatalog = cat;
+    showCatalogJson();
   }
+
+  // The pane shows the last full catalog as received, member order and values
+  // untouched; "parsed" shows the engine's catalog with deltas applied.
+  let parsedCatalog: unknown = null;
+  let receivedCatalog: string | null = null;
+  let deltasSinceReceived = 0;
+  let showParsed = false;
+  function showCatalogJson(): void {
+    const received = !showParsed && receivedCatalog !== null;
+    catJson.textContent = received
+      ? receivedCatalog
+      : JSON.stringify(orderCatalogForDisplay(parsedCatalog), null, 2);
+    const deltas = deltasSinceReceived === 0 ? ''
+      : ` +${deltasSinceReceived} delta${deltasSinceReceived > 1 ? 's' : ''}`;
+    catView.textContent = received ? `received${deltas}` : 'parsed';
+    catView.title = received
+      ? 'The catalog as received; click for the parsed catalog'
+      : 'The parsed catalog; click for the catalog as received';
+  }
+  /** A full catalog replaces the received view; a delta is counted against it. */
+  function noteReceivedCatalog(text: string): void {
+    let obj: unknown;
+    try {
+      obj = JSON.parse(text);
+    } catch {
+      receivedCatalog = text;
+      deltasSinceReceived = 0;
+      return;
+    }
+    const full = typeof obj === 'object' && obj !== null && !Array.isArray(obj)
+      && 'version' in obj && (obj as { deltaUpdate?: unknown }).deltaUpdate !== true;
+    if (full) {
+      receivedCatalog = JSON.stringify(obj, null, 2);
+      deltasSinceReceived = 0;
+    } else {
+      deltasSinceReceived++;
+    }
+  }
+  catView.addEventListener('click', () => {
+    showParsed = !showParsed;
+    showCatalogJson();
+  });
 
   // Periodic catalog refreshes repeat an unchanged catalog; logging each one
   // buries the stall lines. Log and redraw only on a real change.
@@ -1529,6 +1573,11 @@ async function main(): Promise<void> {
   player.on('catalog_raw', ({ bytes, text }) => {
     rawSeen++;
     catSize.textContent = ` · ${bytes}B`;
+    // Empty text: the bytes were not UTF-8.
+    if (text) {
+      noteReceivedCatalog(text);
+      showCatalogJson();
+    }
     if (!debug) return;
     const head = text === null ? '(not UTF-8)' : text.slice(0, 120);
     log(`Catalog raw #${rawSeen}: ${bytes}B ${head}`);
