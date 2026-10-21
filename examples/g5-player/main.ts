@@ -42,6 +42,7 @@ const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
   return v === 'low-latency' || v === 'throughput' ? v : undefined;
 })();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
+import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
@@ -136,6 +137,7 @@ function log(msg: string): void {
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const backdrop = byId('settings-backdrop');
   const fUrl = byId<HTMLInputElement>('s-url');
+  const relayPicker = attachRelayPicker(fUrl);
   const fNs = byId<HTMLInputElement>('s-ns');
   const fV = byId<HTMLSelectElement>('s-v');
   const fTarget = byId<HTMLInputElement>('s-target');
@@ -156,6 +158,7 @@ function log(msg: string): void {
   function populate(): void {
     const p = new URLSearchParams(location.search);
     fUrl.value = p.get('url') ?? '';
+    relayPicker.sync();
     fNs.value = p.get('ns') ?? '';
     fV.value = p.get('v') ?? '';
     fTarget.value = p.get('targetLatency') ?? '';
@@ -238,8 +241,9 @@ function formatTime(ms: number): string {
 
 // ─── Main ───────────────────────────────────────────────────────────
 // Explicit ?url= is used as-is; otherwise the shared discovery probes the
-// page host's common endpoint paths. Total failure renders the diagnostic
-// and stops — no rethrow, no unhandled page error.
+// page host's common endpoint paths and, when none answers, falls back to the
+// default relay. A failing explicit ?url= renders the diagnostic and stops —
+// no rethrow, no unhandled page error.
 
 async function main(): Promise<void> {
   initBuildInfo(log);
@@ -249,10 +253,14 @@ async function main(): Promise<void> {
   try {
     relayUrl = await resolveRelayEndpoint();
   } catch (err) {
-    log(`Fatal: ${(err as Error).message}`);
-    stateBadge.textContent = 'error';
-    stateBadge.className = 'state-badge error';
-    return;
+    if (new URLSearchParams(location.search).get('url')) {
+      log(`Fatal: ${(err as Error).message}`);
+      stateBadge.textContent = 'error';
+      stateBadge.className = 'state-badge error';
+      return;
+    }
+    log(`${(err as Error).message}; using ${DEFAULT_RELAY}`);
+    relayUrl = DEFAULT_RELAY;
   }
 
   // ── Create Player ─────────────────────────────────────────────────
