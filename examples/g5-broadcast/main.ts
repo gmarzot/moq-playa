@@ -36,6 +36,7 @@ import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
+import { VOICE_AUDIO } from '../shared/browser/programme-audio.js';
 import {
   WebCodecsVideoEncoder,
   WebCodecsAudioEncoder,
@@ -105,6 +106,9 @@ const captureHeight = [1080, 720, 480, 360, 240].includes(Number(params.get('hei
 const DEFAULT_KBPS_BY_HEIGHT: Readonly<Record<number, number>> = { 1080: 4500, 720: 2000, 480: 1000, 360: 600, 240: 300 };
 /** `?audio=0`: camera broadcasts video only. */
 const cameraAudio = params.get('audio') !== '0';
+/** `?voiceProcessing=1`: camera audio keeps the browser's call processing (echo
+ *  cancellation, noise suppression, automatic gain), for speech. Off by default. */
+const voiceProcessing = params.get('voiceProcessing') === '1';
 /** `?audioBitrate=`: kbps. */
 const audioBitrateParam = parseInt(params.get('audioBitrate') ?? '', 10);
 const audioBitrate = (Number.isFinite(audioBitrateParam) && audioBitrateParam >= 6 ? audioBitrateParam : 128) * 1000;
@@ -314,6 +318,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sAnnexb = document.getElementById('s-annexb') as HTMLInputElement;
   const sSelfDescribing = document.getElementById('s-self-describing') as HTMLInputElement;
   const sTimescale = document.getElementById('s-timescale') as HTMLInputElement;
+  const sVoiceProcessing = document.getElementById('s-voice-processing') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
@@ -370,11 +375,12 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sAnnexb.checked = annexbParam;
     sSelfDescribing.checked = selfDescribing;
     sTimescale.checked = locTimescale;
+    sVoiceProcessing.checked = voiceProcessing;
     // Advanced opens when anything in it is set, so no change is hidden.
     sAdvanced.open = broadcastDraft !== DEFAULT_DRAFT || packaging !== 'loc' || keyframeSec !== null
       || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
       || catalogIntervalMs !== null || catalogDelivery !== 'both' || params.get('hash') !== null || dynamicGroups || audioDatagrams
-      || selfDescribing || locTimescale || annexbParam || debug || !showStatus;
+      || selfDescribing || locTimescale || annexbParam || debug || !showStatus || voiceProcessing;
     showApplicableFields();
   }
 
@@ -444,6 +450,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
     if (sSelfDescribing.checked && sPackaging.value !== 'locmaf') np.set('selfDescribing', '1');
     if (sTimescale.checked && sPackaging.value === 'loc') np.set('timescale', '1');
+    if (sVoiceProcessing.checked) np.set('voiceProcessing', '1');
     if (sDynamicGroups.checked && sVersion.value === '18') np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
@@ -1015,7 +1022,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           width: Math.round((captureHeight * 16) / 9), height: captureHeight,
           // ideal only: a min is mandatory and hides devices that cannot meet it.
           frameRate: { ideal: captureFps },
-        }, cameraAudio)
+        }, cameraAudio && voiceProcessing ? VOICE_AUDIO : cameraAudio)
         : await cap.startScreen({ video: { frameRate: { ideal: captureFps } }, audio: false });
       // The tracks only become real HERE — MediaCapture.stop() before this
       // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
@@ -1035,6 +1042,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
         const audioSettings = audioTrack.getSettings();
+        const onOff = (v: boolean | undefined) => (v === undefined ? '?' : v ? 'on' : 'off');
+        log(`Audio processing: echo cancellation ${onOff(audioSettings.echoCancellation)} · `
+          + `noise suppression ${onOff(audioSettings.noiseSuppression)} · gain control ${onOff(audioSettings.autoGainControl)}`);
         audio = {
           sampleRate: audioSettings.sampleRate ?? 48000,
           channels: audioSettings.channelCount ?? 1,
