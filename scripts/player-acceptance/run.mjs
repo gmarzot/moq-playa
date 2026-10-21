@@ -167,12 +167,13 @@ try {
     { name: 'loc-missing-audio-control', fixture: 'loc', silent: true, expectedFailure: 'audio-missing', version: 4, mode: 'media',
       expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: 'canvas' } },
     ...['mse', 'frame'].flatMap((decoding) => [
-      // Known failure in this fork: frame mode drops frames at loopback slack.
-      // Pinned so the run fails once it passes.
-      { name: `locmaf-${decoding}`, fixture: 'moving', silent: false, expectedFailure: decoding === 'frame' ? 'presentation-rate' : null },
+      { name: `locmaf-${decoding}`, fixture: 'moving', silent: false, expectedFailure: null },
       { name: `locmaf-${decoding}-frozen-picture-control`, fixture: 'frozen', silent: false, expectedFailure: 'picture-frozen' },
       { name: `locmaf-${decoding}-missing-audio-control`, fixture: 'moving', silent: true, expectedFailure: 'audio-missing' },
     ].map((scenario) => ({ ...scenario, locmaf: decoding,
+      // Known failure in this fork: frame mode drops frames at loopback slack.
+      // Pinned so the run fails once it passes.
+      ...(decoding === 'frame' ? { knownFailures: ['presentation-rate'] } : {}),
       expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: decoding === 'frame' ? 'canvas' : 'video' },
     }))),
   ];
@@ -328,8 +329,9 @@ try {
       assert.deepEqual(pageErrors, [], 'Uncaught browser error');
       if (!scenario.exampleViews) assert.ok(!caseResult.teardown.events.some((event) => event.type === 'error'), 'Player emitted an error, including during teardown');
       assert.ok(!relay.exited && !publisher.exited, 'Media process exited before test teardown');
-      if (scenario.expectedFailure) {
-        assert.deepEqual(caseResult.assessment.failures, [scenario.expectedFailure], 'Control must fail only its intended output check');
+      const expectedFailures = [scenario.expectedFailure, ...(scenario.knownFailures ?? [])].filter(Boolean).sort();
+      if (expectedFailures.length > 0) {
+        assert.deepEqual([...caseResult.assessment.failures].sort(), expectedFailures, 'Control must fail only its intended output check');
       } else assert.equal(caseResult.assessment.passed, true, `Playback failed: ${caseResult.assessment.failures.join(', ')}`);
     } catch (error) {
       caseResult.error = error.message;
