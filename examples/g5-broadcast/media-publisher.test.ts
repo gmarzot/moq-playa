@@ -484,6 +484,27 @@ describe('MediaPublisher — self-describing CMAF objects', () => {
   });
 });
 
+describe('MediaPublisher — LOC Video Config', () => {
+  it.each([16, 18] as const)('draft-%i carries VIDEO_CONFIG on keyframes only', async (draft) => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { draft });
+    pub.setVideoAlias(2n);
+    const videoConfig = new Uint8Array([7, 7]);
+    pub.publishVideo(chunk(1), { ...kf(1_000), videoConfig });
+    pub.publishVideo(chunk(2), { ...delta(2_000), videoConfig });
+    pub.publishVideo(chunk(3), { ...delta(3_000), videoConfig });
+    pub.publishVideo(chunk(4), { ...kf(4_000), videoConfig });
+    await settle();
+    const profile = { wireProfile: locWireProfileForDraft(draft) };
+    const configOf = (tag: number) =>
+      parseLocHeaders(conn.sends.find((s) => s.frame![0] === tag)!.extensions!, profile).videoConfig;
+    expect(configOf(1)).toEqual(videoConfig);
+    expect(configOf(2)).toBeUndefined();
+    expect(configOf(3)).toBeUndefined();
+    expect(configOf(4)).toEqual(videoConfig);
+  });
+});
+
 describe('MediaPublisher — self-describing LOC objects', () => {
   const wall = 1_700_000_000_000_000;
   const selfDescribing = { videoCodec: 'avc1.42001f', audioCodec: 'opus', audioConfig: new Uint8Array([1, 2]) };
