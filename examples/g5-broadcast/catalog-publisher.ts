@@ -259,10 +259,11 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
   const audioInit = !params.audio ? undefined
     : cmaf ? cmaf.audioInit : packaging === 'loc' ? params.locAudioConfig : undefined;
   return buildCatalog({
+    // MSF-01 §5.1.1: the draft release this catalog follows.
+    version: 'draft-01',
     // Initialization data goes in the root initDataList, referenced by initRef:
     // CMAF init segments (CMSF-01 §3.1), or LOC's decoder configuration.
     ...(videoInit || audioInit ? {
-      version: '1' as const,
       initDataList: [
         ...(videoInit ? [{ id: 'v0', type: 'inline', data: toBase64(videoInit) }] : []),
         ...(audioInit ? [{ id: 'a0', type: 'inline', data: toBase64(audioInit) }] : []),
