@@ -29,6 +29,7 @@ import type {
     LocVersion,
     VideoChunkInit,
     AudioChunkInit,
+    SourceTimestamp,
 } from './types.js';
 import { resolveLocHeaders, locHeadersToPropertyMap } from './property-map.js';
 
@@ -94,6 +95,7 @@ export function locWireProfileForDraft(draft: number): PropertyWireProfile {
         case 14:
             return 'd14-absolute-varint';
         case 18:
+        case 22:
             return 'd18-delta-vi64';
         default:
             return 'd16-delta-varint';
@@ -201,11 +203,37 @@ export function stripLocPrivateProperties(payload: Uint8Array): Uint8Array {
     }
 }
 
+function sourceTimestamp(headers: LocHeaders): SourceTimestamp | undefined {
+    const micros = headers.captureTimestamp;
+    if (micros === undefined) return undefined;
+    const scale = headers.timescale;
+    if (scale !== undefined && (scale <= 0n || headers.timestampIsWallClock === true)) return undefined;
+
+    if (headers.timestamp !== undefined) {
+        if (scale === undefined && headers.timestampIsWallClock === false) return undefined;
+        const ticksPerSecond = scale ?? 1_000_000n;
+        // LOC truncates to microseconds; the LOCMAF frame interface rounds.
+        const scaled = headers.timestamp * 1_000_000n;
+        const truncated = scaled / ticksPerSecond;
+        const rounded = (scaled + (scaled >= 0n ? ticksPerSecond / 2n : -(ticksPerSecond / 2n))) / ticksPerSecond;
+        if (micros !== truncated && micros !== rounded) return undefined;
+        return Object.freeze({ ticks: headers.timestamp, ticksPerSecond, domain: scale === undefined ? 'unix' : 'media' });
+    }
+
+    return Object.freeze({
+        ticks: micros,
+        ticksPerSecond: 1_000_000n,
+        domain: headers.timestampIsWallClock === true ? 'unix'
+            : headers.timestampIsWallClock === false || scale !== undefined ? 'media' : 'unknown',
+    });
+}
+
 /**
  * Create a WebCodecs-compatible `EncodedVideoChunkInit` from LOC payload + headers.
  *
  * - `type`: "key" if VideoFrameMarking.independent is true, "delta" otherwise
  * - `timestamp`: from CaptureTimestamp (microseconds), or 0 if absent
+ * - `sourceTimestamp`: exact supplied time and domain, when available
  * - `data`: the LOC payload (zero-copy reference)
  *
  * @param payload LOC payload (= MoqtObjectData.payload)
@@ -221,10 +249,13 @@ export function toVideoChunkInit(
     const timestamp = headers.captureTimestamp !== undefined
         ? Number(headers.captureTimestamp)
         : 0;
+    const source = sourceTimestamp(headers);
 
     return {
         type: isKey ? 'key' : 'delta',
         timestamp,
+        ...(source !== undefined ? { sourceTimestamp: source } : {}),
+        ...(headers.duration !== undefined ? { duration: headers.duration } : {}),
         data: payload,
     };
 }
@@ -247,10 +278,13 @@ export function toAudioChunkInit(
     const timestamp = headers.captureTimestamp !== undefined
         ? Number(headers.captureTimestamp)
         : 0;
+    const source = sourceTimestamp(headers);
 
     return {
         type: 'key',
         timestamp,
+        ...(source !== undefined ? { sourceTimestamp: source } : {}),
+        ...(headers.duration !== undefined ? { duration: headers.duration } : {}),
         data: payload,
     };
 }

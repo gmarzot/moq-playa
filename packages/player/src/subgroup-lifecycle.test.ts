@@ -51,7 +51,14 @@ function createMockAdapter() {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),

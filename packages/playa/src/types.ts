@@ -29,7 +29,7 @@ export interface PlayerOptions {
   /** SHA-256 cert hash for self-signed certs (local dev). */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version. Default: 16. */
-  readonly draftVersion?: 14 | 16 | 18;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
   /** Auth tokens for CLIENT_SETUP. */
   readonly authTokens?: Uint8Array[];
   /** Issuer-supplied credentials for SETUP and subsequent requests. */
@@ -67,6 +67,8 @@ export interface PlayerOptions {
   readonly autoQuality?: boolean;
   /** Initial quality level: 'auto' | 'lowest' | level index. Default: 'auto'. */
   readonly startLevel?: number | 'lowest' | 'auto';
+  /** Initial video view (catalog altGroup). Omitted: first video group. */
+  readonly videoAltGroup?: number;
   /** Cap quality to a maximum resolution. */
   readonly maxResolution?: { readonly width: number; readonly height: number };
 

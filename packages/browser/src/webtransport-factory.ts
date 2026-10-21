@@ -25,6 +25,8 @@ import type { WebTransportLike } from '@openmoq/webtransport';
 
 /** Options for creating the WebTransport factory. */
 export interface WebTransportFactoryOptions {
+  /** Cancels startup only; after readiness the caller owns transport shutdown. */
+  readonly signal?: AbortSignal;
   /**
    * SHA-256 certificate hash as ArrayBuffer for self-signed certs.
    * Passed to `serverCertificateHashes` in the WebTransport constructor.
@@ -38,6 +40,7 @@ export interface WebTransportFactoryOptions {
    * sends the `WT-Available-Protocols` header to the server. The server
    * selects a protocol and the result is available on `transport.protocol`.
    *
+   * - 22 → `["moqt-22"]`
    * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
@@ -46,7 +49,7 @@ export interface WebTransportFactoryOptions {
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
-  readonly draftVersion?: 14 | 16 | 18;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
 
   /**
    * Congestion-control preference for the WebTransport constructor. A hint the
@@ -117,13 +120,34 @@ export function createWebTransport(
     };
 
     const attempt = async (withProtocols: boolean) => {
+      if (options?.signal?.aborted) throw options.signal.reason;
       const opts = buildOpts(withProtocols);
       const transport = new WebTransport(url, opts);
       // Park `closed`: when `ready` rejects, `closed` rejects too, and an
       // unobserved rejection spams the console on strict UAs (Safari).
       (transport as any).closed?.catch?.(() => {});
       const connectStart = performance.now();
-      await transport.ready;
+      const signal = options?.signal;
+      if (signal) {
+        let rejectAbort!: (error: unknown) => void;
+        const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
+        const onAbort = () => {
+          try { transport.close(); } catch { /* ready may already have failed */ }
+          rejectAbort(signal.reason);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          if (signal.aborted) onAbort();
+          await Promise.race([transport.ready, cancelled]);
+          if (signal.aborted) throw signal.reason;
+        } finally { signal.removeEventListener('abort', onAbort); }
+      } else {
+        await transport.ready;
+      }
+      if (options?.draftVersion === 22 && (transport as unknown as { protocol?: string }).protocol !== 'moqt-22') {
+        transport.close();
+        throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+      }
       return { transport, handshakeRttMs: performance.now() - connectStart };
     };
 
@@ -132,8 +156,9 @@ export function createWebTransport(
     try {
       connected = await attempt(true);
     } catch (err) {
+      if (options?.signal?.aborted) throw options.signal.reason;
       const detail = failureDetail(err, firstOpts.protocols);
-      if (!firstOpts.protocols) {
+      if (!firstOpts.protocols || options?.draftVersion === 22) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
       // Draft-16+ negotiate the version only via WT-Protocol. A session
@@ -150,6 +175,7 @@ export function createWebTransport(
       try {
         connected = await attempt(false);
       } catch (retryErr) {
+        if (options?.signal?.aborted) throw options.signal.reason;
         throw new Error(
           `WebTransport connection failed: ${detail} ` +
           `(retry without protocols also failed: ${failureDetail(retryErr)})`,

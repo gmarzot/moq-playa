@@ -13,7 +13,7 @@
 
 export { Player } from './player.js';
 export { catToken, AuthorizationError } from '@openmoq/player';
-export type { PlayerAuthorization, AuthorizationToken, AuthorizationProvider, AuthorizationContext, AuthorizationOperation } from '@openmoq/player';
+export type { PlayerAuthorization, AuthorizationToken, AuthorizationProvider, AuthorizationContext, AuthorizationOperation, VideoPresentation } from '@openmoq/player';
 export type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 export type {
   PlayerEventMap,
@@ -38,6 +38,8 @@ export type {
 } from './events.js';
 export type { SubscriptionStatus, NamespaceState, BootstrapPhase } from '@openmoq/player';
 export { pickCaptureTime } from '@openmoq/player';
+export type { ViewChangedEvent, ProgramChangedEvent, AudioTrackChangedEvent, AudioTrackSwitchFailedEvent } from './events.js';
+export type { ProgramInfo, VideoViewInfo, AudioTrackInfo } from '@openmoq/player';
 export type { CaptureTimes, CaptureTimeSource } from '@openmoq/player';
 export { detectStrategy } from './auto-detect.js';
 export type { DecoderStrategy } from './auto-detect.js';

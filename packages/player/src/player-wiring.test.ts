@@ -22,6 +22,7 @@ import {
 function createMockAdapter() {
   return {
     onMessage: null as any,
+    onGoawayNotice: null as any,
     onClose: null as any,
     onError: null as any,
     onObject: null as any,
@@ -36,6 +37,7 @@ function createMockAdapter() {
 function createHandlers(overrides: Partial<ConnectionHandlers> = {}): ConnectionHandlers {
   return {
     onControlMessage: vi.fn(),
+    onGoawayNotice: vi.fn(),
     onClose: vi.fn(),
     onError: vi.fn(),
     onObject: vi.fn(),
@@ -58,6 +60,34 @@ describe('wireConnectionCallbacks', () => {
     const msg = { type: 'GOAWAY', newSessionUri: 'x' } as ControlMessage;
     adapter.onMessage(msg);
     expect(handlers.onControlMessage).toHaveBeenCalledWith(msg);
+  });
+
+  it('sets onGoawayNotice handler, passing the notice and its connection (§10.4)', () => {
+    const adapter = createMockAdapter();
+    const handlers = createHandlers();
+    wireConnectionCallbacks(adapter as any, handlers);
+
+    // Scope is carried through untouched: the player routes a per-request
+    // GOAWAY differently from a session-wide one, so the wiring must not
+    // flatten or reinterpret it.
+    const request = { scope: 'request', requestId: 7n, newSessionUri: '' } as const;
+    adapter.onGoawayNotice(request, adapter);
+    expect(handlers.onGoawayNotice).toHaveBeenCalledWith(request, adapter);
+
+    const session = { scope: 'session', newSessionUri: 'https://b.example/moq', timeoutMs: 9n } as const;
+    adapter.onGoawayNotice(session, adapter);
+    expect(handlers.onGoawayNotice).toHaveBeenLastCalledWith(session, adapter);
+  });
+
+  it('does not route GOAWAY through onControlMessage any more (§10.4)', () => {
+    // Raw dispatch still observes an accepted GOAWAY, but cannot express its
+    // scope — acting on it there cancelled unrelated subscriptions.
+    const adapter = createMockAdapter();
+    const handlers = createHandlers();
+    wireConnectionCallbacks(adapter as any, handlers);
+
+    adapter.onMessage({ type: 'GOAWAY', newSessionUri: 'x' } as ControlMessage);
+    expect(handlers.onGoawayNotice).not.toHaveBeenCalled();
   });
 
   it('sets onClose handler', () => {

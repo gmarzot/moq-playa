@@ -17,7 +17,7 @@
  * is included only when {@link BroadcastCatalogParams.audio} is present (a
  * screen capture without audio must not advertise an audio track).
  */
-import { varint, SubgroupIdMode, PublishDoneCode } from '@openmoq/transport';
+import { varint, SubgroupIdMode, PublishDoneCode, isRequestStreamDraft } from '@openmoq/transport';
 import type { DraftVersion } from '@openmoq/transport';
 import { buildCatalog } from '@openmoq/msf';
 
@@ -152,7 +152,7 @@ export async function acceptCatalogSubscribe(
         endOfGroup: true,
         defaultPriority: true,
         subgroupIdMode: SubgroupIdMode.ZERO,
-        ...(wire.draft === 18 ? { firstObject: true } : {}),
+        ...(isRequestStreamDraft(wire.draft) ? { firstObject: true } : {}),
       },
     );
     await connection.sendObject(streamId, varint(0), catalogPayload);

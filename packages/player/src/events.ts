@@ -52,6 +52,29 @@ export interface SessionGoawayEvent {
 }
 
 /**
+ * GOAWAY received on ONE request stream — a per-request migration signal that
+ * leaves the rest of the session in place. Unrelated subscriptions keep
+ * delivering and the session does not drain, so this deliberately does NOT
+ * emit `session_goaway`: a listener on that event may reconnect the whole
+ * player, which is the wrong response to a single request migrating.
+ *
+ * Re-issuing the request is application policy; nothing is re-issued
+ * automatically.
+ *
+ * @see draft-ietf-moq-transport-18 §10.4
+ * @see draft-ietf-moq-transport-22 §9.2, §6.6.1
+ */
+export interface RequestGoawayEvent {
+  readonly type: 'request_goaway';
+  /** The request the peer asked to migrate, from its stream context. */
+  readonly requestId: bigint;
+  /** Where to re-issue it; empty means the current session. */
+  readonly newSessionUri: string;
+  /** Track name when the request was a known media or catalog subscription. */
+  readonly trackName?: string;
+}
+
+/**
  * Session migrated to a new relay after GOAWAY.
  * @see draft-ietf-moq-transport-16 §3.5 (Migration)
  * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
@@ -440,6 +463,62 @@ export interface QualitySwitchFailedEvent {
 }
 
 /**
+ * Video view changed — a switch to a track of another altGroup (or another
+ * program's video) committed.
+ * Fires right after the `quality_switched` event of that switch.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+ */
+export interface ViewChangedEvent {
+  readonly type: 'view_changed';
+  /** altGroup of the previous view. */
+  readonly fromView: number | undefined;
+  /** altGroup of the new view; undefined when it has none (a program without altGroups). */
+  readonly toView: number | undefined;
+  /** Track of the new view that is now playing. */
+  readonly trackName: string;
+}
+
+/**
+ * Audio track changed — a switch to another audio track (typically another
+ * language) committed: the new track now feeds the decoder or SourceBuffer.
+ */
+export interface AudioTrackChangedEvent {
+  readonly type: 'audio_track_changed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  /** Catalog `lang` of the new track, when it has one. */
+  readonly lang: string | undefined;
+  readonly reason: string;
+}
+
+/**
+ * Audio track switch rolled back — the new track could not be committed
+ * (e.g. `mediaSource.changeType()` rejected). The old track keeps playing.
+ */
+export interface AudioTrackSwitchFailedEvent {
+  readonly type: 'audio_track_switch_failed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  readonly reason: string;
+  readonly error: Error;
+}
+
+/**
+ * Program changed — the current renderGroup moved. After `selectProgram()`
+ * it fires once every track that had to change has committed (at once when
+ * the program shares all playing tracks); a manual `selectVideoTrack()` of
+ * another program's track fires it when that switch commits.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+ */
+export interface ProgramChangedEvent {
+  readonly type: 'program_changed';
+  readonly fromProgram: number | undefined;
+  readonly toProgram: number;
+}
+
+/**
  * Live catch-up state changed — activated, rate adjusted, or deactivated.
  *
  * Emitted when the player adjusts playback rate to catch up to the live
@@ -670,6 +749,7 @@ export interface PlayerEventMap {
   session_connecting: SessionConnectingEvent;
   session_established: SessionEstablishedEvent;
   session_goaway: SessionGoawayEvent;
+  request_goaway: RequestGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
   session_reconnecting: SessionReconnectingEvent;
@@ -714,6 +794,10 @@ export interface PlayerEventMap {
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;
   quality_switch_failed: QualitySwitchFailedEvent;
+  view_changed: ViewChangedEvent;
+  audio_track_changed: AudioTrackChangedEvent;
+  audio_track_switch_failed: AudioTrackSwitchFailedEvent;
+  program_changed: ProgramChangedEvent;
   catch_up_changed: CatchUpChangedEvent;
 
   // Namespace discovery

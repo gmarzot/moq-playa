@@ -428,6 +428,24 @@ export interface QualityConfig {
   readonly startLevel?: number | 'lowest' | 'auto';
 
   /**
+   * renderGroup of the program to start on when the catalog carries several
+   * (sets of tracks meant to be rendered together, e.g. a commentator booth
+   * and the match). Default: the program of the first video track in catalog
+   * order. `videoAltGroup` wins when it names a view of another program.
+   * Switch later with `selectProgram()`.
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  readonly initialProgram?: number;
+
+  /**
+   * Preferred audio language, e.g. `'es'` or `'en-US'`. Matched against the
+   * catalog's `lang` on the primary subtag, ignoring case. When no track
+   * matches, audio selection proceeds as if unset. Switch later with
+   * `selectAudioTrack()`.
+   */
+  readonly preferredLanguage?: string;
+
+  /**
    * Cap video quality to a maximum resolution.
    * Tracks exceeding this resolution are excluded from selection.
    * Useful for mobile devices or bandwidth-constrained environments.
@@ -446,6 +464,17 @@ export interface QualityConfig {
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
   readonly videoConstraints?: TrackConstraints;
+
+  /**
+   * Video alternate group (view) to select at tune-in, e.g. a landscape or a
+   * portrait canvas; it also selects the view's program. Omitted: the first
+   * view in catalog order. An unknown group fails rather than falling back to
+   * other content. Quality selection and ABR stay within the view; switch
+   * later with `selectView()`. Cannot be combined with the catalog-free
+   * knownTracks fast path.
+   * @see draft-ietf-moq-msf-01 §4.2, §5.2.12
+   */
+  readonly videoAltGroup?: number;
 
   /**
    * Constraints for initial audio track selection from altGroup.
@@ -803,6 +832,14 @@ export const DEFAULT_PLAYER_CONFIG = {
  * into a stream.
  */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.videoAltGroup !== undefined) {
+    if (!Number.isSafeInteger(config.videoAltGroup)) {
+      throw new RangeError('videoAltGroup must be a safe integer');
+    }
+    if (config.knownTracks && !config.catalog && !config.disableVideo) {
+      throw new TypeError('videoAltGroup cannot be combined with knownTracks; select from the catalog');
+    }
+  }
   if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
     throw new TypeError('Invalid authorization configuration');
   }
@@ -952,6 +989,17 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // maxDecodeErrors: > 0
   if (config.maxDecodeErrors !== undefined && (config.maxDecodeErrors <= 0 || !Number.isInteger(config.maxDecodeErrors))) {
     throw new RangeError(`maxDecodeErrors must be a positive integer, got ${config.maxDecodeErrors}`);
+  }
+
+  // initialProgram: a renderGroup number (non-negative integer)
+  if (config.initialProgram !== undefined && (config.initialProgram < 0 || !Number.isInteger(config.initialProgram))) {
+    throw new RangeError(`initialProgram must be a non-negative integer renderGroup, got ${config.initialProgram}`);
+  }
+
+  // preferredLanguage: a non-empty language tag
+  if (config.preferredLanguage !== undefined
+    && (typeof config.preferredLanguage !== 'string' || config.preferredLanguage.trim() === '')) {
+    throw new RangeError('preferredLanguage must be a non-empty language tag');
   }
 
   // capLevelToResolution: both dimensions > 0

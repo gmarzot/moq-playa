@@ -17,7 +17,7 @@
  * @module
  */
 
-import type { VideoRendererLike } from '@openmoq/player';
+import type { VideoRendererLike, VideoPresentation } from '@openmoq/player';
 import type { ClockSource } from '@openmoq/playback';
 import { validateStallThresholdMs } from './mse-adapter.js';
 
@@ -52,6 +52,7 @@ export class CanvasRenderer implements VideoRendererLike {
   private framesDropped = 0;
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
+  private readonly followFrameSize: boolean;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
   /**
@@ -72,6 +73,14 @@ export class CanvasRenderer implements VideoRendererLike {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private destroyed = false;
+  private lastVideoPresentation: VideoPresentation | null = null;
+  private drawDepth = 0;
+  private drawRevision = 0;
+
+  /** Last successful canvas draw; retained on pause, cleared on destruction. */
+  get videoPresentation(): VideoPresentation | null {
+    return this.destroyed || this.drawDepth > 0 ? null : this.lastVideoPresentation;
+  }
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
@@ -97,7 +106,18 @@ export class CanvasRenderer implements VideoRendererLike {
 
   constructor(
     canvas: HTMLCanvasElement,
-    options?: { stallThresholdMs?: number; clock?: ClockSource },
+    options?: {
+      stallThresholdMs?: number;
+      clock?: ClockSource;
+      /**
+       * Resize the canvas backing store to each frame's display size, so a
+       * resolution or aspect change (e.g. a landscape → portrait view switch)
+       * is never stretched; CSS (`object-fit: contain`) then letterboxes the
+       * element. Default true. Pass false for a canvas whose size the caller
+       * owns: frames are then drawn stretched to the canvas.
+       */
+      followFrameSize?: boolean;
+    },
   ) {
     // Validate before acquiring any browser state, so an invalid option
     // cannot leave a half-constructed renderer holding a 2d context.
@@ -106,23 +126,7 @@ export class CanvasRenderer implements VideoRendererLike {
       : validateStallThresholdMs(options.stallThresholdMs);
     this.ctx = canvas.getContext('2d')!;
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
-  }
-
-  /**
-   * Match the backing store to the frame's display size (display, not coded:
-   * coded dimensions carry codec macroblock padding and any pixel aspect
-   * ratio). Frames without the fields (older stubs) leave the canvas alone.
-   */
-  private sizeCanvasTo(frame: unknown): void {
-    const f = frame as { displayWidth?: number; displayHeight?: number;
-                         codedWidth?: number; codedHeight?: number };
-    const w = f.displayWidth ?? f.codedWidth;
-    const h = f.displayHeight ?? f.codedHeight;
-    if (!w || !h) return;
-    const canvas = this.ctx.canvas;
-    if (canvas.width === w && canvas.height === h) return;
-    canvas.width = w;
-    canvas.height = h;
+    this.followFrameSize = options?.followFrameSize ?? true;
   }
 
   /**
@@ -191,23 +195,41 @@ export class CanvasRenderer implements VideoRendererLike {
         // On time — render
         this.queue.shift();
 
-        // Capture timestamp BEFORE close — VideoFrame.timestamp is the
-        // CaptureTimestamp set during toVideoChunkInit() (LOC §2.3.1.1).
-        // Used for drift detection in the feedback path.
-        const captureTimestampUs = BigInt(entry.frame.timestamp);
+        // Capture the decoded timestamp before releasing the frame.
+        const frameTimestampUs = entry.frame.timestamp;
+        const captureTimestampUs = BigInt(frameTimestampUs);
+        const revision = ++this.drawRevision;
 
-        // The backing store must match the frame, not the element's CSS box:
-        // a canvas that was never sized keeps the 300x150 HTML default, and
-        // every frame would be downscaled to it and stretched back by CSS.
-        // Resizing clears the canvas, so only on a genuine size change.
-        this.sizeCanvasTo(entry.frame);
-        this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
         try {
-          this.onFrameDrawn?.(entry.frame.timestamp, Date.now());
-        } catch { /* an observer must not break rendering */ }
-
-        // frame.close() is NON-NEGOTIABLE — GPU memory outside GC
-        entry.frame.close();
+          // Follow the frame's size so a resolution or aspect change (e.g. a
+          // switch from a landscape to a portrait view) is not stretched into
+          // the previous geometry; CSS object-fit letterboxes the element.
+          const canvas = this.ctx.canvas;
+          // Coded size for frames that report no display size.
+          const displayWidth = entry.frame.displayWidth ?? entry.frame.codedWidth;
+          const displayHeight = entry.frame.displayHeight ?? entry.frame.codedHeight;
+          if (this.followFrameSize && displayWidth && displayHeight
+            && (canvas.width !== displayWidth || canvas.height !== displayHeight)) {
+            canvas.width = displayWidth;
+            canvas.height = displayHeight;
+          }
+          this.drawDepth++;
+          try {
+            this.ctx.drawImage(entry.frame, 0, 0, canvas.width, canvas.height);
+          } finally {
+            this.drawDepth--;
+            // A wrapper may reenter before or after its native draw. Neither
+            // invocation nor return order proves the final image in that case.
+            if (revision !== this.drawRevision) this.lastVideoPresentation = null;
+          }
+          this.recordVideoPresentation(frameTimestampUs, revision);
+          try {
+            this.onFrameDrawn?.(frameTimestampUs, Date.now());
+          } catch { /* an observer must not break rendering */ }
+        } finally {
+          // Release even when drawing fails; only successful draws update evidence.
+          entry.frame.close();
+        }
 
         rendered = true;
         // A genuinely rendered frame is the only thing that completes an
@@ -321,6 +343,7 @@ export class CanvasRenderer implements VideoRendererLike {
 
   /** Release resources. MUST close() all held frames. */
   destroy(): void {
+    this.lastVideoPresentation = null;
     this.cancelStallEpisode();
     this.destroyed = true;
     this.stop();
@@ -332,6 +355,26 @@ export class CanvasRenderer implements VideoRendererLike {
   }
 
   // ─── Internal ──────────────────────────────────────────────────
+
+  private recordVideoPresentation(timestampUs: number, revision: number): void {
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return;
+    this.lastVideoPresentation = null;
+    let renderedAtUs: number;
+    try {
+      renderedAtUs = this.clock.now();
+    } catch {
+      // Treat anything escaping this diagnostic query as unavailable evidence,
+      // including exceptions from hooks it calls. Preserve the playback path.
+      return;
+    }
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return;
+    if (!Number.isFinite(renderedAtUs)) return;
+    this.lastVideoPresentation = Object.freeze({
+      frameTimestampUs: Number.isSafeInteger(timestampUs) ? BigInt(timestampUs) : null,
+      timestampDomain: 'unknown',
+      renderedAtUs,
+    });
+  }
 
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;

@@ -34,6 +34,7 @@
  */
 import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {
@@ -69,7 +70,7 @@ export interface AudioChunkMeta {
 export interface MediaPublisherOptions {
   /** Wraps a bigint as the wire integer type (the example passes `varint`). */
   wrapInt: (n: bigint) => unknown;
-  /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft-18,
+  /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft 18+,
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
@@ -99,7 +100,7 @@ export interface MediaPublisherOptions {
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
-const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22];
 
 /** Validate a queue bound: NaN/Infinity would disable backpressure entirely
  *  and a non-positive or fractional cap has no coherent meaning. */
@@ -319,7 +320,7 @@ export class MediaPublisher {
       hasExtensions: true,
       endOfGroup: true,
       publisherPriority: priority,
-      ...(this.draft === 18 ? { firstObject: true } : {}),
+      ...(isRequestStreamDraft(this.draft) ? { firstObject: true } : {}),
     };
   }
 

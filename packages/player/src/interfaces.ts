@@ -14,7 +14,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
+import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -64,8 +64,12 @@ export interface VideoDecoderLike {
    */
   readonly queueDepth: number;
 
-  /** Callback: decoded frame ready for rendering. */
-  onFrame: ((frame: unknown, renderTimeUs: number) => void) | null;
+  /**
+   * Callback: decoded frame ready for rendering. Optional source time belongs to
+   * this output's decode input; null/omitted means unavailable, never guessed from
+   * the latest input or catalog. It is not a render observation or track identity.
+   */
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -126,6 +130,16 @@ export interface AudioDecoderLike {
 
 // ─── Layer 4: Renderer and Audio Output (Swappable) ──────────────────
 
+/** Historical render evidence, not a content playhead or seek-completion signal. */
+export interface VideoPresentation {
+  /** Decoded frame timestamp in microseconds; null if numeric precision is unavailable. */
+  readonly frameTimestampUs: bigint | null;
+  /** The decoder timestamp's origin is not inferred from its value. */
+  readonly timestampDomain: 'unknown';
+  /** Renderer monotonic clock sampled after the successful draw call returns, in microseconds. */
+  readonly renderedAtUs: number;
+}
+
 /**
  * Video renderer interface — draws decoded frames to a display surface.
  *
@@ -133,6 +147,9 @@ export interface AudioDecoderLike {
  * MUST call frame.close() after rendering (GPU memory management).
  */
 export interface VideoRendererLike {
+  /** Most recent successful render observation; null when draw order or timing is unavailable. */
+  readonly videoPresentation?: VideoPresentation | null;
+
   /** Enqueue a decoded frame for presentation at the specified time. */
   enqueue(frame: unknown, renderTimeUs: number): void;
 
@@ -284,6 +301,9 @@ export interface MediaSourceLike {
    * @param codec Codec string for the new mime type
    *              (e.g. `"hvc1.1.6.L93.90"`).
    * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
+   *
+   * The SourceBuffer keeps its timestampOffset: the player's CMAF assembler
+   * already places the new track's fragments on the running timeline.
    */
   changeType?(
     mediaType: 'video' | 'audio',

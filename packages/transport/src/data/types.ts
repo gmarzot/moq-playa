@@ -146,7 +146,12 @@ export interface ObjectDatagram {
  */
 export type DataStreamHeader =
   | { readonly type: 'subgroup'; readonly header: SubgroupHeader }
-  | { readonly type: 'fetch'; readonly header: FetchHeader };
+  /**
+   * `fill` (draft 22 §3.4): a fill fetch stream, whose FETCH_HEADER carries the
+   * Request ID of the SUBSCRIBE (or REQUEST_UPDATE) that asked for the fill. It
+   * has no FETCH_OK: a FIN completes it, a reset fails it.
+   */
+  | { readonly type: 'fetch'; readonly header: FetchHeader; readonly fill?: boolean };
 
 /**
  * Discriminated union for objects delivered via subscription.
@@ -162,6 +167,13 @@ export type MoqtObject =
  */
 export interface MoqtObjectData {
   readonly kind: 'data';
+  /** The delivering subgroup header declares it contains the group's largest
+   * object. Not an assertion that THIS object is last. Absent for FETCH/datagrams. */
+  readonly subgroupContainsEndOfGroup?: boolean;
+  /** True only for the first object of a FIRST_OBJECT-marked subgroup stream.
+   * False for later objects or an unmarked stream; undefined for older drafts,
+   * datagrams, and FETCH delivery. */
+  readonly isFirstObjectInSubgroup?: boolean;
   readonly trackAlias: bigint;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
@@ -186,6 +198,10 @@ export interface MoqtObjectData {
  */
 export interface MoqtObjectGap {
   readonly kind: 'gap';
+  /** Same delivering-subgroup header evidence as on data objects. */
+  readonly subgroupContainsEndOfGroup?: boolean;
+  /** Same per-object FIRST_OBJECT evidence as {@link MoqtObjectData}. */
+  readonly isFirstObjectInSubgroup?: boolean;
   readonly trackAlias: bigint;
   readonly groupId: bigint;
   readonly subgroupId: bigint;

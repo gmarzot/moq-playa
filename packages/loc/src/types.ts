@@ -154,6 +154,11 @@ export interface LocHeaders {
      */
     readonly captureTimestamp?: bigint;
     /**
+     * Sample duration in microseconds, supplied by a container frame interface.
+     * Local decode metadata only; not a LOC wire property.
+     */
+    readonly duration?: number;
+    /**
      * Video frame marking flags (RFC 9626).
      * @see draft-ietf-moq-loc-01 §2.3.2.2
      */
@@ -212,6 +217,20 @@ export interface LocHeaders {
 // ─── WebCodecs-compatible chunk init ─────────────────────────────────
 
 /**
+ * Exact supplied source timestamp before conversion to a WebCodecs number.
+ * Retains raw ticks when available, otherwise supplied normalized microseconds.
+ * Media time has an application-defined origin; unknown means no domain was
+ * declared. This is decode-input metadata, not evidence of a rendered frame.
+ * @see draft-ietf-moq-loc-01 §2.3.1.1
+ * @see draft-ietf-moq-loc-04 §2.3.1.1, §2.3.1.2
+ */
+export interface SourceTimestamp {
+    readonly ticks: bigint;
+    readonly ticksPerSecond: bigint;
+    readonly domain: 'unix' | 'media' | 'unknown';
+}
+
+/**
  * Initialization data for creating an `EncodedVideoChunk`.
  *
  * Pure TypeScript type compatible with the WebCodecs `EncodedVideoChunkInit`
@@ -225,6 +244,8 @@ export interface VideoChunkInit {
     readonly type: 'key' | 'delta';
     /** Timestamp in microseconds. From CaptureTimestamp if available. */
     readonly timestamp: number;
+    /** Immutable source time; absent when time or consistent units are unavailable. */
+    readonly sourceTimestamp?: SourceTimestamp;
     /** Duration in microseconds (optional). */
     readonly duration?: number;
     /** Raw codec bitstream (LOC payload = EncodedVideoChunk internal data). */
@@ -245,6 +266,8 @@ export interface AudioChunkInit {
     readonly type: 'key';
     /** Timestamp in microseconds. From CaptureTimestamp if available. */
     readonly timestamp: number;
+    /** Immutable source time; absent when time or consistent units are unavailable. */
+    readonly sourceTimestamp?: SourceTimestamp;
     /** Duration in microseconds (optional). */
     readonly duration?: number;
     /** Raw codec bitstream (LOC payload = EncodedAudioChunk internal data). */

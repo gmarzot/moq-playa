@@ -14,13 +14,20 @@
 
 import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent, SubgroupHeader } from '@openmoq/transport';
 import type { MoqtObject } from '@openmoq/transport';
-import type { DataStreamTerminal, MoqtConnection } from '@openmoq/webtransport';
+import type { DataStreamTerminal, GoawayNotice, MoqtConnection } from '@openmoq/webtransport';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
 /** Callbacks from connection to player — the inversion-of-control boundary. */
 export interface ConnectionHandlers {
   onControlMessage: (msg: ControlMessage) => void;
+  /**
+   * An ACCEPTED GOAWAY with its scope resolved from the carrying stream. The
+   * raw message channel still sees the same accepted GOAWAY, but cannot
+   * distinguish a session-wide one from a per-request one, so migration
+   * decisions are driven from here instead.
+   */
+  onGoawayNotice: (notice: GoawayNotice, connection: MoqtConnection) => void;
   onClose: (error?: number, reason?: string) => void;
   onError: (error: Error) => void;
   onObject: (streamId: bigint, obj: MoqtObject) => void;
@@ -63,6 +70,10 @@ export function wireConnectionCallbacks(
 ): void {
   conn.onMessage = (msg: ControlMessage) => {
     handlers.onControlMessage(msg);
+  };
+
+  conn.onGoawayNotice = (notice: GoawayNotice, connection: MoqtConnection) => {
+    handlers.onGoawayNotice(notice, connection);
   };
 
   conn.onClose = (error?: number, reason?: string) => {

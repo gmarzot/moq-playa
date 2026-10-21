@@ -21,9 +21,10 @@ import {
 import type { MoqtPlayerConfig } from './config.js';
 import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@openmoq/playback';
 import type { CommandDispatcher } from './command-dispatcher.js';
-import type { MediaSourceLike } from './interfaces.js';
+import type { MediaSourceLike, VideoDecoderLike, VideoRendererLike } from './interfaces.js';
 import type { LoggerLike } from './logger.js';
 import type { QualityController } from './quality-controller.js';
+import { varint } from '@openmoq/transport';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -65,6 +66,78 @@ function mockCallbacks(): PipelineCallbacks {
 // ─── createPipelines ─────────────────────────────────────────────────
 
 describe('createPipelines', () => {
+  it.each([
+    { packaging: 'cmaf' as const, decoding: 'mse' as const, videoReference: true },
+    { packaging: 'locmaf' as const, decoding: 'mse' as const, videoReference: true },
+    { packaging: 'loc' as const, decoding: 'mse' as const, videoReference: false },
+    { packaging: 'locmaf' as const, decoding: 'frame' as const, videoReference: false },
+  ])('anchors LOC video without waiting for an absent audio pipeline: $packaging/$decoding', ({ packaging, decoding, videoReference }) => {
+    const decoder: VideoDecoderLike = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(async () => {}),
+      reset: vi.fn(), destroy: vi.fn(), queueDepth: 0, onFrame: null, onError: null,
+    };
+    const renderer: VideoRendererLike = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const result = createPipelines(minimalConfig({ locmafDecoding: decoding,
+      createVideoDecoder: () => decoder, createRenderer: () => renderer,
+    }), mockClock, {
+      video: { codec: 'avc1.64001e', packaging: 'loc' },
+      audio: { codec: packaging === 'loc' ? 'opus' : 'mp4a.40.2', packaging, samplerate: 48000 },
+    }, mockCallbacks());
+    const object = { kind: 'data' as const, trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: new Uint8Array([1]) };
+    result.videoPipeline!.configure(new Uint8Array([1]));
+    result.videoPipeline!.pushObject(object, { captureTimestamp: 12_345n,
+      videoFrameMarking: { independent: true, startOfFrame: true, endOfFrame: true,
+        discardable: false, baseLayerSync: false, temporalId: 0 } });
+    result.videoPipeline!.tick();
+    expect(result.syncController.hasReference).toBe(videoReference);
+    const frame = { timestamp: 12_345, close: vi.fn() };
+    decoder.onFrame!(frame, 0);
+    expect(renderer.enqueue).toHaveBeenCalledTimes(videoReference ? 1 : 0);
+    if (!videoReference) {
+      result.audioPipeline!.configure(new Uint8Array([1]));
+      result.audioPipeline!.pushObject(object, { captureTimestamp: 12_000n });
+      result.audioPipeline!.tick();
+      expect(result.syncController.hasReference).toBe(true);
+      decoder.onFrame!({ timestamp: 12_346, close: vi.fn() }, 0);
+      expect(renderer.enqueue).toHaveBeenCalledTimes(2);
+    }
+    expect(renderer.enqueue).toHaveBeenCalledWith(frame, expect.any(Number));
+    result.commandDispatcher?.destroy();
+  });
+  it.each([0n, 9_007_199_254_740_993n])('preserves rendered timestamp %s through callbacks and feedback', (timestamp) => {
+    const renderer: VideoRendererLike = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const callbacks = mockCallbacks();
+    const onFrameRendered = vi.fn((captureTimestampUs: bigint, actualRenderUs: number) => {
+      expect(captureTimestampUs + 1n).toBe(timestamp + 1n);
+      expect(actualRenderUs).toBe(123_456);
+    });
+    callbacks.onFrameRendered = onFrameRendered;
+    const result = createPipelines(minimalConfig({
+      createRenderer: () => renderer,
+      createVideoDecoder: () => ({ configure: vi.fn(), destroy: vi.fn() }) as any,
+    }), mockClock, {
+      video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined,
+    }, callbacks);
+
+    try {
+      renderer.onFrameRendered!(timestamp, 123_456, 120_000);
+      expect(onFrameRendered).toHaveBeenCalledExactlyOnceWith(timestamp, 123_456);
+      expect(callbacks.onFeedback).toHaveBeenCalledExactlyOnceWith({
+        type: 'frame_rendered', mediaType: 'video', captureTimestampUs: timestamp,
+        actualRenderUs: 123_456, scheduledRenderUs: 120_000,
+      });
+    } finally {
+      result.commandDispatcher?.destroy();
+    }
+  });
+
   it('creates video pipeline for LOC track', () => {
     const trackInfo: TrackInfo = {
       video: { codec: 'avc1.64001e', width: 1920, height: 1080, packaging: 'loc' },

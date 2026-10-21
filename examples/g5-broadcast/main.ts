@@ -1151,7 +1151,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         log('Relay granted no request credit (SERVER_SETUP without MAX_REQUEST_ID); '
           + 'requests go uncapped until it sends one (compat request-credit)');
       }
-      negotiatedDraft = conn.draftVersion;
+      negotiatedDraft = conn.draftVersion as typeof broadcastDraft;  // built for broadcastDraft only
       setupBadgeState = { tone: 'ok', detail: `Session established, draft-${conn.draftVersion}` };
       // Show the negotiated draft.
       setText('conn-draft', String(negotiatedDraft));

@@ -182,7 +182,7 @@ async function run(): Promise<void> {
   const ns = (document.getElementById('namespace') as HTMLInputElement).value.trim();
   const vRaw = (document.getElementById('draft-version') as HTMLSelectElement).value;
   const hashHex = (document.getElementById('cert-hash') as HTMLInputElement).value.trim();
-  const v: 14 | 16 | 18 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : undefined;
+  const v: 14 | 16 | 18 | 22 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : vRaw === '22' ? 22 : undefined;
 
   if (!ns) { setStatus('Namespace required.', 'error'); return; }
   if (!url) {
@@ -361,8 +361,8 @@ function renderCatalog(catalog: CatalogState, rawJson: string): void {
   // Header
   const thead = table.createTHead();
   const hr = thead.insertRow();
-  const cols = ['#', 'Name', 'Packaging', 'Role', 'Codec', 'Bitrate', 'Details', ''];
-  const colClasses = ['col-idx', '', '', '', '', '', '', 'col-expand'];
+  const cols = ['#', 'Name', 'Packaging', 'Role', 'Render group', 'Alt group', 'Codec', 'Bitrate', 'Details', ''];
+  const colClasses = ['col-idx', '', '', '', 'col-group', 'col-group', '', '', '', 'col-expand'];
   cols.forEach((text, i) => {
     const th = document.createElement('th');
     th.textContent = text;
@@ -399,6 +399,14 @@ function renderCatalog(catalog: CatalogState, rawJson: string): void {
       roleCell.appendChild(badge);
     } else {
       roleCell.innerHTML = '<span class="dim">—</span>';
+    }
+
+    // renderGroup (§5.1.18) and altGroup (§5.1.19)
+    for (const group of [track.renderGroup, track.altGroup]) {
+      const groupCell = row.insertCell();
+      groupCell.className = 'col-group';
+      if (group != null) groupCell.textContent = String(group);
+      else groupCell.innerHTML = '<span class="dim">—</span>';
     }
 
     // Codec
