@@ -1,5 +1,5 @@
 import {
-  AliasType, encodeAuthorizationToken, encodeAuthorizationToken18,
+  AliasType, encodeAuthorizationToken, encodeAuthorizationToken18, isRequestStreamDraft,
   type DraftVersion,
 } from '@openmoq/transport';
 
@@ -108,7 +108,8 @@ export class AuthorizationSession {
       if (this.closed || controller.signal.aborted) throw new AuthorizationError('Authorization connection closed');
       if (!Array.isArray(tokens) || tokens.length === 0) throw new AuthorizationError('Authorization provider returned no credentials');
       if (tokens.length > 16) throw new AuthorizationError('Too many authorization tokens');
-      const encode = context.draftVersion === 18 ? encodeAuthorizationToken18 : encodeAuthorizationToken;
+      // Drafts 18 and later encode the token's integers as vi64.
+      const encode = isRequestStreamDraft(context.draftVersion) ? encodeAuthorizationToken18 : encodeAuthorizationToken;
       const encoded: Uint8Array[] = [];
       let totalBytes = 0;
       for (const token of tokens) {

@@ -33,6 +33,7 @@ import { StreamType18 } from './codes-18.js';
 import { FetchFlags, FetchSubgroupMode, FetchSpecialFlags } from './codes.js';
 import type { SubgroupHeader, SubgroupObject, ObjectDatagram, FetchHeader, FetchObject, FetchEndOfRange, GroupOrder } from './types.js';
 import type { DecodedFetchItem } from './decoder.js';
+import type { RequestStreamDraft } from '../versions.js';
 
 /** Subgroup-ID mode 0b10: an explicit Subgroup ID field follows (§11.4.2). */
 const SUBGROUP_ID_MODE_EXPLICIT = 0b10;
@@ -305,17 +306,25 @@ export function decodeFetchHeader18(
   return { header: { requestId: rid.value }, bytesRead: pos - offset };
 }
 
-/** Whether a Serialization Flags value is an End-of-Range marker. */
-function isEndOfRange18(flags: bigint): boolean {
-  return flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT) || flags === BigInt(FetchSpecialFlags.END_UNKNOWN);
+/** draft-22 §11.4: End of Timed-Out Range, the objects' delivery timeout expired. */
+const END_TIMED_OUT_22 = 0x20cn;
+
+/** Whether a Serialization Flags value is an End-of-Range marker on `version`. */
+function isEndOfRange18(flags: bigint, version: RequestStreamDraft = 18): boolean {
+  return flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT) || flags === BigInt(FetchSpecialFlags.END_UNKNOWN)
+    || (version === 22 && flags === END_TIMED_OUT_22);
 }
 
-/** Validate Serialization Flags: 0x00–0x7F, 0x8C, or 0x10C; else PROTOCOL_VIOLATION. */
-function validateFetchFlags18(flags: bigint): void {
-  if (isEndOfRange18(flags)) return;
+/**
+ * Validate Serialization Flags: 0x00–0x7F, 0x8C, 0x10C, and on draft 22 0x20C;
+ * else PROTOCOL_VIOLATION.
+ */
+function validateFetchFlags18(flags: bigint, version: RequestStreamDraft = 18): void {
+  if (isEndOfRange18(flags, version)) return;
   if (flags >= 0n && flags <= 0x7fn) return;
   throw new ProtocolViolationError(
-    `Invalid draft-18 fetch Serialization Flags 0x${flags.toString(16)} (allowed: 0x00-0x7F, 0x8C, 0x10C)`,
+    `Invalid draft-${version} fetch Serialization Flags 0x${flags.toString(16)} (allowed: 0x00-0x7F, 0x8C, 0x10C`
+      + `${version === 22 ? ', 0x20C' : ''})`,
   );
 }
 
@@ -334,14 +343,17 @@ export function decodeFetchObject18(
   prior: FetchObjectPrior18 | undefined,
   isFirstObject: boolean,
   groupOrder: GroupOrder,
+  version: RequestStreamDraft = 18,
 ): { item: DecodedFetchItem; bytesRead: number; nextPrior: FetchObjectPrior18 } {
   let pos = offset;
   const fl = readVi64(buf, pos); pos += fl.bytesRead;
   const flags = fl.value;
-  validateFetchFlags18(flags);
+  validateFetchFlags18(flags, version);
 
   // ── End-of-Range marker (§11.4.4.2) ──────────────────────────────────
-  if (isEndOfRange18(flags)) {
+  // A draft-22 End of Timed-Out Range (0x20C) is, like 0x10C, a range of unknown
+  // status: the objects may exist but will not be delivered.
+  if (isEndOfRange18(flags, version)) {
     const gid = readVi64(buf, pos); pos += gid.bytesRead;
     const oid = readVi64(buf, pos); pos += oid.bytesRead;
     // The marker ends after the Object ID, as moxygen, LibMoQ, red5-moq-relay and

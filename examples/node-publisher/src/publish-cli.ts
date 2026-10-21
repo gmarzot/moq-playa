@@ -19,7 +19,7 @@
  *
  * Default url https://127.0.0.1:4433/moq. PACE_MS env (default = the manifest's
  * chunkDurationMs) paces chunk sends like a live origin; PACE_MS=0 sends as fast
- * as possible.
+ * as possible. --pace-media instead uses each track's parsed CMAF timestamps.
  */
 import { resolve } from 'node:path';
 import { connectClient } from './client.js';
@@ -30,7 +30,8 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 // Flags first, then [url] [fixtureDir] in either order:
 // anything starting with https:// is the url, anything else is a fixture dir.
 //   --loop | --loop-count N   repeat media as new groups (endless / N groups)
-//   --catalog-format <fmt>    msf-00 (default) | cmsf-01 (string version, root
+//   --pace-media             pace each track from its actual CMAF decode timeline
+//   --catalog-format <fmt>    msf-00 (CMAF default) | cmsf-01 (LOCMAF default, root
 //                             initDataList, per-track initRef)
 //   --msf01                   alias for --catalog-format cmsf-01
 //   --emit-delta              publish an op-array catalog delta after the catalog
@@ -39,13 +40,15 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 //   --locmaf                  alias for --packaging locmaf
 const rawArgs = process.argv.slice(2);
 let loops = 1;
-let catalogFormat: CatalogFormat = 'msf-00';
+let catalogFormat: CatalogFormat | undefined;
 let deltaAfterMs: number | undefined;
 let packaging: MediaPackaging = 'cmaf';
+let paceByMediaTime = false;
 const positionals: string[] = [];
 for (let i = 0; i < rawArgs.length; i++) {
   const a = rawArgs[i]!;
   if (a === '--loop') loops = Infinity;
+  else if (a === '--pace-media') paceByMediaTime = true;
   else if (a === '--loop-count') {
     const n = Number(rawArgs[++i]);
     if (!Number.isInteger(n) || n < 1) { console.error('--loop-count requires a positive integer'); process.exit(2); }
@@ -72,6 +75,11 @@ for (let i = 0; i < rawArgs.length; i++) {
 }
 const url = positionals.find((a) => a.startsWith('https://')) ?? process.env.URL ?? 'https://127.0.0.1:4433/moq';
 const fixtureDir = positionals.find((a) => !a.startsWith('https://'));
+catalogFormat ??= packaging === 'locmaf' ? 'cmsf-01' : 'msf-00';
+if (packaging === 'locmaf' && catalogFormat !== 'cmsf-01') {
+  console.error('LOCMAF publication requires a CMSF-01 catalog with initDataList/initRef');
+  process.exit(2);
+}
 
 let fixture;
 if (fixtureDir) {
@@ -89,10 +97,10 @@ if (fixtureDir) {
 }
 
 const paceMs = process.env.PACE_MS !== undefined ? Number(process.env.PACE_MS) : fixture.manifest.chunkDurationMs;
-console.log(`[publish] connecting to ${url} (paceMs=${paceMs}, loops=${loops === Infinity ? '∞' : loops}, catalog=${catalogFormat}, packaging=${packaging}${deltaAfterMs !== undefined ? `, delta@${deltaAfterMs}ms` : ''})`);
+console.log(`[publish] connecting to ${url} (${paceByMediaTime ? 'pace=media-timestamps' : `paceMs=${paceMs}`}, loops=${loops === Infinity ? '∞' : loops}, catalog=${catalogFormat}, packaging=${packaging}${deltaAfterMs !== undefined ? `, delta@${deltaAfterMs}ms` : ''})`);
 connectClient(url, 'publisher')
   .then(async (h) => {
-    await publishFixture(h.conn, fixture, { paceMs, loops, catalogFormat, packaging, ...(deltaAfterMs !== undefined ? { deltaAfterMs } : {}) });
+    await publishFixture(h.conn, fixture, { paceMs, paceByMediaTime, loops, catalogFormat, packaging, ...(deltaAfterMs !== undefined ? { deltaAfterMs } : {}) });
     await h.close();
     process.exit(0);
   })

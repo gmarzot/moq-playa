@@ -12,12 +12,27 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  // Scoped to simulation suites, test-support helpers, and repository scripts. The wider
+  // Scoped to simulation suites, test-support helpers, repository scripts,
+  // and draft-22 conformance tests. The wider
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
     "packages/*/src/**/*.sim.test.ts",
     "packages/*/test-support/**/*.ts",
+    "packages/transport/src/session/session-d22-conformance.test.ts",
+    "packages/webtransport/src/adapter-d22-conformance.test.ts",
+    "packages/webtransport/src/adapter-d22-lifecycle.test.ts",
+    "packages/webtransport/src/topology/inbound-request.test.ts",
+    "packages/player/src/player-d22-bootstrap.loopback.test.ts",
+    "packages/webtransport/src/adapter-goaway-notice.test.ts",
+    "packages/webtransport/src/adapter-goaway-diagnostics.test.ts",
+    "packages/player/src/player-goaway-request-owners.test.ts",
+    "packages/player/src/player-goaway-catalog-retirement.test.ts",
+    "packages/player/src/player-goaway-owner-isolation.test.ts",
+    "packages/player/src/player-goaway-inflight-fallback.test.ts",
+    "packages/player/src/player-goaway-scope.loopback.test.ts",
+    "packages/msf/src/video-alt-group.test.ts",
+    "packages/player/src/player-video-alt-group.test.ts",
     "scripts/**/*.test.ts",
     "_migration/**/*.test.ts"
   ]

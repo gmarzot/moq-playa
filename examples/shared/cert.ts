@@ -78,12 +78,13 @@ export const targetLatencyMs: number | undefined = positiveMs('targetLatency');
  *  events mirrored into the on-page log. */
 export const debug: boolean = params.get('debug') === '1';
 
-/** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18). */
-export const draftVersion: 14 | 16 | 18 | undefined = (() => {
+/** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18, ?v=22 for draft-22). */
+export const draftVersion: 14 | 16 | 18 | 22 | undefined = (() => {
   const v = params.get('v');
   if (v === '14') return 14;
   if (v === '16') return 16;
   if (v === '18') return 18;
+  if (v === '22') return 22;
   return undefined;
 })();
 

@@ -261,16 +261,17 @@ export function encodeFetchObject18(
 }
 
 /**
- * Encode a draft-18 End-of-Range marker (§11.4.4.2): Serialization Flags 0x8C
- * (non-existent) or 0x10C (unknown), Group ID and Object ID, with no Payload
- * Length (as moxygen, LibMoQ and red5-moq-relay encode it). Position prior
- * advances to the marker; field priors are unchanged.
+ * Encode an End-of-Range marker: Serialization Flags 0x8C (non-existent) or
+ * 0x10C (unknown), Group ID and Object ID, with no Payload Length (as moxygen,
+ * LibMoQ and red5-moq-relay encode it on draft 18; the draft-22 form omits it).
+ * Position prior advances to the marker; field priors are unchanged.
  */
 export function encodeFetchEndOfRange18(
   nonExistent: boolean,
   groupId: bigint,
   objectId: bigint,
   prior: FetchObjectPrior18 | undefined,
+  _version: 18 | 22 = 18,
 ): { bytes: Uint8Array; nextPrior: FetchObjectPrior18 } {
   const flags = BigInt(nonExistent ? FetchSpecialFlags.END_NON_EXISTENT : FetchSpecialFlags.END_UNKNOWN);
   const size = vi64EncodingLength(flags) + vi64EncodingLength(groupId) + vi64EncodingLength(objectId);

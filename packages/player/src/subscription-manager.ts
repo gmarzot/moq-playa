@@ -48,6 +48,14 @@ export interface TrackContext {
   readonly timestamps?: TimestampTrackResult;
 }
 
+interface PendingLocmafTransform {
+  readonly alias: bigint;
+  readonly groupId: bigint;
+  readonly source: unknown;
+  readonly bytes: number;
+  valid: boolean;
+}
+
 /**
  * Manages track alias → pipeline routing.
  */
@@ -58,6 +66,10 @@ export class SubscriptionManager {
   private readonly objectConfigSeen = new Set<bigint>();
   /** Tracks whose timestamp properties proved malformed; ignored until re-registered. */
   private readonly timingErrors = new Map<bigint, string>();
+  private readonly pendingLocmafTransforms = new Set<PendingLocmafTransform>();
+  private pendingLocmafTransformBytes = 0;
+  private static readonly MAX_LOCMAF_TRANSFORMS = 256;
+  private static readonly MAX_LOCMAF_TRANSFORM_BYTES = 8 * 1024 * 1024;
 
   /**
    * Object transform: applied to every MoqtObject before routing.
@@ -231,9 +243,8 @@ export class SubscriptionManager {
     packaging: TrackPackaging = 'loc',
     context?: TrackContext,
   ): void {
+    this.unregisterTrack(trackAlias);
     this.tracks.set(trackAlias, { trackName, mediaType, packaging, ...(context ? { context } : {}) });
-    this.objectConfigSeen.delete(trackAlias);
-    this.timingErrors.delete(trackAlias);
   }
 
   /**
@@ -244,6 +255,31 @@ export class SubscriptionManager {
     this.tracks.delete(trackAlias);
     this.objectConfigSeen.delete(trackAlias);
     this.timingErrors.delete(trackAlias);
+    for (const pending of this.pendingLocmafTransforms) {
+      if (pending.alias === trackAlias) pending.valid = false;
+    }
+  }
+
+  /** In-flight work received before a reset cannot re-anchor its group afterwards. */
+  invalidateLocmafGroup(alias: bigint, groupId: bigint, source?: unknown): void {
+    for (const pending of this.pendingLocmafTransforms) {
+      if (pending.alias === alias && pending.groupId === groupId && pending.source === source) {
+        pending.valid = false;
+      }
+    }
+  }
+
+  clear(): void {
+    this.tracks.clear();
+    this.objectConfigSeen.clear();
+    this.timingErrors.clear();
+    for (const pending of this.pendingLocmafTransforms) pending.valid = false;
+  }
+
+  private retireLocmafTransform(pending: PendingLocmafTransform): void {
+    pending.valid = false;
+    // Invalid work still owns its input until the application transform settles.
+    if (this.pendingLocmafTransforms.delete(pending)) this.pendingLocmafTransformBytes -= pending.bytes;
   }
 
   /**
@@ -329,6 +365,7 @@ export class SubscriptionManager {
     // malformed old-session object recovers against ITS session, not the current.
     const draft = sourceDraft ?? this.draftVersion;
     const source = sourceConnection;
+    let pendingTransform: PendingLocmafTransform | undefined;
 
     try {
       // §7: Mediatimeline objects bypass E2EE transform — metadata is not encrypted.
@@ -362,8 +399,19 @@ export class SubscriptionManager {
       // Supports both sync and async transforms (crypto.subtle.decrypt is async)
       let transformed: MoqtObject | null = obj;
       if (this.objectTransform) {
+        if (info.packaging === 'locmaf') {
+          const bytes = obj.kind === 'data' ? obj.payload.byteLength + (obj.extensions?.byteLength ?? 0) : 0;
+          if (this.pendingLocmafTransforms.size >= SubscriptionManager.MAX_LOCMAF_TRANSFORMS
+              || this.pendingLocmafTransformBytes + bytes > SubscriptionManager.MAX_LOCMAF_TRANSFORM_BYTES) {
+            throw new Error('LOCMAF object transform capacity exceeded');
+          }
+          pendingTransform = { alias, groupId: BigInt(obj.groupId), source, bytes, valid: true };
+          this.pendingLocmafTransforms.add(pendingTransform);
+          this.pendingLocmafTransformBytes += bytes;
+        }
         const result = this.objectTransform(obj);
         transformed = result instanceof Promise ? await result : result;
+        if (pendingTransform && !pendingTransform.valid) return;
         if (!transformed) return; // Transform dropped the object
       }
 
@@ -425,6 +473,7 @@ export class SubscriptionManager {
         this.onObject?.(mediaType, info.trackName, transformed, headers);
       }
     } catch (error) {
+      if (pendingTransform && !pendingTransform.valid) return;
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
       // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(
@@ -434,7 +483,8 @@ export class SubscriptionManager {
         error instanceof Error ? error : new Error(String(error)),
         source,
       );
+    } finally {
+      if (pendingTransform) this.retireLocmafTransform(pendingTransform);
     }
   }
 }
-
