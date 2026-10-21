@@ -194,6 +194,15 @@ describe('broadcast catalog subscription lifecycle', () => {
     expect(catalog.initDataList).toBeUndefined();
   });
 
+  it('the catalog version is "draft-01" with and without initialization data (MSF-01 §5.1.1)', () => {
+    const version = (params: BroadcastCatalogParams) =>
+      JSON.parse(new TextDecoder().decode(buildCatalogPayload(params))).version;
+    expect(version(PARAMS)).toBe('draft-01');
+    expect(version({ ...PARAMS, locVideoConfig: new Uint8Array([1, 2, 3]) })).toBe('draft-01');
+    expect(version({ ...PARAMS, packaging: 'cmaf', cmaf: { videoInit: new Uint8Array([1]), audioInit: new Uint8Array([2]) } }))
+      .toBe('draft-01');
+  });
+
   it('CMAF: an audio track without an init segment is refused', () => {
     expect(() => buildCatalogPayload({ ...PARAMS, packaging: 'cmaf', cmaf: { videoInit: new Uint8Array([1]) } }))
       .toThrow(/audio track without an init/);
