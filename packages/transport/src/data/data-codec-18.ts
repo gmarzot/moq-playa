@@ -20,11 +20,12 @@ import {
   decodeFetchObject18,
 } from './decoder-18.js';
 import { classifyStream18, classifyDatagram18 } from './stream-type-18.js';
+import type { RequestStreamDraft } from '../versions.js';
 
 /** Create the draft-18 {@link DataCodec}. */
-export function createDataCodec18(): DataCodec {
+export function createDataCodec18(version: RequestStreamDraft = 18): DataCodec {
   return {
-    version: 18,
+    version,
 
     decodeSubgroupHeader: (buf, offset) => decodeSubgroupHeader18(buf, offset),
 
@@ -38,7 +39,7 @@ export function createDataCodec18(): DataCodec {
     },
 
     decodeFetchObject18: (buf, offset, prior, isFirstObject, groupOrder) =>
-      decodeFetchObject18(buf, offset, prior, isFirstObject, groupOrder),
+      decodeFetchObject18(buf, offset, prior, isFirstObject, groupOrder, version),
 
     decodeObjectDatagram: (buf, offset) => decodeObjectDatagram18(buf, offset),
 

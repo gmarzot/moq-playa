@@ -29,6 +29,7 @@ export type {
   SessionConnectingEvent,
   SessionEstablishedEvent,
   SessionGoawayEvent,
+  RequestGoawayEvent,
   SessionClosedEvent,
   SessionReconnectingEvent,
   SessionErrorEvent,
@@ -125,6 +126,7 @@ export type {
   VideoDecoderLike,
   AudioDecoderLike,
   VideoRendererLike,
+  VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
 } from './interfaces.js';

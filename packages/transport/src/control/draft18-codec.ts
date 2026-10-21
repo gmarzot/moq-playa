@@ -67,9 +67,12 @@ import {
   decodeMessageParams18,
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
+  DRAFT22_MESSAGE_PARAM_REGISTRY,
   type MessageParams18,
+  type MessageParamRegistry,
   type MessageParamValue,
 } from './message-params-18.js';
+import { encodeFetchLocationFilter, decodeFetchLocationFilter } from './subscription-filter.js';
 import {
   encodeTrackProperties18,
   decodeTrackProperties18,
@@ -77,6 +80,7 @@ import {
 } from './track-properties-18.js';
 import { ProtocolViolationError } from '../errors.js';
 import { validateTrackNamespacePrefix, validateFullTrackName, validateTrackNamespace } from '../primitives/bytes.js';
+import type { RequestStreamDraft } from '../versions.js';
 
 /** Error Code value that carries an optional Redirect structure (§10.6.2). */
 const REDIRECT_ERROR_CODE = 0x34n;
@@ -159,6 +163,9 @@ const TEXT_DECODER = new TextDecoder();
 
 /** §10.4: maximum New Session URI length; longer → PROTOCOL_VIOLATION. */
 const GOAWAY_MAX_URI_LENGTH = 8192;
+
+/** draft-22 LOCATION_FILTER (§9.20.9), the 0x21 message parameter. */
+const LOCATION_FILTER_TYPE = 0x21n;
 
 /** §1.4.2: maximum Reason Phrase length in bytes; longer → PROTOCOL_VIOLATION. */
 const REASON_PHRASE_MAX_LENGTH = 1024;
@@ -280,8 +287,8 @@ function isLocation(v: ParameterValue): v is Location {
   return typeof v === 'object' && v !== null && !(v instanceof Uint8Array) && !Array.isArray(v);
 }
 
-function toTypedParam(type: bigint, v: ParameterValue): MessageParamValue {
-  const kind = DEFAULT_MESSAGE_PARAM_REGISTRY.get(type);
+function toTypedParam(type: bigint, v: ParameterValue, registry: MessageParamRegistry): MessageParamValue {
+  const kind = registry.get(type);
   if (kind === undefined) {
     throw new ProtocolViolationError(`Unknown draft-18 message parameter 0x${type.toString(16)}`);
   }
@@ -304,6 +311,9 @@ function toTypedParam(type: bigint, v: ParameterValue): MessageParamValue {
     case 'bytes':
       if (!(v instanceof Uint8Array)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects bytes`);
       return { kind: 'bytes', value: v };
+    case 'locationFilter':
+      if (!(v instanceof Uint8Array)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects a LOCATION_FILTER`);
+      return { kind: 'locationFilter', value: v };
     case 'location':
       if (!isLocation(v)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects Location`);
       return { kind: 'location', group: v.group, object: v.object };
@@ -318,7 +328,7 @@ function toTypedParam(type: bigint, v: ParameterValue): MessageParamValue {
   }
 }
 
-function paramsToTyped(params: Parameters): MessageParams18 {
+function paramsToTyped(params: Parameters, registry: MessageParamRegistry): MessageParams18 {
   const out = new Map<bigint, MessageParamValue[]>();
   for (const [type, values] of params) {
     if (type === MessageParam.FORWARD) {
@@ -328,7 +338,7 @@ function paramsToTyped(params: Parameters): MessageParams18 {
         throw new ProtocolViolationError('FORWARD must be exactly one value, 0 or 1');
       }
     }
-    out.set(type, values.map((v) => toTypedParam(type, v)));
+    out.set(type, values.map((v) => toTypedParam(type, v, registry)));
   }
   return out;
 }
@@ -342,6 +352,7 @@ function fromTypedParam(v: MessageParamValue): ParameterValue {
       // rather than re-capping through the QUIC Varint range.
       return v.value;
     case 'bytes':
+    case 'locationFilter':
       return v.value;
     case 'location':
       return { group: v.group, object: v.object };
@@ -363,7 +374,16 @@ const notImplemented = (what: string): never => {
 };
 
 export class Draft18Codec implements ControlCodec {
-  readonly version = 18 as const;
+  /**
+   * @param version 18, or 22 for the draft-22 variant of the same stream
+   *   model (its differing messages branch on this).
+   */
+  constructor(readonly version: RequestStreamDraft = 18) {}
+
+  /** The message-parameter table of this codec's draft. */
+  private get paramRegistry(): MessageParamRegistry {
+    return this.version === 22 ? DRAFT22_MESSAGE_PARAM_REGISTRY : DEFAULT_MESSAGE_PARAM_REGISTRY;
+  }
 
   encode(msg: ControlMessage): Uint8Array {
     switch (msg.type) {
@@ -380,7 +400,7 @@ export class Draft18Codec implements ControlCodec {
       case 'REQUEST_ERROR':
         return this.frame(ControlMessageType18.REQUEST_ERROR, this.encodeRequestError(msg));
       case 'FETCH':
-        return this.frame(ControlMessageType18.FETCH, this.encodeFetch(msg));
+        return this.frame(ControlMessageType18.FETCH, this.version === 22 ? this.encodeFetch22(msg) : this.encodeFetch(msg));
       case 'FETCH_OK':
         return this.frame(ControlMessageType18.FETCH_OK, this.encodeFetchOk(msg));
       case 'TRACK_STATUS':
@@ -403,6 +423,11 @@ export class Draft18Codec implements ControlCodec {
         return this.frame(ControlMessageType18.PUBLISH_BLOCKED, this.encodePublishBlocked(msg));
       case 'GOAWAY':
         return this.frame(ControlMessageType18.GOAWAY, this.encodeGoaway(msg));
+      case 'PUBLISH_STATE_NOTIFY':
+        if (this.version !== 22) {
+          throw new ProtocolViolationError('Draft18Codec: PUBLISH_STATE_NOTIFY exists only in draft 22');
+        }
+        return this.frame(ControlMessageType18.PUBLISH_STATE_NOTIFY, this.encodeParamsOnly(msg.parameters));
       case 'PUBLISH_NAMESPACE_DONE':
         // draft-18 §3.3.2 removed this message — withdrawal is a request-stream
         // cancellation. It must never reach the wire.
@@ -436,7 +461,7 @@ export class Draft18Codec implements ControlCodec {
       case ControlMessageType18.REQUEST_ERROR:
         return { message: this.decodeRequestError(payload), bytesRead: total };
       case ControlMessageType18.FETCH:
-        return { message: this.decodeFetch(payload), bytesRead: total };
+        return { message: this.version === 22 ? this.decodeFetch22(payload) : this.decodeFetch(payload), bytesRead: total };
       case ControlMessageType18.FETCH_OK:
         return { message: this.decodeFetchOk(payload), bytesRead: total };
       case ControlMessageType18.TRACK_STATUS:
@@ -459,6 +484,12 @@ export class Draft18Codec implements ControlCodec {
         return { message: this.decodePublishBlocked(payload), bytesRead: total };
       case ControlMessageType18.GOAWAY:
         return { message: this.decodeGoaway(payload), bytesRead: total };
+      case ControlMessageType18.PUBLISH_STATE_NOTIFY:
+        if (this.version !== 22) return notImplemented(`decode of type 0x${type.toString(16)}`);
+        return {
+          message: { type: 'PUBLISH_STATE_NOTIFY', parameters: this.decodeParamsOnly(payload, 'PUBLISH_STATE_NOTIFY') },
+          bytesRead: total,
+        };
       default:
         return notImplemented(`decode of type 0x${type.toString(16)}`);
     }
@@ -494,17 +525,17 @@ export class Draft18Codec implements ControlCodec {
   private encodeSubscribe(msg: Subscribe): Uint8Array {
     // §2.4.1: Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096 bytes.
     validateFullTrackName(msg.trackNamespace, msg.trackName, { allowEmptyNamespace: true });
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
       vi64TupleLength(msg.trackNamespace) +
       vi64BytesLength(msg.trackName) +
-      messageParams18EncodingLength(typed);
+      messageParams18EncodingLength(typed, this.paramRegistry);
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.requestId, buf, 0);
     p += writeVi64Tuple(msg.trackNamespace, buf, p);
     p += writeVi64Bytes(msg.trackName, buf, p);
-    buf.set(encodeMessageParams18(typed), p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
     return buf;
   }
 
@@ -513,7 +544,7 @@ export class Draft18Codec implements ControlCodec {
     const rid = readVi64(payload, p); p += rid.bytesRead;
     const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
     const name = readVi64Bytes(payload, p); p += name.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     // SUBSCRIBE has no field after Parameters; any trailing bytes are malformed.
     if (p !== payload.length) {
@@ -537,17 +568,17 @@ export class Draft18Codec implements ControlCodec {
   private encodeTrackStatus(msg: TrackStatus): Uint8Array {
     // §2.4.1: Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096 bytes.
     validateFullTrackName(msg.trackNamespace, msg.trackName, { allowEmptyNamespace: true });
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
       vi64TupleLength(msg.trackNamespace) +
       vi64BytesLength(msg.trackName) +
-      messageParams18EncodingLength(typed);
+      messageParams18EncodingLength(typed, this.paramRegistry);
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.requestId, buf, 0);
     p += writeVi64Tuple(msg.trackNamespace, buf, p);
     p += writeVi64Bytes(msg.trackName, buf, p);
-    buf.set(encodeMessageParams18(typed), p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
     return buf;
   }
 
@@ -556,7 +587,7 @@ export class Draft18Codec implements ControlCodec {
     const rid = readVi64(payload, p); p += rid.bytesRead;
     const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
     const name = readVi64Bytes(payload, p); p += name.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     if (p !== payload.length) {
       throw new ProtocolViolationError('TRACK_STATUS: unexpected trailing bytes after parameters');
@@ -581,15 +612,15 @@ export class Draft18Codec implements ControlCodec {
     // §2.4.1: PUBLISH_NAMESPACE carries a full Track Namespace (no track name):
     // 0-32 non-empty fields, total ≤ 4096 bytes.
     validateTrackNamespace(msg.trackNamespace, { allowEmpty: true });
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
       vi64TupleLength(msg.trackNamespace) +
-      messageParams18EncodingLength(typed);
+      messageParams18EncodingLength(typed, this.paramRegistry);
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.requestId, buf, 0);
     p += writeVi64Tuple(msg.trackNamespace, buf, p);
-    buf.set(encodeMessageParams18(typed), p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
     return buf;
   }
 
@@ -597,7 +628,7 @@ export class Draft18Codec implements ControlCodec {
     let p = 0;
     const rid = readVi64(payload, p); p += rid.bytesRead;
     const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     if (p !== payload.length) {
       throw new ProtocolViolationError('PUBLISH_NAMESPACE: unexpected trailing bytes after parameters');
@@ -620,20 +651,20 @@ export class Draft18Codec implements ControlCodec {
   private encodePublish(msg: Publish): Uint8Array {
     // §2.4.1: Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096 bytes.
     validateFullTrackName(msg.trackNamespace, msg.trackName, { allowEmptyNamespace: true });
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
       vi64TupleLength(msg.trackNamespace) +
       vi64BytesLength(msg.trackName) +
       vi64EncodingLength(msg.trackAlias) +
-      messageParams18EncodingLength(typed) +
+      messageParams18EncodingLength(typed, this.paramRegistry) +
       trackProperties18EncodingLength(trackPropsOf(msg));
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.requestId, buf, 0);
     p += writeVi64Tuple(msg.trackNamespace, buf, p);
     p += writeVi64Bytes(msg.trackName, buf, p);
     p += writeVi64(msg.trackAlias, buf, p);
-    const params = encodeMessageParams18(typed);
+    const params = encodeMessageParams18(typed, this.paramRegistry);
     buf.set(params, p); p += params.length;
     buf.set(encodeTrackProperties18(trackPropsOf(msg)), p);
     return buf;
@@ -645,7 +676,7 @@ export class Draft18Codec implements ControlCodec {
     const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
     const name = readVi64Bytes(payload, p); p += name.bytesRead;
     const alias = readVi64(payload, p); p += alias.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     const props = decodeTrackProperties18(payload, p); // remaining bytes (empty → {})
     p += props.bytesRead;
@@ -709,15 +740,15 @@ export class Draft18Codec implements ControlCodec {
     prefix: Uint8Array[],
     parameters: Parameters,
   ): Uint8Array {
-    const typed = paramsToTyped(parameters);
+    const typed = paramsToTyped(parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(requestId) +
       vi64TupleLength(prefix) +
-      messageParams18EncodingLength(typed);
+      messageParams18EncodingLength(typed, this.paramRegistry);
     const buf = new Uint8Array(len);
     let p = writeVi64(requestId, buf, 0);
     p += writeVi64Tuple(prefix, buf, p);
-    buf.set(encodeMessageParams18(typed), p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
     return buf;
   }
 
@@ -729,7 +760,7 @@ export class Draft18Codec implements ControlCodec {
     let p = 0;
     const rid = readVi64(payload, p); p += rid.bytesRead;
     const prefix = readVi64Tuple(payload, p); p += prefix.bytesRead; // 0 fields allowed
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     if (p !== payload.length) {
       throw new ProtocolViolationError(`${name}: unexpected trailing bytes after parameters`);
@@ -781,12 +812,14 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError(`GOAWAY New Session URI length ${uri.length} exceeds maximum ${GOAWAY_MAX_URI_LENGTH} bytes`);
     }
     const timeout = msg.timeout ?? 0n;
+    // draft-22 §9.2 dropped the Request ID.
+    const requestId = this.version === 22 ? undefined : msg.requestId;
     let len = vi64BytesLength(uri) + vi64EncodingLength(timeout);
-    if (msg.requestId !== undefined) len += vi64EncodingLength(msg.requestId);
+    if (requestId !== undefined) len += vi64EncodingLength(requestId);
     const buf = new Uint8Array(len);
     let p = writeVi64Bytes(uri, buf, 0);
     p += writeVi64(timeout, buf, p);
-    if (msg.requestId !== undefined) writeVi64(msg.requestId, buf, p);
+    if (requestId !== undefined) writeVi64(requestId, buf, p);
     return buf;
   }
 
@@ -800,12 +833,14 @@ export class Draft18Codec implements ControlCodec {
     // Request ID is present only on the control stream (§10.4). The codec is
     // context-free: read it iff bytes remain, and expose it optionally.
     let requestId: bigint | undefined;
-    if (p < payload.length) {
+    if (p < payload.length && this.version !== 22) {
       const rid = readVi64(payload, p); p += rid.bytesRead;
       requestId = rid.value;
     }
     if (p !== payload.length) {
-      throw new ProtocolViolationError(`GOAWAY: ${payload.length - p} trailing bytes after Request ID`);
+      throw new ProtocolViolationError(this.version === 22
+        ? `GOAWAY: ${payload.length - p} trailing bytes after Timeout`
+        : `GOAWAY: ${payload.length - p} trailing bytes after Request ID`);
     }
     const msg: Goaway = {
       type: 'GOAWAY',
@@ -834,18 +869,18 @@ export class Draft18Codec implements ControlCodec {
   // the bidirectional request stream it is sent on identifies the target.
 
   private encodeRequestUpdate(msg: RequestUpdate): Uint8Array {
-    const typed = paramsToTyped(msg.parameters);
-    const len = vi64EncodingLength(msg.requestId) + messageParams18EncodingLength(typed);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
+    const len = vi64EncodingLength(msg.requestId) + messageParams18EncodingLength(typed, this.paramRegistry);
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.requestId, buf, 0);
-    buf.set(encodeMessageParams18(typed), p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
     return buf;
   }
 
   private decodeRequestUpdate(payload: Uint8Array): DecodedControlMessage {
     let p = 0;
     const rid = readVi64(payload, p); p += rid.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     if (p !== payload.length) {
       throw new ProtocolViolationError('REQUEST_UPDATE: unexpected trailing bytes after parameters');
@@ -857,14 +892,14 @@ export class Draft18Codec implements ControlCodec {
   // ── SUBSCRIBE_OK (response, §10.8 — no Request ID) ─────────────────
 
   private encodeSubscribeOk(msg: SubscribeOk): Uint8Array {
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.trackAlias) +
-      messageParams18EncodingLength(typed) +
+      messageParams18EncodingLength(typed, this.paramRegistry) +
       trackProperties18EncodingLength(trackPropsOf(msg));
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.trackAlias, buf, 0);
-    const params = encodeMessageParams18(typed);
+    const params = encodeMessageParams18(typed, this.paramRegistry);
     buf.set(params, p); p += params.length;
     buf.set(encodeTrackProperties18(trackPropsOf(msg)), p);
     return buf;
@@ -873,7 +908,7 @@ export class Draft18Codec implements ControlCodec {
   private decodeSubscribeOk(payload: Uint8Array): DecodedControlMessage {
     let p = 0;
     const alias = readVi64(payload, p); p += alias.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     const props = decodeTrackProperties18(payload, p); // remaining bytes (empty → {})
     p += props.bytesRead;
@@ -889,9 +924,9 @@ export class Draft18Codec implements ControlCodec {
   // ── REQUEST_OK (response, §10.5 — no Request ID) ───────────────────
 
   private encodeRequestOk(msg: RequestOk): Uint8Array {
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const props = trackPropsOf(msg);
-    const params = encodeMessageParams18(typed);
+    const params = encodeMessageParams18(typed, this.paramRegistry);
     const propBytes = encodeTrackProperties18(props);
     const buf = new Uint8Array(params.length + propBytes.length);
     buf.set(params, 0);
@@ -900,7 +935,7 @@ export class Draft18Codec implements ControlCodec {
   }
 
   private decodeRequestOk(payload: Uint8Array): DecodedControlMessage {
-    const params = decodeMessageParams18(payload, 0, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, 0, this.paramRegistry);
     // Track Properties are CONTEXT-dependent on a REQUEST_OK: valid for a
     // TRACK_STATUS_OK, but not for PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE /
     // SUBSCRIBE_TRACKS responses. The codec is context-free, so it decodes them
@@ -989,7 +1024,7 @@ export class Draft18Codec implements ControlCodec {
   // Standalone body uses vi64 Location fields (full uint64, no QUIC cap).
 
   private encodeFetch(msg: Fetch): Uint8Array {
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const f = msg.fetch;
     let bodyLen: number;
     if (f.fetchType === 0x1) {
@@ -1009,7 +1044,7 @@ export class Draft18Codec implements ControlCodec {
       vi64EncodingLength(msg.requestId) +
       vi64EncodingLength(BigInt(f.fetchType)) +
       bodyLen +
-      messageParams18EncodingLength(typed);
+      messageParams18EncodingLength(typed, this.paramRegistry);
     const buf = new Uint8Array(len);
     let p = writeVi64(msg.requestId, buf, 0);
     p += writeVi64(BigInt(f.fetchType), buf, p);
@@ -1022,7 +1057,7 @@ export class Draft18Codec implements ControlCodec {
       p += writeVi64(f.joiningRequestId, buf, p);
       p += writeVi64(f.joiningStart, buf, p);
     }
-    buf.set(encodeMessageParams18(typed), p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
     return buf;
   }
 
@@ -1057,12 +1092,112 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError(`FETCH: invalid Fetch Type 0x${ft.value.toString(16)}`);
     }
 
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     if (p !== payload.length) {
       throw new ProtocolViolationError('FETCH: unexpected trailing bytes after parameters');
     }
     return { type: 'FETCH', requestId: rid.value, fetch, parameters: typedToParams(params.params) };
+  }
+
+  // ── draft-22 FETCH (§9.11): Request ID, Full Track Name, Parameters ──
+  // The range is a LOCATION_FILTER parameter. A StandaloneFetch's draft-18
+  // range maps onto it: the draft-18 End Location's Object is exclusive, with 0
+  // meaning the whole End Group, while the LOCATION_FILTER's EndObject is
+  // inclusive and omitted for a whole group. There is no Joining FETCH: a
+  // subscriber asks for the prefix with FILL_PARAMETERS on its SUBSCRIBE.
+
+  private encodeFetch22(msg: Fetch): Uint8Array {
+    const f = msg.fetch;
+    if (f.fetchType !== 0x1) {
+      throw new ProtocolViolationError('draft-22 has no Joining FETCH; request the prefix with FILL_PARAMETERS');
+    }
+    validateFullTrackName(f.trackNamespace, f.trackName, { allowEmptyNamespace: true });
+    const parameters = new Map(msg.parameters);
+    if (!parameters.has(LOCATION_FILTER_TYPE)) {
+      const { startLocation: start, endLocation: end } = f;
+      if (end.group < start.group) {
+        throw new ProtocolViolationError(`FETCH End Group ${end.group} < Start Group ${start.group}`);
+      }
+      const fields = [start.group, start.object, end.group - start.group];
+      if (end.object > 0n) fields.push(end.object - 1n);
+      parameters.set(LOCATION_FILTER_TYPE, [encodeFetchLocationFilter(fields)]);
+    }
+    const typed = paramsToTyped(parameters, this.paramRegistry);
+    const len =
+      vi64EncodingLength(msg.requestId) +
+      vi64TupleLength(f.trackNamespace) +
+      vi64BytesLength(f.trackName) +
+      messageParams18EncodingLength(typed, this.paramRegistry);
+    const buf = new Uint8Array(len);
+    let p = writeVi64(msg.requestId, buf, 0);
+    p += writeVi64Tuple(f.trackNamespace, buf, p);
+    p += writeVi64Bytes(f.trackName, buf, p);
+    buf.set(encodeMessageParams18(typed, this.paramRegistry), p);
+    return buf;
+  }
+
+  /**
+   * Decodes a draft-22 FETCH into a StandaloneFetch. An absolute LOCATION_FILTER
+   * with an end maps back to the draft-18 range; a filter that depends on the
+   * Largest Object (one field, or two fields with no end) or no filter at all
+   * gets a start of {0, 0} or its StartGroup/StartObject and an open end
+   * ({2^64-1, 0}), and the LOCATION_FILTER stays in `parameters` for the
+   * receiver to resolve.
+   */
+  private decodeFetch22(payload: Uint8Array): DecodedControlMessage {
+    let p = 0;
+    const rid = readVi64(payload, p); p += rid.bytesRead;
+    const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
+    const name = readVi64Bytes(payload, p); p += name.bytesRead;
+    validateFullTrackName(ns.value, name.value, { allowEmptyNamespace: true });
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
+    p += params.bytesRead;
+    if (p !== payload.length) {
+      throw new ProtocolViolationError('FETCH: unexpected trailing bytes after parameters');
+    }
+    const parameters = typedToParams(params.params);
+    const filter = parameters.get(LOCATION_FILTER_TYPE)?.[0];
+    let fields: bigint[] = [];
+    if (filter !== undefined) {
+      if (!(filter instanceof Uint8Array)) throw new ProtocolViolationError('FETCH: LOCATION_FILTER is not bytes');
+      try {
+        fields = decodeFetchLocationFilter(filter);
+      } catch (e) {
+        throw new ProtocolViolationError(`FETCH: ${(e as Error).message}`);
+      }
+    }
+    const openEnd = { group: MAX_VI64, object: 0n };
+    let startLocation = { group: 0n, object: 0n };
+    let endLocation = openEnd;
+    if (fields.length === 2) {
+      startLocation = { group: fields[0]!, object: fields[1]! };
+    } else if (fields.length >= 3) {
+      startLocation = { group: fields[0]!, object: fields[1]! };
+      const endGroup = fields[0]! + fields[2]!;
+      endLocation = { group: endGroup, object: fields.length === 4 ? fields[3]! + 1n : 0n };
+    }
+    return {
+      type: 'FETCH',
+      requestId: rid.value,
+      fetch: { fetchType: 0x1, trackNamespace: ns.value, trackName: name.value, startLocation, endLocation },
+      parameters,
+    };
+  }
+
+  // ── draft-22 PUBLISH_STATE_NOTIFY (§9.10): Parameters only ──────────
+
+  private encodeParamsOnly(parameters: Parameters): Uint8Array {
+    const typed = paramsToTyped(parameters, this.paramRegistry);
+    return encodeMessageParams18(typed, this.paramRegistry);
+  }
+
+  private decodeParamsOnly(payload: Uint8Array, what: string): Parameters {
+    const params = decodeMessageParams18(payload, 0, this.paramRegistry);
+    if (params.bytesRead !== payload.length) {
+      throw new ProtocolViolationError(`${what}: unexpected trailing bytes after parameters`);
+    }
+    return typedToParams(params.params);
   }
 
   // ── FETCH_OK (response, §10.13 — no Request ID) ────────────────────
@@ -1073,16 +1208,16 @@ export class Draft18Codec implements ControlCodec {
     if (msg.endOfTrack !== 0 && msg.endOfTrack !== 1) {
       throw new ProtocolViolationError(`FETCH_OK End Of Track must be 0 or 1, got ${msg.endOfTrack}`);
     }
-    const typed = paramsToTyped(msg.parameters);
+    const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       1 + vi64LocationLength(msg.endLocation) +
-      messageParams18EncodingLength(typed) +
+      messageParams18EncodingLength(typed, this.paramRegistry) +
       trackProperties18EncodingLength(trackPropsOf(msg));
     const buf = new Uint8Array(len);
     let p = 0;
     buf[p++] = msg.endOfTrack;
     p += writeVi64Location(msg.endLocation, buf, p);
-    const params = encodeMessageParams18(typed);
+    const params = encodeMessageParams18(typed, this.paramRegistry);
     buf.set(params, p); p += params.length;
     buf.set(encodeTrackProperties18(trackPropsOf(msg)), p);
     return buf;
@@ -1096,7 +1231,7 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError(`FETCH_OK End Of Track must be 0 or 1, got ${endOfTrack}`);
     }
     const end = readVi64Location(payload, p); p += end.bytesRead;
-    const params = decodeMessageParams18(payload, p, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     const props = decodeTrackProperties18(payload, p); // remaining bytes (empty → {})
     p += props.bytesRead;

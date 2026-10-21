@@ -62,7 +62,7 @@ export class WebAudioOutput implements AudioOutputLike {
    * Next scheduled playout time in AudioContext.currentTime units.
    * Tracks the end of the last scheduled buffer for seamless playback.
    */
-  private nextScheduledTime = 0;
+  private nextScheduledTime: number | null = null;
 
   /** Active source nodes — tracked for flush/destroy. */
   private readonly activeSources: AudioBufferSourceNode[] = [];
@@ -89,7 +89,6 @@ export class WebAudioOutput implements AudioOutputLike {
   private _underrunCount = 0;
   /** Silence the underruns left (s). */
   private _underrunGapSec = 0;
-  private hasScheduled = false;
 
   /**
    * Each underrun: the silence it left (s), and how late the buffer that
@@ -108,6 +107,7 @@ export class WebAudioOutput implements AudioOutputLike {
 
   /** Audio scheduled beyond the current playout point, in seconds. */
   get scheduledAheadSec(): number {
+    if (this.nextScheduledTime === null) return 0;
     return Math.max(0, this.nextScheduledTime - this.audioCtx.currentTime);
   }
 
@@ -179,7 +179,7 @@ export class WebAudioOutput implements AudioOutputLike {
     // scheduledAheadSec, lead, the playhead — is then measured against a clock
     // that is not moving, so the chain must be dropped and re-anchored rather
     // than resumed against a backlog that was never real.
-    this.audioCtx.addEventListener('statechange', this.onStateChange);
+    this.audioCtx.addEventListener?.('statechange', this.onStateChange);
   }
 
   /** Band above target before the chase engages. */
@@ -267,7 +267,7 @@ export class WebAudioOutput implements AudioOutputLike {
     // - playbackDelaySec matches the video output delay so both media
     //   types start at the same wall-clock offset.
     let startTime: number;
-    if (this.nextScheduledTime >= now) {
+    if (this.nextScheduledTime !== null && this.nextScheduledTime >= now) {
       // Normal playback — back-to-back for seamless audio
       startTime = this.nextScheduledTime;
       if (alignedTime !== null) {
@@ -292,7 +292,7 @@ export class WebAudioOutput implements AudioOutputLike {
           this._chasing = false;
         }
       }
-    } else if (this.hasScheduled) {
+    } else if (this.nextScheduledTime !== null) {
       // Chain ran dry before this buffer arrived: an audible gap.
       this._underrunCount++;
       this._chasing = false;
@@ -320,7 +320,6 @@ export class WebAudioOutput implements AudioOutputLike {
     source.playbackRate.value = rate;
     source.connect(this.destination);
     source.start(startTime);
-    this.hasScheduled = true;
     // Duration at adjusted rate — faster playout means shorter wall-clock time.
     const durSec = buf.duration / rate;
     this.nextScheduledTime = startTime + durSec;
@@ -420,8 +419,7 @@ export class WebAudioOutput implements AudioOutputLike {
     }
     this.activeSources.length = 0;
     this.scheduledRing.length = 0;
-    this.nextScheduledTime = 0;
-    this.hasScheduled = false;
+    this.nextScheduledTime = null;
     this._chasing = false;
     this._leadSec = null;
   }
@@ -436,7 +434,7 @@ export class WebAudioOutput implements AudioOutputLike {
 
   /** Release resources. */
   destroy(): void {
-    this.audioCtx.removeEventListener('statechange', this.onStateChange);
+    this.audioCtx.removeEventListener?.('statechange', this.onStateChange);
     this.flush();
   }
 }
