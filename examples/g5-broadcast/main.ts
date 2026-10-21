@@ -32,6 +32,7 @@ import { parseCertHashHex } from '../shared/relay-url.js';
 import { parseCompat } from '../shared/compat.js';
 import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
+import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
@@ -75,11 +76,6 @@ const params = (() => {
   }
   return merged;
 })();
-/**
- * Our relay. Discovery probes the page's own host, which never finds this one,
- * so it is the default rather than a fallback.
- */
-const DEFAULT_RELAY = 'https://moqx-main.ci.openmoq.org:4433/moq-relay';
 /** Our demos run draft 18; the shared default is draft 16. */
 const DEFAULT_DRAFT = 18;
 const broadcastDraft: 14 | 16 | 18 = (() => {
@@ -294,6 +290,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const settingsBtn = document.getElementById('settings-btn')!;
   const backdrop = document.getElementById('settings-backdrop')!;
   const sUrl = document.getElementById('s-url') as HTMLInputElement;
+  const relayPicker = attachRelayPicker(sUrl);
   const sNs = document.getElementById('s-ns') as HTMLInputElement;
   const sNsNew = document.getElementById('s-ns-new') as HTMLButtonElement;
   const sHash = document.getElementById('s-hash') as HTMLInputElement;
@@ -336,10 +333,11 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
 
   function populateFields() {
     sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? DEFAULT_RELAY;
+    relayPicker.sync();
     if (!sUrl.value && !modalDiscovery) {
       modalDiscovery = new AbortController();
       void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
-        (url) => { if (!sUrl.value) sUrl.value = url; },
+        (url) => { if (!sUrl.value) { sUrl.value = url; relayPicker.sync(); } },
         () => { /* aborted or failed — the field stays editable */ },
       );
     }
