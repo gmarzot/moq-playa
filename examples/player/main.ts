@@ -1736,4 +1736,3 @@ function buildTrackSelector(p: MoqtPlayer): void {
         audioTrackDropdown.classList.remove('visible');
     }
 }
-
