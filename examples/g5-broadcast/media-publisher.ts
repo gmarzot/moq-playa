@@ -35,6 +35,7 @@
 import { encodeLocHeaders, locWireProfileForDraft, withLocPrivateProperties } from '@openmoq/loc';
 import type { LocHeaders } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 import { buildChunk } from '../shared/browser/cmaf-mux.js';
 import {
   LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject,
@@ -208,7 +209,7 @@ export interface MediaPublisherOptions {
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
-const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22];
 
 /** Codec string property (proposed for LOC; odd id, bytes). */
 const LOC_PROP_CODECSTRING = 0x11n;
@@ -408,9 +409,9 @@ export class MediaPublisher {
       ? options.selfDescribing
       : undefined;
     this.cmafHeaderInBand = options.packaging === 'cmaf' && options.selfDescribing !== undefined;
-    // draft-18 only: sendDatagram rejects on 14/16, so never arm it there.
+    // Draft 18 and later: sendDatagram rejects on 14/16, so never arm it there.
     // LOCMAF is carried on subgroups only.
-    this.audioDatagrams = options.audioDatagrams === true && options.draft === 18 && !this.locmaf;
+    this.audioDatagrams = options.audioDatagrams === true && isRequestStreamDraft(options.draft) && !this.locmaf;
     this.audioMaxInFlight = options.audioMaxInFlight ?? 8;
     this.onKeyframeNeeded = options.onKeyframeNeeded ?? null;
     this.minGroupMs = options.minGroupMs ?? 1_000;
@@ -712,7 +713,7 @@ export class MediaPublisher {
       hasExtensions: true,
       endOfGroup: true,
       publisherPriority: priority,
-      ...(this.draft === 18 ? { firstObject: true } : {}),
+      ...(isRequestStreamDraft(this.draft) ? { firstObject: true } : {}),
     };
   }
 
@@ -976,10 +977,10 @@ export class MediaPublisher {
     });
   }
 
-  /** Draft-18 gives LOC-01's 0x02/0x04 Track scope, so it carries LOC-04's ids;
+  /** Draft 18 and later give LOC-01's 0x02/0x04 Track scope, so they carry LOC-04's ids;
    *  self-describing objects use LOC-04's ids on every draft. */
   private locOptions(): { wireProfile: ReturnType<typeof locWireProfileForDraft>; locVersion: 1 | 4 } {
-    const locVersion = this.draft === 18 || this.selfDescribing || this.locTimescale ? 4 : 1;
+    const locVersion = isRequestStreamDraft(this.draft) || this.selfDescribing || this.locTimescale ? 4 : 1;
     return { wireProfile: locWireProfileForDraft(this.draft), locVersion };
   }
 

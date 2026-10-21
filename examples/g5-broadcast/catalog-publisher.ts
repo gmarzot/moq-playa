@@ -19,6 +19,7 @@
  */
 import { varint, SubgroupIdMode, PublishDoneCode } from '@openmoq/transport';
 import type { DraftVersion } from '@openmoq/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 import { buildCatalog } from '@openmoq/msf';
 import { LOCMAF_VERSION } from '@openmoq/locmaf';
 
@@ -200,7 +201,7 @@ export async function publishCatalogGroup(
       endOfGroup: true,
       defaultPriority: true,
       subgroupIdMode: SubgroupIdMode.ZERO,
-      ...(wire.draft === 18 ? { firstObject: true } : {}),
+      ...(isRequestStreamDraft(wire.draft) ? { firstObject: true } : {}),
     },
   );
   onStreamOpen?.(streamId);

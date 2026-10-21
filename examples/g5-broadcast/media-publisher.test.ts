@@ -485,7 +485,7 @@ describe('MediaPublisher — self-describing CMAF objects', () => {
 });
 
 describe('MediaPublisher — LOC Video Config', () => {
-  it.each([16, 18] as const)('draft-%i carries VIDEO_CONFIG on keyframes only', async (draft) => {
+  it.each([16, 18, 22] as const)('draft-%i carries VIDEO_CONFIG on keyframes only', async (draft) => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft });
     pub.setVideoAlias(2n);

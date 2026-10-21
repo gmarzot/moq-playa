@@ -79,9 +79,9 @@ const params = (() => {
 })();
 /** Our demos run draft 18; the shared default is draft 16. */
 const DEFAULT_DRAFT = 18;
-const broadcastDraft: 14 | 16 | 18 = (() => {
+const broadcastDraft: 14 | 16 | 18 | 22 = (() => {
   const v = params.get('v');
-  return v === '14' ? 14 : v === '16' ? 16 : DEFAULT_DRAFT;
+  return v === '14' ? 14 : v === '16' ? 16 : v === '22' ? 22 : DEFAULT_DRAFT;
 })();
 const certHash: ArrayBuffer | undefined = (() => {
   const hex = params.get('hash');
@@ -139,7 +139,7 @@ const catalogIntervalParam = params.get('catalogInterval');
 const catalogIntervalMs = catalogIntervalParam === null ? null : parseInt(catalogIntervalParam, 10);
 /** Draft-18 viewers FETCH the latest catalog; draft-14/16 viewers, which
  *  this page cannot serve by FETCH, need it re-published. */
-const catalogIntervalFor = (draft: 14 | 16 | 18): number => catalogIntervalMs ?? (draft === 18 ? 0 : 1000);
+const catalogIntervalFor = (draft: number): number => catalogIntervalMs ?? (draft >= 18 ? 0 : 1000);
 /** `?catalogDelivery=fetch|subscribe`: catalog by FETCH only, or on the subscription
  *  only. Default both. */
 const catalogDeliveryParam = params.get('catalogDelivery');
@@ -385,14 +385,14 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   }
 
   /** Only the options the selected draft and packaging can use are offered. */
-  const datagramsApply = () => sVersion.value === '18' && sPackaging.value !== 'locmaf';
+  const datagramsApply = () => Number(sVersion.value) >= 18 && sPackaging.value !== 'locmaf';
   const annexbApplies = () => sPackaging.value === 'loc' && sCodec.value.startsWith('avc');
   function showApplicableFields() {
     document.getElementById('s-annexb-row')!.hidden = !annexbApplies();
     document.getElementById('s-self-describing-row')!.hidden = sPackaging.value === 'locmaf';
     document.getElementById('s-timescale-row')!.hidden = sPackaging.value !== 'loc';
     document.getElementById('s-audio-datagram-row')!.hidden = !datagramsApply();
-    document.getElementById('s-dynamic-groups-row')!.hidden = sVersion.value !== '18';
+    document.getElementById('s-dynamic-groups-row')!.hidden = Number(sVersion.value) < 18;
   }
   sVersion.addEventListener('change', showApplicableFields);
   sPackaging.addEventListener('change', showApplicableFields);
@@ -400,7 +400,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
 
   /** The blank interval's value: the selected draft's default. */
   function showCatalogIntervalDefault() {
-    sCatalogInterval.placeholder = String(catalogIntervalFor(Number(sVersion.value) as 14 | 16 | 18));
+    sCatalogInterval.placeholder = String(catalogIntervalFor(Number(sVersion.value)));
   }
   sVersion.addEventListener('change', showCatalogIntervalDefault);
 
@@ -451,7 +451,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sSelfDescribing.checked && sPackaging.value !== 'locmaf') np.set('selfDescribing', '1');
     if (sTimescale.checked && sPackaging.value === 'loc') np.set('timescale', '1');
     if (sVoiceProcessing.checked) np.set('voiceProcessing', '1');
-    if (sDynamicGroups.checked && sVersion.value === '18') np.set('dynamicGroups', '1');
+    if (sDynamicGroups.checked && Number(sVersion.value) >= 18) np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
     // The dialog showed URL overrides too, so they are saved and the URL drops
     // them; where storage is refused, the URL carries them instead. URL-only
@@ -837,7 +837,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let audioEncoder: WebCodecsAudioEncoder | null = null;
   let connection: MoqtConnection | null = null;
   let resolvedRelayUrl = '';   // set by openSession; feeds the viewer link
-  let negotiatedDraft: 14 | 16 | 18 = broadcastDraft;  // replaced by the agreed value at connect
+  let negotiatedDraft: 14 | 16 | 18 | 22 = broadcastDraft;  // replaced by the agreed value at connect
   let audio: { sampleRate: number; channels: number } | undefined;
   let width = 1280;
   let height = 720;
@@ -1167,10 +1167,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       setText('conn-draft', String(negotiatedDraft));
       currentConnection = conn;
       log(`Session established (draft-${negotiatedDraft}).`);
-      audioOnDatagrams = audioDatagrams && negotiatedDraft === 18 && packaging !== 'locmaf';
+      audioOnDatagrams = audioDatagrams && negotiatedDraft >= 18 && packaging !== 'locmaf';
       if (packaging === 'locmaf' && audioDatagrams) log('LOCMAF: audio stays on subgroups (no datagrams)');
-      videoDynamicGroups = dynamicGroups && negotiatedDraft === 18;
-      if (dynamicGroups && !videoDynamicGroups) log(`Dynamic groups need draft-18; off on draft-${negotiatedDraft}`);
+      videoDynamicGroups = dynamicGroups && negotiatedDraft >= 18;
+      if (dynamicGroups && !videoDynamicGroups) log(`Dynamic groups need draft 18 or later; off on draft-${negotiatedDraft}`);
       log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
@@ -1250,8 +1250,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         }).catch(() => {});
         session.handleClose(error, reason);
       };
-      conn.onSubscribe = (requestId, _ns, trackName) => {
-        session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
+      conn.onSubscribe = (requestId, _ns, trackName, parameters) => {
+        session.handleSubscribe(requestId, new TextDecoder().decode(trackName), parameters);
       };
       conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
       conn.onFetch = (requestId, fetch) => session.handleFetch(requestId, fetch);
@@ -1357,7 +1357,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       viewerParams.set('ns', namespace);
       // Draft-18 viewers use the default SUBSCRIBE + Joining FETCH (MSF-01 §5);
       // earlier drafts' FETCH is refused here, so they rely on re-publication.
-      if (negotiatedDraft !== 18) viewerParams.set('catalogBootstrap', 'subscribe');
+      if (negotiatedDraft < 18) viewerParams.set('catalogBootstrap', 'subscribe');
       // A verbose broadcaster hands out a verbose viewer.
       if (debug) viewerParams.set('debug', '1');
       viewerParams.set('v', String(negotiatedDraft));
