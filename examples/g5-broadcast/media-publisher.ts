@@ -1009,7 +1009,9 @@ export class MediaPublisher {
         endOfFrame: true,
         temporalId: 0,
       },
-      ...(meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
+      // Parameter sets travel before key frames (LOC-04 §2.1.2); on a delta a
+      // player that reconfigures on them would reset its decoder.
+      ...(meta.isKeyframe && meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
     }, this.locOptions());
   }
 
