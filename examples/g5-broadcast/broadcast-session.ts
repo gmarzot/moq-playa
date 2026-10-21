@@ -10,6 +10,7 @@
  * stop or mutate the replacement generation.
  */
 import { RequestError, RequestError18 } from '@openmoq/transport';
+import { RequestError22, isDraft22, isRequestStreamDraft } from '@openmoq/transport';
 import { writeLocation, locationEncodingLength } from '@openmoq/transport';
 import type { Fetch, TrackStatus as TrackStatusMessage } from '@openmoq/transport';
 import { acceptCatalogSubscribe, buildCatalogPayload, publishCatalogGroup } from './catalog-publisher.js';
@@ -31,6 +32,8 @@ export interface BroadcastSessionConnection extends MediaPublishConnection {
   acceptTrackStatus(requestId: bigint, options: { parameters: Map<bigint, unknown[]> }): Promise<void>;
   rejectTrackStatus(requestId: bigint, errorCode: bigint, reason: string): Promise<void>;
   openFetchStream(requestId: bigint): Promise<bigint>;
+  /** Draft-22: the fill stream for a SUBSCRIBE that carried FILL_PARAMETERS (§3.4). */
+  openFillStream(requestId: bigint): Promise<bigint>;
   sendFetchObject(streamId: bigint, fields: {
     groupId: bigint; subgroupId: bigint; objectId: bigint; publisherPriority: number; payload: Uint8Array;
   }): Promise<void>;
@@ -48,6 +51,8 @@ const CATALOG_PRIORITY = 128;
 const GROUP_ORDER_PARAM = 0x22n;
 /** SUBSCRIBE_OK / REQUEST_UPDATE_OK parameter carrying the Largest Location (§10.2.11). */
 const LARGEST_OBJECT_PARAM = 0x09n;
+/** Draft-22 SUBSCRIBE parameter asking for a fill of the current range (§3.4). */
+const FILL_PARAMETERS = 0x23n;
 /** Track Property: subscribers may send NEW_GROUP_REQUEST (§12.6). */
 const DYNAMIC_GROUPS_PROPERTY = 0x30n;
 /** PUBLISH_DONE TRACK_ENDED, "the track is no longer being published" (§10.11);
@@ -244,7 +249,7 @@ export class BroadcastSession {
         this.connection as never, alias, payload, { draft: this.opts.publisher.draft, groupId },
       ).then(() => {
         this.noteCatalogGroup(groupId);
-        if (this.opts.publisher.draft === 18 && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
+        if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
         if (!this.retired) this.opts.onCatalogReemitted?.(payload.byteLength);
       }).catch((err: unknown) => {
         if (reportedFailure) return;
@@ -266,7 +271,7 @@ export class BroadcastSession {
    * and void (the connection does not await its onSubscribe callback); every
    * async operation contains its own failure. Inert once retired.
    */
-  handleSubscribe(requestId: bigint, trackName: string): void {
+  handleSubscribe(requestId: bigint, trackName: string, parameters?: ReadonlyMap<bigint, unknown>): void {
     if (this.retired) {
       this.safeLog(`Ignoring SUBSCRIBE for "${trackName}" on a retired broadcast session`);
       return;
@@ -284,12 +289,13 @@ export class BroadcastSession {
       this.subscribedTrack.set(requestId, trackName);
       this.currentRequest.set(trackName, requestId);
     }
+    const fill = isDraft22(this.opts.publisher.draft) && parameters?.has(FILL_PARAMETERS) === true;
 
     if (trackName === 'catalog') {
       this.whenCatalogReady(requestId, report, () => {
         const draft = this.opts.publisher.draft;
-        if (draft === 18 || (draft === 16 && this.catalogDelivery === 'fetch')) {
-          this.acceptCatalogAtLargest(requestId, alias, report);
+        if (isRequestStreamDraft(draft) || (draft === 16 && this.catalogDelivery === 'fetch')) {
+          this.acceptCatalogAtLargest(requestId, alias, report, fill);
         } else {
           this.acceptCatalogWithObject(requestId, alias, report);
         }
@@ -304,6 +310,7 @@ export class BroadcastSession {
           this.noteAccepted(requestId, alias);
           this.publisher.setVideoAlias(alias);
           this.safeLog('video: SUBSCRIBE_OK');
+          if (fill) this.serveUnknownFill(requestId, 'video', report);
         })
         .catch(report);
     } else if (trackName === 'audio') {
@@ -323,6 +330,7 @@ export class BroadcastSession {
           this.noteAccepted(requestId, alias);
           this.publisher.setAudioAlias(alias);
           this.safeLog('audio: SUBSCRIBE_OK');
+          if (fill) this.serveUnknownFill(requestId, 'audio', report);
         })
         .catch(report);
     } else {
@@ -382,12 +390,14 @@ export class BroadcastSession {
   }
 
   /**
-   * Draft-18 (or FETCH-only draft-16) catalog SUBSCRIBE: accept with the current
+   * Draft-18/22 (or FETCH-only draft-16) catalog SUBSCRIBE: accept with the current
    * catalog as the Largest Location (§10.2.11), then, unless FETCH-only, publish
    * it on the subscription so relays that serve later viewers from their own
    * subscription hold it. FETCH retrieves the same group (MSF-01 §5).
    */
-  private acceptCatalogAtLargest(requestId: bigint, alias: bigint, report: (err: unknown) => void): void {
+  private acceptCatalogAtLargest(
+    requestId: bigint, alias: bigint, report: (err: unknown) => void, fill = false,
+  ): void {
     let bytes: number;
     try {
       bytes = this.currentCatalogPayload().byteLength;
@@ -409,19 +419,51 @@ export class BroadcastSession {
           this.opts.onCatalogPublished?.(bytes);
           this.startCatalogReemission(alias);
           if (!fetchOnly) this.resendCatalog(alias);
+          if (fill) this.serveCatalogFill(requestId, largest.group, report);
         }
       })
       .catch(report);
     this.trackWork(work);
   }
 
-  /** Draft-18 SUBSCRIBE_OK carries LARGEST_OBJECT once the track has objects (§10.2.11),
+  /** Draft-22 catalog fill (§3.4): the current catalog group on its fill stream. */
+  private serveCatalogFill(requestId: bigint, groupId: bigint, report: (err: unknown) => void): void {
+    const work = (async () => {
+      const payload = this.currentCatalogPayload();
+      const stream = await this.connection.openFillStream(requestId);
+      await this.connection.sendFetchObject(stream, {
+        groupId, subgroupId: 0n, objectId: 0n, publisherPriority: CATALOG_PRIORITY, payload,
+      });
+      await this.connection.closeFetchStream(stream);
+      this.safeLog(`catalog: fill served (reqId=${requestId}, group ${groupId})`);
+    })().catch(report);
+    this.trackWork(work);
+  }
+
+  /**
+   * Draft-22 media fill: no history is kept, so the range up to the Largest
+   * Location is answered as unknown (End of Unknown Range) and the media
+   * arrives live. No Largest Location means no fill stream (§3.4).
+   */
+  private serveUnknownFill(requestId: bigint, track: 'video' | 'audio', report: (err: unknown) => void): void {
+    const largest = this.publisher.largestLocation(track);
+    if (largest === null) return;
+    const work = (async () => {
+      const stream = await this.connection.openFillStream(requestId);
+      await this.connection.sendFetchEndOfRange(stream, false, largest.group, largest.object);
+      await this.connection.closeFetchStream(stream);
+      this.safeLog(`${track}: fill answered as unknown up to ${largest.group}/${largest.object} (no history kept)`);
+    })().catch(report);
+    this.trackWork(work);
+  }
+
+  /** From draft 18, SUBSCRIBE_OK carries LARGEST_OBJECT once the track has objects (§10.2.11),
    *  and DYNAMIC_GROUPS when the track honours NEW_GROUP_REQUEST. */
   private subscribeOkOptions(
     largest: { group: bigint; object: bigint } | null,
     dynamicGroups = false,
   ): { parameters?: Map<bigint, unknown[]>; trackProperties?: Map<bigint, bigint[]> } | undefined {
-    if (this.opts.publisher.draft !== 18 || (largest === null && !dynamicGroups)) return undefined;
+    if (!isRequestStreamDraft(this.opts.publisher.draft) || (largest === null && !dynamicGroups)) return undefined;
     return {
       ...(largest !== null ? { parameters: new Map([[LARGEST_OBJECT_PARAM, [largest]]]) } : {}),
       ...(dynamicGroups ? { trackProperties: new Map([[DYNAMIC_GROUPS_PROPERTY, [1n]]]) } : {}),
@@ -429,7 +471,7 @@ export class BroadcastSession {
   }
 
   private get dynamicGroups(): boolean {
-    return this.opts.dynamicGroups === true && this.opts.publisher.draft === 18;
+    return this.opts.dynamicGroups === true && isRequestStreamDraft(this.opts.publisher.draft);
   }
 
   /**
@@ -532,8 +574,9 @@ export class BroadcastSession {
   }
 
   /** The REQUEST_ERROR code table of the negotiated draft. */
-  private get requestErrors(): typeof RequestError | typeof RequestError18 {
-    return this.opts.publisher.draft === 18 ? RequestError18 : RequestError;
+  private get requestErrors(): typeof RequestError | typeof RequestError18 | typeof RequestError22 {
+    const draft = this.opts.publisher.draft;
+    return isDraft22(draft) ? RequestError22 : isRequestStreamDraft(draft) ? RequestError18 : RequestError;
   }
 
   /**
@@ -559,9 +602,9 @@ export class BroadcastSession {
     this.connection.acceptTrackStatus(requestId, { parameters }).catch(report);
   }
 
-  /** LARGEST_OBJECT's value: a Location on draft-18, its raw encoding on draft-14/16. */
+  /** LARGEST_OBJECT's value: a Location from draft 18, its raw encoding on draft-14/16. */
   private largestParam(loc: { group: bigint; object: bigint }): unknown {
-    if (this.opts.publisher.draft === 18) return loc;
+    if (isRequestStreamDraft(this.opts.publisher.draft)) return loc;
     const bytes = new Uint8Array(locationEncodingLength(loc));
     writeLocation(loc, bytes, 0);
     return bytes;
@@ -642,7 +685,7 @@ export class BroadcastSession {
     } else if (!forward) {
       this.stopCatalogReemission();
     } else if (this.catalogAlias !== null) {
-      if (this.opts.publisher.draft === 18 && this.catalogDelivery === 'fetch') {
+      if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogDelivery === 'fetch') {
         this.startCatalogReemission(this.catalogAlias);
       } else {
         this.resendCatalog(this.catalogAlias);
@@ -654,7 +697,7 @@ export class BroadcastSession {
   largestLocation(requestId: bigint): { group: bigint; object: bigint } | null {
     const track = this.subscribedTrack.get(requestId);
     if (track === 'video' || track === 'audio') return this.publisher.largestLocation(track);
-    return track === 'catalog' && this.opts.publisher.draft === 18
+    return track === 'catalog' && isRequestStreamDraft(this.opts.publisher.draft)
       ? { group: this.catalogGroup!, object: 0n } : null;
   }
 
@@ -671,7 +714,7 @@ export class BroadcastSession {
       this.connection as never, alias, payload, { draft: this.opts.publisher.draft, groupId },
     ).then(() => {
       this.noteCatalogGroup(groupId);
-      if (this.opts.publisher.draft === 18 && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
+      if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
       if (!this.retired && this.catalogAlias === alias) this.startCatalogReemission(alias);
     }).catch((err: unknown) => {
       this.safeLog(`Catalog resend failed: ${(err as Error)?.message ?? err}`);

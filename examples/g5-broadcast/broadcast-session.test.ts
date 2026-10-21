@@ -70,6 +70,7 @@ function recordingConnection() {
     acceptTrackStatus: async (_rid, options) => { calls.push('acceptTrackStatus'); trackStatuses.push(options.parameters); },
     rejectTrackStatus: async (_rid, code) => { calls.push(`rejectTrackStatus ${code}`); },
     openFetchStream: async () => { calls.push('openFetchStream'); return nextStream++; },
+    openFillStream: async (requestId) => { calls.push(`openFillStream ${requestId}`); return nextStream++; },
     sendFetchObject: async (_sid, { groupId, objectId, payload }) => {
       calls.push('sendFetchObject');
       fetchObjects.push({ groupId, objectId, payload });
@@ -1094,5 +1095,49 @@ describe('BroadcastSession — ending its subscriptions (§10.11)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('BroadcastSession — draft-22 fills', () => {
+  const FILL = new Map<bigint, unknown>([[0x23n, new Uint8Array([0])]]);
+  const d22 = (conn: BroadcastSessionConnection) =>
+    new BroadcastSession(conn, { catalog: CATALOG, publisher: { wrapInt, draft: 22 }, log: () => {}, catalogIntervalMs: 0 });
+
+  it('a catalog SUBSCRIBE asking for a fill gets the current catalog group on its fill stream', async () => {
+    const conn = recordingConnection();
+    const session = d22(conn);
+    session.handleSubscribe(1n, 'catalog', FILL);
+    await settle();
+    const largest = conn.largests[0]!;
+    expect(conn.calls).toContain('openFillStream 1');
+    expect(conn.fetchObjects).toEqual([expect.objectContaining({ groupId: largest.group, objectId: 0n })]);
+    expect(conn.calls.slice(conn.calls.indexOf('openFillStream 1'))).toEqual(
+      expect.arrayContaining(['sendFetchObject', 'closeFetchStream']));
+  });
+
+  it('a catalog SUBSCRIBE without a fill opens no fill stream', async () => {
+    const conn = recordingConnection();
+    d22(conn).handleSubscribe(1n, 'catalog');
+    await settle();
+    expect(conn.calls.some((c) => c.startsWith('openFillStream'))).toBe(false);
+  });
+
+  it('media fills on two tracks are answered as unknown up to each Largest Location; none without one', async () => {
+    const conn = recordingConnection();
+    const session = d22(conn);
+    const largest = { video: { group: 5n, object: 3n }, audio: { group: 41n, object: 0n } } as const;
+    (session as any).publisher.largestLocation = (track: 'video' | 'audio') => largest[track];
+    session.handleSubscribe(3n, 'video', FILL);
+    session.handleSubscribe(5n, 'audio', FILL);
+    await settle();
+    expect(conn.calls).toEqual(expect.arrayContaining([
+      'openFillStream 3', 'endOfRange unknown 5/3', 'openFillStream 5', 'endOfRange unknown 41/0']));
+
+    const empty = recordingConnection();
+    const fresh = d22(empty);
+    (fresh as any).publisher.largestLocation = () => null;
+    fresh.handleSubscribe(3n, 'video', FILL);
+    await settle();
+    expect(empty.calls.some((c) => c.startsWith('openFillStream'))).toBe(false);
   });
 });
