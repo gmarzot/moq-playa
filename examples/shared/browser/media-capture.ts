@@ -8,6 +8,8 @@
  * @module
  */
 
+import { programmeAudio } from './programme-audio.js';
+
 /** AudioData the microphone processor holds while the page is busy (~10 ms
  *  each); past it the processor drops input. */
 const AUDIO_BUFFER_FRAMES = 50;
@@ -49,7 +51,7 @@ export class MediaCapture {
   async startCamera(constraints?: MediaTrackConstraints, audio = true): Promise<MediaStream> {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: constraints ?? true,
-      audio,
+      audio: programmeAudio(audio),
     });
     return this.processStream(stream);
   }
@@ -61,9 +63,9 @@ export class MediaCapture {
    * @returns The MediaStream
    */
   async startScreen(constraints?: DisplayMediaStreamOptions): Promise<MediaStream> {
-    const stream = await navigator.mediaDevices.getDisplayMedia(
-      constraints ?? { video: true, audio: true },
-    );
+    const options = constraints ?? { video: true, audio: true };
+    const stream = await navigator.mediaDevices.getDisplayMedia(options.audio === undefined
+      ? options : { ...options, audio: programmeAudio(options.audio) });
     return this.processStream(stream);
   }
 
