@@ -38,6 +38,8 @@ import {
 } from '@openmoq/player';
 import type { LocmafDecoding, MoqtPlayerConfig, SupportReport, VideoPresentation } from '@openmoq/player';
 import type { BootstrapPhase, NamespaceState, SubscriptionStatus } from '@openmoq/player';
+import type { AudioTrackInfo, ProgramInfo, VideoViewInfo } from '@openmoq/player';
+import { forwardSelectionEvents } from './selection.js';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
@@ -324,6 +326,35 @@ export class Player {
 
   /** Current audio track index. */
   get currentAudioTrack(): number { return this._currentAudioTrack; }
+
+  // ─── Programs, views and audio languages ────────────────────────
+
+  /** Catalog programs (renderGroups). */
+  get availablePrograms(): readonly ProgramInfo[] { return this.engine.availablePrograms; }
+
+  /** renderGroup of the program playing. */
+  get currentProgram(): number | undefined { return this.engine.currentProgram; }
+
+  /** Video views (altGroups) of the current program. */
+  get availableViews(): readonly VideoViewInfo[] { return this.engine.availableViews; }
+
+  /** altGroup of the view playing. */
+  get currentView(): number | undefined { return this.engine.currentView; }
+
+  /** Audio tracks of the current program, e.g. one per language. */
+  get availableAudioTracks(): readonly AudioTrackInfo[] { return this.engine.availableAudioTracks; }
+
+  /** Name of the audio track playing. */
+  get currentAudioTrackName(): string | undefined { return this.engine.currentAudioTrack; }
+
+  /** Switch program live: video and audio together, keeping the language when it can. */
+  selectProgram(renderGroup: number): Promise<void> { return this.engine.selectProgram(renderGroup); }
+
+  /** Switch to another view of the current program live; audio is untouched. */
+  selectView(altGroup: number): Promise<void> { return this.engine.selectView(altGroup); }
+
+  /** Switch audio track live (e.g. another language); video is untouched. */
+  selectAudioTrack(trackName: string): Promise<void> { return this.engine.selectAudioTrack(trackName); }
 
   /** Simplified stats for UI display. */
   get stats(): PlayerStats {
@@ -878,6 +909,7 @@ export class Player {
         this.emitter.emit('qualitychange', { level, auto: this._autoQuality });
       }
     });
+    forwardSelectionEvents(this.engine, this.emitter, (levels, current) => this.applyViewLevels(levels, current));
 
     this.engine.on('duration_changed', (e) => {
       this._duration = e.durationMs;
@@ -895,6 +927,15 @@ export class Player {
         this.setState('error');
       }
     });
+  }
+
+  /** A view switch replaced the quality ladder. */
+  private applyViewLevels(levels: Level[], current: number): void {
+    this._levels = levels;
+    this._currentLevel = current;
+    this.emitter.emit('levelsloaded', { levels });
+    const level = levels[current];
+    if (level) this.emitter.emit('qualitychange', { level, auto: this._autoQuality });
   }
 
   // ─── Private: State ──────────────────────────────────────────────
