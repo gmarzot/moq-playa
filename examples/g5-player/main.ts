@@ -1509,8 +1509,8 @@ async function main(): Promise<void> {
     showCatalogJson();
   }
 
-  // The pane shows the last full catalog as received, member order and values
-  // untouched; "parsed" shows the engine's catalog with deltas applied.
+  // The pane shows the last full catalog as received, values untouched and
+  // fields in display order; "parsed" shows the engine's catalog with deltas applied.
   let parsedCatalog: unknown = null;
   let receivedCatalog: string | null = null;
   let deltasSinceReceived = 0;
@@ -1540,7 +1540,7 @@ async function main(): Promise<void> {
     const full = typeof obj === 'object' && obj !== null && !Array.isArray(obj)
       && 'version' in obj && (obj as { deltaUpdate?: unknown }).deltaUpdate !== true;
     if (full) {
-      receivedCatalog = JSON.stringify(obj, null, 2);
+      receivedCatalog = JSON.stringify(orderCatalogForDisplay(obj), null, 2);
       deltasSinceReceived = 0;
     } else {
       deltasSinceReceived++;
