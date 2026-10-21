@@ -663,7 +663,9 @@ export class Player {
         createVideoDecoder: () => new WebCodecsVideoDecoder(),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
-          this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock });
+          // A caller-owned canvas keeps its size (no DOM mutations); our own
+          // follows the frame size and is letterboxed by object-fit.
+          this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock, followFrameSize: this.ownsCanvas });
           // Catalog discovery can create the pipeline after play() has returned.
           if (this._state === 'playing') this.renderer.start();
           return this.renderer;

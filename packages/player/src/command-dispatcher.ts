@@ -115,9 +115,9 @@ export class CommandDispatcher {
   private videoCodec: string;
   private videoWidth: number | undefined;
   private videoHeight: number | undefined;
-  private readonly audioCodec: string;
-  private readonly audioSampleRate: number | undefined;
-  private readonly audioChannels: number | undefined;
+  private audioCodec: string;
+  private audioSampleRate: number | undefined;
+  private audioChannels: number | undefined;
 
   private readonly onError: ((mediaType: 'video' | 'audio', error: Error) => void) | undefined;
   private readonly onFeedback: ((fb: DecoderFeedback) => void) | undefined;
@@ -285,6 +285,16 @@ export class CommandDispatcher {
     this.videoCodec = codec;
     this.videoWidth = width;
     this.videoHeight = height;
+  }
+
+  /**
+   * Update audio codec metadata for subsequent configure commands.
+   * Called during an audio track switch (e.g. a language change).
+   */
+  updateAudioCodec(codec: string, sampleRate?: number, channels?: number): void {
+    this.audioCodec = codec;
+    this.audioSampleRate = sampleRate;
+    this.audioChannels = channels;
   }
 
   /**

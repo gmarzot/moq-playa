@@ -52,6 +52,7 @@ export class CanvasRenderer implements VideoRendererLike {
   private framesDropped = 0;
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
+  private readonly followFrameSize: boolean;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
   /**
@@ -105,7 +106,18 @@ export class CanvasRenderer implements VideoRendererLike {
 
   constructor(
     canvas: HTMLCanvasElement,
-    options?: { stallThresholdMs?: number; clock?: ClockSource },
+    options?: {
+      stallThresholdMs?: number;
+      clock?: ClockSource;
+      /**
+       * Resize the canvas backing store to each frame's display size, so a
+       * resolution or aspect change (e.g. a landscape → portrait view switch)
+       * is never stretched; CSS (`object-fit: contain`) then letterboxes the
+       * element. Default true. Pass false for a canvas whose size the caller
+       * owns: frames are then drawn stretched to the canvas.
+       */
+      followFrameSize?: boolean;
+    },
   ) {
     // Validate before acquiring any browser state, so an invalid option
     // cannot leave a half-constructed renderer holding a 2d context.
@@ -114,23 +126,7 @@ export class CanvasRenderer implements VideoRendererLike {
       : validateStallThresholdMs(options.stallThresholdMs);
     this.ctx = canvas.getContext('2d')!;
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
-  }
-
-  /**
-   * Match the backing store to the frame's display size (display, not coded:
-   * coded dimensions carry codec macroblock padding and any pixel aspect
-   * ratio). Frames without the fields (older stubs) leave the canvas alone.
-   */
-  private sizeCanvasTo(frame: unknown): void {
-    const f = frame as { displayWidth?: number; displayHeight?: number;
-                         codedWidth?: number; codedHeight?: number };
-    const w = f.displayWidth ?? f.codedWidth;
-    const h = f.displayHeight ?? f.codedHeight;
-    if (!w || !h) return;
-    const canvas = this.ctx.canvas;
-    if (canvas.width === w && canvas.height === h) return;
-    canvas.width = w;
-    canvas.height = h;
+    this.followFrameSize = options?.followFrameSize ?? true;
   }
 
   /**
@@ -204,16 +200,22 @@ export class CanvasRenderer implements VideoRendererLike {
         const captureTimestampUs = BigInt(frameTimestampUs);
         const revision = ++this.drawRevision;
 
-        // The backing store must match the frame, not the element's CSS box:
-        // a canvas that was never sized keeps the 300x150 HTML default, and
-        // every frame would be downscaled to it and stretched back by CSS.
-        // Resizing clears the canvas, so only on a genuine size change.
-        this.sizeCanvasTo(entry.frame);
-
         try {
+          // Follow the frame's size so a resolution or aspect change (e.g. a
+          // switch from a landscape to a portrait view) is not stretched into
+          // the previous geometry; CSS object-fit letterboxes the element.
+          const canvas = this.ctx.canvas;
+          // Coded size for frames that report no display size.
+          const displayWidth = entry.frame.displayWidth ?? entry.frame.codedWidth;
+          const displayHeight = entry.frame.displayHeight ?? entry.frame.codedHeight;
+          if (this.followFrameSize && displayWidth && displayHeight
+            && (canvas.width !== displayWidth || canvas.height !== displayHeight)) {
+            canvas.width = displayWidth;
+            canvas.height = displayHeight;
+          }
           this.drawDepth++;
           try {
-            this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+            this.ctx.drawImage(entry.frame, 0, 0, canvas.width, canvas.height);
           } finally {
             this.drawDepth--;
             // A wrapper may reenter before or after its native draw. Neither

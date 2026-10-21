@@ -428,6 +428,24 @@ export interface QualityConfig {
   readonly startLevel?: number | 'lowest' | 'auto';
 
   /**
+   * renderGroup of the program to start on when the catalog carries several
+   * (sets of tracks meant to be rendered together, e.g. a commentator booth
+   * and the match). Default: the program of the first video track in catalog
+   * order. `videoAltGroup` wins when it names a view of another program.
+   * Switch later with `selectProgram()`.
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  readonly initialProgram?: number;
+
+  /**
+   * Preferred audio language, e.g. `'es'` or `'en-US'`. Matched against the
+   * catalog's `lang` on the primary subtag, ignoring case. When no track
+   * matches, audio selection proceeds as if unset. Switch later with
+   * `selectAudioTrack()`.
+   */
+  readonly preferredLanguage?: string;
+
+  /**
    * Cap video quality to a maximum resolution.
    * Tracks exceeding this resolution are excluded from selection.
    * Useful for mobile devices or bandwidth-constrained environments.
@@ -448,10 +466,12 @@ export interface QualityConfig {
   readonly videoConstraints?: TrackConstraints;
 
   /**
-   * Video alternate group to select at tune-in. Omitted: first video group.
-   * Quality selection and ABR stay within this group. Selecting another group
-   * requires a new player; groups need not share a media timeline or Group IDs.
-   * Cannot be combined with the catalog-free knownTracks fast path.
+   * Video alternate group (view) to select at tune-in, e.g. a landscape or a
+   * portrait canvas; it also selects the view's program. Omitted: the first
+   * view in catalog order. An unknown group fails rather than falling back to
+   * other content. Quality selection and ABR stay within the view; switch
+   * later with `selectView()`. Cannot be combined with the catalog-free
+   * knownTracks fast path.
    * @see draft-ietf-moq-msf-01 §4.2, §5.2.12
    */
   readonly videoAltGroup?: number;
@@ -969,6 +989,17 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // maxDecodeErrors: > 0
   if (config.maxDecodeErrors !== undefined && (config.maxDecodeErrors <= 0 || !Number.isInteger(config.maxDecodeErrors))) {
     throw new RangeError(`maxDecodeErrors must be a positive integer, got ${config.maxDecodeErrors}`);
+  }
+
+  // initialProgram: a renderGroup number (non-negative integer)
+  if (config.initialProgram !== undefined && (config.initialProgram < 0 || !Number.isInteger(config.initialProgram))) {
+    throw new RangeError(`initialProgram must be a non-negative integer renderGroup, got ${config.initialProgram}`);
+  }
+
+  // preferredLanguage: a non-empty language tag
+  if (config.preferredLanguage !== undefined
+    && (typeof config.preferredLanguage !== 'string' || config.preferredLanguage.trim() === '')) {
+    throw new RangeError('preferredLanguage must be a non-empty language tag');
   }
 
   // capLevelToResolution: both dimensions > 0

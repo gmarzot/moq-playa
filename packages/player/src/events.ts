@@ -463,6 +463,62 @@ export interface QualitySwitchFailedEvent {
 }
 
 /**
+ * Video view changed — a switch to a track of another altGroup (or another
+ * program's video) committed.
+ * Fires right after the `quality_switched` event of that switch.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+ */
+export interface ViewChangedEvent {
+  readonly type: 'view_changed';
+  /** altGroup of the previous view. */
+  readonly fromView: number | undefined;
+  /** altGroup of the new view; undefined when it has none (a program without altGroups). */
+  readonly toView: number | undefined;
+  /** Track of the new view that is now playing. */
+  readonly trackName: string;
+}
+
+/**
+ * Audio track changed — a switch to another audio track (typically another
+ * language) committed: the new track now feeds the decoder or SourceBuffer.
+ */
+export interface AudioTrackChangedEvent {
+  readonly type: 'audio_track_changed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  /** Catalog `lang` of the new track, when it has one. */
+  readonly lang: string | undefined;
+  readonly reason: string;
+}
+
+/**
+ * Audio track switch rolled back — the new track could not be committed
+ * (e.g. `mediaSource.changeType()` rejected). The old track keeps playing.
+ */
+export interface AudioTrackSwitchFailedEvent {
+  readonly type: 'audio_track_switch_failed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  readonly reason: string;
+  readonly error: Error;
+}
+
+/**
+ * Program changed — the current renderGroup moved. After `selectProgram()`
+ * it fires once every track that had to change has committed (at once when
+ * the program shares all playing tracks); a manual `selectVideoTrack()` of
+ * another program's track fires it when that switch commits.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+ */
+export interface ProgramChangedEvent {
+  readonly type: 'program_changed';
+  readonly fromProgram: number | undefined;
+  readonly toProgram: number;
+}
+
+/**
  * Live catch-up state changed — activated, rate adjusted, or deactivated.
  *
  * Emitted when the player adjusts playback rate to catch up to the live
@@ -738,6 +794,10 @@ export interface PlayerEventMap {
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;
   quality_switch_failed: QualitySwitchFailedEvent;
+  view_changed: ViewChangedEvent;
+  audio_track_changed: AudioTrackChangedEvent;
+  audio_track_switch_failed: AudioTrackSwitchFailedEvent;
+  program_changed: ProgramChangedEvent;
   catch_up_changed: CatchUpChangedEvent;
 
   // Namespace discovery

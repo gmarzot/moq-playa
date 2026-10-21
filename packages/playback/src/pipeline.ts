@@ -424,6 +424,10 @@ export class PlaybackPipeline {
         this._throttled = false;
         this.activeGroupWaitStartUs = null;
         this.gapDetector.reset();
+        // The new track is not ended, and its configuration must reach the
+        // decoder even when its bytes equal the old track's.
+        this._trackEnded = false;
+        this.decoderState.resetConfig();
         // Force decoder back to NEEDS_KEYFRAME so partial-group deltas
         // from a mid-stream subscription are skipped, not decoded.
         const decision = this.decoderState.notifyGap();
