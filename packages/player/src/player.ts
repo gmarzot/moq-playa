@@ -790,6 +790,10 @@ export class MoqtPlayer {
   private readonly _datagramObjects = { audio: 0, video: 0 };
   /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
   private recoveryUpdateBlockedUntilUs = 0;
+  /** Clock time of the last recovery REQUEST_UPDATE, per media type. */
+  private readonly lastRecoveryUpdateUs = { video: Number.NEGATIVE_INFINITY, audio: Number.NEGATIVE_INFINITY };
+  /** Minimum spacing of recovery REQUEST_UPDATEs on one media type. */
+  private static readonly RECOVERY_UPDATE_MIN_INTERVAL_US = 2_000_000;
   private recoveryUpdateFailures = 0;
   /** Reconnect after the current session closed during playback; null when none is pending. */
   private reconnect: {
@@ -9684,7 +9688,7 @@ export class MoqtPlayer {
               });
             },
             onResubscribe: (recoveryMediaType, startGroup) => {
-              this.requestFreshSubscriptionStart(recoveryMediaType, startGroup);
+              this.recoveryResubscribe(recoveryMediaType, startGroup);
             },
             onTerminate: (_reason) => {
               if (this.stateMachine.state !== PlayerState.ERROR) {
@@ -9745,7 +9749,7 @@ export class MoqtPlayer {
           this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
         });
       },
-      onResubscribe: (mt, sg) => this.requestFreshSubscriptionStart(mt, sg),
+      onResubscribe: (mt, sg) => this.recoveryResubscribe(mt, sg),
       onTerminate: (_reason) => {
         if (this.stateMachine.state !== PlayerState.ERROR) {
           this.transitionState(PlayerState.ERROR);
@@ -9827,6 +9831,14 @@ export class MoqtPlayer {
         },
       );
     }, delayMs);
+  }
+
+  /** Recovery's resubscribe: at most one REQUEST_UPDATE per media type per interval. */
+  private recoveryResubscribe(mediaType: 'video' | 'audio', startGroup?: bigint): void {
+    const now = this.clock.now();
+    if (now - this.lastRecoveryUpdateUs[mediaType] < MoqtPlayer.RECOVERY_UPDATE_MIN_INTERVAL_US) return;
+    this.lastRecoveryUpdateUs[mediaType] = now;
+    this.requestFreshSubscriptionStart(mediaType, startGroup);
   }
 
   private requestFreshSubscriptionStart(

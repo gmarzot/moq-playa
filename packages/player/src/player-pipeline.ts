@@ -575,6 +575,12 @@ export function handleRecoveryAction(
 ): void {
   switch (action.type) {
     case 'skip_forward':
+      // Each audio group stands alone and the live subscription already
+      // carries the next one: skipping needs no REQUEST_UPDATE.
+      if (mediaType === 'audio') {
+        log.debug('Recovery: skip forward audio — continue at the next group');
+        break;
+      }
       log.warn('Recovery: skip forward %s — flush pipeline and resubscribe from live edge', mediaType);
       callbacks.onResubscribe(mediaType);
       break;
