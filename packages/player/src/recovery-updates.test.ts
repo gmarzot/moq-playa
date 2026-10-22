@@ -21,11 +21,11 @@ describe('recovery REQUEST_UPDATEs', () => {
     const player = new MoqtPlayer({
       url: 'https://relay.example/moq', namespace: 'test', logLevel: 'none', clock: { now: () => nowUs },
     } as never);
-    const requestUpdate = vi.fn(async () => {});
+    const requestUpdate = vi.fn(async (_requestId: unknown, _options: unknown) => {});
     (player as any).connection = { requestUpdate };
     (player as any).activeSubscriptions.set(2n, { trackName: 'video', mediaType: 'video', trackAlias: 1n });
     (player as any).activeSubscriptions.set(3n, { trackName: 'audio', mediaType: 'audio', trackAlias: 2n });
-    const sent = () => requestUpdate.mock.calls.map((c) => BigInt(c[0] as never));
+    const sent = () => requestUpdate.mock.calls.map((c) => BigInt(c[0] as bigint));
 
     (player as any).recoveryResubscribe('video');
     (player as any).recoveryResubscribe('video');
