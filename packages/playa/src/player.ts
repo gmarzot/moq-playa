@@ -607,6 +607,7 @@ export class Player {
     this.awaySinceMs = null;
     this.frozenSinceMs = null;
     this.emitter.emit('lifecycle', { state: kind, awayMs });
+    this.engine.reconnectNow();
     if (frozenMs >= Player.RESUME_JUMP_TO_LIVE_MS && this.state === 'playing') {
       this.engine.jumpToLive(`resumed after ${(frozenMs / 1000).toFixed(1)}s frozen`);
     }

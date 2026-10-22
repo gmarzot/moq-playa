@@ -9817,16 +9817,35 @@ export class MoqtPlayer {
     this.emitter.emit('session_reconnecting', { type: 'session_reconnecting', attempt: r.attempt, delayMs });
     r.timer = setTimeout(() => {
       r.timer = null;
-      if (this._destroyed || this.reconnect !== r) return;
-      this.migrate(this.config.createConnection!()).then(
-        () => { if (this.reconnect === r) this.reconnect = null; },
-        (err: unknown) => {
-          this.log.warn('Reconnect attempt %d failed: %s',
-            r.attempt, err instanceof Error ? err.message : String(err));
-          if (this.reconnect === r) this.scheduleReconnect(r.closeReason);
-        },
-      );
+      this.attemptReconnect(r);
     }, delayMs);
+  }
+
+  private attemptReconnect(r: NonNullable<MoqtPlayer['reconnect']>): void {
+    if (this._destroyed || this.reconnect !== r) return;
+    this.migrate(this.config.createConnection!()).then(
+      () => { if (this.reconnect === r) this.reconnect = null; },
+      (err: unknown) => {
+        this.log.warn('Reconnect attempt %d failed: %s',
+          r.attempt, err instanceof Error ? err.message : String(err));
+        if (this.reconnect === r) this.scheduleReconnect(r.closeReason);
+      },
+    );
+  }
+
+  /**
+   * Run a reconnect waiting out its backoff now, with the backoff restarted,
+   * e.g. when the page becomes visible again: failures while it was hidden say
+   * nothing about the network now. No-op without a pending attempt.
+   */
+  reconnectNow(): void {
+    const r = this.reconnect;
+    if (!r || r.timer === null || this._destroyed) return;
+    clearTimeout(r.timer);
+    r.timer = null;
+    r.attempt = 0;
+    this.log.info('Reconnecting now (session closed: %s)', r.closeReason);
+    this.attemptReconnect(r);
   }
 
   private requestFreshSubscriptionStart(
