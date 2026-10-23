@@ -49,6 +49,8 @@ import type { BadgeTone } from '../shared/status-badge.js';
 import type { SubscriptionStatus } from '@openmoq/playa';
 import type { Level } from '@openmoq/playa';
 import { ClockDriftEstimator } from '../shared/clock-drift.js';
+import { measureClockOffset } from '../shared/clock-sync.js';
+import type { ClockOffset } from '../shared/clock-sync.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 
@@ -731,6 +733,31 @@ async function main(): Promise<void> {
   let clockDriftMsPerMin: number | null = null;
   /** Fitted from the latency floor; stalls, re-anchors and returns to view unsettle it. */
   const clockDrift = new ClockDriftEstimator();
+  // Latency compares this machine's clock with the publisher's. The relay
+  // site's /time (?clockUrl= overrides) calibrates it; without an answer the
+  // figures read this clock uncorrected, and the label says so.
+  const clockUrl = new URLSearchParams(location.search).get('clockUrl') ?? new URL('/time', location.href).href;
+  let clockOffset: ClockOffset | null = null;
+  let clockMissingLogged = false;
+  const calibrateClock = async (): Promise<void> => {
+    const r = await measureClockOffset(clockUrl);
+    if (r === null) {
+      if (!clockMissingLogged) log(`Clock: no reference at ${clockUrl}; latency uses this machine's clock`);
+      clockMissingLogged = true;
+      return;
+    }
+    const moved = clockOffset === null || Math.abs(r.offsetMs - clockOffset.offsetMs) > Math.max(5, r.rttMs / 2);
+    clockOffset = r;
+    if (!moved) return;
+    log(`Clock: this machine is ${Math.abs(r.offsetMs).toFixed(0)} ms ${r.offsetMs >= 0 ? 'behind' : 'ahead of'} `
+      + `${new URL(clockUrl).host} (±${(r.rttMs / 2).toFixed(0)} ms); latency corrected`);
+    clockDrift.disturb(performance.now());
+  };
+  /** Date.now() on the reference clock. */
+  const wallNowMs = (): number => Date.now() + (clockOffset?.offsetMs ?? 0);
+  void calibrateClock();
+  setInterval(() => { void calibrateClock(); }, 300_000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void calibrateClock(); });
   let clockDriftApplied = false;
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) clockDrift.disturb(performance.now());
@@ -756,7 +783,7 @@ async function main(): Promise<void> {
   /** LOC: capture-to-paint age of each frame drawn, kept like latWindow. */
   const screenWindow: Array<[number, number]> = [];
   const noteFrameDrawn = (captureUs: number, drawnAtWallMs: number): void => {
-    const ageMs = drawnAtWallMs - captureUs / 1000;
+    const ageMs = drawnAtWallMs + (clockOffset?.offsetMs ?? 0) - captureUs / 1000;
     if (Math.abs(ageMs) < 120_000) screenWindow.push([performance.now(), ageMs]);
   };
   /** Underruns since the last report: buffers late past their slot, buffers on
@@ -1148,7 +1175,7 @@ async function main(): Promise<void> {
     const picked = e.kind === 'data' ? pickCaptureTime(e.captureTimes) : undefined;
     if (e.kind === 'data') noteTiming(e, picked);
     if (e.mediaType === 'audio' && picked) {
-      const audioLatencyMs = Date.now() - picked.us / 1000;
+      const audioLatencyMs = wallNowMs() - picked.us / 1000;
       if (Math.abs(audioLatencyMs) < 120_000) audioLatWindow.push([performance.now(), audioLatencyMs]);
     }
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
@@ -1173,7 +1200,7 @@ async function main(): Promise<void> {
     prevArrivalMs = arrivalMs;
     if (captureMs) {
       prevCaptureMs = captureMs;
-      let latencyMs = Date.now() - captureMs;
+      let latencyMs = wallNowMs() - captureMs;
       latencySource = picked?.source ?? null;
       relativeDelay = !picked;
       if (relativeDelay) {
@@ -1506,8 +1533,9 @@ async function main(): Promise<void> {
 
     latVal.textContent = latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
     latP95.textContent = latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
+    const clockNote = clockOffset ? ` · clock ±${(clockOffset.rttMs / 2).toFixed(0)}ms` : ' · local clock';
     latKind.textContent = relativeDelay ? 'relative delay'
-      : latencySource ? `latency (${SOURCE_SHORT[latencySource]})` : 'latency';
+      : (latencySource ? `latency (${SOURCE_SHORT[latencySource]})` : 'latency') + clockNote;
     latScreen.textContent = relativeDelay ? '—'
       : screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
       : cmafPlayoutMs != null ? `≈${cmafPlayoutMs.toFixed(0)}` : '—';
@@ -1515,7 +1543,12 @@ async function main(): Promise<void> {
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
-      : [latencySource ? SOURCE_TIP[latencySource] : '', clockDriftMsPerMin !== null
+      : [latencySource ? SOURCE_TIP[latencySource] : '',
+        clockOffset
+          ? `Clock: ${(clockOffset.offsetMs >= 0 ? '+' : '') + clockOffset.offsetMs.toFixed(0)} ms against `
+            + `${new URL(clockUrl).host}, ±${(clockOffset.rttMs / 2).toFixed(0)} ms; applied to latency and E2E.`
+          : 'No clock reference answered: this machine\'s clock, uncorrected.',
+        clockDriftMsPerMin !== null
         ? `Clock drift ${clockDriftMsPerMin.toFixed(1)} ms/min; `
           + (clockDriftApplied ? `${driftCorrectionMs.toFixed(0)} ms removed. Constant offset remains.`
             : 'not applied until it holds steadily across the window.')
