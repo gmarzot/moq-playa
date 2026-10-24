@@ -333,7 +333,7 @@ describe('createWebTransport protocol fallback', () => {
   it('throws an error mentioning both attempts when the bare retry also fails', async () => {
     stubWebTransport({ rejectAlways: true });
     await expect(createWebTransport()('https://r:4433'))
-      .rejects.toThrow(/protocols=\[moqt-16\][\s\S]*retry without protocols/);
+      .rejects.toThrow(/protocols=\[moqt-22,moqt-18,moqt-16\][\s\S]*retry without protocols/);
     expect(constructed).toHaveLength(2);
   });
 
