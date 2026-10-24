@@ -22,12 +22,13 @@ import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
 import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
-import type { MediaPublisher } from './media-publisher.js';
+import type { MediaPublisher, MediaPublisherOptions } from './media-publisher.js';
 import { CMAF_AUDIO_TRACK_ID, CMAF_VIDEO_TRACK_ID } from './media-publisher.js';
 import {
   aacAudioSpecificConfig, buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE, opusHead,
 } from '../shared/browser/cmaf-mux.js';
 import { log } from '../shared/log.js';
+import { ClockReference, describeClockOffset } from '../shared/clock-sync.js';
 import { parseCertHashHex } from '../shared/relay-url.js';
 import { parseCompat } from '../shared/compat.js';
 import { orderCatalogForDisplay } from '../shared/msf-order.js';
@@ -796,6 +797,36 @@ shareBackdrop.addEventListener('click', (e) => {
   if (e.target === shareBackdrop) shareBackdrop.classList.remove('visible');
 });
 
+// ─── Reference clock ─────────────────────────────────────────────────
+// Capture times go out on the relay site's clock (/time; ?clockUrl= overrides),
+// the reference g5-player corrects its own clock to.
+
+const clockUrl = new URLSearchParams(location.search).get('clockUrl') ?? new URL('/time', location.href).href;
+/** Longest a broadcast start waits for the first clock answer. */
+const CLOCK_WAIT_MS = 2_000;
+let clockMissingLogged = false;
+const referenceClock = new ClockReference(clockUrl, {
+  onAdopt: (o) => log(`Clock: ${describeClockOffset(o, clockUrl)}; capture times corrected`),
+  onFail: () => {
+    if (clockMissingLogged || referenceClock.offset !== null) return;
+    clockMissingLogged = true;
+    log(`Clock: no reference at ${clockUrl}; capture times use this machine's clock`);
+  },
+});
+void referenceClock.calibrate();
+setInterval(() => { void referenceClock.calibrate(); }, 300_000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void referenceClock.calibrate(); });
+
+/** Publisher clocks on the reference clock; a later offset change eases in
+ *  through the publisher's wall-clock follow. */
+function referenceStampClocks(): Pick<MediaPublisherOptions, 'wallClockUs' | 'timeOriginUs' | 'monotonicNowUs'> {
+  return {
+    wallClockUs: () => referenceClock.nowMs() * 1000,
+    timeOriginUs: () => (performance.timeOrigin + (referenceClock.offset?.offsetMs ?? 0)) * 1000,
+    monotonicNowUs: () => (performance.timeOrigin + performance.now()) * 1000,
+  };
+}
+
 // ─── Start ───────────────────────────────────────────────────────────
 
 startCameraBtn.addEventListener('click', () => startBroadcast('camera'));
@@ -1054,6 +1085,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       }
       activeVideoCodec = await supportedVideoCodec(h264LevelFor(videoCodec, height, fps), width, height, fps, videoBitrate);
       if (audio) activeAudioCodec = await supportedAudioCodec(AUDIO_CODECS[audioCodecParam], audio.sampleRate, audio.channels);
+      // After capture starts: Screen's picker needs the click's activation.
+      if (referenceClock.offset === null) {
+        await Promise.race([referenceClock.calibrate(), new Promise((r) => setTimeout(r, CLOCK_WAIT_MS))]);
+      }
       ctx.throwIfCancelled();
       return { stop: () => cap.stop() };
     },
@@ -1209,6 +1244,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
             },
           } : {}),
           cmafInit: () => catalog.cmaf,
+          // On the reference clock only if it answered before this session.
+          ...(referenceClock.offset !== null ? referenceStampClocks() : {}),
           // The anchor's measured error, once per track.
           onAnchor: ({ track, excessUs, timeOriginDeltaUs }) => log(
             `Capture anchor ${track}: first chunk cost `
