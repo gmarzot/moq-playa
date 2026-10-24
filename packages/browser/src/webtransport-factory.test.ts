@@ -136,12 +136,12 @@ describe('createWebTransport', () => {
     await expect(transport.resetSendStream!(writer, new Error('cancelled'))).resolves.toBeUndefined();
   });
 
-  it('auto-negotiate offers moqt-16 only (safe default)', async () => {
+  it('auto-negotiate offers every draft, newest first', async () => {
     const factory = createWebTransport();
     await factory('https://relay.example.com/moq');
 
     expect(capturedUrl).toBe('https://relay.example.com/moq');
-    expect(capturedOptions.protocols).toEqual(['moqt-16']);
+    expect(capturedOptions.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
   });
 
   it('draft-14: no protocols sent (h3 ALPN fallback)', async () => {
@@ -220,13 +220,13 @@ describe('createWebTransport', () => {
     expect(capturedOptions.protocols).toBeUndefined();
   });
 
-  it('cert hash without draftVersion offers moqt-16', async () => {
+  it('cert hash without draftVersion offers the auto list', async () => {
     const hash = new Uint8Array([0x01, 0x02]).buffer;
     const factory = createWebTransport({ certHash: hash });
     await factory('https://localhost:4443');
 
     expect(capturedOptions.serverCertificateHashes).toBeDefined();
-    expect(capturedOptions.protocols).toEqual(['moqt-16']);
+    expect(capturedOptions.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
   });
 
   it('returned transport has handshakeRttMs', async () => {
@@ -312,7 +312,7 @@ describe('createWebTransport protocol fallback', () => {
     const transport = await createWebTransport()('https://r:4433');
 
     expect(constructed).toHaveLength(2);
-    expect(constructed[0]!.options.protocols).toEqual(['moqt-16']);
+    expect(constructed[0]!.options.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
     expect(constructed[1]!.options.protocols).toBeUndefined();
     // No negotiated protocol on the fallback path — the adapter
     // negotiates in-band via CLIENT_SETUP.

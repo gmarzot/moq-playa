@@ -23,6 +23,9 @@
 
 import type { WebTransportLike } from '@openmoq/webtransport';
 
+/** Auto mode's offer, newest first. */
+const AUTO_PROTOCOLS = ['moqt-22', 'moqt-18', 'moqt-16'];
+
 /** Options for creating the WebTransport factory. */
 export interface WebTransportFactoryOptions {
   /** Cancels startup only; after readiness the caller owns transport shutdown. */
@@ -44,7 +47,7 @@ export interface WebTransportFactoryOptions {
    * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
-   * - undefined → `["moqt-16"]` (default, kept for backward compatibility)
+   * - undefined → `["moqt-22", "moqt-18", "moqt-16"]`: newest first, the server picks
    *
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
@@ -81,7 +84,7 @@ export function createWebTransport(
     }
     // Build options as a plain object — WebTransportOptions varies by environment.
     // §3.1: WT-Available-Protocols for MOQT version negotiation.
-    // Default: offer ['moqt-16']. Draft-14 does not send protocols —
+    // Default: offer every wired draft, newest first. Draft-14 does not send protocols —
     // it relies on h3 ALPN with in-band CLIENT_SETUP version list.
     const buildOpts = (withProtocols: boolean): any => {
       const opts: any = {};
@@ -101,9 +104,8 @@ export function createWebTransport(
       if (options?.draftVersion && options.draftVersion >= 15) {
         opts.protocols = [`moqt-${options.draftVersion}`];
       } else if (!options?.draftVersion) {
-        // Auto-negotiate: offer draft-16 protocol string.
-        // Don't offer moq-00/moqt-14 — servers reject unknown protocol strings.
-        opts.protocols = ['moqt-16'];
+        // Auto-negotiate. No moq-00/moqt-14: servers reject unknown protocol strings.
+        opts.protocols = [...AUTO_PROTOCOLS];
       }
       // draft-14: no protocols sent — h3 ALPN fallback with CLIENT_SETUP version list
       return opts;
