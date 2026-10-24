@@ -239,7 +239,9 @@ export function handleControlMessage(
         const props = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties;
         // Draft-18 TIMESCALE track property (0x08): the units of the track's object Timestamps.
         const timescale = props?.get(0x08n)?.[0];
-        const timestamps = parseTimestampTrack(props);
+        // Timestamp properties: Track Properties, or Track Extensions on draft-16.
+        const timestamps = parseTimestampTrack(
+          props ?? (msg as { trackExtensions?: Map<bigint, unknown[]> }).trackExtensions);
         const context: TrackContext = {
           ...(typeof timescale === 'bigint' && timescale > 0n ? { timescale } : {}),
           ...(timestamps ? { timestamps } : {}),
