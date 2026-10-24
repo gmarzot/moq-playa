@@ -60,3 +60,58 @@ export async function measureClockOffset(url: string, opts: {
   }
   return offsetFromSamples(samples);
 }
+
+/** "this machine is 294 ms behind relay.example (±45 ms)" */
+export function describeClockOffset(offset: ClockOffset, url: string): string {
+  return `this machine is ${Math.abs(offset.offsetMs).toFixed(0)} ms `
+    + `${offset.offsetMs >= 0 ? 'behind' : 'ahead of'} ${new URL(url).host} `
+    + `(±${(offset.rttMs / 2).toFixed(0)} ms)`;
+}
+
+/** Smallest move a new measurement must make to replace the offset (ms). */
+const MIN_MOVE_MS = 5;
+
+/**
+ * An offset kept against a reference clock. A new measurement replaces it only
+ * when it moved by more than its own error, so noise does not make the
+ * corrected clock wander.
+ */
+export class ClockReference {
+  private current: ClockOffset | null = null;
+  private pending: Promise<void> | null = null;
+  private readonly measure: (url: string) => Promise<ClockOffset | null>;
+  private readonly now: () => number;
+
+  constructor(readonly url: string, private readonly opts: {
+    /** Called when the offset is first known or replaced. */
+    onAdopt?: (offset: ClockOffset) => void;
+    /** Called when a measurement gets no answer. */
+    onFail?: () => void;
+    measure?: (url: string) => Promise<ClockOffset | null>;
+    now?: () => number;
+  } = {}) {
+    this.measure = opts.measure ?? ((u) => measureClockOffset(u));
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** The offset in use; null until a measurement answers. */
+  get offset(): ClockOffset | null { return this.current; }
+
+  /** Date.now() on the reference clock; this clock's own until calibrated. */
+  nowMs(): number { return this.now() + (this.current?.offsetMs ?? 0); }
+
+  /** Measure once; a call while one runs joins it. */
+  calibrate(): Promise<void> {
+    this.pending ??= this.measure(this.url).then((r) => {
+      if (r === null) {
+        this.opts.onFail?.();
+        return;
+      }
+      const c = this.current;
+      if (c !== null && Math.abs(r.offsetMs - c.offsetMs) <= Math.max(MIN_MOVE_MS, r.rttMs / 2)) return;
+      this.current = r;
+      this.opts.onAdopt?.(r);
+    }).finally(() => { this.pending = null; });
+    return this.pending;
+  }
+}

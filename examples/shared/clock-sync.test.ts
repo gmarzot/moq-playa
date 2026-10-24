@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { measureClockOffset, offsetFromSamples, parseServerTime } from './clock-sync.js';
+import { ClockReference, describeClockOffset, measureClockOffset, offsetFromSamples, parseServerTime } from './clock-sync.js';
+import type { ClockOffset } from './clock-sync.js';
 
 describe('clock-sync', () => {
   it('takes the offset from the fastest round trip', () => {
@@ -32,5 +33,37 @@ describe('clock-sync', () => {
     expect(await measureClockOffset('https://relay.example/time', {
       samples: 2, fetch: async () => { throw new Error('offline'); }, now,
     })).toBeNull();
+  });
+
+  it('keeps its offset until a measurement moves past that measurement\'s error', async () => {
+    const answers: Array<ClockOffset | null> = [
+      { offsetMs: 294, rttMs: 90 }, { offsetMs: 330, rttMs: 90 }, { offsetMs: 360, rttMs: 20 }, null,
+    ];
+    const adopted: number[] = [];
+    let failed = 0;
+    const ref = new ClockReference('https://relay.example/time', {
+      measure: async () => answers.shift() ?? null,
+      now: () => 1_000,
+      onAdopt: (o) => adopted.push(o.offsetMs),
+      onFail: () => { failed++; },
+    });
+    expect(ref.nowMs()).toBe(1_000);
+    await ref.calibrate();
+    expect(ref.nowMs()).toBe(1_294);
+    await ref.calibrate();                 // 36 ms move, within ±45: kept
+    expect(ref.offset?.offsetMs).toBe(294);
+    await ref.calibrate();                 // 66 ms move, past ±10: adopted
+    await ref.calibrate();                 // no answer: the offset stays
+    expect(adopted).toEqual([294, 360]);
+    expect(failed).toBe(1);
+    expect(ref.offset).toEqual({ offsetMs: 360, rttMs: 20 });
+  });
+
+  it('joins a calibration already running', async () => {
+    const measure = vi.fn(async () => ({ offsetMs: 10, rttMs: 4 }));
+    const ref = new ClockReference('https://relay.example/time', { measure });
+    await Promise.all([ref.calibrate(), ref.calibrate()]);
+    expect(measure).toHaveBeenCalledTimes(1);
+    expect(describeClockOffset(ref.offset!, ref.url)).toBe('this machine is 10 ms behind relay.example (±2 ms)');
   });
 });

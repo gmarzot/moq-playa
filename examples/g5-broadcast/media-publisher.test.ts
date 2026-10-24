@@ -1472,6 +1472,31 @@ describe('MediaPublisher — capture clock drift', () => {
     for (const t of last) expect(Math.abs(Number(t) - expected)).toBeLessThanOrEqual(1);
   });
 
+  it('stamps on a corrected wall clock and eases a change of its offset in', async () => {
+    const conn = recordingConnection();
+    const epoch = 1_700_000_000_000_000;
+    let monoUs = epoch;
+    let offsetUs = 294_000;
+    const pub = makePublisher(conn, {
+      draft: 18, wallClockUs: () => monoUs + offsetUs, monotonicNowUs: () => monoUs,
+    });
+    pub.setVideoAlias(2n);
+    for (let k = 0; k < 600; k++) {
+      monoUs = epoch + k * 20_000;
+      if (k === 100) offsetUs += 40_000;     // a recalibration
+      pub.publishVideo(chunk(k), { isKeyframe: k === 0, timestampUs: k * 20_000 });
+      await settle();
+    }
+    const profile = { wireProfile: locWireProfileForDraft(18) };
+    const stamps = conn.sends.filter((x) => x.extensions)
+      .map((x) => Number(parseLocHeaders(x.extensions!, profile).captureTimestamp!));
+    expect(stamps).toHaveLength(600);
+    expect(stamps[0]).toBe(epoch + 294_000);
+    const steps = stamps.slice(1).map((t, i) => t - stamps[i]!);
+    expect(Math.max(...steps)).toBeLessThan(21_000);
+    expect(Math.abs(stamps[599]! - (epoch + 599 * 20_000 + 334_000))).toBeLessThanOrEqual(5);
+  });
+
   it('reports the follow it applied and the drift left after it', async () => {
     const epoch = 1_700_000_000_000_000;
     let monoUs = epoch;
