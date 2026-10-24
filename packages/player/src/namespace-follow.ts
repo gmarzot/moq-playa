@@ -1,5 +1,5 @@
 /**
- * Following the played namespace with SUBSCRIBE_NAMESPACE (draft-18 §10.18):
+ * Following the played namespace with SUBSCRIBE_NAMESPACE (draft-18 §10.18, draft-22 §9.15):
  * reports whether the publisher is announcing it and, when it is published
  * again after going away, asks the player to re-establish the session.
  *

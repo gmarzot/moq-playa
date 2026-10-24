@@ -9,7 +9,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { encodePropertyBlock, writeVi64, vi64EncodingLength } from '@openmoq/transport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { parseLocHeaders } from '@openmoq/loc';
-import { zigzagEncode } from '@openmoq/locmaf';
+import { LocmafHeader, serializeLocmafObject, zigzagEncode } from '@openmoq/locmaf';
 import {
   TIMESTAMP_PROPERTY as P,
   parseTimestampTrack,
@@ -269,6 +269,23 @@ describe('SubscriptionManager.captureTimeFields', () => {
     expect(routed(sm, dataObject(8n, 3n, 1n, undefined, payload))).toEqual({});
   });
 
+  it('reads prft from a LOCMAF genBox or rawBoxes Object, on a group\'s first object', () => {
+    const sm = new SubscriptionManager();
+    sm.registerTrack(8n, 'video', 'video', 'locmaf');
+    const genBox = serializeLocmafObject({
+      kind: 'moof', genBoxes: [{ type: 'prft', payload: prft(1, NTP_W, 0).subarray(8) }],
+      header: new LocmafHeader(true), mdat: new Uint8Array(4),
+    });
+    const raw = serializeLocmafObject({
+      kind: 'rawBoxes', boxes: concat(prft(0, NTP_W, 0x8000_0000), box('moof', new Uint8Array(16))),
+    });
+    expect(routed(sm, dataObject(8n, 3n, 0n, undefined, genBox))).toEqual({ captureTimes: { prft: Number(W_US) } });
+    expect(routed(sm, dataObject(8n, 4n, 0n, undefined, raw)))
+      .toEqual({ captureTimes: { prft: Number(W_US + 500_000n) } });
+    expect(routed(sm, dataObject(8n, 3n, 1n, undefined, genBox))).toEqual({});
+    expect(routed(sm, dataObject(8n, 5n, 0n, undefined, new Uint8Array([0x7f])))).toEqual({});
+  });
+
   it('adds nothing for a track without timing metadata', () => {
     const sm = new SubscriptionManager();
     sm.registerTrack(9n, 'video', 'video', 'loc');
@@ -277,7 +294,7 @@ describe('SubscriptionManager.captureTimeFields', () => {
 });
 
 describe('SUBSCRIBE_OK timestamp Track Properties', () => {
-  it('ride the track registration', () => {
+  const subscribeOk = (field: 'trackProperties' | 'trackExtensions') => {
     const registerTrack = vi.fn();
     const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const ctx: ControlMessageContext = {
@@ -298,12 +315,20 @@ describe('SUBSCRIBE_OK timestamp Track Properties', () => {
     const msg = {
       type: 'SUBSCRIBE_OK', requestId: 5n, trackAlias: 99n,
       expires: 0n, groupOrder: 0x1n, contentExists: false,
-      trackProperties: new Map<bigint, unknown[]>([
+      [field]: new Map<bigint, unknown[]>([
         [P.timescale, [30000n]],
         [P.timestampMapping, [vi64s(1000n, W * 30000n, 60060n, 1001n)]],
       ]),
     } as unknown as ControlMessage;
     handleControlMessage(msg, ctx);
-    expect(registerTrack).toHaveBeenCalledWith(99n, 'video', 'video', 'loc', { timestamps: ntsc() });
+    return registerTrack;
+  };
+
+  it('ride the track registration', () => {
+    expect(subscribeOk('trackProperties')).toHaveBeenCalledWith(99n, 'video', 'video', 'loc', { timestamps: ntsc() });
+  });
+
+  it('ride draft-16 Track Extensions the same way', () => {
+    expect(subscribeOk('trackExtensions')).toHaveBeenCalledWith(99n, 'video', 'video', 'loc', { timestamps: ntsc() });
   });
 });

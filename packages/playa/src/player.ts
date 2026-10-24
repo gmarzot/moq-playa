@@ -64,7 +64,6 @@ import type { AltGroup } from '@openmoq/msf';
 
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
-  draftVersion: 16 as const,
   autoplay: false,
   volume: 1,
   muted: false,
@@ -664,17 +663,18 @@ export class Player {
 
   private buildMoqtPlayerConfig(): MoqtPlayerConfig {
     const opts = this.options;
-    const draftVersion = opts.draftVersion ?? DEFAULTS.draftVersion;
+    // Unset: offer every draft and play the one the relay picks.
+    const draftVersion = opts.draftVersion;
     const transportFactory = createWebTransport({
       ...(opts.certHash ? { certHash: opts.certHash } : {}),
       ...(opts.congestionControl ? { congestionControl: opts.congestionControl } : {}),
-      draftVersion,
+      ...(draftVersion !== undefined ? { draftVersion } : {}),
     });
 
     const base: MoqtPlayerConfig = {
       url: opts.url,
       namespace: opts.namespace,
-      draftVersion,
+      ...(draftVersion !== undefined ? { draftVersion } : {}),
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,

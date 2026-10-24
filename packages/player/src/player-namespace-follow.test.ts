@@ -199,6 +199,17 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
     expect(states).toEqual(['pending', 'listening', 'published', 'withdrawn']);
   });
 
+  it('follows on a draft-22 session too', async () => {
+    const adapter = createMockAdapter();
+    adapter.draftVersion = 22;
+    const { player, states, nsReqId } = await startFollowing(adapter);
+    requestOk(adapter, nsReqId!);
+    namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+    expect(adapter.subscribeNamespace).toHaveBeenCalledOnce();
+    expect(player.namespaceState).toBe('published');
+    expect(states).toEqual(['pending', 'listening', 'published']);
+  });
+
   it('a REQUEST_ERROR reports refused', async () => {
     const adapter = createMockAdapter();
     const { player, nsReqId } = await startFollowing(adapter);

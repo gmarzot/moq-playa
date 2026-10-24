@@ -20,7 +20,9 @@ import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
 import { parseLocHeaders, locWireProfileForDraft, stripLocPrivateProperties } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
 import type { CaptureTimes, TimestampTrackResult } from './capture-time.js';
-import { propertyCaptureUs, readObjectTimestamp, readPrftUs, undeclaredTimestampError } from './capture-time.js';
+import {
+  propertyCaptureUs, readLocmafPrftUs, readObjectTimestamp, readPrftUs, undeclaredTimestampError,
+} from './capture-time.js';
 
 /**
  * Packaging type for container format dispatch.
@@ -318,7 +320,11 @@ export class SubscriptionManager {
       if (error !== undefined) this.timingErrors.set(alias, error);
     }
 
-    const prft = info.packaging === 'cmaf' && BigInt(obj.objectId) === 0n ? readPrftUs(obj.payload) : undefined;
+    // A group's first object carries the prft.
+    const first = BigInt(obj.objectId) === 0n;
+    const prft = !first ? undefined
+      : info.packaging === 'cmaf' ? readPrftUs(obj.payload)
+        : info.packaging === 'locmaf' ? readLocmafPrftUs(obj.payload) : undefined;
     const captureTimes: CaptureTimes = {
       ...(property !== undefined ? { property: Number(property) } : {}),
       ...(headers.timestampIsWallClock && headers.captureTimestamp !== undefined

@@ -9760,11 +9760,11 @@ export class MoqtPlayer {
   }
 
   /**
-   * SUBSCRIBE_NAMESPACE for config.namespace on `conn` (§10.18). Draft-18 only:
-   * on draft-16 the same request can solicit PUBLISH, which this player does not serve.
+   * SUBSCRIBE_NAMESPACE for config.namespace on `conn` (d18 §10.18, d22 §9.15). Draft-18
+   * and later: on draft-16 the same request can solicit PUBLISH, which this player does not serve.
    */
   private async followNamespace(conn: MoqtConnection): Promise<void> {
-    if (!this.config.followNamespace || conn.draftVersion !== 18) return;
+    if (!this.config.followNamespace || !isRequestStreamDraft(conn.draftVersion)) return;
     await this.follower.follow(conn);
   }
 

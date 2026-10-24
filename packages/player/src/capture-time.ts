@@ -10,7 +10,8 @@
 
 import { decodePropertyBlock, readVi64 } from '@openmoq/transport';
 import type { PropertyWireProfile } from '@openmoq/transport';
-import { zigzagDecode } from '@openmoq/locmaf';
+import { deserializeLocmafObject, zigzagDecode } from '@openmoq/locmaf';
+import type { LocmafObject } from '@openmoq/locmaf';
 
 /** @see draft-frindell-moq-timestamp-00 §9 */
 export const TIMESTAMP_PROPERTY = {
@@ -217,17 +218,34 @@ export function readPrftUs(payload: Uint8Array): bigint | undefined {
     if (size < header) return undefined;
     if (payload[pos + 4] === 0x70 && payload[pos + 5] === 0x72
         && payload[pos + 6] === 0x66 && payload[pos + 7] === 0x74) {
-      // FullBox version/flags, reference_track_ID, then the 64-bit NTP timestamp.
-      const ntp = pos + header + 8;
-      if (ntp + 8 > Math.min(pos + size, len)) return undefined;
-      const sec = BigInt(view.getUint32(ntp));
-      const frac = BigInt(view.getUint32(ntp + 4));
-      if (sec < NTP_UNIX_OFFSET_S) return undefined;
-      return (sec - NTP_UNIX_OFFSET_S) * 1_000_000n + ((frac * 1_000_000n) >> 32n);
+      return prftBodyUs(payload.subarray(pos + header, Math.min(pos + size, len)));
     }
     pos += size;
   }
   return undefined;
+}
+
+/** NTP time of a prft in a LOCMAF Object: a genBox, or a box of a rawBoxes Object. */
+export function readLocmafPrftUs(payload: Uint8Array): bigint | undefined {
+  let obj: LocmafObject;
+  try {
+    obj = deserializeLocmafObject(payload);
+  } catch {
+    return undefined;
+  }
+  if (obj.kind === 'rawBoxes') return readPrftUs(obj.boxes);
+  const box = obj.genBoxes.find((b) => b.type === 'prft');
+  return box ? prftBodyUs(box.payload) : undefined;
+}
+
+/** A prft body (after the box header): version/flags, reference_track_ID, then the 64-bit NTP time. */
+function prftBodyUs(body: Uint8Array): bigint | undefined {
+  if (body.byteLength < 16) return undefined;
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const sec = BigInt(view.getUint32(8));
+  const frac = BigInt(view.getUint32(12));
+  if (sec < NTP_UNIX_OFFSET_S) return undefined;
+  return (sec - NTP_UNIX_OFFSET_S) * 1_000_000n + ((frac * 1_000_000n) >> 32n);
 }
 
 const ORDER: readonly CaptureTimeSource[] = ['property', 'loc', 'prft'];
