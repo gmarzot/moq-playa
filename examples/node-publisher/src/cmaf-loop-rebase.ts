@@ -21,6 +21,7 @@
  *
  * @module
  */
+import { parseLocmafTrackContext, parseCmafChunk } from '@openmoq/locmaf';
 
 /** Big-endian u32 at `off`. */
 const u32At = (b: Uint8Array, off: number): number =>
@@ -136,6 +137,42 @@ export function analyzeLoopSpan(chunks: readonly Uint8Array[]): bigint | null {
   return last.bmd + last.durationTicks - first.bmd;
 }
 
+export interface CmafTimeline {
+  readonly timescale: number;
+  readonly offsetsMs: readonly number[];
+  readonly durationsMs: readonly number[];
+  readonly durationMs: number;
+}
+
+/** Decode-time pacing for a single-track fixture, including its final chunk. */
+export function analyzeCmafTimeline(init: Uint8Array, chunks: readonly Uint8Array[]): CmafTimeline | null {
+  try {
+    const context = parseLocmafTrackContext(init);
+    const { timescale } = context;
+    if (timescale <= 0 || chunks.length === 0) return null;
+    const timings = chunks.map((chunk) => {
+      // Pacing must reject every fragment that the subsequent loop cannot rebase.
+      rebaseTfdtCopy(chunk, 0n);
+      const parsed = parseCmafChunk(chunk, context);
+      if (!parsed.fits) return null;
+      return { bmd: parsed.effective.baseMediaDecodeTime,
+        durationTicks: parsed.effective.durations.reduce((sum, duration) => sum + BigInt(duration), 0n) };
+    });
+    if (timings.some((t) => !t || t.durationTicks <= 0n)) return null;
+    const first = timings[0]!;
+    const last = timings.at(-1)!;
+    if (!first || !last) return null;
+    for (let i = 1; i < timings.length; i++) {
+      if (timings[i]!.bmd < timings[i - 1]!.bmd + timings[i - 1]!.durationTicks) return null;
+    }
+    const ms = (ticks: bigint) => Number(ticks) / timescale * 1000;
+    const span = last.bmd + last.durationTicks - first.bmd;
+    if (span > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    return { timescale, offsetsMs: timings.map((t) => ms(t!.bmd - first.bmd)),
+      durationsMs: timings.map((t) => ms(t!.durationTicks)), durationMs: ms(span) };
+  } catch { return null; }
+}
+
 /**
  * Copy `chunk` with every traf's tfdt baseMediaDecodeTime advanced by
  * `deltaTicks`. The input is never mutated (loop iterations all rebase from
@@ -145,7 +182,7 @@ export function analyzeLoopSpan(chunks: readonly Uint8Array[]): bigint | null {
  *   version-0 (32-bit) tfdt would overflow.
  */
 export function rebaseTfdtCopy(chunk: Uint8Array, deltaTicks: bigint): Uint8Array {
-  const out = chunk.slice();
+  const out = new Uint8Array(chunk);
   let patched = 0;
   for (const top of boxes(out, 0, out.byteLength)) {
     if (top.type !== 'moof') continue;

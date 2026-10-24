@@ -15,10 +15,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 const VIDEO_ALIAS = 50n;
 const AUDIO_ALIAS = 51n;
@@ -51,7 +51,14 @@ function createMockAdapter() {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
@@ -480,11 +487,8 @@ describe('subgroup lifecycle witness — alias unbound at header time', () => {
 
 });
 
-describe('subgroup lifecycle witness — optimistic alias registrations', () => {
-  // A subscription is registered under its request ID before SUBSCRIBE_OK,
-  // because many relays echo the request ID as the track alias. The two are
-  // separate spaces, so that registration is a guess. Classifying from it can
-  // label an audio subgroup as video.
+describe('subgroup lifecycle witness - request IDs and aliases', () => {
+  // Request IDs and aliases are independent, even when their values coincide.
   let adapter: ReturnType<typeof createMockAdapter>;
 
   beforeEach(() => {
@@ -509,6 +513,22 @@ describe('subgroup lifecycle witness — optimistic alias registrations', () => 
     await new Promise((r) => setTimeout(r, 0));
     return player;
   }
+
+  it('reports a confirmed video alias equal to a pending audio request ID', async () => {
+    const player = await startAwaitingSubscribeOk();
+    try {
+      const videoReqId = await adapter.subscribe.mock.results[1]?.value;
+      const audioReqId = await adapter.subscribe.mock.results[2]?.value;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: audioReqId,
+        parameters: new Map(), trackExtensions: [],
+      } as unknown as ControlMessage);
+      const header = subgroupHeader(BigInt(audioReqId), 902n, true);
+      adapter._triggerDataStream(75n, header);
+      adapter._triggerSubgroupFin(75n, header);
+      expect(lifecycleLines().map(l => l.group_id)).toEqual(['902']);
+    } finally { await player.destroy(); }
+  });
 
   it('never classifies from an unconfirmed request-id-as-alias guess', async () => {
     const player = await startAwaitingSubscribeOk();
@@ -546,19 +566,8 @@ describe('subgroup lifecycle witness — optimistic alias registrations', () => 
   });
 });
 
-describe('KNOWN DEFECT — object routing trusts optimistic aliases', () => {
-  // Reported separately (handoff 0145). The witness now refuses to classify
-  // from an unconfirmed alias, but the ordinary object-routing path still
-  // routes as soon as SubscriptionManager has any entry, including the
-  // optimistic request-id registration. The same schedule can therefore feed
-  // an audio object into the video pipeline, bypassing pendingObjectsByAlias.
-  //
-  // Marked `fails` deliberately: it asserts the CORRECT behaviour, so it will
-  // start failing — and must then be un-marked — the moment the routing fix
-  // lands. The production change is broader than this slice (warm-start FETCH
-  // objects, alias remapping, owner-set settlement), so it is not folded in
-  // here.
-  it.fails('does not route an object from an unconfirmed alias', async () => {
+describe('object routing requires confirmed aliases', () => {
+  it('does not route an object from an unconfirmed alias', async () => {
     const adapter = createMockAdapter();
     logs = { error: [], warn: [], info: [], debug: [] };
     const player = new MoqtPlayer(createConfig(adapter));
@@ -584,7 +593,7 @@ describe('KNOWN DEFECT — object routing trusts optimistic aliases', () => {
         kind: 'data', trackAlias: varint(optimistic), groupId: varint(900),
         subgroupId: varint(0), objectId: varint(0), payload: new Uint8Array([1, 2, 3]),
       } as MoqtObject);
-      // Correct behaviour: park it. Actual behaviour: routed as video.
+      // Request IDs are not evidence of a track binding.
       const parked = (player as any).pendingObjectsByAlias.get(optimistic);
       expect(parked?.length ?? 0).toBeGreaterThan(0);
     } finally { await player.destroy(); }

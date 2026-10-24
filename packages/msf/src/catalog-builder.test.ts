@@ -11,6 +11,24 @@ import { parseMsfCatalog } from './catalog-msf00.js';
 import { parseCatalogAuto } from './catalog-detect.js';
 
 describe('buildCatalog', () => {
+  it('round-trips alternative, language and label fields without changing defaults', () => {
+    for (const version of [1, '1'] as const) {
+      const catalog = parseCatalogAuto(buildCatalog({ version, tracks: [
+        { name: 'video', packaging: 'cmaf', isLive: true, altGroup: 0, lang: 'en', label: 'Test signal' },
+        { name: 'plain', packaging: 'cmaf', isLive: true },
+      ] }));
+      expect(catalog.tracks[0]).toMatchObject({ altGroup: 0, lang: 'en', label: 'Test signal' });
+      expect(catalog.tracks[1]).not.toHaveProperty('altGroup');
+      expect(catalog.tracks[1]).not.toHaveProperty('lang');
+      expect(catalog.tracks[1]).not.toHaveProperty('label');
+    }
+  });
+
+  it('rejects nonfinite alternative-group IDs rather than emitting null', () => {
+    expect(() => buildCatalog({ tracks: [
+      { name: 'video', packaging: 'cmaf', isLive: true, altGroup: Infinity },
+    ] })).toThrow();
+  });
   it('builds valid MSF catalog JSON with video + audio', () => {
     const payload = buildCatalog({
       tracks: [
@@ -163,6 +181,31 @@ describe('buildCatalog — MSF-01/CMSF-01 init-by-reference emission', () => {
     expect(cat.initDataList).toHaveLength(1);
     expect(cat.tracks.every((t) => t.initRef === 'init-video')).toBe(true);
     expect(cat.tracks.every((t) => t.initData === undefined)).toBe(true);
+  });
+
+  it('emits packaging "locmaf" with its locmafVersion and round-trips through parseCatalogAuto (draft-einarsson-moq-locmaf-01 §5)', () => {
+    const payload = buildCatalog({
+      version: '1',
+      initDataList: [{ id: 'init-video', type: 'inline', data: 'AAAAGGZ0eXA=' }],
+      tracks: [
+        { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', codec: 'avc1.640028', renderGroup: 1, initRef: 'init-video' },
+      ],
+    });
+    const json = JSON.parse(new TextDecoder().decode(payload));
+    expect(json.tracks[0].packaging).toBe('locmaf');
+    expect(json.tracks[0].locmafVersion).toBe('0.3');
+    const cat = parseCatalogAuto(payload);
+    expect(cat.tracks[0]!.packaging).toBe('locmaf');
+    expect(cat.tracks[0]!.locmafVersion).toBe('0.3');
+  });
+
+  it('emits the version "draft-01" as given and parses it as version 1 (MSF-01 §5.1.1)', () => {
+    const payload = buildCatalog({
+      version: 'draft-01',
+      tracks: [{ name: 'v', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.640028' }],
+    });
+    expect(JSON.parse(new TextDecoder().decode(payload)).version).toBe('draft-01');
+    expect(parseCatalogAuto(payload).version).toBe(1);
   });
 
   it('the numeric MSF-00 default is unchanged (version 1, inline initData, no initDataList)', () => {

@@ -10,7 +10,7 @@
  * @module
  */
 
-import { parseCatalogAuto, parseMsf01Delta, type Catalog, type CatalogTrack, type Msf01Delta } from '@moqt/msf';
+import { parseCatalogAuto, parseMsf01Delta, type Catalog, type CatalogTrack, type Msf01Delta } from '@openmoq/msf';
 import type { ErrorCategory } from './schema-types.js';
 import type { ExecResult } from './exec-compare.js';
 
@@ -63,6 +63,8 @@ function projectTrack(t: CatalogTrack): Record<string, unknown> {
   if (t.maxObjSapStartingType !== undefined) o['maxObjSapStartingType'] = numStr(t.maxObjSapStartingType);
   // MSF-01 / CMSF-01.
   if (t.initRef !== undefined) o['initRef'] = t.initRef;
+  // draft-einarsson-moq-locmaf-01 §5.
+  if (t.locmafVersion !== undefined) o['locmafVersion'] = t.locmafVersion;
   if (t.template !== undefined) o['template'] = numStrDeep(t.template);
   if (t.contentProtectionRefIDs !== undefined) o['contentProtectionRefIDs'] = [...t.contentProtectionRefIDs];
   return o;

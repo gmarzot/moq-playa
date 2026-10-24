@@ -1,5 +1,5 @@
 /**
- * Browser WebTransport factory for @moqt/player.
+ * Browser WebTransport factory for @openmoq/player.
  *
  * Creates a `createTransport` factory that the player calls with a URL
  * to get a ready WebTransport connection. Handles cert hash pinning
@@ -21,10 +21,15 @@
  * @module
  */
 
-import type { WebTransportLike } from '@moqt/webtransport';
+import type { WebTransportLike } from '@openmoq/webtransport';
+
+/** Auto mode's offer, newest first. */
+const AUTO_PROTOCOLS = ['moqt-22', 'moqt-18', 'moqt-16'];
 
 /** Options for creating the WebTransport factory. */
 export interface WebTransportFactoryOptions {
+  /** Cancels startup only; after readiness the caller owns transport shutdown. */
+  readonly signal?: AbortSignal;
   /**
    * SHA-256 certificate hash as ArrayBuffer for self-signed certs.
    * Passed to `serverCertificateHashes` in the WebTransport constructor.
@@ -38,15 +43,23 @@ export interface WebTransportFactoryOptions {
    * sends the `WT-Available-Protocols` header to the server. The server
    * selects a protocol and the result is available on `transport.protocol`.
    *
+   * - 22 → `["moqt-22"]`
    * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
-   * - undefined → `["moqt-16"]` (default, kept for backward compatibility)
+   * - undefined → `["moqt-22", "moqt-18", "moqt-16"]`: newest first, the server picks
    *
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
-  readonly draftVersion?: 14 | 16 | 18;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
+
+  /**
+   * Congestion-control preference for the WebTransport constructor. A hint the
+   * browser may ignore; what it applied is reported as `congestionControl` on
+   * the returned transport.
+   */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 }
 
 /**
@@ -62,9 +75,16 @@ export function createWebTransport(
   options?: WebTransportFactoryOptions,
 ): (url: string) => Promise<WebTransportLike> {
   return async (url: string): Promise<WebTransportLike> => {
+    if (!/^https:\/\//i.test(url)) {
+      const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1];
+      throw new Error(
+        'Relay URL must be an https:// WebTransport endpoint, got '
+        + (scheme ? `${scheme}://` : `"${url}"`),
+      );
+    }
     // Build options as a plain object — WebTransportOptions varies by environment.
     // §3.1: WT-Available-Protocols for MOQT version negotiation.
-    // Default: offer ['moqt-16']. Draft-14 does not send protocols —
+    // Default: offer every wired draft, newest first. Draft-14 does not send protocols —
     // it relies on h3 ALPN with in-band CLIENT_SETUP version list.
     const buildOpts = (withProtocols: boolean): any => {
       const opts: any = {};
@@ -74,6 +94,7 @@ export function createWebTransport(
           value: options.certHash,
         }];
       }
+      if (options?.congestionControl) opts.congestionControl = options.congestionControl;
       if (!withProtocols) return opts;
       // Protocol negotiation via WT-Available-Protocols (§3.1).
       // Draft-14 and below used "moq-00" ALPN over raw QUIC, but over WebTransport
@@ -83,9 +104,8 @@ export function createWebTransport(
       if (options?.draftVersion && options.draftVersion >= 15) {
         opts.protocols = [`moqt-${options.draftVersion}`];
       } else if (!options?.draftVersion) {
-        // Auto-negotiate: offer draft-16 protocol string.
-        // Don't offer moq-00/moqt-14 — servers reject unknown protocol strings.
-        opts.protocols = ['moqt-16'];
+        // Auto-negotiate. No moq-00/moqt-14: servers reject unknown protocol strings.
+        opts.protocols = [...AUTO_PROTOCOLS];
       }
       // draft-14: no protocols sent — h3 ALPN fallback with CLIENT_SETUP version list
       return opts;
@@ -102,13 +122,34 @@ export function createWebTransport(
     };
 
     const attempt = async (withProtocols: boolean) => {
+      if (options?.signal?.aborted) throw options.signal.reason;
       const opts = buildOpts(withProtocols);
       const transport = new WebTransport(url, opts);
       // Park `closed`: when `ready` rejects, `closed` rejects too, and an
       // unobserved rejection spams the console on strict UAs (Safari).
       (transport as any).closed?.catch?.(() => {});
       const connectStart = performance.now();
-      await transport.ready;
+      const signal = options?.signal;
+      if (signal) {
+        let rejectAbort!: (error: unknown) => void;
+        const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
+        const onAbort = () => {
+          try { transport.close(); } catch { /* ready may already have failed */ }
+          rejectAbort(signal.reason);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          if (signal.aborted) onAbort();
+          await Promise.race([transport.ready, cancelled]);
+          if (signal.aborted) throw signal.reason;
+        } finally { signal.removeEventListener('abort', onAbort); }
+      } else {
+        await transport.ready;
+      }
+      if (options?.draftVersion === 22 && (transport as unknown as { protocol?: string }).protocol !== 'moqt-22') {
+        transport.close();
+        throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+      }
       return { transport, handshakeRttMs: performance.now() - connectStart };
     };
 
@@ -117,22 +158,26 @@ export function createWebTransport(
     try {
       connected = await attempt(true);
     } catch (err) {
+      if (options?.signal?.aborted) throw options.signal.reason;
       const detail = failureDetail(err, firstOpts.protocols);
-      if (!firstOpts.protocols) {
+      if (!firstOpts.protocols || options?.draftVersion === 22) {
+        throw new Error(`WebTransport connection failed: ${detail}`);
+      }
+      // Draft-16+ negotiate the version only via WT-Protocol. A session
+      // without it leaves the server with no draft, and a draft-18 uni
+      // control stream on such a session is a protocol violation (moqx
+      // segfaults on it). So an explicit 16/18 pin never retries bare.
+      if (options?.draftVersion && options.draftVersion >= 15) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
       // Strict UAs (Safari 26) fail the session when WT-Available-Protocols
-      // negotiation does not complete. MOQT does not require it — the
-      // CLIENT_SETUP version list (§9.3) negotiates in-band — so retry
-      // once without offering before giving up.
-      //
-      // In auto mode, the fallback has no transport.protocol, so the adapter
-      // uses its default draft unless the caller passed draftVersion
-      // explicitly. Callers that need deterministic draft selection should
-      // pass draftVersion.
+      // negotiation does not complete. In auto mode retry once without
+      // offering; the fallback has no transport.protocol, so the adapter
+      // uses its default draft.
       try {
         connected = await attempt(false);
       } catch (retryErr) {
+        if (options?.signal?.aborted) throw options.signal.reason;
         throw new Error(
           `WebTransport connection failed: ${detail} ` +
           `(retry without protocols also failed: ${failureDetail(retryErr)})`,
@@ -148,6 +193,23 @@ export function createWebTransport(
       get handshakeRttMs() { return handshakeRttMs; },
       createBidirectionalStream: () => wt.createBidirectionalStream(),
       createUnidirectionalStream: () => (transport as any).createUnidirectionalStream(),
+      async resetSendStream(
+        writer: WritableStreamDefaultWriter<Uint8Array>,
+        reason: unknown,
+        pendingFin?: Promise<void>,
+      ): Promise<void> {
+        try {
+          await writer.abort(reason);
+        } catch (error) {
+          if (error !== reason || !pendingFin) throw error;
+          // W3C WebTransport §7.4 rejects PendingOperation with the abort
+          // signal's reason only AFTER the underlying reset fulfills. When a
+          // FIN is pending, Web Streams propagates that rejection to abort().
+          // This is reset evidence for WebTransport, not for arbitrary sinks.
+          const resetFin = await pendingFin.then(() => false, (finError) => finError === reason);
+          if (!resetFin) throw error;
+        }
+      },
       get incomingUnidirectionalStreams() { return wt.incomingUnidirectionalStreams; },
       // draft-18 inbound request streams (e.g. a publisher's PUBLISH, §10.10)
       // arrive as peer-initiated bidi streams; surface them when present.
@@ -158,8 +220,13 @@ export function createWebTransport(
     };
 
     const protocol = (transport as any).protocol as string | undefined;
+    const congestionControl = (transport as any).congestionControl as string | undefined;
+    // Absent when unsupported, so callers can tell that from empty stats.
+    const getStats = (transport as WebTransportLike).getStats;
     return {
       ...(protocol !== undefined ? { protocol } : {}),
+      ...(congestionControl !== undefined ? { congestionControl } : {}),
+      ...(getStats ? { getStats: () => getStats.call(transport) } : {}),
       ...wrappedTransport,
     } satisfies WebTransportLike;
   };

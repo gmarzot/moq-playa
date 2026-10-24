@@ -21,7 +21,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit, VideoFrameMarking } from '@moqt/loc';
+import type { VideoChunkInit, AudioChunkInit, VideoFrameMarking } from '@openmoq/loc';
 
 // ─── State constants ────────────────────────────────────────────────
 
@@ -103,6 +103,17 @@ export class DecoderStateMachine {
             this._state = DecoderState.NEEDS_KEYFRAME;
         }
         return { action: 'configure', config };
+    }
+
+    /**
+     * Forget the last configuration (and a track end): the next `configure`
+     * reconfigures the decoder even with identical bytes. Used on a track
+     * switch, where the codec metadata that goes with the bytes (codec string,
+     * sample rate, channels) may differ although the bytes do not.
+     */
+    resetConfig(): void {
+        this.lastConfig = null;
+        if (this._state === DecoderState.ENDED) this._state = DecoderState.IDLE;
     }
 
     /** Byte-level config comparison. */

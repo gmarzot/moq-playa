@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { varint } from '@moqt/transport';
+import { varint } from '@openmoq/transport';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions } from './player-connect.js';
 import type { MoqtPlayerConfig } from './config.js';
 
@@ -50,6 +50,33 @@ describe('buildConnectUrl', () => {
 // ─── buildSetupOptions ───────────────────────────────────────────────
 
 describe('buildSetupOptions', () => {
+  const getTokens = () => [{ tokenType: 1n, value: new Uint8Array([1]) }];
+
+  it('binds the credential provider to the actual relay URL', () => {
+    const config = minimalConfig({ authorization: { getTokens, timeoutMs: 50 } });
+    expect(buildSetupOptions(config).authorization).toEqual({ relayUrl: config.url, getTokens, timeoutMs: 50 });
+    expect(buildSetupOptions(config, 'https://relay.example.com/other').authorization?.relayUrl)
+      .toBe('https://relay.example.com/other');
+  });
+
+  it('rejects cross-origin credential forwarding unless the destination is explicitly allowed', () => {
+    const config = minimalConfig({ authorization: { getTokens } });
+    expect(() => buildSetupOptions(config, 'https://untrusted.example/moq')).toThrow('not authorized');
+    const allowed = minimalConfig({ authorization: { getTokens, allowedRelayOrigins: ['https://trusted.example'] } });
+    expect(buildSetupOptions(allowed, 'https://trusted.example/moq').authorization?.relayUrl)
+      .toBe('https://trusted.example/moq');
+  });
+
+  it('does not combine a provider with raw SETUP tokens', () => {
+    const config = minimalConfig({ authTokens: [], authorization: { getTokens } });
+    expect(() => buildSetupOptions(config)).toThrow('not both');
+  });
+
+  it('does not treat distinct raw QUIC authorities as the same origin', () => {
+    const config = minimalConfig({ url: 'moqt://relay.example/moq', authorization: { getTokens } });
+    expect(() => buildSetupOptions(config, 'moqt://untrusted.example/moq')).toThrow('not authorized');
+  });
+
   it('includes maxRequestId as varint (§9.3.1.3)', () => {
     const config = minimalConfig({ maxRequestId: 200 });
     const options = buildSetupOptions(config);
@@ -78,6 +105,14 @@ describe('buildSetupOptions', () => {
     const config = minimalConfig({ authority: undefined });
     const options = buildSetupOptions(config);
     expect(options.authority).toBeUndefined();
+  });
+
+  it('opts into uncapped requests only with compat request-credit', () => {
+    expect(buildSetupOptions(minimalConfig({})).requestsUncappedUntilMaxRequestId).toBeUndefined();
+    expect(buildSetupOptions(minimalConfig({ compat: ['empty-objects'] }))
+      .requestsUncappedUntilMaxRequestId).toBeUndefined();
+    expect(buildSetupOptions(minimalConfig({ compat: ['request-credit'] }))
+      .requestsUncappedUntilMaxRequestId).toBe(true);
   });
 
   it('omits implementation when not configured', () => {

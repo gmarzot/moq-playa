@@ -16,30 +16,32 @@
  *     draft-18 §10.12) — see handleFetch;
  *   - forwarding preserves the publisher's groupId/subgroupId/objectId and raw
  *     Object Properties/Extensions, and mirrors graceful subgroup FIN so
- *     downstream stream credit is returned.
+ *     downstream stream credit is returned. The incoming END_OF_GROUP header
+ *     bit is preserved before forwarding its first object.
  *
  * Deliberately a TOY — see README:
  *   - LIVE only: the cache holds just the latest group, so a late joiner gets that
  *     group, not full history (no DVR / no real init-segment retention policy).
  *   - NO route authorization, fairness, reconnect/migration, or persistence.
  *     A bounded per-subscription forwarder sheds a subscriber that cannot keep up.
- *   - Forwards DATA objects ONLY. Gap/status objects (incl. END_OF_GROUP) are NOT
- *     relayed: a live relay can't reproduce them with the public API — per-object
- *     status has no `sendObject` field, and the END_OF_GROUP header bit is set at
- *     subgroup-OPEN time (before the relay knows the group is ending). See README.
+ *   - Forwards DATA objects and their subgroup header evidence. Explicit wire
+ *     gap/status objects are not relayed; sendObject has no status argument.
  * All forwarding uses the public MoqtConnection API — no internals.
  */
-import type { MoqtConnection, IncomingPublish } from '@moqt/webtransport';
-import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@moqt/transport';
-import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, nsStr, hex } from './demo.js';
+import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
+import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
+import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 
 /** Tracks this relay will route: the simple demo track + the toy media ladder. */
-const REGISTERED_TRACKS = new Set<string>([DEMO_TRACK, ...MEDIA_TRACKS]);
+const REGISTERED_TRACKS = new Set([DEMO_TRACK, ...MEDIA_TRACKS].map((name) => hex(te(name))));
 
 interface CachedObject {
+  readonly firstObject: boolean;
+  readonly endOfGroup: boolean;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
@@ -55,6 +57,8 @@ interface SubscriberSubgroup {
 }
 
 interface ForwardObjectFields {
+  readonly firstObject: boolean;
+  readonly endOfGroup: boolean;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
@@ -83,6 +87,8 @@ class Subscriber {
 }
 
 export interface RelayOptions {
+  /** Exact namespace tuples this toy relay accepts. Defaults to DEMO_NAMESPACE. */
+  readonly registeredNamespaces?: readonly (readonly string[])[];
   /** Maximum downstream subgroup streams held open by one subscription. */
   readonly maxConcurrentSubgroupsPerSubscription?: number;
   /** Disconnect a subscriber rather than retain more queued objects than this. */
@@ -106,19 +112,31 @@ interface Track {
   cacheClosedSubgroups: Set<string>;
 }
 
+/** ASCII-safe namespace key that preserves tuple-field boundaries. */
+const namespaceKeyOf = (namespace: readonly Uint8Array[]): string =>
+  namespace.map(hex).join(',');
+
+const configuredNamespaceKeyOf = (namespace: readonly string[]): string =>
+  namespaceKeyOf(namespace.map(te));
+
 /** ASCII-safe route-table key (hex of each namespace field + the track name). */
 const trackKeyOf = (namespace: Uint8Array[], trackName: Uint8Array): string =>
-  `${namespace.map(hex).join(',')}|${hex(trackName)}`;
-
-const isRegisteredTrack = (namespace: Uint8Array[], trackName: Uint8Array): boolean =>
-  nsStr(namespace) === DEMO_NAMESPACE.join('/') && REGISTERED_TRACKS.has(td(trackName));
+  `${namespaceKeyOf(namespace)}|${hex(trackName)}`;
 
 export class Relay {
   private readonly tracks = new Map<string, Track>();
   private nextAlias = 100n;
   private readonly forwardLimits: ForwardLimits;
+  private readonly registeredNamespaceKeys: ReadonlySet<string>;
 
   constructor(options: RelayOptions = {}) {
+    const registeredNamespaces = options.registeredNamespaces ?? [DEMO_NAMESPACE];
+    if (registeredNamespaces.length === 0) {
+      throw new RangeError('registeredNamespaces must contain at least one namespace');
+    }
+    this.registeredNamespaceKeys = new Set(
+      registeredNamespaces.map(configuredNamespaceKeyOf),
+    );
     this.forwardLimits = {
       maxConcurrentSubgroups: positiveInteger(
         'maxConcurrentSubgroupsPerSubscription',
@@ -149,6 +167,11 @@ export class Relay {
     return track;
   }
 
+  private isRegisteredTrack(namespace: Uint8Array[], trackName: Uint8Array): boolean {
+    return this.registeredNamespaceKeys.has(namespaceKeyOf(namespace))
+      && REGISTERED_TRACKS.has(hex(trackName));
+  }
+
   /** A subscriber's SUBSCRIBE: accept with a fresh alias, register, replay live cache. */
   async handleSubscribe(
     conn: MoqtConnection,
@@ -157,7 +180,7 @@ export class Relay {
     trackName: Uint8Array,
   ): Promise<void> {
     try {
-      if (!isRegisteredTrack(namespace, trackName)) {
+      if (!this.isRegisteredTrack(namespace, trackName)) {
         log(`SUBSCRIBE ${nsStr(namespace)}/${td(trackName)} — not registered; rejecting`);
         await conn.rejectSubscribe(requestId, RequestError18.DOES_NOT_EXIST, 'unknown track');
         return;
@@ -172,7 +195,7 @@ export class Relay {
       const cachedLargest = latestCached(this.tracks.get(key));
       let acceptParams: Parameters | undefined;
       if (cachedLargest) {
-        const value = conn.draftVersion === 18
+        const value = isRequestStreamDraft(conn.draftVersion)
           ? { group: cachedLargest.groupId, object: cachedLargest.objectId }
           : (() => {
               const loc = { group: varint(cachedLargest.groupId), object: varint(cachedLargest.objectId) };
@@ -214,7 +237,7 @@ export class Relay {
   /** A publisher's PUBLISH: accept and forward its objects to all subscribers. */
   async handlePublish(conn: MoqtConnection, publish: IncomingPublish): Promise<void> {
     try {
-      if (!isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
+      if (!this.isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
         log(`PUBLISH ${nsStr(publish.trackNamespace)}/${td(publish.trackName)} — not registered; rejecting`);
         await conn.rejectSubscribe(publish.requestId, RequestError18.DOES_NOT_EXIST, 'unknown track');
         return;
@@ -237,7 +260,11 @@ export class Relay {
           track.cacheClosedSubgroups.clear();
         }
         const extensions = obj.properties ?? obj.extensions;
+        const firstObject = obj.isFirstObjectInSubgroup === true;
+        const endOfGroup = obj.subgroupContainsEndOfGroup === true;
         track.cache.push({
+          firstObject,
+          endOfGroup,
           groupId: obj.groupId,
           subgroupId: obj.subgroupId,
           objectId: obj.objectId,
@@ -249,7 +276,7 @@ export class Relay {
         const { groupId, subgroupId, objectId, payload } = obj;
         for (const sub of [...track.subscribers]) {
           this.enqueueObject(track, sub, {
-            groupId, subgroupId, objectId, payload, extensions,
+            groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup,
           });
         }
       };
@@ -290,7 +317,7 @@ export class Relay {
     try {
       if (fetch.fetch.fetchType === 0x1) {
         const sf = fetch.fetch as StandaloneFetch;
-        if (!isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
+        if (!this.isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
           log(`FETCH ${nsStr(sf.trackNamespace)}/${td(sf.trackName)} — not registered; rejecting`);
           await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST as bigint, 'unknown track');
           return;
@@ -384,8 +411,9 @@ export class Relay {
       const i = track.subscribers.findIndex((s) => s.conn === conn && s.requestId === requestId);
       if (i < 0) continue;
       const [sub] = track.subscribers.splice(i, 1);
-      // Finish already-queued forwards in subgroup order, then FIN each stream.
-      void sub!.forwarder.retire();
+      // Cancellation is not completion. Stop queued writes; the adapter resets
+      // this request's open data streams (§5.1.1), without inventing a FIN.
+      sub!.forwarder.abort();
       log(`subscription requestId=${requestId} unsubscribed; ${track.subscribers.length} subscriber(s) remain on this track`);
       return; // (conn, requestId) is unique to one subscription
     }
@@ -461,15 +489,16 @@ async function forwardObject(
   fields: ForwardObjectFields,
 ): Promise<void> {
   try {
-    const { groupId, subgroupId, objectId, payload, extensions } = fields;
+    const { groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup } = fields;
     const skey = subgroupKey(groupId, subgroupId);
     let subgroup = sub.subgroups.get(skey);
     if (subgroup === undefined) {
       const hasExtensions = extensions !== undefined;
       const streamId = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, {
         publisherPriority: 128,
-        firstObject: objectId === 0n,
+        firstObject,
         hasExtensions,
+        ...(endOfGroup ? { endOfGroup: true } : {}),
       });
       subgroup = { streamId, hasExtensions };
       sub.subgroups.set(skey, subgroup);

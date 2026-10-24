@@ -19,7 +19,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike } from './interfaces.js';
-import type { DecoderCommand, DecoderFeedback } from '@moqt/playback';
+import type { DecoderCommand, DecoderFeedback } from '@openmoq/playback';
 
 // ─── Mock Factories ───────────────────────────────────────────────────
 
@@ -59,8 +59,8 @@ function createMockAudioDecoder(): AudioDecoderLike & {
     onData: null,
     onError: null,
     destroy: vi.fn(),
-    _triggerData(data: unknown, renderTimeUs: number) {
-      mock.onData?.(data, renderTimeUs);
+    _triggerData(data: unknown, renderTimeUs: number, captureUs?: number) {
+      mock.onData?.(data, renderTimeUs, captureUs);
     },
     _triggerError(err: Error) {
       mock.onError?.(err);
@@ -326,9 +326,10 @@ describe('CommandDispatcher', () => {
     const _dispatcher = new CommandDispatcher({ audioDecoder, audioOutput });
 
     const fakeAudioData = { sampleRate: 48000 };
-    audioDecoder._triggerData(fakeAudioData, 3000);
+    audioDecoder._triggerData(fakeAudioData, 3000, 7_000_000);
 
-    expect(audioOutput.schedule).toHaveBeenCalledWith(fakeAudioData, 3000);
+    // The chunk's capture timestamp rides along: decoders may rebase their own.
+    expect(audioOutput.schedule).toHaveBeenCalledWith(fakeAudioData, 3000, 7_000_000);
   });
 
   it('reports video decoder error via onError callback', () => {
@@ -481,6 +482,39 @@ describe('CommandDispatcher', () => {
   });
 
   // ─── Lifecycle ──────────────────────────────────────────────────
+
+  it('reports unavailable presentation for an older renderer without the optional observation', () => {
+    const dispatcher = new CommandDispatcher({ renderer: createMockRenderer() });
+    expect(dispatcher.videoPresentation).toBeNull();
+    dispatcher.destroy();
+  });
+
+  it('copies exact presentation evidence and retires it on destruction', () => {
+    const observation = { frameTimestampUs: 9_007_199_254_740_993n, timestampDomain: 'unknown' as const, renderedAtUs: 123 };
+    const renderer = { ...createMockRenderer(), videoPresentation: observation };
+    const dispatcher = new CommandDispatcher({ renderer });
+    const snapshot = dispatcher.videoPresentation;
+    expect(snapshot).toEqual(observation);
+    expect(snapshot).not.toBe(observation);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    observation.frameTimestampUs = 0n;
+    expect(snapshot?.frameTimestampUs).toBe(9_007_199_254_740_993n);
+    expect(dispatcher.videoPresentation?.frameTimestampUs).toBe(0n);
+    dispatcher.destroy();
+    expect(dispatcher.videoPresentation).toBeNull();
+  });
+
+  it('rejects a presentation getter that retires the dispatcher while being sampled', () => {
+    const renderer = {
+      ...createMockRenderer(),
+      get videoPresentation() {
+        dispatcher.destroy();
+        return { frameTimestampUs: 0n, timestampDomain: 'unknown' as const, renderedAtUs: 123 };
+      },
+    };
+    const dispatcher = new CommandDispatcher({ renderer });
+    expect(dispatcher.videoPresentation).toBeNull();
+  });
 
   it('destroy() calls destroy on all adapters', () => {
     const videoDecoder = createMockVideoDecoder();
@@ -673,6 +707,97 @@ describe('CommandDispatcher', () => {
         expect(renderedFb.captureTimestampUs).toBe(1_000_100_000n);
         expect(renderedFb.actualRenderUs).toBe(5_100_000);
       }
+    });
+
+    it('ignores a retained render callback after dispatcher destruction', () => {
+      const renderer = createMockRenderer();
+      const onFrameRendered = vi.fn();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn();
+      const dispatcher = new CommandDispatcher({
+        renderer, onFrameRendered, onFeedback, onAvSkew,
+        audioOutput: { ...createMockAudioOutput(), playheadCaptureUs: () => 0 },
+      });
+      const retiredCallback = renderer.onFrameRendered!;
+      retiredCallback(0n, 100, 90);
+      expect(onFrameRendered).toHaveBeenCalledOnce();
+      expect(onFeedback).toHaveBeenCalledOnce();
+      expect(onAvSkew).toHaveBeenCalledOnce();
+      onFrameRendered.mockClear();
+      onFeedback.mockClear();
+      onAvSkew.mockClear();
+      dispatcher.destroy();
+
+      retiredCallback(1_000_000n, 200, 190);
+      expect(onFrameRendered).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+      expect(onAvSkew).not.toHaveBeenCalled();
+    });
+
+    it('retires render feedback before fallible adapter destruction', () => {
+      const renderer = createMockRenderer();
+      const onFrameRendered = vi.fn();
+      const onFeedback = vi.fn();
+      const dispatcher = new CommandDispatcher({ renderer, onFrameRendered, onFeedback });
+      const retiredCallback = renderer.onFrameRendered!;
+      vi.mocked(renderer.destroy).mockImplementation(() => {
+        retiredCallback(0n, 100);
+        throw new Error('renderer teardown failed');
+      });
+
+      expect(() => dispatcher.destroy()).toThrow('renderer teardown failed');
+      retiredCallback(1n, 200);
+      expect(onFrameRendered).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
+    it('stops the remaining render report when a listener destroys the dispatcher', () => {
+      const renderer = createMockRenderer();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn();
+      const onFrameRendered = vi.fn(() => dispatcher.destroy());
+      const dispatcher = new CommandDispatcher({
+        renderer, onFrameRendered, onFeedback, onAvSkew,
+        audioOutput: { ...createMockAudioOutput(), playheadCaptureUs: () => 0 },
+      });
+
+      renderer._triggerFrameRendered(0n, 100);
+      expect(onFrameRendered).toHaveBeenCalledOnce();
+      expect(onAvSkew).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
+    it('stops render feedback when the skew listener destroys the dispatcher', () => {
+      const renderer = createMockRenderer();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn(() => dispatcher.destroy());
+      const onFrameRendered = vi.fn();
+      const dispatcher = new CommandDispatcher({
+        renderer, onFrameRendered, onFeedback, onAvSkew,
+        audioOutput: { ...createMockAudioOutput(), playheadCaptureUs: () => 0 },
+      });
+
+      renderer._triggerFrameRendered(0n, 100);
+      expect(onFrameRendered).toHaveBeenCalledOnce();
+      expect(onAvSkew).toHaveBeenCalledOnce();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
+    it('stops render feedback when the audio playhead hook destroys the dispatcher', () => {
+      const renderer = createMockRenderer();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn();
+      const dispatcher = new CommandDispatcher({
+        renderer, onFeedback, onAvSkew,
+        audioOutput: {
+          ...createMockAudioOutput(),
+          playheadCaptureUs: () => { dispatcher.destroy(); return 0; },
+        },
+      });
+
+      renderer._triggerFrameRendered(0n, 100);
+      expect(onAvSkew).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
     });
 
     it('emits flush_complete after flush resolves', async () => {
@@ -877,7 +1002,7 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
       getPlaybackDelayUs: () => 200_000,
     });
     audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
-    expect(audioOutput.schedule).toHaveBeenCalledWith({ sampleRate: 48000 }, 203_000);
+    expect(audioOutput.schedule).toHaveBeenCalledWith({ sampleRate: 48000 }, 203_000, undefined);
   });
 
   it('adaptive cushion changes reach subsequent audio schedule() arguments (adoption at anchor/underrun is pinned in webaudio-output.test.ts)', () => {
@@ -891,8 +1016,8 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
     audioDecoder._triggerData({ sampleRate: 48000 }, 1000);
     cushion = 400_000; // adaptive gap timeout grew under jitter
     audioDecoder._triggerData({ sampleRate: 48000 }, 2000);
-    expect(audioOutput.schedule).toHaveBeenNthCalledWith(1, expect.anything(), 201_000);
-    expect(audioOutput.schedule).toHaveBeenNthCalledWith(2, expect.anything(), 402_000);
+    expect(audioOutput.schedule).toHaveBeenNthCalledWith(1, expect.anything(), 201_000, undefined);
+    expect(audioOutput.schedule).toHaveBeenNthCalledWith(2, expect.anything(), 402_000, undefined);
   });
 
   it('without the hook, audio render times pass through unchanged (standalone back-compat)', () => {
@@ -900,6 +1025,6 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
     const audioOutput = createMockAudioOutput();
     const _d = new CommandDispatcher({ audioDecoder, audioOutput });
     audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
-    expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000);
+    expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000, undefined);
   });
 });

@@ -15,9 +15,11 @@
  */
 
 import type { PlayerStateValue } from './state.js';
-import type { RecoveryAction, DecoderCommand } from '@moqt/playback';
-import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@moqt/msf';
+import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
+import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
+import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
+import type { CaptureTimes } from './capture-time.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
 
@@ -50,6 +52,29 @@ export interface SessionGoawayEvent {
 }
 
 /**
+ * GOAWAY received on ONE request stream — a per-request migration signal that
+ * leaves the rest of the session in place. Unrelated subscriptions keep
+ * delivering and the session does not drain, so this deliberately does NOT
+ * emit `session_goaway`: a listener on that event may reconnect the whole
+ * player, which is the wrong response to a single request migrating.
+ *
+ * Re-issuing the request is application policy; nothing is re-issued
+ * automatically.
+ *
+ * @see draft-ietf-moq-transport-18 §10.4
+ * @see draft-ietf-moq-transport-22 §9.2, §6.6.1
+ */
+export interface RequestGoawayEvent {
+  readonly type: 'request_goaway';
+  /** The request the peer asked to migrate, from its stream context. */
+  readonly requestId: bigint;
+  /** Where to re-issue it; empty means the current session. */
+  readonly newSessionUri: string;
+  /** Track name when the request was a known media or catalog subscription. */
+  readonly trackName?: string;
+}
+
+/**
  * Session migrated to a new relay after GOAWAY.
  * @see draft-ietf-moq-transport-16 §3.5 (Migration)
  * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
@@ -66,6 +91,14 @@ export interface SessionClosedEvent {
   readonly type: 'session_closed';
   readonly error?: number;
   readonly reason?: string;
+}
+
+/** The current session closed during playback; a fresh session is attempted after `delayMs`. */
+export interface SessionReconnectingEvent {
+  readonly type: 'session_reconnecting';
+  /** 1 for the first attempt after the close. */
+  readonly attempt: number;
+  readonly delayMs: number;
 }
 
 /**
@@ -159,7 +192,7 @@ export interface TrackSubscribeFailedEvent {
   readonly reason: string;
 }
 
-// ─── Playback Events (bridged from @moqt/playback) ──────────────────
+// ─── Playback Events (bridged from @openmoq/playback) ──────────────────
 
 /**
  * Group gap detected — missing objects in sequence.
@@ -317,7 +350,13 @@ export interface MediaObjectEvent {
   readonly extensions?: Uint8Array;
   readonly status?: bigint;
   readonly captureTimestamp?: bigint;
+  /** False when captureTimestamp is media time under a declared timescale, not wall clock. */
+  readonly timestampIsWallClock?: boolean;
   readonly isKeyframe?: boolean;
+  /** Wall-clock capture times by source, for latency measurement only. */
+  readonly captureTimes?: CaptureTimes;
+  /** Why the track's timestamp properties are not used. */
+  readonly timingError?: string;
 }
 
 // ─── Rendering Events ────────────────────────────────────────────────
@@ -424,6 +463,62 @@ export interface QualitySwitchFailedEvent {
 }
 
 /**
+ * Video view changed — a switch to a track of another altGroup (or another
+ * program's video) committed.
+ * Fires right after the `quality_switched` event of that switch.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+ */
+export interface ViewChangedEvent {
+  readonly type: 'view_changed';
+  /** altGroup of the previous view. */
+  readonly fromView: number | undefined;
+  /** altGroup of the new view; undefined when it has none (a program without altGroups). */
+  readonly toView: number | undefined;
+  /** Track of the new view that is now playing. */
+  readonly trackName: string;
+}
+
+/**
+ * Audio track changed — a switch to another audio track (typically another
+ * language) committed: the new track now feeds the decoder or SourceBuffer.
+ */
+export interface AudioTrackChangedEvent {
+  readonly type: 'audio_track_changed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  /** Catalog `lang` of the new track, when it has one. */
+  readonly lang: string | undefined;
+  readonly reason: string;
+}
+
+/**
+ * Audio track switch rolled back — the new track could not be committed
+ * (e.g. `mediaSource.changeType()` rejected). The old track keeps playing.
+ */
+export interface AudioTrackSwitchFailedEvent {
+  readonly type: 'audio_track_switch_failed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  readonly reason: string;
+  readonly error: Error;
+}
+
+/**
+ * Program changed — the current renderGroup moved. After `selectProgram()`
+ * it fires once every track that had to change has committed (at once when
+ * the program shares all playing tracks); a manual `selectVideoTrack()` of
+ * another program's track fires it when that switch commits.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+ */
+export interface ProgramChangedEvent {
+  readonly type: 'program_changed';
+  readonly fromProgram: number | undefined;
+  readonly toProgram: number;
+}
+
+/**
  * Live catch-up state changed — activated, rate adjusted, or deactivated.
  *
  * Emitted when the player adjusts playback rate to catch up to the live
@@ -461,6 +556,21 @@ export interface NamespaceDoneEvent {
   readonly type: 'namespace_done';
   readonly requestId: bigint;
   readonly namespaceSuffix: Uint8Array[];
+}
+
+/** The followed namespace at the relay (config `followNamespace`). */
+export type NamespaceState = 'pending' | 'listening' | 'published' | 'withdrawn' | 'refused';
+
+/**
+ * The followed namespace changed state: SUBSCRIBE_NAMESPACE sent (`pending`),
+ * accepted (`listening`), NAMESPACE received (`published`), NAMESPACE_DONE
+ * (`withdrawn`), or REQUEST_ERROR / stream failure (`refused`).
+ * @see draft-ietf-moq-transport-18 §10.18
+ */
+export interface NamespaceStateEvent {
+  readonly type: 'namespace_state';
+  readonly state: NamespaceState;
+  readonly detail: string;
 }
 
 /**
@@ -572,6 +682,28 @@ export interface EventTimelineReceivedEvent {
   readonly records: EventTimelineRecord[];
 }
 
+/**
+ * Timed events carried by a LOCMAF event-only track: the `emsg` boxes that
+ * rode as genBox elements ahead of one chunk's header, parsed. A version-0
+ * emsg's presentation time is a delta from this chunk's
+ * `baseMediaDecodeTime`; a version-1 emsg's is absolute.
+ *
+ * @see draft-einarsson-moq-locmaf-01 §8, §14 (Event-Only Tracks)
+ */
+export interface LocmafEventReceivedEvent {
+  readonly type: 'locmaf_event';
+  /** Name of the locmaf track in the catalog. */
+  readonly trackName: string;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
+  /** The track's timescale (mdhd), which the chunk's decode time is in. */
+  readonly timescale: number;
+  /** The chunk's tfdt base media decode time. */
+  readonly baseMediaDecodeTime: bigint;
+  /** The chunk's emsg boxes, in order. */
+  readonly events: readonly EmsgEvent[];
+}
+
 // ─── Seek Events ────────────────────────────────────────────────────
 
 /**
@@ -617,8 +749,10 @@ export interface PlayerEventMap {
   session_connecting: SessionConnectingEvent;
   session_established: SessionEstablishedEvent;
   session_goaway: SessionGoawayEvent;
+  request_goaway: RequestGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
+  session_reconnecting: SessionReconnectingEvent;
   session_error: SessionErrorEvent;
 
   // Errors (structured)
@@ -660,11 +794,16 @@ export interface PlayerEventMap {
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;
   quality_switch_failed: QualitySwitchFailedEvent;
+  view_changed: ViewChangedEvent;
+  audio_track_changed: AudioTrackChangedEvent;
+  audio_track_switch_failed: AudioTrackSwitchFailedEvent;
+  program_changed: ProgramChangedEvent;
   catch_up_changed: CatchUpChangedEvent;
 
   // Namespace discovery
   namespace_discovered: NamespaceDiscoveredEvent;
   namespace_done: NamespaceDoneEvent;
+  namespace_state: NamespaceStateEvent;
   namespace_announced: NamespaceAnnouncedEvent;
   namespace_announcement_done: NamespaceAnnouncementDoneEvent;
 
@@ -676,6 +815,7 @@ export interface PlayerEventMap {
   // SAP / Event Timeline
   sap_event: SapEventReceivedEvent;
   event_timeline: EventTimelineReceivedEvent;
+  locmaf_event: LocmafEventReceivedEvent;
 
   // Seek
   seeking: SeekingEvent;

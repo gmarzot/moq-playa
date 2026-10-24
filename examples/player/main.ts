@@ -1,5 +1,5 @@
 /**
- * Player API example — A/V playback using @moqt/player with browser adapters.
+ * Player API example — A/V playback using @openmoq/player with browser adapters.
  *
  * Demonstrates the convenience facade: load()/play()/pause()/destroy()
  * with adapter factories for plug-and-play decode/render.
@@ -17,10 +17,10 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer, PlayerErrorCode } from '@moqt/player';
-import { MoqtConnection } from '@moqt/webtransport';
-import { QlogTrace, varint } from '@moqt/transport';
-import { CATALOG_TRACK_NAME } from '@moqt/msf';
+import { MoqtPlayer, PlayerErrorCode, usesMsePath } from '@openmoq/player';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { QlogTrace, varint } from '@openmoq/transport';
+import { CATALOG_TRACK_NAME } from '@openmoq/msf';
 import { log } from '../shared/log.js';
 import { namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
@@ -35,9 +35,11 @@ import {
     type CmafStartupGeometry,
     CmafAssembler,
     createWebTransport,
-} from '@moqt/browser';
+} from '@openmoq/browser';
 
-import type { PlayerStats, TTFFBreakdown } from '@moqt/player';
+import type { PlayerEventMap, PlayerStats, TTFFBreakdown } from '@openmoq/player';
+import type { CatalogTrack } from '@openmoq/msf';
+import { TeardownBarrier, parseVideoAltGroup } from './view-selection.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -158,6 +160,10 @@ const catalogFromUrl = readCatalogParam();
         if (gap) newParams.set('gap', gap);
         if (sSwDec.checked) newParams.set('swdec', '1');
         if (sFetchCatalog.checked) newParams.set('fetchCatalog', '1');
+        // ?altGroup= / ?program= / ?lang= / ?programs= have no settings fields — carry them over as is.
+        for (const name of ['altGroup', 'program', 'lang', 'programs']) {
+            if (params.get(name)) newParams.set(name, params.get(name)!);
+        }
 
         if (catalogJson) {
             try {
@@ -421,6 +427,7 @@ let reconnecting = false;     // a reconnect loop is in flight
 let reconnectCancelled = false; // user pressed Stop during a reconnect loop
 let retryCount = 0;
 let startupDiscovery: AbortController | null = null; // aborts endpoint discovery on Stop
+let startupTransport: AbortController | null = null;
 let playEpoch = 0;            // bumped by every stopPlayback(); a startPlayback()
                               // that observes a stale epoch must not touch state
 
@@ -584,6 +591,11 @@ function showPlayerControls() {
 }
 
 function hidePlayerControls() {
+    // Never fade the controls out from under an open track menu.
+    if (videoTrackDropdown.classList.contains('open') || audioTrackDropdown.classList.contains('open')) {
+        resetHideTimer();
+        return;
+    }
     if (isPlaying && player) {
         controls.classList.add('hidden');
         playerWrap.classList.add('hide-cursor');
@@ -613,7 +625,8 @@ function setControlIcon(playing: boolean) {
  * `player.destroy()` unsubscribes everything and (for player-owned connections)
  * closes the session; the `?fetchCatalog=1` external connection is closed here.
  */
-async function stopPlayback(): Promise<void> {
+const teardownBarrier = new TeardownBarrier();
+async function stopPlayback(strict = false): Promise<void> {
     // Immediate visual stop FIRST — never let the element drain its buffer.
     videoEl.pause();
     renderer?.stop();
@@ -623,27 +636,42 @@ async function stopPlayback(): Promise<void> {
     playEpoch++;     // invalidate any in-flight startPlayback() attempt
     startupDiscovery?.abort(new Error('playback stopped'));
     startupDiscovery = null;
+    startupTransport?.abort(new Error('playback stopped'));
+    startupTransport = null;
 
     const p = player;
+    const oldExternalConnection = externalConnection;
     player = null;
+    externalConnection = null;
+    renderer = null;
+    mediaSourceRef = null;
     (window as any).__player = null;
     isPlaying = false;
+    // Switches in flight and the menus die with the session.
+    clearPendingChoices();
+    closeTrackMenus();
+    videoTrackDropdown.classList.remove('visible');
+    audioTrackDropdown.classList.remove('visible');
     setControlIcon(false);
     flashCenter('stop');
     showPlayerControls();
     if (hideTimer) clearTimeout(hideTimer);
 
+    if (p || oldExternalConnection) {
+        void teardownBarrier.run(async () => {
+            const failures: unknown[] = [];
+            try { await p?.destroy(); } catch (err) { failures.push(err); }
+            try { await oldExternalConnection?.close(); } catch (err) { failures.push(err); }
+            if (failures.length) throw new AggregateError(failures, 'Player teardown failed');
+        }).catch(() => {});
+    }
     try {
-        await p?.destroy(); // unsubscribes; closes player-owned connection; MSE detached
+        await teardownBarrier.wait();
+        log('Stopped. Press play to tune back in at the live edge.');
     } catch (err) {
-        log(`stop: destroy error (ignored): ${(err as Error).message}`);
+        log(`stop: ${(err as Error).message}`);
+        if (strict) throw err;
     }
-    if (externalConnection) {
-        try { await externalConnection.close(); } catch { /* already closed */ }
-        externalConnection = null;
-    }
-    renderer = null;
-    log('Stopped. Press play to tune back in at the live edge.');
 }
 
 /** Stop ⇄ fresh-tune-in toggle, guarded against double clicks. */
@@ -684,6 +712,8 @@ playerWrap.addEventListener('click', (e) => {
     if (videoEl.muted) videoEl.muted = false;
     // Don't toggle if clicking controls or center play
     if ((e.target as HTMLElement).closest('.controls, .center-play, .stats-overlay')) return;
+    // A click on the video while a track menu is open only dismisses the menu.
+    if (closeTrackMenus()) return;
     if (player || isPlaying) void toggleStopPlay();
 });
 playerWrap.addEventListener('dblclick', (e) => {
@@ -948,13 +978,18 @@ function renderPipelineBar(s: PlayerStats): string {
  * Demo-quality: assumes JSON (MSF) catalog; would need parseCatalogAuto
  * for CF01-encoded catalogs.
  */
-async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
+async function prefetchCatalogViaFetch(relayUrl: string, signal: AbortSignal): Promise<{
     connection: InstanceType<typeof MoqtConnection>;
     catalog: { tracks: any[] };
 }> {
     log('FETCH-catalog mode: pre-fetching catalog (no SUBSCRIBE)...');
-    const transport = await createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) })(relayUrl);
+    const transport = await createWebTransport({ signal, ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) })(relayUrl);
+    if (signal.aborted) {
+        transport.close();
+        signal.throwIfAborted();
+    }
     const connection = new MoqtConnection(draftVersion);
+    externalConnection = connection;
 
     const enc = new TextEncoder();
     const dec = new TextDecoder();
@@ -963,10 +998,10 @@ async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
         : namespaceArg;
     const nsBytes = nsFields.map((s) => enc.encode(s));
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let aborted: (() => void) | undefined;
     const catalogPromise = new Promise<{ tracks: any[] }>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('FETCH catalog timeout (10s)')), 10_000);
         connection.onObject = (_streamId, obj) => {
-            clearTimeout(timer);
             if (obj.kind === 'gap') { reject(new Error('FETCH returned gap — catalog not in cache')); return; }
             if (!obj.payload || obj.payload.byteLength === 0) { reject(new Error('FETCH returned empty payload')); return; }
             try {
@@ -976,28 +1011,69 @@ async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
             } catch (err) { reject(err instanceof Error ? err : new Error(String(err))); }
         };
     });
-
-    await connection.connect(transport, {
-        maxRequestId: varint(100),
-        ...(authority ? { authority } : {}),
+    void catalogPromise.catch(() => {});
+    const interrupted = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('FETCH catalog timeout (10s)')), 10_000);
+        aborted = () => reject(signal.reason);
+        signal.addEventListener('abort', aborted, { once: true });
+        if (signal.aborted) aborted();
     });
-    const reqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
-        startGroup: varint(0n), startObject: varint(0n),
-        endGroup: varint(0n), endObject: varint(0n),
-    });
-    log(`FETCH catalog: reqId=${reqId} group=0 object=0`);
-
-    const catalog = await catalogPromise;
-    log(`FETCH'd catalog: ${catalog.tracks.length} tracks`);
-    return { connection, catalog };
+    try {
+        return await Promise.race([(async () => {
+            await connection.connect(transport, {
+                maxRequestId: varint(100),
+                ...(authority ? { authority } : {}),
+            });
+            signal.throwIfAborted();
+            const reqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
+                startGroup: varint(0n), startObject: varint(0n),
+                endGroup: varint(0n), endObject: varint(0n),
+            });
+            signal.throwIfAborted();
+            log(`FETCH catalog: reqId=${reqId} group=0 object=0`);
+            const catalog = await catalogPromise;
+            log(`FETCH'd catalog: ${catalog.tracks.length} tracks`);
+            return { connection, catalog };
+        })(), interrupted]);
+    } catch (error) {
+        // Stop may already own this connection's teardown.
+        if (externalConnection === connection) {
+            externalConnection = null;
+            await connection.close();
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+        if (aborted) signal.removeEventListener('abort', aborted);
+        delete connection.onObject;
+    }
 }
 
 /** Fresh tune-in: connect → catalog → subscribe → play. Re-invokable after stopPlayback(). */
-async function startPlayback(): Promise<void> {
+async function startPlayback(outputSignal?: AbortSignal): Promise<void> {
+    const epoch = playEpoch;
+    await teardownBarrier.wait();
+    if (epoch !== playEpoch || outputSignal?.aborted) return;
+    const transportAbort = new AbortController();
+    const abortTransport = () => transportAbort.abort(outputSignal?.reason);
+    startupTransport = transportAbort;
+    outputSignal?.addEventListener('abort', abortTransport, { once: true });
+    try {
+        await startPlaybackAttempt(epoch, transportAbort, outputSignal);
+    } catch (error) {
+        if (epoch === playEpoch) await stopPlayback(true);
+        throw error;
+    } finally {
+        outputSignal?.removeEventListener('abort', abortTransport);
+    }
+}
+
+async function startPlaybackAttempt(epoch: number, transportAbort: AbortController, outputSignal?: AbortSignal): Promise<void> {
+    // ?altGroup=<n> → start on that video view when the catalog has several.
+    const videoAltGroup = parseVideoAltGroup(params.get('altGroup'));
     // Stale-attempt token: a reconnect attempt that times out (withTimeout) keeps
     // running underneath — the loop's cleanup stopPlayback() bumps playEpoch, and
     // this attempt must then bail without mutating player/UI state.
-    const epoch = playEpoch;
     // One latch per session; both adapter factories below close over it.
     const latch = newStartupLatch();
     const { ctx: audioCtx, clock: audioClock } = ensureAudio();
@@ -1006,7 +1082,7 @@ async function startPlayback(): Promise<void> {
     // the shared discovery probes the page host's common endpoint paths.
     // The consumer is tied to this startup attempt: Stop aborts it (which
     // closes any connecting probe transport once no consumer remains).
-    const discovery = new AbortController();
+    const discovery = transportAbort;
     startupDiscovery = discovery;
     let relayUrl: string;
     try {
@@ -1017,7 +1093,7 @@ async function startPlayback(): Promise<void> {
         log(`Endpoint discovery failed: ${(err as Error).message}`);
         isPlaying = false;
         setControlIcon(false);
-        return;
+        throw err;
     } finally {
         // Identity-safe: a stale attempt must not clear a successor's
         // controller (Stop nulls the slot itself when it aborts).
@@ -1036,7 +1112,8 @@ async function startPlayback(): Promise<void> {
     // These wrap browser APIs behind the player's swappable interfaces.
     // CommandDispatcher routes pipeline decoder commands to them.
 
-    renderer = new CanvasRenderer(canvas, { clock: audioClock });
+    const attemptRenderer = new CanvasRenderer(canvas, { clock: audioClock });
+    renderer = attemptRenderer;
 
     // ── Create player with adapter factories ─────────────────────────
     // The player internally creates these after catalog arrives (so it
@@ -1070,6 +1147,10 @@ async function startPlayback(): Promise<void> {
     // Lets a standard/object-url control carry the same disableRemotePlayback
     // flag that managed always sets, so that flag is not a hidden variable.
     const mseRemote = pickParam('mseremote', ['auto', 'disabled'] as const, 'auto');
+    // ?locmaf=mse|frame — how LOCMAF tracks are consumed (draft-einarsson-moq-locmaf-01
+    // §16): reconstructed into CMAF chunks for MSE (default), or sliced into
+    // coded frames for the WebCodecs decoders, the same sink LOC tracks use.
+    const locmafDecoding = pickParam('locmaf', ['mse', 'frame'] as const, 'mse');
     // DIAGNOSTIC: `legacy` restores pre-RED5DEV-2315 per-track zero-basing, which
     // maps both tracks to 0 and erases the publisher's real A/V offset. It is
     // knowingly incorrect and exists only to compare startup geometry in one
@@ -1082,13 +1163,11 @@ async function startPlayback(): Promise<void> {
     // the connect handshake AND the catalog SUBSCRIBE.
     let prefetched: { connection: InstanceType<typeof MoqtConnection>; catalog: { tracks: any[] } } | null = null;
     if (params.get('fetchCatalog') === '1' && !catalogFromUrl) {
-        prefetched = await prefetchCatalogViaFetch(relayUrl);
+        prefetched = await prefetchCatalogViaFetch(relayUrl, transportAbort.signal);
         if (epoch !== playEpoch) {
-            // Superseded (timeout/stop) while prefetching — leave state alone.
-            try { await prefetched.connection.close(); } catch { /* already closed */ }
+            // Stop already owns the registered preflight connection.
             return;
         }
-        externalConnection = prefetched.connection; // closed by stopPlayback()
     }
 
     // ?res=720 → quality controller picks the matching track at startup
@@ -1098,8 +1177,12 @@ async function startPlayback(): Promise<void> {
     const resHeight = resParam ? parseInt(resParam, 10) : 0;
     const videoConstraints = resHeight > 0
         ? { maxHeight: resHeight } : undefined;
+    // ?program=<renderGroup> → start on that program; ?lang=es → preferred audio language.
+    const programParam = params.get('program');
+    const initialProgram = programParam && /^\d+$/.test(programParam) ? parseInt(programParam, 10) : undefined;
+    const preferredLanguage = params.get('lang')?.trim() || undefined;
 
-    player = new MoqtPlayer({
+    const p = new MoqtPlayer({
         url: relayUrl,
         namespace: namespaceArg,
         ...(authority ? { authority } : {}),
@@ -1110,15 +1193,20 @@ async function startPlayback(): Promise<void> {
         ...(draftVersion ? { draftVersion } : {}),
         clock: audioClock,
         ...(videoConstraints ? { videoConstraints } : {}),
+        ...(videoAltGroup !== undefined ? { videoAltGroup } : {}),
+        ...(initialProgram !== undefined ? { initialProgram } : {}),
+        ...(preferredLanguage ? { preferredLanguage } : {}),
         ...(catalogFromUrl ? { catalog: catalogFromUrl } : {}),
         ...(prefetched ? { catalog: prefetched.catalog, connection: prefetched.connection } : {}),
         ...(lateMs ? { lateFrameThresholdMs: lateMs } : {}),
         ...(gapMs ? { gapTimeoutMs: gapMs } : {}),
-        createTransport: createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
+        ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
+        createTransport: createWebTransport({ signal: transportAbort.signal,
+            ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
         createConnection: () => new MoqtConnection(draftVersion),
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
-        createRenderer: () => renderer!,
+        createRenderer: () => attemptRenderer,
         // Delay 0: the shared playout cushion is applied upstream by the
         // CommandDispatcher (delay unification) — no independent audio delay.
         createAudioOutput: () => new WebAudioOutput(audioCtx, undefined, 0, audioClock),
@@ -1129,10 +1217,12 @@ async function startPlayback(): Promise<void> {
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
+            const licenseUrl = params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
+                ...(licenseUrl ? { drmConfig: { licenseUrl } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
@@ -1173,15 +1263,30 @@ async function startPlayback(): Promise<void> {
         },
         onQlogEvent: (e) => trace?.record(e),
     });
+    if (outputSignal?.aborted) transportAbort.abort(outputSignal.reason);
+    player = p;
+    const on = <K extends keyof PlayerEventMap>(type: K, listener: (event: PlayerEventMap[K]) => void) =>
+        p.on(type, event => { if (player === p && epoch === playEpoch) listener(event); });
+    let catalogTracks: readonly CatalogTrack[] = [];
+    const applySurface = (track: CatalogTrack) => {
+        cmafActive = usesMsePath(track.packaging, locmafDecoding);
+        canvas.style.display = cmafActive ? 'none' : 'block';
+        videoEl.hidden = !cmafActive;
+        videoEl.style.display = cmafActive ? 'block' : 'none';
+        if (track.role === 'video') {
+            canvas.width = track.width ?? 1920;
+            canvas.height = track.height ?? 1080;
+        }
+    };
 
     // ── Wire player events ──────────────────────────────────────────
 
-    player.on('session_connecting', (e) => log(`Connecting to ${e.url}...`));
-    player.on('session_established', () => log('Session established.'));
-    player.on('session_goaway', (e) => log(`GOAWAY: ${e.newSessionUri ?? 'no URI'}`));
-    player.on('session_closed', (e) => log(`Closed: ${e.reason ?? 'clean'}`));
-    player.on('session_error', (e) => log(`Error: ${e.error.message}`));
-    player.on('error', (e) => {
+    on('session_connecting', (e) => log(`Connecting to ${e.url}...`));
+    on('session_established', () => log('Session established.'));
+    on('session_goaway', (e) => log(`GOAWAY: ${e.newSessionUri ?? 'no URI'}`));
+    on('session_closed', (e) => log(`Closed: ${e.reason ?? 'clean'}`));
+    on('session_error', (e) => log(`Error: ${e.error.message}`));
+    on('error', (e) => {
         const err = e.error;
         log(`[ErrorTaxonomy] ${err.severity}/${err.source} code=0x${err.code.toString(16)}: ${err.message}`);
         // Fatal connection loss → same Stop + fresh-tune-in lifecycle as the
@@ -1196,7 +1301,8 @@ async function startPlayback(): Promise<void> {
         }
     });
 
-    player.on('catalog_received', (e) => {
+    on('catalog_received', (e) => {
+        catalogTracks = e.catalog.tracks;
         log(`Catalog: ${e.catalog.tracks.length} tracks`);
         for (const t of e.catalog.tracks) {
             const parts: string[] = [t.name];
@@ -1206,54 +1312,70 @@ async function startPlayback(): Promise<void> {
             log(`  ${parts.join(' | ')}`);
         }
 
-        // Detect packaging: CMAF uses <video> element, LOC uses <canvas>
-        const hasCmaf = e.catalog.tracks.some(t => t.packaging === 'cmaf');
-        cmafActive = hasCmaf; // gates unexpected-pause recovery to the <video> sink
-        if (hasCmaf) {
-            canvas.style.display = 'none';
-            videoEl.hidden = false;
-            videoEl.style.display = 'block';
-            log('  [CMAF mode — using MSE/<video>]');
-        }
-
-        // Size canvas to video dimensions from catalog
-        const videoTrack = e.catalog.tracks.find(t => t.role === 'video');
-        if (videoTrack) {
-            canvas.width = videoTrack.width ?? 1920;
-            canvas.height = videoTrack.height ?? 1080;
-        }
-
         // Populate track selector after subscriptions are set up (next microtask)
-        setTimeout(() => { if (player) buildTrackSelector(player); }, 0);
+        setTimeout(() => { if (player === p && epoch === playEpoch) buildTrackSelector(p); }, 0);
     });
 
-    player.on('catalog_updated', () => log('Catalog updated (delta).'));
+    on('catalog_updated', (e) => {
+        catalogTracks = e.catalog.tracks;
+        buildTrackSelector(p); // tracks, views or programs may have changed
+        log('Catalog updated (delta).');
+    });
 
-    player.on('track_subscribed', (e) => {
+    on('track_subscribed', (e) => {
+        const track = catalogTracks.find(track => track.name === e.trackName);
+        if (track && (e.mediaType === 'video' || (e.mediaType === 'audio' && p.availableVideoTracks.length === 0))) applySurface(track);
+        buildTrackSelector(p);
         log(`Subscribed: ${e.trackName} (${e.mediaType}, reqId=${e.requestId})`);
     });
 
     // Rendering lifecycle events from the CanvasRenderer
-    player.on('first_frame', () => log('First video frame rendered!'));
-    player.on('stall', (e) => log(`Stall detected: ${e.durationMs.toFixed(0)}ms${e.cause ? ` (${e.cause})` : ''}`));
-    player.on('gap_jump', (e) => log(
+    on('first_frame', () => log('First video frame rendered!'));
+    on('stall', (e) => log(`Stall detected: ${e.durationMs.toFixed(0)}ms${e.cause ? ` (${e.cause})` : ''}`));
+    on('gap_jump', (e) => log(
         `Gap-jump: skipped ${e.holeSec.toFixed(2)}s hole ${e.from.toFixed(2)}s -> ${e.to.toFixed(2)}s (waited ${e.waitedMs.toFixed(0)}ms)`));
 
     // Playback events from the pipeline
-    player.on('gap_detected', (e) => log(`Gap: ${e.mediaType} group=${e.groupId}`));
-    player.on('skip_forward', (e) => log(`Skip: ${e.mediaType} ${e.fromGroupId}->${e.toGroupId}`));
-    player.on('track_ended', (e) => log(`Track ended: ${e.mediaType}`));
-    player.on('keyframe_waiting', (e) => log(`Keyframe waiting: ${e.mediaType} group=${e.groupId}`));
-    player.on('recovery_action', (e) => log(`Recovery: ${e.action.type}`));
+    on('gap_detected', (e) => log(`Gap: ${e.mediaType} group=${e.groupId}`));
+    on('skip_forward', (e) => log(`Skip: ${e.mediaType} ${e.fromGroupId}->${e.toGroupId}`));
+    on('track_ended', (e) => log(`Track ended: ${e.mediaType}`));
+    on('keyframe_waiting', (e) => log(`Keyframe waiting: ${e.mediaType} group=${e.groupId}`));
+    on('recovery_action', (e) => log(`Recovery: ${e.action.type}`));
 
-    player.on('state_changed', (e) => log(`State: ${e.from} -> ${e.to}`));
-    player.on('quality_switched', (e) => {
+    on('state_changed', (e) => log(`State: ${e.from} -> ${e.to}`));
+    on('quality_switched', (e) => {
         log(`Quality: ${e.fromTrackName} -> ${e.toTrackName} (${e.reason})`);
-        if (player) buildTrackSelector(player);
+        settleKind('video');
+        buildTrackSelector(p);
+    });
+    on('quality_switch_failed', (e) => {
+        log(`Video switch failed: ${e.error.message}`);
+        for (const kind of ['video', 'view', 'program']) settleKind(kind);
+    });
+    on('view_changed', (e) => {
+        log(`View: ${e.fromView ?? '-'} -> ${e.toView} (${e.trackName})`);
+        settleKind('view');
+    });
+    on('program_changed', (e) => {
+        log(`Program: ${e.fromProgram ?? '-'} -> ${e.toProgram}`);
+        settleKind('program');
+        buildTrackSelector(p);
+    });
+    on('audio_track_changed', (e) => {
+        log(`Audio: ${e.fromTrackName} -> ${e.toTrackName}${e.lang ? ` (${e.lang})` : ''}`);
+        settleKind('audio');
+        buildTrackSelector(p);
+    });
+    on('audio_track_switch_failed', (e) => {
+        log(`Audio switch failed: ${e.error.message}`);
+        settleKind('audio');
+        // A program switch's video leg may still be running; program_changed
+        // or quality_switch_failed (or the timeout) settles the program row.
+        if (e.reason !== 'program') settleKind('program');
     });
 
     // Collect jitter + latency for sparkline graphs
-    player.on('media_object', (e) => {
+    on('media_object', (e) => {
         // Liveness watchdog: ANY media object (audio included) proves the data
         // path is alive — stamp before the video-only sparkline filter.
         noteMediaArrival();
@@ -1283,139 +1405,334 @@ async function startPlayback(): Promise<void> {
     // Expose player on window for console inspection (dev only)
     (window as any).__player = player;
 
-    const p = player; // local ref: the global may be swapped while load() is in flight
-    await p.load();
-    if (epoch !== playEpoch) {
-        // This attempt was timed out / cancelled while load() was pending. The
-        // reconnect loop (or a user Stop) has already torn down and moved on —
-        // a late completion must not resurrect old player/UI state.
-        try { await p.destroy(); } catch { /* best effort */ }
-        return;
+    const output = outputSignal ? waitForOutput(p, outputSignal) : undefined;
+    void output?.promise.catch(() => {});
+    try {
+        await p.load();
+        if (epoch !== playEpoch) {
+            // A late completion must not resurrect a stopped player.
+            try { await p.destroy(); } catch { /* best effort */ }
+            return;
+        }
+        // The MSE adapter owns startup positioning and playback.
+        p.play();
+        attemptRenderer.start();
+        await output?.promise;
+        if (epoch !== playEpoch) return;
+
+        loadingSpinner.style.display = 'none';
+        controls.style.display = '';
+        isPlaying = true;
+        setControlIcon(true);
+        showPlayerControls();
+    } finally {
+        output?.dispose();
     }
-    // play() declares playback intent; the MSE adapter owns the startup
-    // positioning/play sequence from there. A second videoEl.play() here would
-    // be a competing owner that can play into an unresolved startup seek.
-    p.play();
+}
 
-    // Start the rendering loop (rAF-driven frame presentation)
-    renderer.start();
-
-    // Show controls, hide spinner; reflect playing state on the Stop/Play control.
-    loadingSpinner.style.display = 'none';
-    controls.style.display = '';
-    isPlaying = true;
-    setControlIcon(true);
-    showPlayerControls();
+function waitForOutput(p: MoqtPlayer, signal: AbortSignal) {
+    let complete!: () => void;
+    let fail!: (error: unknown) => void;
+    const promise = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+    const offFrame = p.on('first_frame', complete);
+    const offError = p.on('error', e => { if (e.error.severity === 'fatal') fail(new Error(e.error.message)); });
+    const aborted = () => fail(signal.reason);
+    signal.addEventListener('abort', aborted, { once: true });
+    if (signal.aborted) aborted();
+    return { promise, dispose() { offFrame(); offError(); signal.removeEventListener('abort', aborted); } };
 }
 
 // ─── Track Dropdowns ─────────────────────────────────────────────────
+
+/** Close every track menu; true when one was open. */
+function closeTrackMenus(): boolean {
+    const wasOpen = videoTrackDropdown.classList.contains('open') || audioTrackDropdown.classList.contains('open');
+    videoTrackDropdown.classList.remove('open');
+    audioTrackDropdown.classList.remove('open');
+    return wasOpen;
+}
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTrackMenus(); });
 
 // Close any open dropdown on outside click
 document.addEventListener('click', (e) => {
     if (!videoTrackDropdown.contains(e.target as Node)) videoTrackDropdown.classList.remove('open');
     if (!audioTrackDropdown.contains(e.target as Node)) audioTrackDropdown.classList.remove('open');
 });
+/** Keep an upward menu inside the player (which clips its overflow), scrolling when it is taller. */
+function fitMenu(menu: HTMLElement, button: HTMLElement): void {
+    const room = button.getBoundingClientRect().top - playerWrap.getBoundingClientRect().top - 12;
+    menu.style.maxHeight = `${Math.max(96, room)}px`;
+}
 videoTrackBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     audioTrackDropdown.classList.remove('open');
+    fitMenu(videoTrackMenu, videoTrackBtn);
     videoTrackDropdown.classList.toggle('open');
 });
 audioTrackBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     videoTrackDropdown.classList.remove('open');
+    fitMenu(audioTrackMenu, audioTrackBtn);
     audioTrackDropdown.classList.toggle('open');
 });
 
+/**
+ * Program names by catalog order (the catalog carries none), from
+ * `?programs=Name A,Name B`; programs without one show "Program <renderGroup>".
+ */
+const PROGRAM_NAMES = params.get('programs')?.split(',').map(n => n.trim()).filter(Boolean) ?? [];
+
+function programName(renderGroup: number, index: number): string {
+    return PROGRAM_NAMES[index] ?? `Program ${renderGroup}`;
+}
+
+/** The catalog label, else "Landscape" / "Portrait" / "Square" from its dimensions, else its altGroup. */
+function viewLabel(v: { altGroup: number; label?: string; width?: number; height?: number }): string {
+    if (v.label) return v.label;
+    if (!v.width || !v.height) return `View ${v.altGroup}`;
+    if (v.width === v.height) return 'Square';
+    return v.width > v.height ? 'Landscape' : 'Portrait';
+}
+
+/** The catalog label, else the language's display name, else the track name. */
+function audioLabel(t: { name: string; lang?: string; label?: string }): string {
+    if (t.label) return t.label;
+    // Placeholder codes (undetermined, no content, multiple, private use) name no language.
+    if (t.lang && !/^(und|zxx|mis|mul|q[a-t][a-z])$/i.test(t.lang)) {
+        try {
+            const name = new Intl.DisplayNames([navigator.language], { type: 'language' }).of(t.lang);
+            if (name) return name;
+        } catch { /* invalid tag — fall through */ }
+    }
+    return t.name;
+}
+
+/** Quality name from the short side ("720p", also for a 720x1280 portrait rung), else the track name. */
+function qualityLabel(t: { name: string; width?: number; height?: number }): string {
+    const side = t.width && t.height ? Math.min(t.width, t.height) : t.height;
+    return side ? `${side}p` : t.name;
+}
+
+/**
+ * Switches in flight, per track group: the video group (program, view or
+ * quality rows) and the audio group (language rows); a program switch holds
+ * both. Keys are "program:2", "view:1", "video:<name>", "audio:<name>".
+ * Switches commit at the new track's next group (up to a GOP away), so rows
+ * show "switching…" until the player's event for that switch — and the other
+ * rows of a busy group are disabled, since the player runs one at a time.
+ */
+const pendingChoice: { video: string | null; audio: string | null } = { video: null, audio: null };
+const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function choiceKind(key: string): string {
+    return key.slice(0, key.indexOf(':'));
+}
+
+function choiceGroups(key: string): Array<'video' | 'audio'> {
+    const kind = choiceKind(key);
+    return kind === 'program' ? ['video', 'audio'] : kind === 'audio' ? ['audio'] : ['video'];
+}
+
+/** Mark `key` as switching and start the switch; its player event (or a failure) settles it. */
+function startChoice(p: MoqtPlayer, key: string, what: string, start: () => Promise<void>): void {
+    for (const group of choiceGroups(key)) pendingChoice[group] = key;
+    // A switch that never commits (e.g. the track stopped) must not leave the menu stuck.
+    pendingTimers.set(key, setTimeout(() => settleChoice(key), 15_000));
+    buildTrackSelector(p);
+    log(`Switching to ${what}…`);
+    start().catch((err: Error) => {
+        log(`Switch to ${what} failed: ${err.message}`);
+        settleChoice(key);
+    });
+}
+
+/** Clear the pending choice `key` (exactly), wherever it is held. */
+function settleChoice(key: string): void {
+    let changed = false;
+    for (const group of ['video', 'audio'] as const) {
+        if (pendingChoice[group] === key) { pendingChoice[group] = null; changed = true; }
+    }
+    const timer = pendingTimers.get(key);
+    if (timer) clearTimeout(timer);
+    pendingTimers.delete(key);
+    if (changed && player) buildTrackSelector(player);
+}
+
+/** Clear every pending choice of `kind` ("program", "view", "video", "audio") — a player event settled it. */
+function settleKind(kind: string): void {
+    for (const key of new Set([pendingChoice.video, pendingChoice.audio])) {
+        if (key && choiceKind(key) === kind) settleChoice(key);
+    }
+}
+
+function clearPendingChoices(): void {
+    for (const timer of pendingTimers.values()) clearTimeout(timer);
+    pendingTimers.clear();
+    pendingChoice.video = null;
+    pendingChoice.audio = null;
+}
+
+/** Append a section heading. */
+function addMenuHeader(menu: HTMLElement, text: string): void {
+    const header = document.createElement('div');
+    header.className = 'track-dropdown-header';
+    header.textContent = text;
+    menu.appendChild(header);
+}
+
+/**
+ * Append one dropdown row. Clicking the active, pending or a busy group's row
+ * only closes the menu; any other row starts its switch through `startChoice`.
+ */
+function addMenuItem(
+    p: MoqtPlayer, menu: HTMLElement, dropdown: HTMLElement,
+    opts: { key: string; text: string; detail?: string; active: boolean; start: () => Promise<void> },
+): void {
+    const holders = choiceGroups(opts.key).map(group => pendingChoice[group]);
+    const pending = holders.includes(opts.key);
+    const busy = !pending && holders.some(key => key !== null);
+    const item = document.createElement('div');
+    item.className = 'track-dropdown-item';
+    item.title = opts.text;
+    if (pending) item.classList.add('pending');
+    else if (opts.active) item.classList.add('active');
+    if (busy) item.classList.add('disabled');
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'item-name';
+    nameSpan.textContent = opts.text;
+    const detailSpan = document.createElement('span');
+    detailSpan.className = 'item-detail';
+    detailSpan.textContent = pending ? 'switching…' : opts.detail ?? '';
+    item.appendChild(nameSpan);
+    item.appendChild(detailSpan);
+    item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        dropdown.classList.remove('open');
+        if (!opts.active && !pending && !busy) startChoice(p, opts.key, opts.text, opts.start);
+    });
+    menu.appendChild(item);
+}
+
+/** "codec bitrate samplerate" detail per track, keeping only what differs between the tracks. */
+function audioDetails(tracks: ReadonlyArray<{ codec?: string; bitrate?: number; samplerate?: number }>): string[] {
+    const fields = [
+        (t: typeof tracks[number]) => t.codec ?? '',
+        (t: typeof tracks[number]) => t.bitrate ? `${(t.bitrate / 1000).toFixed(0)}k` : '',
+        (t: typeof tracks[number]) => t.samplerate ? `${t.samplerate / 1000}kHz` : '',
+    ].filter(field => new Set(tracks.map(field)).size > 1);
+    return tracks.map(t => fields.map(field => field(t)).filter(Boolean).join(' '));
+}
+
 function buildTrackSelector(p: MoqtPlayer): void {
     const videoTracks = p.availableVideoTracks;
-    const currentRes = p.stats.currentResolution;
+    const programs = p.availablePrograms;
+    const views = p.availableViews;
+    const multiProgram = programs.length > 1;
+    const multiView = views.length > 1;
+    const multiQuality = videoTracks.length > 1;
 
-    // Video dropdown
+    // Video dropdown: programs, then this program's views (different
+    // content), then this view's qualities — headings once there are several.
     if (videoTracks.length > 0) {
         videoTrackDropdown.classList.add('visible');
+        const current = videoTracks.find(t => t.name === p.currentVideoTrack) ?? videoTracks[0]!;
+        const programIndex = programs.findIndex(prog => prog.renderGroup === p.currentProgram);
+        const currentView = views.find(v => v.altGroup === p.currentView);
 
-        // Find current
-        const current = videoTracks.find(t =>
-            currentRes && t.width === currentRes.width && t.height === currentRes.height,
-        ) ?? videoTracks[0];
+        // Button: what is playing, most significant first.
+        const parts: string[] = [];
+        if (multiProgram && programIndex >= 0) parts.push(programName(p.currentProgram!, programIndex));
+        if (multiView && currentView) parts.push(viewLabel(currentView));
+        if (multiQuality || parts.length === 0) parts.push(qualityLabel(current));
+        videoTrackLabel.textContent = parts.join(' · ') + (pendingChoice.video ? ' …' : '');
 
-        // Button label: current resolution
-        const label = current?.width && current?.height
-            ? `${current.height}p`
-            : 'Video';
-        videoTrackLabel.innerHTML = label +
-            (videoTracks.length > 1 ? '' : '');
-
-        // Hide chevron if only one track
         const chevron = videoTrackBtn.querySelector('.chevron') as HTMLElement;
-        if (chevron) chevron.style.display = videoTracks.length > 1 ? '' : 'none';
+        if (chevron) chevron.style.display = multiQuality || multiView || multiProgram ? '' : 'none';
 
-        // Build menu
         videoTrackMenu.innerHTML = '';
-        for (const t of videoTracks) {
-            const item = document.createElement('div');
-            item.className = 'track-dropdown-item';
-            if (current && t.name === current.name) item.classList.add('active');
-
-            const nameSpan = document.createElement('span');
-            nameSpan.textContent = t.width && t.height ? `${t.width}x${t.height}` : t.name;
-
-            const detailSpan = document.createElement('span');
-            detailSpan.className = 'item-detail';
-            detailSpan.textContent = t.bitrate ? `${(t.bitrate / 1000).toFixed(0)}k` : '';
-
-            item.appendChild(nameSpan);
-            item.appendChild(detailSpan);
-
-            item.addEventListener('click', (e) => {
-                e.stopPropagation();
-                videoTrackDropdown.classList.remove('open');
-                p.selectVideoTrack(t.name).then(() => {
-                    log(`Switched to ${t.name}`);
-                }).catch((err: Error) => {
-                    log(`Switch failed: ${err.message}`);
+        const headed = [multiProgram, multiView, multiQuality].filter(Boolean).length > 1;
+        if (multiProgram) {
+            if (headed) addMenuHeader(videoTrackMenu, 'Program');
+            for (const [i, prog] of programs.entries()) {
+                addMenuItem(p, videoTrackMenu, videoTrackDropdown, {
+                    key: `program:${prog.renderGroup}`,
+                    text: programName(prog.renderGroup, i),
+                    active: prog.renderGroup === p.currentProgram,
+                    start: () => p.selectProgram(prog.renderGroup),
                 });
+            }
+        }
+        if (multiView) {
+            if (headed) addMenuHeader(videoTrackMenu, 'View');
+            for (const v of views) {
+                addMenuItem(p, videoTrackMenu, videoTrackDropdown, {
+                    key: `view:${v.altGroup}`,
+                    text: viewLabel(v),
+                    // Dimensions only help tell views apart when they differ.
+                    ...(new Set(views.map(x => `${x.width}x${x.height}`)).size > 1 && v.width && v.height
+                        ? { detail: `${v.width}x${v.height}` } : {}),
+                    active: v.altGroup === p.currentView,
+                    start: () => p.selectView(v.altGroup),
+                });
+            }
+        }
+        if (multiQuality) {
+            if (headed) addMenuHeader(videoTrackMenu, 'Quality');
+            // Auto hands quality back to ABR; a manual pick locks it.
+            const auto = p.autoQuality;
+            addMenuItem(p, videoTrackMenu, videoTrackDropdown, {
+                key: 'video:(auto)',
+                text: 'Auto',
+                ...(auto ? { detail: qualityLabel(current) } : {}),
+                active: auto,
+                start: async () => {
+                    p.setAutoQuality(true);
+                    settleChoice('video:(auto)');
+                },
             });
-
-            videoTrackMenu.appendChild(item);
+            for (const t of videoTracks) {
+                const key = `video:${t.name}`;
+                addMenuItem(p, videoTrackMenu, videoTrackDropdown, {
+                    key,
+                    text: qualityLabel(t),
+                    ...(t.bitrate ? { detail: `${(t.bitrate / 1000).toFixed(0)}k` } : {}),
+                    active: !auto && t.name === current.name,
+                    // Picking the quality Auto is already playing just locks it.
+                    start: t.name === current.name
+                        ? async () => { p.setAutoQuality(false); settleChoice(key); }
+                        : () => p.selectVideoTrack(t.name),
+                });
+            }
         }
     } else {
         videoTrackDropdown.classList.remove('visible');
     }
 
-    // Audio dropdown — show codec/bitrate info (no switching yet)
-    // TODO: wire audio track switching when implemented
-    const catalog = (p as any)._catalogState;
-    if (catalog) {
-        const audioTracks = catalog.tracks.filter((t: any) => t.role === 'audio');
-        if (audioTracks.length > 0) {
-            audioTrackDropdown.classList.add('visible');
-            const current = audioTracks[0];
-            audioTrackLabel.textContent = current.codec ?? 'Audio';
+    // Audio dropdown — the current program's audio tracks (usually languages)
+    const audioTracks = p.availableAudioTracks;
+    if (audioTracks.length > 0) {
+        audioTrackDropdown.classList.add('visible');
+        const current = audioTracks.find(t => t.name === p.currentAudioTrack) ?? audioTracks[0]!;
+        // A lone, unnamed track keeps the codec as its label, as before.
+        audioTrackLabel.textContent = (audioTracks.length > 1 || current.lang || current.label
+            ? audioLabel(current)
+            : current.codec ?? 'Audio') + (pendingChoice.audio ? ' …' : '');
 
-            const chevron = audioTrackBtn.querySelector('.chevron') as HTMLElement;
-            if (chevron) chevron.style.display = audioTracks.length > 1 ? '' : 'none';
+        const chevron = audioTrackBtn.querySelector('.chevron') as HTMLElement;
+        if (chevron) chevron.style.display = audioTracks.length > 1 ? '' : 'none';
 
-            audioTrackMenu.innerHTML = '';
-            for (const t of audioTracks) {
-                const item = document.createElement('div');
-                item.className = 'track-dropdown-item';
-                if (t === current) item.classList.add('active');
-
-                const nameSpan = document.createElement('span');
-                nameSpan.textContent = t.codec ?? t.name;
-
-                const detailSpan = document.createElement('span');
-                detailSpan.className = 'item-detail';
-                const parts: string[] = [];
-                if (t.bitrate) parts.push(`${(t.bitrate / 1000).toFixed(0)}k`);
-                if (t.samplerate) parts.push(`${t.samplerate / 1000}kHz`);
-                detailSpan.textContent = parts.join(' ');
-
-                item.appendChild(nameSpan);
-                item.appendChild(detailSpan);
-                audioTrackMenu.appendChild(item);
-            }
+        audioTrackMenu.innerHTML = '';
+        const details = audioDetails(audioTracks);
+        for (const [i, t] of audioTracks.entries()) {
+            addMenuItem(p, audioTrackMenu, audioTrackDropdown, {
+                key: `audio:${t.name}`,
+                text: audioLabel(t),
+                detail: details[i]!,
+                active: t.name === current.name,
+                start: () => p.selectAudioTrack(t.name),
+            });
         }
+    } else {
+        audioTrackDropdown.classList.remove('visible');
     }
 }

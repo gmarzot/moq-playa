@@ -14,9 +14,10 @@
  *     resolves with the first reply (SUBSCRIBE_OK / FETCH_OK / REQUEST_ERROR)
  *     for the caller to route.
  *
- * This topology owns only the control plane. Incoming data streams (subgroup /
- * fetch) and datagrams are read by the adapter's data loops directly from the
- * transport, not through this object.
+ * This topology owns the control plane. `establish()` classifies the shared
+ * unidirectional stream space and exposes data streams through
+ * `onIncomingDataStream`; MoqtConnection uses the same classifier directly.
+ * Datagrams remain outside this object.
  *
  * @see draft-ietf-moq-transport-18 §3.3
  * @module
@@ -24,16 +25,21 @@
 
 import {
   createControlCodec,
+  SessionError as SessionErrorCode,
+  SessionState,
   StreamResetCode18,
   ProtocolViolationError,
   type ControlCodec,
   type ControlMessage,
   type DecodedControlMessage,
+  type CloseConnectionAction,
   type Session,
-} from '@moqt/transport';
-import type { SetupOptions } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { SetupOptions } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportLike, WebTransportBidirectionalStream } from '../types.js';
+import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';
+import type { RequestStreamDraft } from '@openmoq/transport';
 
 /**
  * Marks a request stream torn down by a LOCAL cancellation (e.g. draft-18 FETCH
@@ -44,6 +50,14 @@ export class RequestCancelledError extends Error {
   constructor(readonly errorCode: bigint) {
     super(`request stream cancelled (code ${errorCode})`);
     this.name = 'RequestCancelledError';
+  }
+}
+
+/** Peer SETUP was parsed and the Session selected an exact connection close. */
+export class PeerSetupRejectedError extends Error {
+  constructor(readonly closeAction: CloseConnectionAction) {
+    super(closeAction.reason);
+    this.name = 'PeerSetupRejectedError';
   }
 }
 
@@ -94,12 +108,19 @@ export interface ContinuingRequestStream {
 }
 
 export class UniPairTopology {
-  readonly version = 18 as const;
-  private readonly codec: ControlCodec = createControlCodec(18);
+  /** The request-stream draft (18 or 22) this topology speaks. */
+  readonly version: RequestStreamDraft;
+  private readonly codec: ControlCodec;
 
   /** Our outbound uni control stream writer. Held open for the session lifetime
    *  (the draft-18 control stream pair must NOT be closed after SETUP). */
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  /** Peer control stream reader retained after SETUP for GOAWAY and teardown. */
+  private controlReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  /** Invalidates a control-stream open that settles after terminal shutdown. */
+  private controlEpoch = 0;
+  /** Owns the shared incoming-unidirectional-stream accept loop after setup. */
+  private incomingUniRouter: IncomingUniRouter | null = null;
 
   /** Called when a request stream fails (e.g. unsolicited / wrong-typed
    *  response), so the owner can surface the error immediately rather than only
@@ -112,11 +133,19 @@ export class UniPairTopology {
   onControlMessage?: (message: DecodedControlMessage) => void | Promise<void>;
 
   /** Called when the control stream violates its draft-18 lifecycle AFTER SETUP:
-   *  a non-GOAWAY message (only GOAWAY is allowed, §10.4), a decode failure, or a
-   *  FIN/close (the control stream MUST stay open for the session, §3.3). The owner
+   *  a message assigned to a Request stream (§3.3; §10 Table 5), a decode failure,
+   *  or a FIN/close (the control stream MUST stay open for the session, §3.3). The owner
    *  MUST close the session with PROTOCOL_VIOLATION — this is fatal, NOT a per-stream
    *  error routed through {@link onStreamError}. */
   onControlStreamViolation?: (reason: string) => void;
+
+  /**
+   * Called for a subgroup, FETCH, or PADDING stream classified by
+   * {@link establish}. Set this before calling `establish()` when using the
+   * topology directly. {@link MoqtConnection} owns the equivalent routing in
+   * normal use.
+   */
+  onIncomingDataStream?: (stream: RoutedIncomingUniStream) => void | Promise<void>;
 
   /** Called for a peer-initiated REQUEST_UPDATE on an open PUBLISH request stream
    *  (§10.9). `originalRequestId` is the PUBLISH's Request ID (from stream
@@ -132,47 +161,149 @@ export class UniPairTopology {
    *  cleanup still runs through {@link onRequestClosed} as the stream tears down. */
   onRequestGoaway?: (error: RequestGoawayError) => void | Promise<void>;
 
-  /** Called when an open OUTBOUND request stream ends by PEER action — NOT a local
-   *  cancel/finish (those are driven by the owner). `disposition` distinguishes a
-   *  clean FIN (`'fin'`) from a reset/failure (`'reset'`), which the owner needs to
-   *  tell a valid post-response request-stream close (e.g. a FETCH whose data stream
-   *  outlives it, §5.2) from a terminal reset (§11.4.1). The owner cleans any
-   *  persistent local state for `requestId`; the context is already dropped from the
-   *  topology (and our writable half is FINned on a clean FIN — no half-open). */
-  onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset') => void | Promise<void>;
+  /** Called for a SESSION-fatal violation observed on a request stream (a second
+   *  GOAWAY, §10.4). The owner records the offending message raw, then closes with
+   *  PROTOCOL_VIOLATION. */
+  onRequestGoawayViolation?: (reason: string, message: DecodedControlMessage) => void;
 
-  constructor(private readonly session: Session) {}
+  /** Called when an open OUTBOUND request stream ends by PEER action — NOT a local
+   *  cancel/finish (those are driven by the owner). `disposition` distinguishes:
+   *   - `'fin'`: a clean peer FIN. The owner needs this to tell a valid
+   *     post-response close (e.g. a FETCH whose data stream outlives its request
+   *     stream, §5.2) from a terminal reset, and may legitimately RETAIN the
+   *     request while that data stream finishes.
+   *   - `'reset'`: a reset or read failure — terminal (§11.4.1).
+   *   - `'goaway'`: a GOAWAY migrated this request (§10.4). The close is clean,
+   *     but it is a LOCAL cancellation, not a peer FIN: no data stream is coming,
+   *     so a retained request would leak. Must be reclaimed like a reset.
+   *  The owner cleans any persistent local state for `requestId`; the context is
+   *  already dropped from the topology (and our writable half is FINned on a clean
+   *  FIN — no half-open). */
+  onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset' | 'goaway') => void | Promise<void>;
+
+  constructor(private readonly session: Session) {
+    this.version = session.draftVersion === 22 ? 22 : 18;
+    this.codec = createControlCodec(this.version);
+  }
 
   /**
    * Establish the draft-18 control-stream pair: open our outbound uni control
-   * stream and send SETUP, then read the peer's inbound uni control stream and
-   * feed its SETUP to the session.
+   * stream and send SETUP, then classify peer unidirectional streams until its
+   * SETUP arrives. Data streams may arrive first and are held until SETUP is
+   * accepted rather than being mistaken for the control stream.
    */
   async establish(transport: WebTransportLike, options: SetupOptions = {}): Promise<void> {
+    let localFailure: unknown;
+    const localSetup = this.openControlStream(transport, options).catch((error) => {
+      localFailure = error;
+      throw error;
+    });
+    const router = new IncomingUniRouter({
+      onSetup: (stream) => this.acceptControlStream(stream),
+      onData: (stream) => {
+        if (this.onIncomingDataStream) {
+          try {
+            void Promise.resolve(this.onIncomingDataStream(stream)).catch((error) => {
+              this.failIncomingDataHandler(stream, error);
+            });
+          } catch (error) {
+            this.failIncomingDataHandler(stream, error);
+          }
+          return;
+        }
+        const error = new Error(
+          'UniPairTopology: incoming data stream has no onIncomingDataStream handler',
+        );
+        void stream.reader.cancel(error).catch(() => {});
+        this.reportStreamError(error);
+      },
+      onViolation: (reason, error) => {
+        if (error instanceof PeerSetupRejectedError) {
+          this.shutdown({ transportClosing: true });
+          closeTransport(transport, error.closeAction);
+          return;
+        }
+        this.onControlStreamViolation?.(reason);
+      },
+      onTransportError: (error) => this.reportStreamError(error),
+    });
+    this.incomingUniRouter = router;
+    try {
+      await Promise.all([
+        localSetup,
+        router.start(transport.incomingUnidirectionalStreams),
+      ]);
+      router.releaseData();
+    } catch (error) {
+      router.retire(error);
+      if (this.incomingUniRouter === router) this.incomingUniRouter = null;
+      if (error === localFailure && this.session.state !== SessionState.CLOSED) {
+        const reason = `local SETUP failed: ${error instanceof Error ? error.message : String(error)}`;
+        const closeAction = this.session.close(SessionErrorCode.INTERNAL_ERROR, reason)
+          .find((action): action is CloseConnectionAction => action.type === 'close_connection');
+        this.shutdown({ transportClosing: true });
+        if (closeAction) closeTransport(transport, closeAction);
+      }
+      throw error;
+    }
+  }
+
+  private reportStreamError(error: Error): void {
+    try { this.onStreamError?.(error); } catch { /* error observers are advisory */ }
+  }
+
+  private failIncomingDataHandler(stream: RoutedIncomingUniStream, error: unknown): void {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    void stream.reader.cancel(normalized).catch(() => {});
+    this.reportStreamError(normalized);
+  }
+
+  /** Open our control stream and send SETUP, leaving the stream open. */
+  async openControlStream(transport: WebTransportLike, options: SetupOptions = {}): Promise<void> {
     if (!transport.createUnidirectionalStream) {
       throw new Error('UniPairTopology: transport does not support unidirectional streams');
     }
+
+    // initiateSetup runs before the first await. The peer's independent SETUP
+    // stream may arrive immediately, but our state machine must first record
+    // that we initiated setup.
+    const epoch = this.controlEpoch;
+    const actions = this.session.initiateSetup(options);
 
     // Outbound control stream — send our SETUP and KEEP THE STREAM OPEN. The
     // draft-18 control-stream pair lives for the session lifetime; closing a
     // control stream is a protocol violation, so we retain the writer for later
     // control messages rather than FIN-ing after SETUP.
-    this.controlWriter = (await transport.createUnidirectionalStream()).getWriter();
-    for (const action of this.session.initiateSetup(options)) {
-      if (action.type === 'send_control') {
-        await this.controlWriter.write(this.codec.encode(action.message));
+    let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+    try {
+      writer = (await transport.createUnidirectionalStream()).getWriter();
+      if (this.controlOpenInvalid(epoch)) {
+        throw new Error('UniPairTopology: control stream opened after session termination');
       }
+      this.controlWriter = writer;
+      for (const action of actions) {
+        if (action.type === 'send_control') {
+          await writer.write(this.codec.encode(action.message));
+          if (this.controlOpenInvalid(epoch)) {
+            throw new Error('UniPairTopology: SETUP write crossed session termination');
+          }
+        }
+      }
+    } catch (error) {
+      if (this.controlWriter === writer) this.controlWriter = null;
+      if (writer) {
+        try { void writer.abort(error).catch(() => {}); } catch { /* stream already closed */ }
+      }
+      throw error;
     }
+  }
 
-    // Inbound control stream — the first incoming uni stream, which must begin
-    // with SETUP. Subsequent incoming uni streams are data streams, read by the
-    // adapter's data loop after establish() releases this reader lock.
-    const incoming = transport.incomingUnidirectionalStreams.getReader();
-    const { value: stream, done } = await incoming.read();
-    incoming.releaseLock();
-    if (done || !stream) {
-      throw new Error('UniPairTopology: no inbound control stream');
-    }
+  private controlOpenInvalid(epoch: number): boolean {
+    return epoch !== this.controlEpoch || this.session.state === SessionState.CLOSED;
+  }
+
+  /** Accept the peer control stream selected by the shared stream classifier. */
+  async acceptControlStream(stream: ReadableStream<Uint8Array>): Promise<void> {
     await this.readControlStream(stream);
   }
 
@@ -187,7 +318,9 @@ export class UniPairTopology {
     const framer = new ControlStreamFramer(this.codec);
     const reader = stream.getReader();
     const setupSeen = deferred<void>();
-    void this.controlReadLoop(reader, framer, setupSeen);
+    const epoch = this.controlEpoch;
+    this.controlReader = reader;
+    void this.controlReadLoop(reader, framer, setupSeen, epoch);
     await setupSeen.promise;
   }
 
@@ -205,8 +338,10 @@ export class UniPairTopology {
     reader: ReadableStreamDefaultReader<Uint8Array>,
     framer: ControlStreamFramer,
     setupSeen: Deferred<void>,
+    epoch: number,
   ): Promise<void> {
     let sawSetup = false;
+    let acceptedSetup = false;
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -217,23 +352,34 @@ export class UniPairTopology {
               throw new Error(`UniPairTopology: expected SETUP on the control stream, got ${message.type}`);
             }
             sawSetup = true;
-            this.session.handleControlMessage(message);
+            const actions = this.session.handleControlMessage(message);
+            const closeAction = actions.find(
+              (action): action is CloseConnectionAction => action.type === 'close_connection',
+            );
+            if (closeAction) throw new PeerSetupRejectedError(closeAction);
+            if (actions.length !== 0) {
+              throw new Error('UniPairTopology: peer SETUP produced unexpected outbound actions');
+            }
+            acceptedSetup = true;
             setupSeen.resolve();
           } else if (message.type === 'GOAWAY') {
-            // §10.4: GOAWAY is the ONLY message permitted on the control stream
-            // after SETUP — hand it to the owner.
+            // §3.3 and §10 Table 5: after SETUP, GOAWAY is the only defined
+            // message assigned to the control stream. Hand it to the owner.
             await this.onControlMessage?.(message);
           } else {
-            // §10.4: any other post-SETUP control-stream message is a fatal
-            // protocol violation. (A SUBSCRIBE etc. belongs on a request stream and
-            // MUST NOT reach the session's request handler from here.)
+            // §3.3 and §10 Table 5: request messages and their responses belong on
+            // request streams and MUST NOT reach the session's request handler here.
             this.onControlStreamViolation?.(
-              `unexpected ${message.type} on the control stream after SETUP (only GOAWAY is permitted, §10.4)`,
+              `unexpected ${message.type} on the control stream after SETUP (stream assignment: §3.3; §10 Table 5)`,
             );
             return;
           }
         }
         if (done) {
+          if (epoch !== this.controlEpoch) {
+            if (!acceptedSetup) throw new Error('control stream retired during SETUP');
+            return;
+          }
           if (!sawSetup) throw new Error('UniPairTopology: control stream ended before SETUP');
           // §3.3: the control stream MUST NOT be closed during the session — a FIN
           // after SETUP is a protocol violation (the owner skips it if already closed).
@@ -243,15 +389,16 @@ export class UniPairTopology {
       }
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      if (!sawSetup) {
+      if (!acceptedSetup) {
         setupSeen.reject(e); // pre-SETUP failure → establish() rejects
-      } else {
+      } else if (epoch === this.controlEpoch) {
         // A post-SETUP framer/codec decode failure is a fatal control-stream
         // protocol violation (NOT a per-request stream error).
         this.onControlStreamViolation?.(e.message);
       }
     } finally {
-      reader.releaseLock();
+      if (this.controlReader === reader) this.controlReader = null;
+      try { reader.releaseLock(); } catch { /* local teardown may already have released it */ }
     }
   }
 
@@ -298,6 +445,8 @@ export class UniPairTopology {
     // A request-stream GOAWAY (§10.4) is surfaced to the owner whether or not a
     // response is still pending (established streams have an empty FIFO queue).
     ctx.onGoaway = (err) => this.onRequestGoaway?.(err);
+    // A session-fatal violation seen on this request stream closes the session.
+    ctx.onFatalViolation = (reason, message) => this.onRequestGoawayViolation?.(reason, message);
     // Surface a stream failure (unsolicited/wrong-typed response, early end)
     // immediately, even if no operation is awaiting a response at the time, and
     // ALWAYS reclaim the context when the stream ends so it can't leak. A clean FIN
@@ -314,7 +463,10 @@ export class UniPairTopology {
           this.contexts.delete(requestId);
           // peer-initiated close → owner cleans local state, told whether the close
           // was a clean FIN or a reset (§5.2 vs §11.4.1 — matters for FETCH).
-          void this.onRequestClosed?.(requestId, closedClean ? 'fin' : 'reset');
+          void this.onRequestClosed?.(
+            requestId,
+            !closedClean ? 'reset' : ctx.endedByGoaway ? 'goaway' : 'fin',
+          );
         }
       });
     let response: Promise<DecodedControlMessage>;
@@ -533,11 +685,29 @@ export class UniPairTopology {
 
   /**
    * Terminal shutdown: cancel every open request-stream context and close every
-   * continuing-request context, then drop them. Used by the owner's one-shot
-   * terminal coordinator so no topology-owned stream context outlives the
-   * session. Fire-and-forget teardown (idempotent; safe if already torn down).
+   * continuing-request context, then drop them. By default this also cancels the
+   * aggregate incoming-uni source so standalone callers release its reader lock.
+   * When the same operation closes the transport, pass `transportClosing`; the
+   * backend then remains the sole owner of that aggregate source's terminal
+   * transition. Fire-and-forget teardown (idempotent; safe if already torn down).
    */
-  shutdown(): void {
+  shutdown(options: { transportClosing?: boolean } = {}): void {
+    const reason = new Error('session terminated');
+    const router = this.incomingUniRouter;
+    this.incomingUniRouter = null;
+    if (options.transportClosing) router?.retire(reason);
+    else router?.abort(reason);
+    this.controlEpoch++;
+    const controlReader = this.controlReader;
+    this.controlReader = null;
+    if (controlReader) {
+      try { void controlReader.cancel(reason).catch(() => {}); } catch { /* already closed */ }
+    }
+    const controlWriter = this.controlWriter;
+    this.controlWriter = null;
+    if (controlWriter) {
+      try { void controlWriter.abort(reason).catch(() => {}); } catch { /* already closed */ }
+    }
     for (const [, ctx] of this.contexts) void ctx.cancel(StreamResetCode18.CANCELLED);
     this.contexts.clear();
     for (const [, ctx] of this.continuingContexts) void ctx.close();
@@ -548,6 +718,16 @@ export class UniPairTopology {
 /** Create a {@link UniPairTopology} for a draft-18 session. */
 export function createUniPairTopology(session: Session): UniPairTopology {
   return new UniPairTopology(session);
+}
+
+function closeTransport(transport: WebTransportLike, action: CloseConnectionAction): void {
+  try {
+    const result = transport.close({
+      closeCode: Number(action.error),
+      reason: action.reason,
+    }) as unknown;
+    void Promise.resolve(result).catch(() => {});
+  } catch { /* transport already closed */ }
 }
 
 // ── per-request-stream response router ────────────────────────────────
@@ -647,6 +827,9 @@ class RequestStreamContext {
   /** §10.11: a terminal PUBLISH_DONE was processed — NOTHING may follow it
    *  (including further frames in the same receive) except the peer's FIN. */
   private terminalSeen = false;
+  /** A GOAWAY has already been observed on this stream (§10.4: at most one). */
+  private goawaySeen = false;
+
   /** The opener was rejected: the FIRST response was REQUEST_ERROR. Once every
    *  already-queued update response has settled, our writable is FINned. */
   private rejectedTerminal = false;
@@ -662,6 +845,18 @@ class RequestStreamContext {
   /** Invoked when a GOAWAY arrives on this request stream (§10.4) — a per-request
    *  migration signal, fired whether or not a response is still pending. */
   onGoaway?: (error: RequestGoawayError) => void | Promise<void>;
+
+  /** Invoked for a SESSION-fatal violation observed on this stream (a second
+   *  GOAWAY, §10.4). The owner MUST close with PROTOCOL_VIOLATION; a per-stream
+   *  error would only be reported and would leave the session running. The
+   *  offending message is passed so the owner can record it raw before closing. */
+  onFatalViolation?: (reason: string, message: DecodedControlMessage) => void;
+
+  /** Whether this stream ended because a GOAWAY migrated its request. The close
+   *  is CLEAN (the owner gets a migration signal, not a stream error), but it is
+   *  a LOCAL cancellation, not a peer FIN — an accepted FETCH must be reclaimed
+   *  rather than left waiting for data that will never arrive (§5.2). */
+  get endedByGoaway(): boolean { return this.goawaySeen; }
 
   /** Resolves when the stream closes cleanly; rejects on failure (an unsolicited
    *  or wrong-typed response, or an early end) — so the owner can surface the
@@ -793,6 +988,21 @@ class RequestStreamContext {
               `${message.type} received after the terminal PUBLISH_DONE (§10.11)`,
             );
           }
+          // After a GOAWAY this stream is cancelled. Frames already decoded from
+          // the same receive still have to be INSPECTED — a duplicate GOAWAY is a
+          // violation however many valid-looking frames the peer interleaves — but
+          // they must not be DISPATCHED: resuming response handling on a cancelled
+          // request would endorse an invalid sequence, and its throw would be
+          // swallowed as a teardown race. No further read is issued either.
+          if (this.goawaySeen) {
+            if (message.type === 'GOAWAY') {
+              this.onFatalViolation?.(
+                'second GOAWAY received on one request stream (§10.4)', message,
+              );
+              return;
+            }
+            continue;
+          }
           // A peer-initiated REQUEST_UPDATE is a stream-scoped REQUEST, not a
           // response — it must NOT be FIFO-matched against our local operations.
           // §10.9: only a PUBLISH stream carries one, and only after the initial
@@ -807,6 +1017,22 @@ class RequestStreamContext {
               throw new ProtocolViolationError(
                 'peer REQUEST_UPDATE before the initial PUBLISH response',
               );
+            }
+            await this.onPeerRequest?.(message);
+            continue;
+          }
+          // draft-22 §9.10: PUBLISH_STATE_NOTIFY is a publisher's report on a
+          // subscription's request stream, after SUBSCRIBE_OK. Not a response to
+          // any local operation — never FIFO-matched. Anywhere else it is a
+          // protocol violation.
+          if (message.type === 'PUBLISH_STATE_NOTIFY') {
+            if (this.openerType !== 'SUBSCRIBE') {
+              throw new ProtocolViolationError(
+                `PUBLISH_STATE_NOTIFY not accepted on a ${this.openerType} request stream`,
+              );
+            }
+            if (!this.subscribeEstablished) {
+              throw new ProtocolViolationError('PUBLISH_STATE_NOTIFY without a preceding SUBSCRIBE_OK');
             }
             await this.onPeerRequest?.(message);
             continue;
@@ -852,18 +1078,24 @@ class RequestStreamContext {
           // signal, not an onStreamError. Control-stream GOAWAY (the other form)
           // still drives session DRAINING. The FIFO queue is left untouched.
           if (message.type === 'GOAWAY') {
+            // §10.4 / §9.2: at most ONE GOAWAY per request stream. The check for
+            // a second one lives at the top of this drain, so it also catches a
+            // duplicate that arrives behind other already-decoded frames.
+            this.goawaySeen = true;
             this.cancelled = true; // graceful teardown — suppress read-loop failure handling
             const reason = new RequestGoawayError(this.requestId, message);
             // Surface the per-request migration signal to the owner FIRST, regardless
             // of whether a FIFO response is still pending — an ESTABLISHED request has
-            // an empty queue but must still see the GOAWAY.
-            await this.onGoaway?.(reason);
+            // an empty queue but must still see the GOAWAY. Contained: an owner that
+            // throws must not skip the waiter settlement or the stream teardown below.
+            try { await this.onGoaway?.(reason); }
+            catch { /* owner failure must not strand this stream */ }
             // Then settle any still-pending first-response waiter with the same error.
             for (const d of this.queue.splice(0)) d.reject(reason);
             try { await this.reader.cancel(reason); } catch { /* already closed */ }
             try { await this.writer.abort(reason); } catch { /* already closed */ }
             this.closedDeferred.resolve();
-            return;
+            continue;
           }
           const exp = this.queue.shift();
           if (!exp) {
@@ -906,6 +1138,10 @@ class RequestStreamContext {
             try { await this.writer.close(); } catch { /* already closed/aborted */ }
           }
         }
+        // A GOAWAY ended this stream: the batch has been fully inspected and
+        // `closed` is already resolved. Returning here keeps the contract that no
+        // further read is issued to hunt for more frames.
+        if (this.goawaySeen) return;
         if (done) {
           // A local cancel drains the queue and resolves `closed` itself; a
           // peer-side early end with responses still pending is a failure.

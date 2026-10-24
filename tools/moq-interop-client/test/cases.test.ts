@@ -8,10 +8,11 @@
  * only shows green runs cannot tell a working verdict from a vacuous one.
  */
 import {
-  CaseScope, Inbox, __setConnect, __setBoundScale,
+  CaseScope, Inbox, __setConnect, __setBoundScale, connectPeer,
   caseSubscribeError, caseAnnounceSubscribe, caseSubscribeBeforeAnnounce,
-  casePublishNamespaceDone,
+  casePublishNamespaceDone, selectDraft, protocolsFor,
 } from "../src/main.js";
+import assert from 'node:assert/strict';
 
 let failures = 0;
 const check = (name: string, cond: boolean, detail = "") => {
@@ -97,6 +98,25 @@ async function run(caseFn: (d: number, s: CaseScope) => Promise<void>, sc: Scena
 }
 
 async function main() {
+  const previousDraft = process.env.MOQT_DRAFT;
+  try {
+    for (const draft of [16, 18, 22]) {
+      for (const raw of [String(draft), `draft-${draft}`]) {
+        process.env.MOQT_DRAFT = raw;
+        assert.equal(selectDraft(), draft);
+        assert.deepEqual(protocolsFor(selectDraft()), [`moqt-${draft}`]);
+      }
+    }
+    for (const raw of ['21', 'draft-21', 'draft-22-rc1', '22.5']) {
+      process.env.MOQT_DRAFT = raw;
+      assert.throws(() => selectDraft(), /unsupported MOQT_DRAFT/);
+    }
+    delete process.env.MOQT_DRAFT;
+    assert.equal(selectDraft(), 18);
+  } finally {
+    if (previousDraft === undefined) delete process.env.MOQT_DRAFT;
+    else process.env.MOQT_DRAFT = previousDraft;
+  }
   __setBoundScale(0.02);   // 8000ms bounds become 160ms
 
   // -- 2. subscribe-error
@@ -159,7 +179,57 @@ async function main() {
   check("inbox retains a response delivered synchronously during subscribe()",
     (await run(caseSubscribeError, { subscribeReply: "REQUEST_ERROR", replyDuringEmit: true })) === null);
 
+  // -- connection ownership: a SETUP failure still leaves a peer to tear down
+  {
+    const failure = new Error("induced SETUP failure");
+    let closeCalls = 0;
+    let resolveClosed!: () => void;
+    const transport = {
+      protocol: "moqt-18",
+      closed: new Promise<void>((resolve) => { resolveClosed = resolve; }),
+    };
+    const conn: any = {
+      async connect() { throw failure; },
+      async close() { closeCalls++; resolveClosed(); },
+    };
+    const scope = new CaseScope();
+    const result = await connectPeer(18, "failed-setup", scope, {
+      makeTransport: async () => transport,
+      makeConnection: () => conn,
+    }).then(() => null, (error) => error);
+    check("failed SETUP preserves the original failure", result === failure);
+    const cleanup = await scope.teardownAll();
+    check("failed SETUP tears down the adopted connection",
+      cleanup.length === 0 && closeCalls === 1,
+      `cleanup=${cleanup.join(";")} closeCalls=${closeCalls}`);
+  }
+
+  // connectPeer adopts successful peers before returning; case bodies may
+  // track the returned peer again without creating a second close owner.
+  {
+    let closeCalls = 0;
+    let resolveClosed!: () => void;
+    const transport = {
+      protocol: "moqt-18",
+      closed: new Promise<void>((resolve) => { resolveClosed = resolve; }),
+    };
+    const conn: any = {
+      async connect() {},
+      async close() { closeCalls++; resolveClosed(); },
+    };
+    const scope = new CaseScope();
+    const peer = await connectPeer(18, "successful-setup", scope, {
+      makeTransport: async () => transport,
+      makeConnection: () => conn,
+    });
+    scope.track(peer);
+    const cleanup = await scope.teardownAll();
+    check("successful SETUP has one teardown owner",
+      cleanup.length === 0 && closeCalls === 1,
+      `cleanup=${cleanup.join(";")} closeCalls=${closeCalls}`);
+  }
+
   console.log(failures === 0 ? "# all case discriminators passed" : `# ${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }
-main();
+main().catch(error => { console.error(error); process.exit(1); });

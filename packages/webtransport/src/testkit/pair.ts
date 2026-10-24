@@ -9,7 +9,7 @@
 import { MoqtConnection } from '../adapter.js';
 import { createLoopback, type LoopbackTransport, type PipeFaults } from './loopback.js';
 import type { WebTransportLike } from '../types.js';
-import { varint, type DraftVersion, type SetupOptions } from '@moqt/transport';
+import { varint, isRequestStreamDraft, type DraftVersion, type SetupOptions } from '@openmoq/transport';
 
 /** Build a single-field Track Namespace tuple from a string. */
 export const ns = (s: string): Uint8Array[] => [new TextEncoder().encode(s)];
@@ -61,6 +61,8 @@ export async function connectedPair(
     faults?: { a?: PipeFaults; b?: PipeFaults };
     serverOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
     clientOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
+    /** Extra Setup Options the server advertises (e.g. draft-22 maxRequestUpdates). */
+    serverSetup?: SetupOptions;
   } = {},
 ): Promise<ConnectedPair> {
   const { a, b } = createLoopback(opts.faults ?? {});
@@ -78,7 +80,10 @@ export async function connectedPair(
   // which never happen here. draft-18 has no request credit (the option is
   // ignored there), so both sides get an empty setup.
   const clientSetup: SetupOptions = {};
-  const serverSetup: SetupOptions = version === 18 ? {} : { maxRequestId: varint(1_000_000n) };
+  const serverSetup: SetupOptions = {
+    ...(isRequestStreamDraft(version) ? {} : { maxRequestId: varint(1_000_000n) }),
+    ...(opts.serverSetup ?? {}),
+  };
   // Both endpoints establish concurrently — neither can complete before the other
   // starts (each must read the peer's SETUP).
   await Promise.all([client.connect(a, clientSetup), server.connect(b, serverSetup)]);

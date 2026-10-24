@@ -21,8 +21,9 @@ import {
   type ControlCodec,
   type DataCodec,
   type DraftVersion,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 /** The per-version codec bundle for a single-bidi-control-stream topology. */
 export interface BidiControlTopology {
@@ -46,7 +47,7 @@ export function createBidiControlTopology(version: DraftVersion = 16): BidiContr
   // single-bidi-control path, which casts DecodedControlMessage to a fully
   // correlated ControlMessage — that is only sound for draft-14/16. Reject it
   // explicitly here rather than relying on the data codec to throw.
-  if (version === 18) {
+  if (isRequestStreamDraft(version)) {
     throw new Error('createBidiControlTopology: draft-18 uses the uni-pair topology, not single-bidi control');
   }
   const control = createControlCodec(version);

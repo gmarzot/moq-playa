@@ -17,8 +17,8 @@
  * @module
  */
 
-import type { VideoRendererLike } from '@moqt/player';
-import type { ClockSource } from '@moqt/playback';
+import type { VideoRendererLike, VideoPresentation } from '@openmoq/player';
+import type { ClockSource } from '@openmoq/playback';
 import { validateStallThresholdMs } from './mse-adapter.js';
 
 /** A queued frame awaiting presentation. */
@@ -49,8 +49,10 @@ const FALLBACK_INTERVAL_MS = 16;
 export class CanvasRenderer implements VideoRendererLike {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly queue: QueuedFrame[] = [];
+  private framesDropped = 0;
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
+  private readonly followFrameSize: boolean;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
   /**
@@ -71,6 +73,14 @@ export class CanvasRenderer implements VideoRendererLike {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private destroyed = false;
+  private lastVideoPresentation: VideoPresentation | null = null;
+  private drawDepth = 0;
+  private drawRevision = 0;
+
+  /** Last successful canvas draw; retained on pause, cleared on destruction. */
+  get videoPresentation(): VideoPresentation | null {
+    return this.destroyed || this.drawDepth > 0 ? null : this.lastVideoPresentation;
+  }
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
@@ -81,6 +91,12 @@ export class CanvasRenderer implements VideoRendererLike {
    * drift — it already includes the playout cushion applied to this frame.
    */
   onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null = null;
+  /**
+   * Observer for each frame drawn: its capture timestamp (µs) and the wall
+   * clock when it was drawn (ms), so capture-to-screen latency can be measured.
+   * Never used for playout.
+   */
+  onFrameDrawn: ((captureTimestampUs: number, drawnAtWallMs: number) => void) | null = null;
   onStall: ((durationMs: number) => void) | null = null;
 
   /**
@@ -90,7 +106,18 @@ export class CanvasRenderer implements VideoRendererLike {
 
   constructor(
     canvas: HTMLCanvasElement,
-    options?: { stallThresholdMs?: number; clock?: ClockSource },
+    options?: {
+      stallThresholdMs?: number;
+      clock?: ClockSource;
+      /**
+       * Resize the canvas backing store to each frame's display size, so a
+       * resolution or aspect change (e.g. a landscape → portrait view switch)
+       * is never stretched; CSS (`object-fit: contain`) then letterboxes the
+       * element. Default true. Pass false for a canvas whose size the caller
+       * owns: frames are then drawn stretched to the canvas.
+       */
+      followFrameSize?: boolean;
+    },
   ) {
     // Validate before acquiring any browser state, so an invalid option
     // cannot leave a half-constructed renderer holding a 2d context.
@@ -99,6 +126,7 @@ export class CanvasRenderer implements VideoRendererLike {
       : validateStallThresholdMs(options.stallThresholdMs);
     this.ctx = canvas.getContext('2d')!;
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
+    this.followFrameSize = options?.followFrameSize ?? true;
   }
 
   /**
@@ -113,6 +141,24 @@ export class CanvasRenderer implements VideoRendererLike {
       return;
     }
     this.queue.push({ frame: frame as VideoFrame, renderTimeUs });
+  }
+
+  /** Decoded video held for presentation: newest queued render time ahead of now, in ms. */
+  /** Frames discarded without being painted. */
+  get droppedCount(): number {
+    return this.framesDropped;
+  }
+
+  get queuedAheadMs(): number | null {
+    if (this.queue.length === 0) return null;
+    let newest = this.queue[0]!.renderTimeUs;
+    for (const e of this.queue) if (e.renderTimeUs > newest) newest = e.renderTimeUs;
+    return Math.max(0, (newest - this.clock.now()) / 1000);
+  }
+
+  /** Decoded frames waiting for their render time. */
+  get queueLength(): number {
+    return this.queue.length;
   }
 
   /**
@@ -149,15 +195,41 @@ export class CanvasRenderer implements VideoRendererLike {
         // On time — render
         this.queue.shift();
 
-        // Capture timestamp BEFORE close — VideoFrame.timestamp is the
-        // CaptureTimestamp set during toVideoChunkInit() (LOC §2.3.1.1).
-        // Used for drift detection in the feedback path.
-        const captureTimestampUs = BigInt(entry.frame.timestamp);
+        // Capture the decoded timestamp before releasing the frame.
+        const frameTimestampUs = entry.frame.timestamp;
+        const captureTimestampUs = BigInt(frameTimestampUs);
+        const revision = ++this.drawRevision;
 
-        this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
-
-        // frame.close() is NON-NEGOTIABLE — GPU memory outside GC
-        entry.frame.close();
+        try {
+          // Follow the frame's size so a resolution or aspect change (e.g. a
+          // switch from a landscape to a portrait view) is not stretched into
+          // the previous geometry; CSS object-fit letterboxes the element.
+          const canvas = this.ctx.canvas;
+          // Coded size for frames that report no display size.
+          const displayWidth = entry.frame.displayWidth ?? entry.frame.codedWidth;
+          const displayHeight = entry.frame.displayHeight ?? entry.frame.codedHeight;
+          if (this.followFrameSize && displayWidth && displayHeight
+            && (canvas.width !== displayWidth || canvas.height !== displayHeight)) {
+            canvas.width = displayWidth;
+            canvas.height = displayHeight;
+          }
+          this.drawDepth++;
+          try {
+            this.ctx.drawImage(entry.frame, 0, 0, canvas.width, canvas.height);
+          } finally {
+            this.drawDepth--;
+            // A wrapper may reenter before or after its native draw. Neither
+            // invocation nor return order proves the final image in that case.
+            if (revision !== this.drawRevision) this.lastVideoPresentation = null;
+          }
+          this.recordVideoPresentation(frameTimestampUs, revision);
+          try {
+            this.onFrameDrawn?.(frameTimestampUs, Date.now());
+          } catch { /* an observer must not break rendering */ }
+        } finally {
+          // Release even when drawing fails; only successful draws update evidence.
+          entry.frame.close();
+        }
 
         rendered = true;
         // A genuinely rendered frame is the only thing that completes an
@@ -271,6 +343,7 @@ export class CanvasRenderer implements VideoRendererLike {
 
   /** Release resources. MUST close() all held frames. */
   destroy(): void {
+    this.lastVideoPresentation = null;
     this.cancelStallEpisode();
     this.destroyed = true;
     this.stop();
@@ -283,11 +356,54 @@ export class CanvasRenderer implements VideoRendererLike {
 
   // ─── Internal ──────────────────────────────────────────────────
 
+  private recordVideoPresentation(timestampUs: number, revision: number): void {
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return;
+    this.lastVideoPresentation = null;
+    let renderedAtUs: number;
+    try {
+      renderedAtUs = this.clock.now();
+    } catch {
+      // Treat anything escaping this diagnostic query as unavailable evidence,
+      // including exceptions from hooks it calls. Preserve the playback path.
+      return;
+    }
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return;
+    if (!Number.isFinite(renderedAtUs)) return;
+    this.lastVideoPresentation = Object.freeze({
+      frameTimestampUs: Number.isSafeInteger(timestampUs) ? BigInt(timestampUs) : null,
+      timestampDomain: 'unknown',
+      renderedAtUs,
+    });
+  }
+
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;
+    // Becoming visible: the queue built while painting was throttled holds
+    // frames whose moment has passed. Keep only the newest so playback
+    // resumes at the live edge instead of replaying the backlog.
+    if (!document.hidden) {
+      this.dropAllButNewest();
+      // Throttled painting while hidden is not a stall: time the next one from
+      // now. A stall already detected before the page was hidden keeps running.
+      if (this.lastRenderTimeMs > 0) this.lastRenderTimeMs = performance.now();
+      if (this.stallEpisode !== null && !this.stallEpisode.detected) this.stallEpisode = null;
+    }
     this.cancelLoop();
     this.scheduleLoop();
   };
+
+  /** Close and discard every queued frame but the last. */
+  private dropAllButNewest(): void {
+    if (this.queue.length <= 1) return;
+    const newest = this.queue[this.queue.length - 1]!;
+    for (const q of this.queue) {
+      if (q === newest) continue;
+      this.framesDropped++;
+      try { q.frame.close(); } catch { /* already closed */ }
+    }
+    this.queue.length = 0;
+    this.queue.push(newest);
+  }
 
   private scheduleLoop(): void {
     if (document.hidden) {

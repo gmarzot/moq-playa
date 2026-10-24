@@ -18,10 +18,11 @@ import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
+import { withLocPrivateProperties } from '@openmoq/loc';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -45,7 +46,14 @@ function createMockAdapter() {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
@@ -151,7 +159,7 @@ let nextObjectId = 0n;
 function feedVideo(adapter: ReturnType<typeof createMockAdapter>, streamId = 0n): void {
   adapter._triggerObject(streamId, {
     kind: 'data', trackAlias: varint(VIDEO_ALIAS), groupId: varint(0), subgroupId: varint(0),
-    objectId: varint(nextObjectId++), payload: new Uint8Array([0xaa, 0xbb]),
+    objectId: varint(nextObjectId++), payload: withLocPrivateProperties(new Uint8Array([0xaa, 0xbb])),
   } as MoqtObject);
 }
 
@@ -212,7 +220,7 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
     adapter._triggerObject(0n, {
       kind: 'data', trackAlias: newReqId, groupId: varint(1), subgroupId: varint(0),
-      objectId: varint(0), payload: new Uint8Array([0xcc]),
+      objectId: varint(0), payload: withLocPrivateProperties(new Uint8Array([0xcc])),
     } as MoqtObject);
     await sleep(50);
     expect(player.state).toBe(PlayerState.PLAYING); // no fatal — recovered
@@ -235,6 +243,38 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     expect(starved.severity).toBe('fatal');
     expect(starved.source).toBe('connection');
     expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('followNamespace: an exhausted ladder waits, keeps resubscribing, and recovers when media returns', async () => {
+    const adapter = createMockAdapter();
+    adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+    const { player } = await startPlaying(adapter, { followNamespace: true });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    feedVideo(adapter); // arm, then silence
+    await vi.waitFor(() => {
+      expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true);
+    }, { timeout: 3_000 });
+    const starved = errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED);
+    expect(starved.severity).toBe('degraded');
+    expect(player.state).toBe(PlayerState.PLAYING);
+
+    // Still resubscribing after the ladder ran out.
+    const subscribesAtWait = adapter.subscribe.mock.calls.length;
+    await vi.waitFor(() => expect(adapter.subscribe.mock.calls.length).toBeGreaterThan(subscribesAtWait),
+      { timeout: 2_000 });
+
+    // Media returns on the newest subscription; no fatal follows.
+    const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: newReqId, groupId: varint(5), subgroupId: varint(0),
+      objectId: varint(0), payload: withLocPrivateProperties(new Uint8Array([0xcc])),
+    } as MoqtObject);
+    await sleep(200);
+    expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED && e.severity === 'fatal')).toBe(false);
+    expect(player.state).toBe(PlayerState.PLAYING);
     await player.destroy();
   });
 
@@ -371,6 +411,52 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('a hidden page holds the restart until visible', async () => {
+    const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+    (globalThis as any).document = doc;
+    try {
+      const adapter = createMockAdapter();
+      const { player } = await startPlaying(adapter);
+      const subscribesAtStart = adapter.subscribe.mock.calls.length;
+
+      feedVideo(adapter); // arm
+      doc.visibilityState = 'hidden';
+      await sleep(400); // starved several timeouts over
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      expect(adapter.subscribe.mock.calls.length).toBe(subscribesAtStart);
+
+      doc.visibilityState = 'visible';
+      await vi.waitFor(() => expect(adapter.requestUpdate).toHaveBeenCalled(), { timeout: 2_000 });
+      await player.destroy();
+    } finally {
+      delete (globalThis as any).document;
+    }
+  });
+
+  it('delivery that resumes once visible needs no restart', async () => {
+    const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+    (globalThis as any).document = doc;
+    let feeder: ReturnType<typeof setInterval> | undefined;
+    try {
+      const adapter = createMockAdapter();
+      const { player } = await startPlaying(adapter);
+
+      feedVideo(adapter); // arm
+      doc.visibilityState = 'hidden';
+      await sleep(400);
+
+      doc.visibilityState = 'visible';
+      feedVideo(adapter);
+      feeder = setInterval(() => feedVideo(adapter), 20);
+      await sleep(400);
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      await player.destroy();
+    } finally {
+      if (feeder) clearInterval(feeder);
+      delete (globalThis as any).document;
+    }
+  });
+
   it('livenessTimeoutMs: 0 disables monitoring entirely', async () => {
     const adapter = createMockAdapter();
     const { player } = await startPlaying(adapter, { livenessTimeoutMs: 0 });
@@ -381,6 +467,19 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await sleep(250); // many times the (disabled) timeout
     expect(recoveries.filter((a) => a.type === 'track_restart')).toHaveLength(0);
     expect(adapter.requestUpdate).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+});
+
+describe('datagram arrivals', () => {
+  it('are counted per media type', async () => {
+    const adapter = createMockAdapter();
+    const { player } = await startPlaying(adapter);
+    adapter.onDatagram?.({
+      trackAlias: varint(AUDIO_ALIAS), groupId: varint(1), objectId: varint(0),
+      publisherPriority: 64, payload: withLocPrivateProperties(new Uint8Array([1, 2, 3])),
+    });
+    expect(player.datagramObjects).toEqual({ audio: 1, video: 0 });
     await player.destroy();
   });
 });

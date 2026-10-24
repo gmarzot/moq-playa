@@ -22,19 +22,20 @@ import { QualityController } from './quality-controller.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { PlayerEventMap } from './events.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
-import { encodeLocHeaders } from '@moqt/loc';
-import type { ClockSource } from '@moqt/playback';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
+import { encodeLocHeaders, withLocPrivateProperties } from '@openmoq/loc';
+import type { ClockSource } from '@openmoq/playback';
+import type { DataStreamTerminal, GoawayNotice } from '@openmoq/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
 /** Minimal mock of MoqtConnection for testing. */
 function createMockAdapter(): MoqtConnection & {
   _triggerMessage: (msg: ControlMessage) => void;
+  _triggerGoawayNotice: (notice: GoawayNotice) => void;
   _triggerObject: (streamId: bigint, obj: MoqtObject) => void;
   _triggerDatagram: (datagram: ObjectDatagram) => void;
   _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => void;
@@ -83,13 +84,25 @@ function createMockAdapter(): MoqtConnection & {
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
-    trackStatus: vi.fn(async () => varint(nextRequestId++)),
+    // Mirrors the real contract: the pre-send ownership hook fires between
+    // request-ID allocation and wire emission, so a caller can register before
+    // any response (or a request-stream GOAWAY) can be handled.
+    trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
+      const requestId = varint(nextRequestId++);
+      opts?.onRequestId?.(BigInt(requestId));
+      return requestId;
+    }),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
     cancelNamespace: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
 
     _triggerMessage(msg: ControlMessage) {
       adapter.onMessage?.(msg);
+    },
+    // Delivers an ACCEPTED, scoped notice — the player's GOAWAY entry point.
+    // Stated by the test, never synthesized from a raw message.
+    _triggerGoawayNotice(notice: GoawayNotice) {
+      adapter.onGoawayNotice?.(notice, adapter as unknown as MoqtConnection);
     },
     _triggerObject(streamId: bigint, obj: MoqtObject) {
       adapter.onObject?.(streamId, obj);
@@ -196,6 +209,265 @@ function ackCatalog(adapter: ReturnType<typeof createMockAdapter>, reqId?: bigin
     parameters: new Map(),
   } as unknown as ControlMessage);
 }
+
+async function ackMedia(adapter: ReturnType<typeof createMockAdapter>): Promise<void> {
+  for (const result of vi.mocked(adapter.subscribe).mock.results.slice(1)) {
+    const requestId = await result.value;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map() } as ControlMessage);
+  }
+}
+
+describe('catalog subscribe retry intervals and ownership', () => {
+  const players: MoqtPlayer[] = [];
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(async () => {
+    for (const player of players.splice(0)) await player.destroy();
+    vi.useRealTimers();
+  });
+
+  async function loaded(draft: 16 | 18 = 16) {
+    const adapter = createMockAdapter();
+    Object.defineProperty(adapter, 'draftVersion', { value: draft });
+    const player = new MoqtPlayer(createConfig(adapter));
+    players.push(player);
+    const loading = player.load();
+    await resolveConnect(adapter);
+    await loading;
+    return { adapter, player };
+  }
+
+  function rejectCatalog(adapter: ReturnType<typeof createMockAdapter>, retryInterval = 1n) {
+    adapter._triggerMessage({
+      type: 'REQUEST_ERROR', requestId: varint(1), errorCode: varint(0x10),
+      retryInterval, errorReason: 'No publisher yet',
+    } as ControlMessage);
+  }
+
+  it('keeps a one-second backoff for an immediately retryable request', async () => {
+    const { adapter } = await loaded();
+    rejectCatalog(adapter);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([16, 18] as const)('draft %i: does not retry when Retry Interval is zero', async (draft) => {
+    const { adapter } = await loaded(draft);
+    rejectCatalog(adapter, 0n);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([16, 18] as const)('draft %i: waits Retry Interval minus one milliseconds', async (draft) => {
+    const { adapter } = await loaded(draft);
+    rejectCatalog(adapter, 5001n);
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('splits waits exceeding the platform timer limit without retrying early', async () => {
+    const { adapter } = await loaded(18);
+    const timerLimit = 0x7fffffff;
+    rejectCatalog(adapter, BigInt(timerLimit) + 1001n);
+    await vi.advanceTimersByTimeAsync(timerLimit);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not overflow a draft-18 uint64 Retry Interval into an immediate retry', async () => {
+    const { adapter } = await loaded(18);
+    rejectCatalog(adapter, (1n << 64n) - 1n);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['close', 'fatal error'] as const)('cancels retries on session %s', async (terminal) => {
+    const { adapter } = await loaded();
+    rejectCatalog(adapter);
+    if (terminal === 'close') adapter._triggerClose();
+    else adapter._triggerError(new Error('Transport lost'));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the retry after a nonfatal data-stream error', async () => {
+    const { adapter } = await loaded();
+    rejectCatalog(adapter);
+    adapter._triggerError(new MoqtConnectionError('Subgroup reset', { errorSource: 'data' }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('still rejects load when the initial write fails after reporting a fatal error', async () => {
+    const adapter = createMockAdapter();
+    const error = new Error('Control stream write failed');
+    vi.mocked(adapter.subscribe).mockImplementationOnce(async () => {
+      adapter._triggerError(error);
+      throw error;
+    });
+    const player = new MoqtPlayer(createConfig(adapter));
+    players.push(player);
+    const loading = player.load().then(() => null, (err: unknown) => err);
+    await resolveConnect(adapter);
+    expect(await loading).toBe(error);
+  });
+
+  it('does not let a superseded timer suppress the replacement session retry', async () => {
+    const { adapter, player } = await loaded();
+    rejectCatalog(adapter);
+    const replacement = createMockAdapter();
+    const migrating = player.migrate(replacement);
+    await resolveConnect(replacement);
+    await migrating;
+    rejectCatalog(replacement);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(replacement.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a completed old retry overwrite the replacement catalog request', async () => {
+    const { adapter, player } = await loaded();
+    let finishRetry!: (id: ReturnType<typeof varint>) => void;
+    vi.mocked(adapter.subscribe).mockImplementationOnce(() => new Promise((resolve) => {
+      finishRetry = resolve;
+    }));
+    rejectCatalog(adapter);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+
+    const replacement = createMockAdapter();
+    const migrating = player.migrate(replacement);
+    await resolveConnect(replacement);
+    await migrating;
+    finishRetry(varint(2));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const received = vi.fn();
+    player.on('catalog_received', received);
+    ackCatalog(replacement);
+    replacement._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1), groupId: varint(0),
+      subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    expect(received).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reclaim the replacement pending request when an old retry fails to send', async () => {
+    const { adapter, player } = await loaded();
+    let failRetry!: (error: Error) => void;
+    vi.mocked(adapter.subscribe).mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      failRetry = reject;
+    }));
+    rejectCatalog(adapter);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const replacement = createMockAdapter();
+    const migrating = player.migrate(replacement);
+    await resolveConnect(replacement);
+    await migrating;
+    failRetry(new Error('Old stream closed'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const received = vi.fn();
+    player.on('catalog_received', received);
+    replacement._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(40), groupId: varint(0),
+      subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    replacement._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(1), trackAlias: varint(40), parameters: new Map(),
+    } as ControlMessage);
+    expect(received).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('request ID and track alias namespace separation', () => {
+  const scenarios = [
+    { name: 'distinct values', videoAlias: 40n, audioAlias: 50n, order: ['video', 'audio'], early: 'none' },
+    { name: 'video alias equals pending audio request ID', videoAlias: 4n, audioAlias: 5n, order: ['video', 'audio'], early: 'none' },
+    { name: 'same alias assignment with reversed acknowledgements', videoAlias: 4n, audioAlias: 5n, order: ['audio', 'video'], early: 'none' },
+    { name: 'early video on an unknown alias', videoAlias: 40n, audioAlias: 50n, order: ['video', 'audio'], early: 'before' },
+    { name: 'early video alias equals pending audio request ID', videoAlias: 4n, audioAlias: 5n, order: ['audio', 'video'], early: 'before' },
+    { name: 'video between overlapping acknowledgements', videoAlias: 4n, audioAlias: 5n, order: ['video', 'audio'], early: 'between' },
+  ] as const;
+
+  it.each(scenarios)('$name', async ({ videoAlias, audioAlias, order, early }) => {
+    const adapter = createMockAdapter();
+    Object.defineProperty(adapter, 'draftVersion', { value: 18 });
+    let nextId = 0n;
+    vi.mocked(adapter.subscribe).mockImplementation(async (_ns, _name, options) => {
+      const id = varint(nextId);
+      nextId += 2n;
+      options?.onRequestId?.(id);
+      return id;
+    });
+    const player = new MoqtPlayer({
+      ...createConfig(adapter),
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(),
+        mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null,
+      }),
+      createCmafAssembler: () => ({
+        push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+        setInitSegment: vi.fn(), clearPending: vi.fn(),
+      }),
+    });
+    const delivered: Array<{ track: string; mediaType: string; marker: number | undefined }> = [];
+    player.on('media_object', (event) => delivered.push({
+      track: event.trackName, mediaType: event.mediaType, marker: event.payload?.[8],
+    }));
+    const ack = (track: 'video' | 'audio') => adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(track === 'video' ? 2 : 4),
+      trackAlias: varint(track === 'video' ? videoAlias : audioAlias), parameters: new Map(),
+    } as unknown as ControlMessage);
+    // Routing is observed before CMAF parsing. Payload markers identify the
+    // source track independently of the player's chosen media type.
+    const send = (alias: bigint, marker: number) => adapter._triggerObject(BigInt(marker), {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0), payload: Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker),
+    } as MoqtObject);
+    try {
+      const load = player.load();
+      await resolveConnect(adapter);
+      await load;
+      ackCatalog(adapter, 0n);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(0), groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(JSON.stringify({
+          version: 1,
+          tracks: [
+            { name: 'vide_1', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1, codec: 'avc1.640029', width: 1920, height: 1080, bitrate: 1_500_000 },
+            { name: 'soun_2', packaging: 'cmaf', isLive: true, role: 'audio', renderGroup: 1, codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', bitrate: 128000 },
+          ],
+        })),
+      } as MoqtObject);
+      await vi.waitFor(() => expect(adapter.subscribe).toHaveBeenCalledTimes(3));
+      const calls = vi.mocked(adapter.subscribe).mock.calls;
+      expect(calls.slice(1).map((call) => new TextDecoder().decode(call[1]))).toEqual(['vide_1', 'soun_2']);
+      expect(await vi.mocked(adapter.subscribe).mock.results[1]!.value).toBe(2n);
+      expect(await vi.mocked(adapter.subscribe).mock.results[2]!.value).toBe(4n);
+      if (early === 'before') send(videoAlias, 1);
+      ack(order[0]);
+      if (early === 'between') send(videoAlias, 1);
+      ack(order[1]);
+      if (early === 'none') send(videoAlias, 1);
+      send(audioAlias, 2);
+      expect(delivered).toEqual([
+        { track: 'vide_1', mediaType: 'video', marker: 1 },
+        { track: 'soun_2', mediaType: 'audio', marker: 2 },
+      ]);
+    } finally {
+      await player.destroy();
+    }
+  });
+});
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
@@ -425,8 +697,9 @@ describe('MoqtPlayer', () => {
   it('destroy() cleans up and transitions to ended', async () => {
     const adapter = createMockAdapter();
     const player = new MoqtPlayer(createConfig(adapter));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     await player.destroy();
     expect(adapter.close).toHaveBeenCalled();
@@ -503,8 +776,9 @@ describe('MoqtPlayer', () => {
     const player = new MoqtPlayer(createConfig(adapter));
     const errorEvents: unknown[] = [];
     player.on('error', (e) => errorEvents.push(e));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     // Quiet-destroy contract: a dead transport rejecting close() must not
     // make destroy() reject for library consumers without a try/catch.
@@ -551,10 +825,7 @@ describe('MoqtPlayer', () => {
     player.load();
     await resolveConnect(adapter);
 
-    adapter._triggerMessage({
-      type: 'GOAWAY',
-      newSessionUri: 'https://new-relay.example.com/moq',
-    } as ControlMessage);
+    adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
     expect(fn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -632,6 +903,162 @@ describe('MoqtPlayer', () => {
       expect(fn).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'session_established' }),
       );
+    });
+  });
+
+  // ─── Catalog subscribe retry (viewer arrives before publisher) ─────
+  //
+  // Regression coverage: a viewer subscribing before the publisher exists
+  // got REQUEST_ERROR(DOES_NOT_EXIST) and the player gave up permanently
+  // instead of retrying (reproduced live against moq-relay.red5.net).
+  describe('catalog subscribe retry on DOES_NOT_EXIST (viewer arrives before publisher)', () => {
+    it('retries the catalog subscribe and reaches catalog_received once the publisher shows up', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const fn = vi.fn();
+        player.on('catalog_received', fn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+
+        // No publisher yet: the relay refuses the catalog subscribe but permits retry.
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x10),
+          retryInterval: varint(1n),
+          errorReason: 'Track not found',
+        } as ControlMessage);
+
+        // The retry is timed, not synchronous.
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(2000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        const secondReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        expect(secondReqId).not.toBe(firstReqId);
+
+        // Publisher has since shown up: this attempt succeeds.
+        ackCatalog(adapter, secondReqId);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: secondReqId,
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CATALOG_JSON),
+        } as MoqtObject);
+
+        expect(fn).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'catalog_received' }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps retrying across repeated DOES_NOT_EXIST rejections', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const fn = vi.fn();
+        player.on('catalog_received', fn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        for (let i = 0; i < 3; i++) {
+          const reqId = await (adapter.subscribe as any).mock.results[i]?.value;
+          adapter._triggerMessage({
+            type: 'REQUEST_ERROR',
+            requestId: reqId,
+            errorCode: varint(0x10),
+            retryInterval: varint(1n),
+            errorReason: 'Track not found',
+          } as ControlMessage);
+          await vi.advanceTimersByTimeAsync(2000);
+        }
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(4);
+        const fourthReqId = await (adapter.subscribe as any).mock.results[3]?.value;
+        ackCatalog(adapter, fourthReqId);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: fourthReqId,
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CATALOG_JSON),
+        } as MoqtObject);
+
+        expect(fn).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'catalog_received' }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not retry on a non-retriable REQUEST_ERROR (e.g. UNAUTHORIZED)', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x01),
+          retryInterval: varint(0n),
+          errorReason: 'unauthorized',
+        } as ControlMessage);
+
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops retrying once the player is destroyed', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x10),
+          retryInterval: varint(1n),
+          errorReason: 'Track not found',
+        } as ControlMessage);
+
+        await player.destroy();
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -1040,10 +1467,7 @@ describe('MoqtPlayer', () => {
       await resolveConnect(adapter);
 
       // ControlMessage types are UPPERCASE per messages.ts
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       expect(fn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1096,10 +1520,7 @@ describe('MoqtPlayer', () => {
       } as ControlMessage);
 
       // Receive GOAWAY
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       // §9.4 SHOULD: UNSUBSCRIBE called for each active media subscription
       expect(adapter.unsubscribe).toHaveBeenCalledTimes(2);
@@ -1127,10 +1548,7 @@ describe('MoqtPlayer', () => {
 
       player.play();
 
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       (adapter.requestUpdate as any).mockClear();
       player.pause();
@@ -1431,6 +1849,153 @@ describe('MoqtPlayer', () => {
       });
     });
 
+    // INTERNAL_ERROR / EXCESSIVE_LOAD end a live subscription on a publisher
+    // send-side condition (e.g. no stream credit toward a slow page): retried,
+    // never as a storm.
+    describe('retriable PUBLISH_DONE backoff', () => {
+      const done = (requestId: unknown, code: number, reason = 'Failed to create uni stream.') => ({
+        type: 'PUBLISH_DONE',
+        requestId,
+        statusCode: varint(code),
+        streamCount: varint(0),
+        errorReason: reason,
+      }) as ControlMessage;
+      const videoSubscribes = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.subscribe as any).mock.calls
+          .filter((c: any[]) => new TextDecoder().decode(c[1] as Uint8Array) === 'video').length;
+      const latestReqId = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.subscribe as any).mock.results.at(-1)?.value;
+
+      it('resubscribes at once on INTERNAL_ERROR and does not end the track', async () => {
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const unsubscribed = vi.fn();
+        player.on('track_unsubscribed', unsubscribed);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = videoSubscribes(adapter);
+
+        adapter._triggerMessage(done(videoReqId, 0x0));
+
+        expect(videoSubscribes(adapter)).toBe(before + 1);
+        expect(unsubscribed).not.toHaveBeenCalled();
+        await player.destroy();
+      });
+
+      it('resubscribes on draft-18 EXCESSIVE_LOAD', async () => {
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = videoSubscribes(adapter);
+
+        adapter._triggerMessage(done(videoReqId, 0x9, 'overloaded'));
+
+        expect(videoSubscribes(adapter)).toBe(before + 1);
+        await player.destroy();
+      });
+
+      it('backs off a repeated end: the next retry waits, doubling', async () => {
+        vi.useFakeTimers();
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          const before = videoSubscribes(adapter);
+
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(0); // the replacement registers
+
+          adapter._triggerMessage(done(await latestReqId(adapter), 0x0));
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(999);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(videoSubscribes(adapter)).toBe(before + 2);
+
+          adapter._triggerMessage(done(await latestReqId(adapter), 0x0));
+          await vi.advanceTimersByTimeAsync(1_999);
+          expect(videoSubscribes(adapter)).toBe(before + 2);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(videoSubscribes(adapter)).toBe(before + 3);
+          await player.destroy();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('a failed replacement retries on the backoff, not at once', async () => {
+        vi.useFakeTimers();
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          const before = videoSubscribes(adapter);
+          (adapter.subscribe as any).mockRejectedValueOnce(new Error('Failed to create bidirectional stream.'));
+
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          await vi.advanceTimersByTimeAsync(0);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(999);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await vi.advanceTimersByTimeAsync(1);
+          expect(videoSubscribes(adapter)).toBe(before + 2);
+          await player.destroy();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('parks the retry while the document is hidden and resubscribes once visible', async () => {
+        vi.useFakeTimers();
+        const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
+        (globalThis as any).document = doc;
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          const before = videoSubscribes(adapter);
+          doc.visibilityState = 'hidden';
+
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(videoSubscribes(adapter)).toBe(before);
+
+          doc.visibilityState = 'visible';
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(videoSubscribes(adapter)).toBe(before + 1);
+          await player.destroy();
+        } finally {
+          delete (globalThis as any).document;
+          vi.useRealTimers();
+        }
+      });
+
+      it('destroy cancels a pending retry', async () => {
+        vi.useFakeTimers();
+        try {
+          const adapter = createMockAdapter();
+          adapter.draftVersion = 18;
+          const player = await loadAndSubscribeMedia(adapter);
+          const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+          adapter._triggerMessage(done(videoReqId, 0x0));
+          await vi.advanceTimersByTimeAsync(0);
+          adapter._triggerMessage(done(await latestReqId(adapter), 0x0));
+          const pending = videoSubscribes(adapter);
+
+          await player.destroy();
+          await vi.advanceTimersByTimeAsync(60_000);
+          expect(videoSubscribes(adapter)).toBe(pending);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
+
     it('removes subscription from active set — no REQUEST_UPDATE after PUBLISH_DONE', async () => {
       // After PUBLISH_DONE for video, pause() should only send
       // REQUEST_UPDATE for audio (the remaining active subscription).
@@ -1665,7 +2230,7 @@ describe('MoqtPlayer', () => {
         publisherPriority: 128,
         isEndOfGroup: false,
         extensions: undefined,
-        payload: new Uint8Array([0xAA, 0xBB]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB])),
         status: undefined,
       });
 
@@ -2489,7 +3054,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA, 0xBB, 0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB, 0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -2528,7 +3093,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(1),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -2638,7 +3203,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -2682,7 +3247,8 @@ describe('MoqtPlayer', () => {
         trackExtensions: [],
       } as ControlMessage);
 
-      // Push 2 objects into a buffer of size 1 → overflow → recovery
+      // Buffer of size 1; the clock is frozen, so only the first arrival pumps a
+      // tick and the next two overflow → recovery.
       clockTime = 1_000_000;
       adapter._triggerObject(1n, {
         kind: 'data',
@@ -2690,7 +3256,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -2700,7 +3266,17 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(1),
-        payload: new Uint8Array([0xBB]),
+        payload: withLocPrivateProperties(new Uint8Array([0xBB])),
+        extensions: undefined,
+        publisherPriority: 128,
+      } as MoqtObject);
+      adapter._triggerObject(1n, {
+        kind: 'data',
+        trackAlias: varint(51n),
+        groupId: varint(0),
+        subgroupId: varint(0),
+        objectId: varint(2),
+        payload: withLocPrivateProperties(new Uint8Array([0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -2792,6 +3368,43 @@ describe('MoqtPlayer', () => {
       expect(createAudioDecoder).toHaveBeenCalledOnce();
       expect(createRenderer).toHaveBeenCalledOnce();
       expect(createAudioOutput).toHaveBeenCalledOnce();
+    });
+
+    it('exposes optional renderer draw evidence through the catalog-created pipeline', async () => {
+      const adapter = createMockAdapter();
+      const renderer = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+        videoPresentation: null as import('./interfaces.js').VideoPresentation | null,
+      };
+      const player = await loadWithCatalog(adapter, {
+        ...createPipelineConfig(adapter),
+        createRenderer: () => renderer,
+        createVideoDecoder: () => ({
+          configure: vi.fn(), decode: vi.fn(), flush: vi.fn(async () => {}),
+          reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+        }),
+      });
+      try {
+        expect(player.videoPresentation).toBeNull();
+        renderer.videoPresentation = {
+          frameTimestampUs: 0n, timestampDomain: 'unknown', renderedAtUs: 123,
+        };
+        expect(player.videoPresentation).toEqual(renderer.videoPresentation);
+        expect(player.videoPresentation).not.toBe(renderer.videoPresentation);
+      } finally {
+        await player.destroy();
+      }
+      expect(player.videoPresentation).toBeNull();
+    });
+
+    it('has no video presentation without an instrumented renderer', async () => {
+      const player = await loadWithCatalog(createMockAdapter());
+      try {
+        expect(player.videoPresentation).toBeNull();
+      } finally {
+        await player.destroy();
+      }
     });
 
     // The stall metric only means something if the player actually wires both
@@ -2933,7 +3546,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA, 0xBB, 0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB, 0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3052,7 +3665,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xAA, 0xBB, 0xCC]),
+        payload: withLocPrivateProperties(new Uint8Array([0xAA, 0xBB, 0xCC])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -3586,10 +4199,7 @@ describe('MoqtPlayer', () => {
       const fn = vi.fn();
       player.on('session_goaway', fn);
 
-      adapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       expect(fn).toHaveBeenCalled();
       // No new connect should have happened
@@ -3631,10 +4241,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Trigger GOAWAY with new URI
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'https://new-relay.example.com/moq',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
       // Resolve new adapter connect
       await resolveConnect(newAdapter);
@@ -3686,10 +4293,7 @@ describe('MoqtPlayer', () => {
       } as MoqtObject);
 
       // Trigger GOAWAY with empty URI — should fall back to config.url
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: '',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
 
       await resolveConnect(newAdapter);
       await new Promise(r => setTimeout(r, 0));
@@ -3750,10 +4354,7 @@ describe('MoqtPlayer', () => {
       player.on('error', (e) => errors.push(e));
 
       // Observed in the field: a relay putting its parser-error text in the field.
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter' });
       await new Promise((r) => setTimeout(r, 0));
 
       expect(createConnection.mock.calls.length).toBe(baseConnections); // no candidate
@@ -3769,10 +4370,7 @@ describe('MoqtPlayer', () => {
       const errors: any[] = [];
       player.on('error', (e) => errors.push(e));
 
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'http://insecure.example.com/moq', // WebTransport requires https
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'http://insecure.example.com/moq' }); // WebTransport requires https
       await new Promise((r) => setTimeout(r, 0));
 
       expect(createConnection.mock.calls.length).toBe(baseConnections);
@@ -3791,7 +4389,7 @@ describe('MoqtPlayer', () => {
         const errors: any[] = [];
         player.on('error', (e) => errors.push(e));
 
-        oldAdapter._triggerMessage({ type: 'GOAWAY', newSessionUri: uri } as ControlMessage);
+        oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: uri });
         await new Promise((r) => setTimeout(r, 0));
 
         expect(createConnection.mock.calls.length).toBe(baseConnections);
@@ -3806,10 +4404,7 @@ describe('MoqtPlayer', () => {
       const updated = vi.fn();
       player.on('catalog_updated', updated);
 
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'not a uri at all',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'not a uri at all' });
       await new Promise((r) => setTimeout(r, 0));
 
       // A parseable catalog object arriving on the GOAWAY'd session must not
@@ -3843,10 +4438,7 @@ describe('MoqtPlayer', () => {
 
       // The old session (still current until commit) sends its one GOAWAY,
       // carrying garbage — it is queued, not acted on.
-      oldAdapter._triggerMessage({
-        type: 'GOAWAY',
-        newSessionUri: 'definitely not a webtransport url',
-      } as ControlMessage);
+      oldAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'definitely not a webtransport url' });
       await new Promise((r) => setTimeout(r, 0));
       expect(createConnection.mock.calls.length).toBe(baseConnections); // nothing created for the GOAWAY
 
@@ -4623,9 +5215,9 @@ describe('MoqtPlayer', () => {
       await loadPromise;
 
       // Should have logged "Connecting to ..." and "Session established"
-      const calls = spyInfo.mock.calls.map(c => c[1]);
-      expect(calls).toContain('Connecting to %s');
-      expect(calls.some((c: string) => c.startsWith('Session established'))).toBe(true);
+      const calls = spyInfo.mock.calls.map(c => c[0]);
+      expect(calls).toContain('[moqt] Connecting to %s');
+      expect(calls.some((c: string) => c.startsWith('[moqt] Session established'))).toBe(true);
 
       vi.restoreAllMocks();
     });
@@ -4661,8 +5253,8 @@ describe('MoqtPlayer', () => {
 
       // Wait for async subscription wiring
       await vi.waitFor(() => {
-        const calls = spyInfo.mock.calls.map(c => c[1]);
-        expect(calls).toContain('Catalog received: %d tracks');
+        const calls = spyInfo.mock.calls.map(c => c[0]);
+        expect(calls).toContain('[moqt] Catalog received: %d tracks');
       });
 
       vi.restoreAllMocks();
@@ -4742,8 +5334,9 @@ describe('MoqtPlayer', () => {
 
       // Wait for subscription wiring
       await vi.waitFor(() => {
-        expect(spyInfo.mock.calls.some(c => c[1] === 'Catalog received: %d tracks')).toBe(true);
+        expect(spyInfo.mock.calls.some(c => c[0] === '[moqt] Catalog received: %d tracks')).toBe(true);
       });
+      await ackMedia(adapter);
 
       spyDebug.mockClear();
 
@@ -4756,11 +5349,11 @@ describe('MoqtPlayer', () => {
         objectId: varint(0n),
         publisherPriority: 0,
         extensions: new Uint8Array(0),
-        payload: new Uint8Array([1, 2, 3]),
+        payload: withLocPrivateProperties(new Uint8Array([1, 2, 3])),
       });
 
       // Video objects log at info level with [OBJ] prefix for debugging
-      const infoCalls = spyInfo.mock.calls.map(c => c[1]);
+      const infoCalls = spyInfo.mock.calls.map(c => c[0]);
       expect(infoCalls.some((c: string) => typeof c === 'string' && c.includes('[OBJ]'))).toBe(true);
 
       vi.restoreAllMocks();
@@ -4783,7 +5376,7 @@ describe('MoqtPlayer', () => {
       adapter._triggerError(new Error('control stream closed'));
 
       expect(spyError).toHaveBeenCalled();
-      const errorCalls = spyError.mock.calls.map(c => c[1]);
+      const errorCalls = spyError.mock.calls.map(c => c[0]);
       expect(errorCalls.some(c => typeof c === 'string' && c.includes('Error'))).toBe(true);
       // Info-level messages should be suppressed
       expect(spyInfo).not.toHaveBeenCalled();
@@ -4989,6 +5582,7 @@ describe('MoqtPlayer', () => {
 
       // Flush async subscription setup
       await new Promise(r => setTimeout(r, 0));
+      await ackMedia(adapter);
 
       return { player, catalogReqId };
     }
@@ -5066,7 +5660,7 @@ describe('MoqtPlayer', () => {
         objectId: varint(0),
         publisherPriority: varint(0),
         extensions: new Uint8Array(0),
-        payload: new Uint8Array(512),
+        payload: withLocPrivateProperties(new Uint8Array(512)),
       } as MoqtObject);
 
       const snap = player.stats;
@@ -5183,7 +5777,7 @@ describe('MoqtPlayer', () => {
         objectId: varint(0),
         publisherPriority: varint(0),
         extensions: new Uint8Array(0),
-        payload: new Uint8Array(256),
+        payload: withLocPrivateProperties(new Uint8Array(256)),
       } as MoqtObject);
 
       const snap2 = player.stats;
@@ -5523,7 +6117,7 @@ describe('MoqtPlayer', () => {
         subgroupId: varint(0),
         objectId: varint(0),
         extensions: new Uint8Array([0x02, 0x00]),
-        payload: new Uint8Array([0xCA, 0xFE]),
+        payload: withLocPrivateProperties(new Uint8Array([0xCA, 0xFE])),
       } as MoqtObject);
 
       expect(player.readyState).toBeGreaterThanOrEqual(2); // HAVE_MEDIA or higher
@@ -5879,7 +6473,7 @@ describe('MoqtPlayer', () => {
         groupId: varint(0),
         subgroupId: varint(0),
         objectId: varint(0),
-        payload: new Uint8Array([0xCA, 0xFE]),
+        payload: withLocPrivateProperties(new Uint8Array([0xCA, 0xFE])),
         extensions: undefined,
         publisherPriority: 128,
       } as MoqtObject);
@@ -6288,7 +6882,7 @@ describe('MoqtPlayer', () => {
 
     /**
      * Minimal CMAF assembler for testing — pairs moof+mdat by media type.
-     * Matches CmafAssemblerLike interface without importing @moqt/browser.
+     * Matches CmafAssemblerLike interface without importing @openmoq/browser.
      */
     function createCmafAssemblerFactory() {
       return (options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void }) => {
@@ -6442,9 +7036,8 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('a player that never declared intent leaves the adapter default alone', async () => {
-      // Backward compatibility: stating `false` here would stop an embedder
-      // that relies on the adapter starting once media arrives.
+    it('a player that never declared intent tells the adapter not to play', async () => {
+      // The player owns startup: an adapter must never start on its own.
       const adapter = createMockAdapter();
       const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
       const player = new MoqtPlayer({
@@ -6458,7 +7051,7 @@ describe('MoqtPlayer', () => {
 
       await deliverCmafCatalog(adapter);
 
-      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
       await player.destroy();
     });
 
@@ -6505,7 +7098,8 @@ describe('MoqtPlayer', () => {
       await loadPromise;
       await deliverCmafCatalog(adapter);
 
-      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
+      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalledWith(true);
       await player.destroy();
     });
 
@@ -6843,7 +7437,7 @@ describe('MoqtPlayer', () => {
       const onTimeout = (wd as { onTimeout?: (e: unknown) => void }).onTimeout
         ?? ((wd as { config?: { onTimeout?: (e: unknown) => void } }).config?.onTimeout);
       expect(typeof onTimeout).toBe('function');
-      onTimeout!({ event: 'catalog_received', elapsedMs: 10_000, timeoutMs: 10_000 });
+      onTimeout!({ event: 'first_media_object', elapsedMs: 20_000, timeoutMs: 20_000 });
 
       expect(seenA).toEqual(seenB);
       expect(seenA).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
@@ -6998,6 +7592,7 @@ describe('MoqtPlayer', () => {
       // Start playback
       player.play();
 
+      await ackMedia(adapter);
       // Now deliver a CMAF video frame as two objects: moof then mdat
       // The assembler pairs them and emits a concatenated segment.
 
@@ -7434,6 +8029,7 @@ describe('MoqtPlayer', () => {
 
       player.play();
 
+      await ackMedia(adapter);
       // Deliver a CMAF media object
 
       adapter._triggerObject(1n, {
@@ -7528,6 +8124,7 @@ describe('MoqtPlayer', () => {
         payload: new TextEncoder().encode(VOD_CATALOG_JSON),
       } as MoqtObject);
       await new Promise(r => setTimeout(r, 10));
+      await ackMedia(adapter);
     }
 
     it('subscribes to mediatimeline track when present in catalog (§7.2)', async () => {
@@ -8153,6 +8750,7 @@ describe('MoqtPlayer', () => {
         // new codec isn't supported (or any other MSE-level failure).
         changeType: vi.fn(() => Promise.reject(new Error('mock changeType rejected'))),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8176,6 +8774,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8228,6 +8827,7 @@ describe('MoqtPlayer', () => {
       expect((adapter.subscribe as any).mock.calls.length).toBe(subscribesBefore + 1);
       expect(switchingFn).toHaveBeenCalledTimes(1);
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
 
       // Ack the new subscription with a DIFFERENT trackAlias so the
       // SUBSCRIBE_OK handler registers the track with the
@@ -8270,6 +8870,10 @@ describe('MoqtPlayer', () => {
       });
       // No "switched" event ever fires for the failed switch.
       expect(switchedFn).not.toHaveBeenCalled();
+      // The assembler was pinned to the new track for the re-type, then
+      // handed back to the old one when it failed.
+      expect(selectCmafTrack).toHaveBeenNthCalledWith(1, 'video', 'video_hevc');
+      expect(selectCmafTrack).toHaveBeenLastCalledWith('video', 'video_avc');
       // An `error` event also surfaces (PlayerErrorCode.VIDEO_DECODE_ERROR).
       expect(errorFn).toHaveBeenCalled();
 
@@ -8341,6 +8945,7 @@ describe('MoqtPlayer', () => {
         // changeType resolves successfully — the happy path.
         changeType: vi.fn(() => Promise.resolve()),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8364,6 +8969,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8439,6 +9045,7 @@ describe('MoqtPlayer', () => {
       expect(ctCodec).toBe('hvc1.1.6.L93.90');
       expect(ctInit).toBeInstanceOf(Uint8Array);
       expect(Array.from(ctInit as Uint8Array)).toEqual([0x10, 0x11, 0x12, 0x13]);
+      expect(selectCmafTrack).toHaveBeenCalledWith('video', 'video_hevc');
 
       // Commit-time event fired exactly once with the right payload.
       expect(switchedFn).toHaveBeenCalledTimes(1);
@@ -8871,7 +9478,7 @@ describe('MoqtPlayer', () => {
           adapter._triggerObject(BigInt(g + 1), {
             kind: 'data', trackAlias: videoAlias,
             groupId: varint(g), subgroupId: varint(0), objectId: varint(0),
-            payload: new Uint8Array(payloadSize), extensions: new Uint8Array(0),
+            payload: withLocPrivateProperties(new Uint8Array(payloadSize)), extensions: new Uint8Array(0),
           } as MoqtObject);
           adapter._triggerObject(BigInt(g + 1), {
             kind: 'gap', trackAlias: videoAlias,
@@ -9065,19 +9672,62 @@ describe('MoqtPlayer', () => {
 
       const recoveryEvents: any[] = [];
       player.on('recovery_action' as any, (evt: any) => recoveryEvents.push(evt));
+      vi.useFakeTimers();
+      try {
+        renderer.onStall?.(508);
+        // The skip waits for delivery to resume first.
+        expect(recoveryEvents).toEqual([]);
 
-      // Fire a stall — recovery controller should evaluate and
-      // the result should be emitted as an event, not silently filtered
-      renderer.onStall?.(508);
+        // Nothing rendered within the bound: the action is carried out, and
+        // skip_forward asks the relay for fresh data (REQUEST_UPDATE).
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(recoveryEvents.length).toBeGreaterThan(0);
+        expect(adapter.requestUpdate.mock.calls.length).toBeGreaterThan(0);
+      } finally {
+        vi.useRealTimers();
+      }
 
-      // The stall should produce SOME recovery event (skip_forward,
-      // reduce_quality, or jump_to_live) — it must not be silently dropped
-      expect(recoveryEvents.length).toBeGreaterThan(0);
+      await player.destroy();
+    });
 
-      // skip_forward from stall triggers requestFreshSubscriptionStart →
-      // adapter.requestUpdate (REQUEST_UPDATE to relay for fresh data)
-      await new Promise(r => setTimeout(r, 0));
-      expect(adapter.requestUpdate.mock.calls.length).toBeGreaterThan(0);
+    it('lists its SUBSCRIBEs with their MoQT state for status displays', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadWithAbr(adapter, createMockRenderer(), createMockVideoDecoder());
+      const subs = player.subscriptions;
+      expect(subs.find((s) => s.kind === 'catalog')).toMatchObject({ established: true, forward: true });
+      const media = subs.filter((s) => s.kind === 'video' || s.kind === 'audio');
+      expect(media.length).toBeGreaterThan(0);
+      for (const s of media) {
+        expect(s.forward).toBe(true);
+        // The alias is reported only once SUBSCRIBE_OK has assigned it.
+        expect(s.alias === null).toBe(!s.established);
+      }
+      await player.destroy();
+    });
+
+    it('a frame rendered while a stall waits keeps the group: no skip, no relay restart', async () => {
+      const adapter = createMockAdapter();
+      const renderer = createMockRenderer();
+      const decoder = createMockVideoDecoder();
+      const player = await loadWithAbr(adapter, renderer, decoder);
+
+      const recoveryEvents: any[] = [];
+      player.on('recovery_action' as any, (evt: any) => recoveryEvents.push(evt));
+      const flushesBefore = renderer.flush.mock.calls.length;
+      const updatesBefore = adapter.requestUpdate.mock.calls.length;
+      vi.useFakeTimers();
+      try {
+        renderer.onStall?.(508);
+        await vi.advanceTimersByTimeAsync(700);
+        renderer.onFrameRendered?.(1000n, clockTimeUs);
+        await vi.advanceTimersByTimeAsync(5_000);
+
+        expect(recoveryEvents).toEqual([]);
+        expect(adapter.requestUpdate.mock.calls.length).toBe(updatesBefore);
+        expect(renderer.flush.mock.calls.length).toBe(flushesBefore);
+      } finally {
+        vi.useRealTimers();
+      }
 
       await player.destroy();
     });
@@ -9852,7 +10502,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     subgroupId: varint(0),
     objectId: varint(0),
     extensions: encodeLocHeaders({ captureTimestamp: TS }, { wireProfile }),
-    payload: new Uint8Array([0x00]),
+    payload: withLocPrivateProperties(new Uint8Array([0x00])),
   } as MoqtObject);
 
   type TestMgr = {
@@ -10516,7 +11166,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     player.on('session_error', errorFn);
 
     // GOAWAY → automatic migration to a2, whose connect() rejects.
-    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://new-relay.example.com/moq' } as unknown as ControlMessage);
+    a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
     await vi.waitFor(() => expect(a2.connect).toHaveBeenCalled());
     await vi.waitFor(() => expect(errorFn).toHaveBeenCalled()); // surfaced, not an unhandled rejection
 
@@ -10974,7 +11624,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // A GOAWAY arrives on the candidate DURING establishment → staged as a control
     // message, replayed during drain (when the slot is still held).
-    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
 
     sub.release(7n);
     await m; // first handoff completes → processes the queued GOAWAY
@@ -10982,6 +11632,45 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a3);
     await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
     expect(createTransport.mock.calls.some((c) => String(c[0]).includes('goaway-target'))).toBe(true);
+    await player.destroy();
+  });
+
+  it('staging a GOAWAY notice charges the notice only, never the connection', async () => {
+    // The notice callback also receives the connection. Charging the whole
+    // argument list would walk the adapter's own state — traversing its getters
+    // and billing unrelated session state against the staged-event budget.
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const createConnection = vi.fn(() => a1 as unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast', createTransport, createConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    // A tripwire the cost accounting must never read.
+    let getterReads = 0;
+    Object.defineProperty(a2, 'tripwire', {
+      enumerable: true,
+      get() { getterReads++; return 'x'.repeat(1_000_000); },
+    });
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // Staged while the candidate is uncommitted — the path that computes cost.
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
+    expect(getterReads).toBe(0);
+
+    sub.release(7n);
+    await m;
+    expect(getterReads).toBe(0);
     await player.destroy();
   });
 
@@ -11011,7 +11700,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled()); // parked in retirement
 
     // A LIVE GOAWAY from the committed session while the old close is pending.
-    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
     expect(cc).toBe(1); // NOT acted on yet — no replacement adapter created (no leak)
 
     releaseOldClose!(); // retirement finishes → the queued GOAWAY is processed
@@ -11046,7 +11735,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // The OLD session (a1, still current during a2's establishment) sends GOAWAY —
     // it passes the ownership guard and is queued, but its source is a1.
-    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://unwanted-target.example.com/moq' } as unknown as ControlMessage);
+    a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://unwanted-target.example.com/moq' });
 
     sub.release(7n);
     await m;
@@ -11324,6 +12013,918 @@ describe('MSE gap-jump escalation and wiring', () => {
     expect(fatal).toHaveLength(1);
     expect(fatal[0].severity).toBe('fatal');
     expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});
+
+describe('MoqtPlayer.jumpToLive', () => {
+  it('resets both pipelines past their current group and the sync reference before re-subscribing', () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    const order: string[] = [];
+    const video = { currentGroupId: 41n, reset: vi.fn(() => { order.push('video reset'); }) };
+    const audio = { currentGroupId: 900n, reset: vi.fn(() => { order.push('audio reset'); }) };
+    const sync = { reset: vi.fn(() => { order.push('sync reset'); }) };
+    const requestUpdate = vi.fn(async () => { order.push('update'); });
+    Object.assign(player as any, {
+      videoPipeline: video,
+      audioPipeline: audio,
+      syncController: sync,
+      connection: { requestUpdate },
+    });
+    (player as any).activeSubscriptions.set(2n, { mediaType: 'video', trackName: 'video' });
+    (player as any).activeSubscriptions.set(3n, { mediaType: 'audio', trackName: 'audio' });
+
+    player.jumpToLive('test');
+
+    expect(video.reset).toHaveBeenCalledWith(42n);
+    expect(audio.reset).toHaveBeenCalledWith(901n);
+    expect(sync.reset).toHaveBeenCalledOnce();
+    expect(requestUpdate.mock.calls.map((c: any[]) => c[1].subscriptionFilter.type))
+      .toEqual(['NextGroupStart', 'NextGroupStart']);
+    expect(order.indexOf('update')).toBeGreaterThan(order.indexOf('sync reset'));
+  });
+});
+
+describe('MoqtPlayer — reconnect after the session closes', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** A loaded player in PLAYING whose later connections come from `next`. */
+  async function loaded(
+    first: ReturnType<typeof createMockAdapter>,
+    opts: { playing: boolean; createTransport?: MoqtPlayerConfig['createTransport'] },
+  ) {
+    const next: ReturnType<typeof createMockAdapter>[] = [];
+    const createConnection = vi.fn(() =>
+      (createConnection.mock.calls.length === 1 ? first : (next.shift() ?? createMockAdapter())) as
+        unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      ...createConfig(first),
+      createConnection,
+      ...(opts.createTransport ? { createTransport: opts.createTransport } : {}),
+    });
+    const loading = player.load();
+    await resolveConnect(first);
+    await loading;
+    if (opts.playing && player.state !== PlayerState.PLAYING) {
+      (player as any).transitionState(PlayerState.PLAYING);
+    }
+    return { player, createConnection, next };
+  }
+
+  it('reconnects 1 s after a close during playback and reports the migration', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection, next } = await loaded(first, { playing: true });
+    const second = createMockAdapter();
+    next.push(second);
+    vi.useFakeTimers();
+    const reconnecting: unknown[] = [];
+    const migrated = vi.fn();
+    player.on('session_reconnecting', (e) => reconnecting.push(e));
+    player.on('session_migrated', migrated);
+
+    first._triggerClose(0x1, 'relay restarted');
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(createConnection).toHaveBeenCalledTimes(2);
+    await resolveConnect(second);
+    await vi.waitFor(() => expect(migrated).toHaveBeenCalledOnce());
+    expect((player as any).reconnect).toBeNull();
+    await player.destroy();
+  });
+
+  it('backs off between failed attempts and ends fatal after the last', async () => {
+    const first = createMockAdapter();
+    const createTransport = vi.fn(async () => ({}) as any);
+    const { player } = await loaded(first, { playing: true, createTransport });
+    createTransport.mockRejectedValue(new Error('relay down'));
+    vi.useFakeTimers();
+    const delays: number[] = [];
+    const fatal: PlayerError[] = [];
+    player.on('session_reconnecting', (e) => delays.push(e.delayMs));
+    player.on('error', (e) => { if (e.error.severity === 'fatal') fatal.push(e.error); });
+
+    first._triggerClose(0x1, 'relay restarted');
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, ...Array(7).fill(15_000)]);
+    expect(fatal).toHaveLength(1);
+    expect(fatal[0]!.code).toBe(PlayerErrorCode.CONNECTION_LOST);
+    expect(fatal[0]!.message).toMatch(/relay restarted.*11 attempts/);
+    expect(player.state).toBe(PlayerState.ERROR);
+  });
+
+  it('destroy() cancels a pending reconnect', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection } = await loaded(first, { playing: true });
+    vi.useFakeTimers();
+
+    first._triggerClose(0x1, 'relay restarted');
+    await player.destroy();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(createConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reconnect a session that closes before playback starts', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection } = await loaded(first, { playing: false });
+    expect(player.state).not.toBe(PlayerState.PLAYING);
+    vi.useFakeTimers();
+    const reconnecting = vi.fn();
+    player.on('session_reconnecting', reconnecting);
+
+    first._triggerClose(0x1, 'relay restarted');
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(reconnecting).not.toHaveBeenCalled();
+    expect(createConnection).toHaveBeenCalledTimes(1);
+    await player.destroy();
+  });
+});
+
+describe('MoqtPlayer — video views (altGroups)', () => {
+  /** Two views in one catalog, as the FFmpeg/OBS publishers emit them. */
+  function twoViewCatalog(packaging: 'loc' | 'cmaf'): string {
+    const init = (b: number) => (packaging === 'cmaf' ? { initData: btoa(String.fromCharCode(b, b, b, b)) } : {});
+    return JSON.stringify({
+      version: 1,
+      tracks: [
+        { name: 'video_main', packaging, isLive: true, role: 'video', altGroup: 1,
+          codec: 'avc1.64001f', width: 1280, height: 720, bitrate: 3_000_000, ...init(1) },
+        { name: 'video_portrait', packaging, isLive: true, role: 'video', altGroup: 2,
+          codec: 'avc1.64001f', width: 720, height: 1280, bitrate: 3_000_000, ...init(2) },
+        { name: 'audio', packaging, isLive: true, role: 'audio',
+          codec: packaging === 'cmaf' ? 'mp4a.40.2' : 'opus', samplerate: 48000, channelConfig: '2', ...init(3) },
+      ],
+    });
+  }
+
+  async function loadWithCatalog(
+    adapter: ReturnType<typeof createMockAdapter>,
+    catalogJson: string,
+    extra: Partial<MoqtPlayerConfig> = {},
+  ) {
+    const player = new MoqtPlayer({ ...createConfig(adapter), compat: ['loc-bare'], ...extra });
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+    ackCatalog(adapter);
+    adapter._triggerObject(0n, {
+      kind: 'data',
+      trackAlias: catalogReqId,
+      groupId: varint(0),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      payload: new TextEncoder().encode(catalogJson),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    return player;
+  }
+
+  const subscribedNames = (adapter: ReturnType<typeof createMockAdapter>): string[] =>
+    (adapter.subscribe as any).mock.calls.map((c: any) => new TextDecoder().decode(c[1]));
+
+  /** SUBSCRIBE_OK the latest subscription and deliver its first keyframe object. */
+  async function landLatestSubscription(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {
+    const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+    const newAlias = BigInt(newReqId) + 100n;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK',
+      requestId: varint(BigInt(newReqId)),
+      trackAlias: varint(newAlias),
+      parameters: new Map(),
+      trackExtensions: new Map(),
+    } as any);
+    adapter._triggerObject(newAlias, {
+      kind: 'data',
+      trackAlias: varint(newAlias),
+      groupId: varint(7),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      payload,
+      extensions: new Uint8Array(0),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  it('lists every view, plays the first, and keeps the other out of the ABR ladder', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+
+    expect(player.availableViews).toEqual([
+      { altGroup: 1, width: 1280, height: 720, tracks: ['video_main'] },
+      { altGroup: 2, width: 720, height: 1280, tracks: ['video_portrait'] },
+    ]);
+    expect(player.currentView).toBe(1);
+    expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video_main']);
+    expect(subscribedNames(adapter)).toContain('video_main');
+    expect(subscribedNames(adapter)).not.toContain('video_portrait');
+
+    await player.destroy();
+  });
+
+  it('starts on the configured videoAltGroup', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'), { videoAltGroup: 2 });
+
+    expect(player.currentView).toBe(2);
+    expect(subscribedNames(adapter)).toContain('video_portrait');
+    expect(subscribedNames(adapter)).not.toContain('video_main');
+
+    await player.destroy();
+  });
+
+  it('has no views for a single video track without altGroup', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, JSON.stringify({
+      version: 1,
+      tracks: [{ name: 'video', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', width: 1280, height: 720 }],
+    }));
+
+    expect(player.availableViews).toEqual([]);
+    expect(player.currentView).toBeUndefined();
+    await expect(player.selectView(1)).rejects.toThrow(/altGroup 1/);
+
+    await player.destroy();
+  });
+
+  it('joins a live view at its next group, not at the old view\'s currentGroup + 1', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = { currentGroupId: 42n };
+
+    await player.selectView(2);
+
+    const call = (adapter.subscribe as any).mock.calls.at(-1);
+    expect(new TextDecoder().decode(call[1])).toBe('video_portrait');
+    expect(call[2]?.subscriptionFilter?.type).toBe('NextGroupStart');
+
+    await player.destroy();
+  });
+
+  it('commits a LOC view switch: old view torn down, view_changed fired, ABR stays automatic', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    const viewChanged = vi.fn();
+    const switched = vi.fn();
+    player.on('view_changed', viewChanged);
+    player.on('quality_switched', switched);
+
+    await player.selectView(2);
+    expect(viewChanged).not.toHaveBeenCalled();
+    expect(player.currentView).toBe(1);
+    // A second request for the view being switched to is a no-op; another view is refused.
+    await player.selectView(2);
+    await expect(player.selectView(1)).rejects.toThrow(/in progress/);
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(1);
+
+    await landLatestSubscription(adapter, new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67]));
+
+    expect(adapter.unsubscribe).toHaveBeenCalled();
+    expect(switched).toHaveBeenCalledWith(expect.objectContaining({
+      fromTrackName: 'video_main', toTrackName: 'video_portrait', reason: 'view',
+    }));
+    expect(viewChanged).toHaveBeenCalledWith({
+      type: 'view_changed', fromView: 1, toView: 2, trackName: 'video_portrait',
+    });
+    expect(player.currentView).toBe(2);
+    expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video_portrait']);
+    expect((player as unknown as { qualityController: QualityController }).qualityController.isAutoQuality).toBe(true);
+
+    await player.destroy();
+  });
+
+  it('splices a LOC switch in at a real keyframe, not at a delta frame numbered object 0', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    const viewChanged = vi.fn();
+    player.on('view_changed', viewChanged);
+    const oldVideo = await requestIdOf(adapter, 'video_main');
+
+    await player.selectView(2);
+    // A relay joining mid-group delivered a P-slice (NAL type 1) as object 0.
+    await landSubscription(adapter, 'video_portrait', new Uint8Array([0, 0, 0, 2, 0x41, 0x9a]), 38);
+    expect(viewChanged).not.toHaveBeenCalled();
+    expect(unsubscribedIds(adapter)).not.toContain(oldVideo);
+
+    // The next group's IDR (NAL type 5) is the splice point.
+    const alias = (await requestIdOf(adapter, 'video_portrait')) + 100n;
+    adapter._triggerObject(alias, {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(39), subgroupId: varint(0),
+      objectId: varint(0), payload: new Uint8Array([0, 0, 0, 2, 0x65, 0x88]), extensions: new Uint8Array(0),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    expect(viewChanged).toHaveBeenCalledTimes(1);
+    expect(unsubscribedIds(adapter)).toContain(oldVideo);
+
+    await player.destroy();
+  });
+
+  it('splices a CMAF switch in at the first sync sample, not at a delta frame numbered object 0', async () => {
+    // A relay joining the new subscription mid-group can deliver a delta
+    // frame as object 0; the real IDR follows as the next group's object 0.
+    const u32 = (v: number) => [v >>> 24, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+    const box = (type: string, ...parts: number[][]) => {
+      const body = parts.flat();
+      return [...u32(8 + body.length), ...[...type].map(c => c.charCodeAt(0)), ...body];
+    };
+    const chunk = (sampleFlags: number) => new Uint8Array([
+      ...box('moof', box('traf',
+        box('tfhd', u32(0x020000), u32(1)),
+        box('trun', u32(0x000205), u32(1), u32(0), u32(sampleFlags), u32(4)))),
+      ...box('mdat', [0, 0, 0, 0]),
+    ]);
+    const adapter = createMockAdapter();
+    const mockMs = {
+      initialize: vi.fn(),
+      appendChunk: vi.fn(),
+      endOfStream: vi.fn(),
+      reset: vi.fn(),
+      destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn(() => Promise.resolve()),
+    };
+    const pushed: Array<[string, bigint, number]> = [];
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => ({
+        push: (_mt: string, track: string, group: bigint, payload: Uint8Array) => { pushed.push([track, group, payload[payload.length - 1]!]); },
+        selectTrack: vi.fn(),
+        setInitSegment: vi.fn(),
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    (player as unknown as { cmafVideoSynced: boolean }).cmafVideoSynced = true;
+    const viewChanged = vi.fn();
+    player.on('view_changed', viewChanged);
+
+    await player.selectView(2);
+    const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+    const newAlias = BigInt(newReqId) + 100n;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(BigInt(newReqId)), trackAlias: varint(newAlias),
+      parameters: new Map(), trackExtensions: new Map(),
+    } as any);
+    const deliver = (group: number, object: number, payload: Uint8Array) => adapter._triggerObject(newAlias, {
+      kind: 'data', trackAlias: varint(newAlias), groupId: varint(group), subgroupId: varint(0),
+      objectId: varint(object), payload, extensions: new Uint8Array(0),
+    } as MoqtObject);
+    const delta = chunk(0x01010000);
+    delta[delta.length - 1] = 0xd;
+    const idr = chunk(0x02000000);
+    idr[idr.length - 1] = 0x5;
+
+    deliver(38, 0, delta);
+    await new Promise(r => setTimeout(r, 10));
+    expect(mockMs.changeType).not.toHaveBeenCalled();
+    expect(viewChanged).not.toHaveBeenCalled();
+
+    deliver(39, 0, idr);
+    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 10));
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    expect(viewChanged).toHaveBeenCalledTimes(1);
+    // Only the IDR reaches the assembler for the new view.
+    expect(pushed.filter(([t]) => t === 'video_portrait')).toEqual([['video_portrait', 39n, 0x5]]);
+
+    await player.destroy();
+  });
+
+  it('re-inits MSE for a CMAF view switch even with an identical codec string', async () => {
+    const adapter = createMockAdapter();
+    const mockMs = {
+      initialize: vi.fn(),
+      appendChunk: vi.fn(),
+      endOfStream: vi.fn(),
+      reset: vi.fn(),
+      destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array, _opts?: unknown) => Promise.resolve()),
+    };
+    const setInitSegment = vi.fn();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => ({
+        push: vi.fn(),
+        selectTrack: vi.fn(),
+        setInitSegment,
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    const viewChanged = vi.fn();
+    player.on('view_changed', viewChanged);
+    setInitSegment.mockClear();
+
+    await player.selectView(2);
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    const [mt, codec, init, opts] = mockMs.changeType.mock.calls[0]!;
+    expect(mt).toBe('video');
+    expect(codec).toBe('avc1.64001f');
+    expect(Array.from(init)).toEqual([2, 2, 2, 2]);
+    expect(opts).toBeUndefined();
+    expect(setInitSegment).toHaveBeenCalledWith('video', init);
+    expect(viewChanged).toHaveBeenCalledWith(expect.objectContaining({ fromView: 1, toView: 2 }));
+
+    await player.destroy();
+  });
+
+  /** The handoff's booth + match catalog: two programs, two angles, two languages. */
+  function boothCatalog(packaging: 'loc' | 'cmaf'): string {
+    const init = (b: number) => (packaging === 'cmaf' ? { initData: btoa(String.fromCharCode(b, b, b, b)) } : {});
+    const video = (name: string, altGroup: number, renderGroup: number, label: string, b: number) => ({
+      name, packaging, isLive: true, role: 'video', codec: 'avc1.64001f', width: 1280, height: 720,
+      bitrate: 3_000_000, altGroup, renderGroup, label, ...init(b),
+    });
+    const audio = (name: string, extra: object, b: number) => ({
+      name, packaging, isLive: true, role: 'audio', codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '1',
+      ...extra, ...init(b),
+    });
+    return JSON.stringify({
+      version: 1,
+      tracks: [
+        video('video_booth', 4, 1, 'Commentator Booth', 1),
+        video('video_match_main', 1, 2, 'Main Camera', 2),
+        video('video_match_cam2', 2, 2, 'Tactical', 3),
+        audio('audio_booth', { renderGroup: 1 }, 4),
+        audio('audio_match_en', { altGroup: 3, renderGroup: 2, lang: 'en' }, 5),
+        audio('audio_match_es', { altGroup: 3, renderGroup: 2, lang: 'es' }, 6),
+      ],
+    });
+  }
+
+  /** Request id of the latest SUBSCRIBE for `name`. */
+  async function requestIdOf(adapter: ReturnType<typeof createMockAdapter>, name: string): Promise<bigint> {
+    const calls = (adapter.subscribe as any).mock.calls;
+    for (let i = calls.length - 1; i >= 0; i--) {
+      if (new TextDecoder().decode(calls[i][1]) === name) return BigInt(await (adapter.subscribe as any).mock.results[i].value);
+    }
+    throw new Error(`no SUBSCRIBE for ${name}`);
+  }
+
+  /** SUBSCRIBE_OK the latest subscription of `name` and deliver one object on it. */
+  async function landSubscription(adapter: ReturnType<typeof createMockAdapter>, name: string, payload: Uint8Array, group = 7) {
+    const reqId = await requestIdOf(adapter, name);
+    const alias = reqId + 100n;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(alias),
+      parameters: new Map(), trackExtensions: new Map(),
+    } as any);
+    adapter._triggerObject(alias, {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(group), subgroupId: varint(0),
+      objectId: varint(0), payload, extensions: new Uint8Array(0),
+    } as MoqtObject);
+    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  const unsubscribedIds = (adapter: ReturnType<typeof createMockAdapter>): bigint[] =>
+    (adapter.unsubscribe as any).mock.calls.map((c: any) => BigInt(c[0]));
+
+  it('exposes programs, labels, languages and the current program\'s audio tracks', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'));
+
+    expect(player.availablePrograms).toEqual([
+      { renderGroup: 1, tracks: ['video_booth', 'audio_booth'] },
+      { renderGroup: 2,
+        tracks: ['video_match_main', 'video_match_cam2', 'audio_match_en', 'audio_match_es'] },
+    ]);
+    expect(player.currentProgram).toBe(1);
+    expect(player.availableViews).toEqual([
+      { altGroup: 4, renderGroup: 1, label: 'Commentator Booth', width: 1280, height: 720, tracks: ['video_booth'] },
+    ]);
+    expect(player.availableVideoTracks[0]).toMatchObject({ name: 'video_booth', label: 'Commentator Booth', altGroup: 4, renderGroup: 1 });
+    expect(player.availableAudioTracks.map(t => t.name)).toEqual(['audio_booth']);
+    expect(player.currentAudioTrack).toBe('audio_booth');
+    expect(subscribedNames(adapter)).toEqual(expect.arrayContaining(['video_booth', 'audio_booth']));
+
+    await player.destroy();
+  });
+
+  it('starts on initialProgram with the preferred language', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2, preferredLanguage: 'es' });
+
+    expect(player.currentProgram).toBe(2);
+    expect(player.availableAudioTracks.map(t => [t.name, t.lang])).toEqual([['audio_match_en', 'en'], ['audio_match_es', 'es']]);
+    expect(player.currentAudioTrack).toBe('audio_match_es');
+    expect(subscribedNames(adapter)).toEqual(expect.arrayContaining(['video_match_main', 'audio_match_es']));
+    expect(subscribedNames(adapter)).not.toContain('audio_match_en');
+
+    await player.destroy();
+  });
+
+  it('switches LOC audio language at the new track\'s first object, leaving video alone', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    const changed = vi.fn();
+    player.on('audio_track_changed', changed);
+    const oldAudio = await requestIdOf(adapter, 'audio_match_en');
+    const videoSubs = subscribedNames(adapter).filter(n => n.startsWith('video')).length;
+
+    await player.selectAudioTrack('audio_match_es');
+    const call = (adapter.subscribe as any).mock.calls.at(-1);
+    expect(new TextDecoder().decode(call[1])).toBe('audio_match_es');
+    expect(call[2]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(unsubscribedIds(adapter)).not.toContain(oldAudio);
+    await player.selectAudioTrack('audio_match_es'); // same target: no-op
+    await expect(player.selectAudioTrack('audio_match_en')).rejects.toThrow(/in progress/);
+
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0x21, 0x10, 0x05]));
+
+    expect(unsubscribedIds(adapter)).toContain(oldAudio);
+    expect(changed).toHaveBeenCalledWith({
+      type: 'audio_track_changed', fromTrackName: 'audio_match_en', toTrackName: 'audio_match_es', lang: 'es', reason: 'manual',
+    });
+    expect(player.currentAudioTrack).toBe('audio_match_es');
+    expect(subscribedNames(adapter).filter(n => n.startsWith('video'))).toHaveLength(videoSubs);
+    await expect(player.selectAudioTrack('nope')).rejects.toThrow(/Unknown audio track/);
+
+    await player.destroy();
+  });
+
+  function cmafHarness(changeType: () => Promise<void>) {
+    const mockMs = {
+      initialize: vi.fn(),
+      appendChunk: vi.fn(),
+      endOfStream: vi.fn(),
+      reset: vi.fn(),
+      destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array, _opts?: unknown) => changeType()),
+    };
+    const assembler = {
+      push: vi.fn(),
+      selectTrack: vi.fn(),
+      setInitSegment: vi.fn(),
+      getEpoch: () => null,
+      reset: vi.fn(),
+      destroy: vi.fn(),
+    };
+    return {
+      mockMs, assembler,
+      config: { createMediaSource: () => mockMs, createCmafAssembler: () => assembler } as Partial<MoqtPlayerConfig>,
+    };
+  }
+
+  it('switches CMAF audio language by re-typing the audio SourceBuffer, then dropping the old track', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.resolve());
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), { ...h.config, initialProgram: 2 });
+    const changed = vi.fn();
+    player.on('audio_track_changed', changed);
+    const oldAudio = await requestIdOf(adapter, 'audio_match_en');
+    h.assembler.push.mockClear();
+
+    await player.selectAudioTrack('audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(h.mockMs.changeType).toHaveBeenCalledTimes(1);
+    const [mt, codec, init, opts] = h.mockMs.changeType.mock.calls[0]!;
+    expect([mt, codec, Array.from(init), opts]).toEqual(['audio', 'mp4a.40.2', [6, 6, 6, 6], undefined]);
+    expect(h.assembler.selectTrack).toHaveBeenLastCalledWith('audio', 'audio_match_es');
+    expect(h.assembler.setInitSegment).toHaveBeenCalledWith('audio', init);
+    expect(h.assembler.push).toHaveBeenCalledWith('audio', 'audio_match_es', 7n, expect.any(Uint8Array));
+    expect(unsubscribedIds(adapter)).toContain(oldAudio);
+    expect(changed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'audio_match_es', lang: 'es' }));
+
+    await player.destroy();
+  });
+
+  it('rolls a CMAF audio switch back when changeType fails, keeping the old track', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.reject(new Error('no')));
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), { ...h.config, initialProgram: 2 });
+    const failed = vi.fn();
+    player.on('audio_track_switch_failed', failed);
+    player.on('error', () => {});
+    const oldAudio = await requestIdOf(adapter, 'audio_match_en');
+
+    await player.selectAudioTrack('audio_match_es');
+    const newAudio = await requestIdOf(adapter, 'audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ fromTrackName: 'audio_match_en', toTrackName: 'audio_match_es' }));
+    expect(h.assembler.selectTrack).toHaveBeenLastCalledWith('audio', 'audio_match_en');
+    expect(unsubscribedIds(adapter)).toContain(newAudio);
+    expect(unsubscribedIds(adapter)).not.toContain(oldAudio);
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+
+    await player.destroy();
+  });
+
+  it('switches program: video and audio together, then program_changed', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { preferredLanguage: 'es' });
+    const programChanged = vi.fn();
+    const viewChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    player.on('view_changed', viewChanged);
+    (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = { currentGroupId: 42n };
+
+    await player.selectProgram(2);
+    const videoCall = (adapter.subscribe as any).mock.calls.find((c: any) => new TextDecoder().decode(c[1]) === 'video_match_main');
+    // Programs are not time-aligned (msf#142): the new video joins at its own next group.
+    expect(videoCall[2]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    expect(subscribedNames(adapter)).toContain('audio_match_es');
+    // Nothing committed yet: the old program plays on.
+    expect(player.currentProgram).toBe(1);
+    expect(programChanged).not.toHaveBeenCalled();
+    expect(viewChanged).not.toHaveBeenCalled();
+    await player.selectProgram(2); // same target in flight: no-op
+    await expect(player.selectProgram(9)).rejects.toThrow(/Unknown program/);
+    await player.destroy();
+  });
+
+  it('refuses an audio switch when audio is disabled', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2, disableAudio: true });
+    await expect(player.selectAudioTrack('audio_match_es')).rejects.toThrow(/not playing/);
+    expect(subscribedNames(adapter)).not.toContain('audio_match_es');
+    await player.destroy();
+  });
+
+  it('refuses a program switch while an audio switch is pending, without touching video', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    await player.selectAudioTrack('audio_match_es');
+    const before = subscribedNames(adapter).length;
+    await expect(player.selectProgram(1)).rejects.toThrow(/audio track switch is already in progress/);
+    expect(subscribedNames(adapter)).toHaveLength(before);
+    await player.destroy();
+  });
+
+  it('switches at once to a program that shares every playing track', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, JSON.stringify({
+      version: 1,
+      tracks: [
+        { name: 'video', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f' },
+        { name: 'audio', packaging: 'loc', isLive: true, role: 'audio', codec: 'opus', samplerate: 48000, channelConfig: '2' },
+        { name: 'subtitles_a', packaging: 'loc', isLive: true, role: 'subtitle', renderGroup: 1 },
+        { name: 'subtitles_b', packaging: 'loc', isLive: true, role: 'subtitle', renderGroup: 2 },
+      ],
+    }));
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    const before = subscribedNames(adapter).length;
+    expect(player.currentProgram).toBe(1);
+
+    await player.selectProgram(2);
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    expect(player.currentProgram).toBe(2);
+    expect(subscribedNames(adapter)).toHaveLength(before);
+    await player.destroy();
+  });
+
+  /** The relay refuses the latest SUBSCRIBE for `name`. */
+  async function refuseSubscription(adapter: ReturnType<typeof createMockAdapter>, name: string) {
+    adapter._triggerMessage({
+      type: 'REQUEST_ERROR', requestId: varint(await requestIdOf(adapter, name)),
+      errorCode: varint(0x10n), errorReason: 'Track not found',
+    } as any);
+    await new Promise(r => setTimeout(r, 10));
+  }
+
+  it('aborts an audio switch whose track the relay refuses, so the next one can run', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    player.on('error', () => {});
+    const failed = vi.fn();
+    player.on('audio_track_switch_failed', failed);
+
+    await player.selectAudioTrack('audio_match_es');
+    await refuseSubscription(adapter, 'audio_match_es');
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'audio_match_es' }));
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+
+    await player.selectAudioTrack('audio_match_es'); // not stuck "in progress"
+    expect(subscribedNames(adapter).filter(n => n === 'audio_match_es')).toHaveLength(2);
+    await player.destroy();
+  });
+
+  it('aborts a view switch whose track the relay refuses, so views and ABR work again', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    player.on('error', () => {});
+    const failed = vi.fn();
+    player.on('quality_switch_failed', failed);
+
+    await player.selectView(2);
+    await refuseSubscription(adapter, 'video_portrait');
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video_portrait' }));
+    expect(player.currentView).toBe(1);
+
+    await player.selectView(2);
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(2);
+    await player.destroy();
+  });
+
+  it('runs one video switch at a time', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    const view = player.selectView(2);
+    // A second switch racing the first through its awaits is refused.
+    await expect(player.selectVideoTrack('video_main')).rejects.toThrow(/already in progress/);
+    await view;
+    await expect(player.selectVideoTrack('video_main')).rejects.toThrow(/already in progress/);
+    await player.selectVideoTrack('video_portrait'); // same target: no-op
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(1);
+    await player.destroy();
+  });
+
+  it('commits a program switch through its audio when video is disabled', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { disableVideo: true });
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    expect(player.availableViews).toEqual([]);
+    expect(player.currentVideoTrack).toBeUndefined();
+
+    await player.selectProgram(2);
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0x21, 0x10, 0x05]));
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    expect(player.currentProgram).toBe(2);
+    expect(player.availableAudioTracks.map(t => t.name)).toEqual(['audio_match_en', 'audio_match_es']);
+    await expect(player.selectView(1)).rejects.toThrow(/video is not playing/);
+    await player.destroy();
+  });
+
+  it('keeps the program and puts the audio back when the program\'s video fails', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.resolve());
+    h.mockMs.changeType.mockImplementation((mt: string) =>
+      mt === 'video' ? Promise.reject(new Error('no video retype')) : Promise.resolve());
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), h.config);
+    player.on('error', () => {});
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+
+    await player.selectProgram(2);
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+    const before = subscribedNames(adapter).filter(n => n === 'audio_booth').length;
+    await landSubscription(adapter, 'video_match_main', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(programChanged).not.toHaveBeenCalled();
+    expect(player.currentProgram).toBe(1);
+    // The new program's language is rolled back to the old program's track.
+    expect(subscribedNames(adapter).filter(n => n === 'audio_booth')).toHaveLength(before + 1);
+    await player.destroy();
+  });
+
+  it('fires no view_changed for a switch inside one view\'s ABR ladder', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, JSON.stringify({
+      version: 1,
+      tracks: [
+        { name: 'hi', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', bitrate: 3e6, altGroup: 1 },
+        { name: 'lo', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', bitrate: 1e6, altGroup: 1 },
+      ],
+    }), { startLevel: 0 });
+    const viewChanged = vi.fn();
+    const switched = vi.fn();
+    player.on('view_changed', viewChanged);
+    player.on('quality_switched', switched);
+    await player.selectVideoTrack('lo');
+    await landSubscription(adapter, 'lo', new Uint8Array([0, 0, 0, 2, 0x65, 0x88]));
+    expect(switched).toHaveBeenCalledTimes(1);
+    expect(viewChanged).not.toHaveBeenCalled();
+    expect(player.currentVideoTrack).toBe('lo');
+    await player.destroy();
+  });
+
+  it('keeps the viewer\'s language across a detour through a program without it', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2 });
+    await player.selectAudioTrack('audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0x21, 0x10, 0x05]));
+    await player.selectProgram(1);
+    await landSubscription(adapter, 'audio_booth', new Uint8Array([0x21, 0x10, 0x05]));
+    await landSubscription(adapter, 'video_booth', new Uint8Array([0, 0, 0, 2, 0x65, 0x88]));
+    expect(player.currentProgram).toBe(1);
+
+    await player.selectProgram(2);
+    // The booth audio has no language; the match picks Spanish again, not English.
+    expect(subscribedNames(adapter).filter(n => n === 'audio_match_es')).toHaveLength(2);
+    expect(subscribedNames(adapter).filter(n => n === 'audio_match_en')).toHaveLength(1);
+    await player.destroy();
+  });
+
+  it('does not let an aborted switch\'s staging timer complete the next switch', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    player.on('error', () => {});
+    const switched = vi.fn();
+    player.on('quality_switched', switched);
+    const oldVideo = await requestIdOf(adapter, 'video_main');
+
+    await player.selectView(2);
+    // One delta frame staged (arms the 3 s staging timer), then the track ends.
+    await landSubscription(adapter, 'video_portrait', new Uint8Array([0, 0, 0, 2, 0x41, 0x9a]));
+    adapter._triggerMessage({
+      type: 'PUBLISH_DONE', requestId: varint(await requestIdOf(adapter, 'video_portrait')),
+      statusCode: varint(0x2n), streamCount: varint(0n), errorReason: 'ended',
+    } as any);
+    await new Promise(r => setTimeout(r, 10));
+    await player.selectView(2); // retry; it delivers nothing yet
+    await new Promise(r => setTimeout(r, 3_300));
+
+    expect(switched).not.toHaveBeenCalled();
+    expect(unsubscribedIds(adapter)).not.toContain(oldVideo);
+    await player.destroy();
+  }, 10_000);
+
+  it('abandons a switch whose new track never delivers, so later switches run', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));
+    player.on('error', () => {});
+    const failed = vi.fn();
+    player.on('quality_switch_failed', failed);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await player.selectView(2);
+      await expect(player.selectView(1)).rejects.toThrow(/already in progress/);
+      await vi.advanceTimersByTimeAsync(10_500);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video_portrait' }));
+    await player.selectView(2); // not stuck "in progress"
+    expect(subscribedNames(adapter).filter(n => n === 'video_portrait')).toHaveLength(2);
+    await player.destroy();
+  });
+
+  it('settles a program switch whose audio leg joins an in-flight manual pick of the same track', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'));
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+
+    const program = player.selectProgram(2);
+    await player.selectAudioTrack('audio_match_en'); // manual pick of the leg's own target
+    await program;
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0x21, 0x10, 0x05]));
+    await landSubscription(adapter, 'video_match_main', new Uint8Array([0, 0, 0, 2, 0x65, 0x88]));
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    await player.selectProgram(1); // not stuck
+    await player.destroy();
+  });
+
+  it('keeps the program when every track it had to change failed', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { disableVideo: true });
+    player.on('error', () => {});
+    const programChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    await player.selectProgram(2);
+    await refuseSubscription(adapter, 'audio_match_en');
+    expect(programChanged).not.toHaveBeenCalled();
+    expect(player.currentProgram).toBe(1);
+    expect(player.currentAudioTrack).toBe('audio_booth');
+    await player.selectProgram(2); // can try again
+    await player.destroy();
+  });
+
+  it('commits a program switch once its video lands', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'));
+    const programChanged = vi.fn();
+    const viewChanged = vi.fn();
+    player.on('program_changed', programChanged);
+    player.on('view_changed', viewChanged);
+
+    await player.selectProgram(2);
+    await landSubscription(adapter, 'audio_match_en', new Uint8Array([0x21, 0x10, 0x05]));
+    expect(programChanged).not.toHaveBeenCalled(); // audio alone does not move a program with video
+    await landSubscription(adapter, 'video_match_main', new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x65]));
+
+    expect(programChanged).toHaveBeenCalledTimes(1);
+    expect(programChanged).toHaveBeenCalledWith({ type: 'program_changed', fromProgram: 1, toProgram: 2 });
+    expect(viewChanged).toHaveBeenCalledWith(expect.objectContaining({ fromView: 4, toView: 1 }));
+    expect(player.currentProgram).toBe(2);
+    expect(player.availableViews.map(v => v.label)).toEqual(['Main Camera', 'Tactical']);
+    expect(player.currentAudioTrack).toBe('audio_match_en');
+
     await player.destroy();
   });
 });

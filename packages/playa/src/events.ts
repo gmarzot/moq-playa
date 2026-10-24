@@ -1,14 +1,16 @@
 /**
- * UI-friendly event map for @playa/player.
+ * UI-friendly event map for @openmoq/playa.
  *
  * Event names mirror HTMLMediaElement conventions where possible
  * (timeupdate, volumechange, durationchange) for familiarity.
- * Protocol-level events from @moqt/player are absorbed and re-emitted
+ * Protocol-level events from @openmoq/player are absorbed and re-emitted
  * as higher-level UI events.
  *
  * @module
  */
 
+import type { CatalogState } from '@openmoq/msf';
+import type { NamespaceState, CaptureTimes } from '@openmoq/player';
 import type { Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 
 /** Event map for Player.on() / Player.off(). */
@@ -41,10 +43,26 @@ export interface PlayerEventMap {
   /** Quality level switched (ABR or manual). */
   'qualitychange': QualitychangeEvent;
 
-  /** Playback stalled (buffering). */
+  /** Playback stalled. `durationMs` is detection latency, not the outage length. */
   'stall': StallEvent;
-  /** Playback resumed after stall. */
-  'unstall': Record<string, never>;
+  /** A stall ended, with the full outage length. */
+  'stall_recovered': StallRecoveredEvent;
+  /** The page was suspended or restored by the browser. */
+  'lifecycle': LifecycleEvent;
+  /** The connection to the relay closed. */
+  'session_closed': SessionClosedEvent;
+  /** A fresh session will be attempted after `delayMs`. */
+  'session_reconnecting': SessionReconnectingEvent;
+  /** The relay answered SETUP: the session is established. */
+  'session_established': Record<string, never>;
+  /** A new session took over, after a reconnect or a relay GOAWAY. */
+  'session_migrated': Record<string, never>;
+  /** The followed namespace changed state at the relay (`followNamespace`). */
+  'namespace_state': NamespaceStateEvent;
+  /** A media subscription ended and the player did not resubscribe. */
+  'track_unsubscribed': TrackUnsubscribedEvent;
+  /** The relay refused a media subscription. */
+  'track_subscribe_failed': TrackSubscribeFailedEvent;
 
   /** Periodic stats update (~1Hz). Wire to stats overlay. */
   'stats': PlayerStats;
@@ -54,6 +72,57 @@ export interface PlayerEventMap {
 
   /** Player state changed. */
   'statechange': StatechangeEvent;
+
+  /** Catalog received and parsed. */
+  'catalog_received': CatalogEvent;
+  /** Delta catalog update applied. */
+  'catalog_updated': CatalogEvent;
+  /** Raw catalog bytes as delivered, before parsing. Diagnostics only. */
+  'catalog_raw': CatalogRawEvent;
+
+  /**
+   * One media object arrived. Fires per object — measurement and
+   * diagnostics only; playback needs none of it.
+   */
+  'media_object': MediaObjectEvent;
+
+  /** A switch to another video view (altGroup) committed. */
+  'view_changed': ViewChangedEvent;
+  /** The current program (renderGroup) changed. */
+  'program_changed': ProgramChangedEvent;
+  /** A switch to another audio track (typically another language) committed. */
+  'audio_track_changed': AudioTrackChangedEvent;
+  /** An audio track switch was rolled back; the old track keeps playing. */
+  'audio_track_switch_failed': AudioTrackSwitchFailedEvent;
+}
+
+export interface CatalogEvent {
+  readonly catalog: CatalogState;
+}
+
+export interface CatalogRawEvent {
+  readonly bytes: number;
+  /** UTF-8 decoding of the payload, or null when it is not valid UTF-8. */
+  readonly text: string | null;
+}
+
+export interface MediaObjectEvent {
+  readonly mediaType: 'video' | 'audio';
+  readonly trackName: string;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
+  readonly kind: string;
+  /** Payload size in bytes — the measured contribution to track bitrate. */
+  readonly bytes: number;
+  /** Publisher capture time, µs since the epoch, when the object carries it. */
+  readonly captureTimestamp?: bigint | undefined;
+  /** False when captureTimestamp is media time, not wall clock. */
+  readonly timestampIsWallClock?: boolean | undefined;
+  readonly isKeyframe?: boolean | undefined;
+  /** Wall-clock capture times by source, for latency measurement only. */
+  readonly captureTimes?: CaptureTimes | undefined;
+  /** Why the track's timestamp properties are not used. */
+  readonly timingError?: string | undefined;
 }
 
 export interface ReadyEvent {
@@ -96,6 +165,49 @@ export interface StallEvent {
   readonly durationMs: number;
 }
 
+export interface StallRecoveredEvent {
+  /** Outage length, onset to recovery. */
+  readonly durationMs: number;
+}
+
+/** A browser page-lifecycle transition. A frozen tab runs no timers or socket
+ *  reads, so its gap otherwise looks like a network failure. */
+export interface LifecycleEvent {
+  readonly state: 'hidden' | 'visible' | 'frozen' | 'resumed';
+  /** How long the page spent away, on the transition back. */
+  readonly awayMs?: number;
+}
+
+export interface SessionClosedEvent {
+  /** Session termination code, when the close carried one. */
+  readonly code?: number;
+  readonly reason?: string;
+}
+
+export interface SessionReconnectingEvent {
+  /** 1 for the first attempt after the close. */
+  readonly attempt: number;
+  readonly delayMs: number;
+}
+
+export interface NamespaceStateEvent {
+  readonly state: NamespaceState;
+  /** The MoQT message behind the change. */
+  readonly detail: string;
+}
+
+export interface TrackUnsubscribedEvent {
+  readonly trackName: string;
+  readonly reason: string;
+}
+
+export interface TrackSubscribeFailedEvent {
+  readonly trackName: string;
+  readonly mediaType: 'video' | 'audio';
+  readonly errorCode: bigint;
+  readonly reason: string;
+}
+
 export interface ErrorEvent {
   readonly severity: 'fatal' | 'recoverable';
   readonly code: number;
@@ -104,4 +216,32 @@ export interface ErrorEvent {
 
 export interface StatechangeEvent {
   readonly state: PlayerState;
+}
+
+export interface ViewChangedEvent {
+  readonly fromView: number | undefined;
+  /** Undefined for a program without altGroups. */
+  readonly toView: number | undefined;
+  /** Track of the new view now playing. */
+  readonly trackName: string;
+}
+
+export interface ProgramChangedEvent {
+  readonly fromProgram: number | undefined;
+  readonly toProgram: number;
+}
+
+export interface AudioTrackChangedEvent {
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  /** Catalog `lang` of the new track, when it has one. */
+  readonly lang: string | undefined;
+  readonly reason: string;
+}
+
+export interface AudioTrackSwitchFailedEvent {
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  readonly reason: string;
+  readonly error: Error;
 }

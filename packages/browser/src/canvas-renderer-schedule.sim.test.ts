@@ -13,7 +13,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { CanvasRenderer } from './canvas-renderer.js';
-import type { ClockSource } from '@moqt/playback';
+import type { ClockSource } from '@openmoq/playback';
 
 class SimClock implements ClockSource {
   private nowUs = 0;
@@ -76,5 +76,40 @@ describe('CanvasRenderer — reports the queued schedule', () => {
     renderer.renderTick(clock.now());
 
     expect(scheduled).toEqual([1_000_000, 1_250_000]);
+  });
+});
+
+describe('CanvasRenderer — follows the frame size', () => {
+  it('resizes the canvas to each frame\'s display size and draws to fill it', () => {
+    const clock = new SimClock();
+    const canvas = { width: 1280, height: 720 };
+    const draws: number[][] = [];
+    const ctx = { drawImage: (_f: unknown, ...r: number[]) => { draws.push(r); }, clearRect() {}, canvas };
+    const renderer = new CanvasRenderer({ getContext: () => ctx } as unknown as HTMLCanvasElement, { clock });
+    const sized = (ts: number, w: number, h: number) => ({ timestamp: ts, displayWidth: w, displayHeight: h, close() {} });
+
+    renderer.enqueue(sized(0, 1280, 720), 0);
+    renderer.renderTick(0);
+    expect(canvas).toEqual({ width: 1280, height: 720 });
+
+    // A portrait view replaces the landscape one.
+    renderer.enqueue(sized(33_333, 720, 1280), 33_333);
+    clock.set(33_333);
+    renderer.renderTick(33_333);
+    expect(canvas).toEqual({ width: 720, height: 1280 });
+    expect(draws.at(-1)).toEqual([0, 0, 720, 1280]);
+  });
+
+  it('leaves a caller-sized canvas alone with followFrameSize: false', () => {
+    const clock = new SimClock();
+    const canvas = { width: 640, height: 360 };
+    const draws: number[][] = [];
+    const ctx = { drawImage: (_f: unknown, ...r: number[]) => { draws.push(r); }, clearRect() {}, canvas };
+    const renderer = new CanvasRenderer({ getContext: () => ctx } as unknown as HTMLCanvasElement,
+      { clock, followFrameSize: false });
+    renderer.enqueue({ timestamp: 0, displayWidth: 720, displayHeight: 1280, close() {} }, 0);
+    renderer.renderTick(0);
+    expect(canvas).toEqual({ width: 640, height: 360 });
+    expect(draws.at(-1)).toEqual([0, 0, 640, 360]);
   });
 });

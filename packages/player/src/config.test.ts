@@ -12,6 +12,33 @@ function minConfig(overrides?: Partial<MoqtPlayerConfig>): MoqtPlayerConfig {
   return { url: 'https://relay.example.com/moq', namespace: 'live', ...overrides };
 }
 
+describe('video altGroup configuration', () => {
+  it.each([0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid group ID %s', (videoAltGroup) => {
+    expect(() => validateConfig(minConfig({ videoAltGroup }))).toThrow('videoAltGroup');
+  });
+
+  it('accepts zero and leaves the default unset', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0 }))).not.toThrow();
+    expect((DEFAULT_PLAYER_CONFIG as Partial<MoqtPlayerConfig>).videoAltGroup).toBeUndefined();
+  });
+
+  it('accepts negative integer group labels permitted by MSF', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: -1 }))).not.toThrow();
+  });
+
+  it('rejects the catalog-free known-video fast path when a catalog group must be selected', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0, knownTracks: {
+      video: { name: 'v', codec: 'avc1.640028' },
+    } }))).toThrow('knownTracks');
+  });
+
+  it('also rejects the known-audio fast path rather than silently ignoring a requested video group', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0, knownTracks: {
+      audio: { name: 'a', codec: 'opus', samplerate: 48000, channels: 2 },
+    } }))).toThrow('knownTracks');
+  });
+});
+
 // ─── DEFAULT_PLAYER_CONFIG shape ─────────────────────────────────────
 
 describe('DEFAULT_PLAYER_CONFIG', () => {
@@ -37,6 +64,7 @@ describe('DEFAULT_PLAYER_CONFIG', () => {
     expect(DEFAULT_PLAYER_CONFIG.maxDecodeErrors).toBe(10);
     expect(DEFAULT_PLAYER_CONFIG.gapEscalationWindowMs).toBe(10_000);
     expect(DEFAULT_PLAYER_CONFIG.cmafBootstrapTimeoutMs).toBe(10_000);
+    expect(DEFAULT_PLAYER_CONFIG.cmafFirstFrameMaxWaitMs).toBe(60_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessTimeoutMs).toBe(10_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessResetProbeMs).toBe(2_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessMaxRestarts).toBe(3);
@@ -124,6 +152,10 @@ describe('validateConfig', () => {
 
   it('rejects negative cmafBootstrapTimeoutMs', () => {
     expect(() => validateConfig(minConfig({ cmafBootstrapTimeoutMs: -1 }))).toThrow(RangeError);
+  });
+
+  it.each([NaN, Infinity])('rejects non-finite cmafFirstFrameMaxWaitMs: %s', (value) => {
+    expect(() => validateConfig(minConfig({ cmafFirstFrameMaxWaitMs: value }))).toThrow(RangeError);
   });
 
   // ── warm start (joining FETCH) ──
@@ -294,6 +326,22 @@ describe('validateConfig', () => {
 
   it('accepts targetLatencyMs > 0', () => {
     expect(() => validateConfig(minConfig({ targetLatencyMs: 1000 }))).not.toThrow();
+  });
+
+  // ── renderCushionFloorMs / renderCushionMaxMs ──
+
+  it('rejects renderCushionFloorMs <= 0 and renderCushionMaxMs <= 0', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 0 }))).toThrow(RangeError);
+    expect(() => validateConfig(minConfig({ renderCushionMaxMs: -1 }))).toThrow(RangeError);
+  });
+
+  it('rejects renderCushionMaxMs below renderCushionFloorMs', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 300, renderCushionMaxMs: 200 }))).toThrow(RangeError);
+  });
+
+  it('accepts a render cushion floor at or below its max', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 50 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 400 }))).not.toThrow();
   });
 
   // ── deliveryTimeoutMs ──

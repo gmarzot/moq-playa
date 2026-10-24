@@ -40,7 +40,7 @@ import {
   createControlCodec,
   writeVarint,
   varintEncodingLength,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import type {
   ServerSetup,
   Goaway,
@@ -58,7 +58,7 @@ import type {
   NamespaceDone,
   Subscribe,
   PublishDone,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 
 // ─── Mock WebTransport factory ──────────────────────────────────────
 
@@ -564,7 +564,7 @@ describe('MoqtConnection', () => {
       expect(mock.controlWritten.length).toBeGreaterThan(0);
       const { message } = decodeControlMessage(mock.controlWritten[0]!, 0);
       expect(message.type).toBe('CLIENT_SETUP');
-      const clientSetup = message as import('@moqt/transport').ClientSetup;
+      const clientSetup = message as import('@openmoq/transport').ClientSetup;
 
       // PATH (0x01) MUST NOT appear in the parameters
       expect(clientSetup.parameters.has(varint(SetupParam.PATH))).toBe(false);
@@ -585,7 +585,7 @@ describe('MoqtConnection', () => {
 
       // Decode the CLIENT_SETUP that was sent on the wire
       const { message } = decodeControlMessage(mock.controlWritten[0]!, 0);
-      const clientSetup = message as import('@moqt/transport').ClientSetup;
+      const clientSetup = message as import('@openmoq/transport').ClientSetup;
 
       const authority = clientSetup.parameters.get(varint(SetupParam.AUTHORITY))?.[0];
       expect(new TextDecoder().decode(authority as Uint8Array)).toBe('example.com');
@@ -1643,7 +1643,7 @@ describe('MoqtConnection', () => {
       expect(nsSm!.state).toBe('terminated');
     });
 
-    it('routes NAMESPACE_DONE and terminates namespace subscription (§6.1)', async () => {
+    it('routes NAMESPACE_DONE as a per-suffix withdrawal; the subscription stays active (§10.17)', async () => {
       const mock = createMockTransport();
       const adapter = await connectAdapter(mock);
 
@@ -1674,7 +1674,8 @@ describe('MoqtConnection', () => {
       await deepFlush();
 
       const nsSm = adapter.session.getNamespaceSubscription(requestId);
-      expect(nsSm!.state).toBe('terminated');
+      expect(nsSm!.state).toBe('active');
+      expect(nsSm!.discoveredNamespaces.length).toBe(0);
     });
 
     it('closes session on unexpected message type on namespace stream', async () => {
@@ -1915,9 +1916,9 @@ describe('MoqtConnection', () => {
       // controlWritten: [0]=CLIENT_SETUP, [1]=SUBSCRIBE, [2]=FETCH
       const decoded = decodeControlMessage(mock.controlWritten[2]!, 0);
       expect(decoded.message.type).toBe('FETCH');
-      const f = (decoded.message as import('@moqt/transport').Fetch).fetch;
+      const f = (decoded.message as import('@openmoq/transport').Fetch).fetch;
       expect(f.fetchType).toBe(0x2);
-      const jf = f as import('@moqt/transport').JoiningFetch;
+      const jf = f as import('@openmoq/transport').JoiningFetch;
       expect(jf.joiningRequestId).toBe(subReqId);
       expect(jf.joiningStart).toBe(1n);
     });
@@ -4856,15 +4857,15 @@ describe('MoqtConnection draft-14', () => {
         await flush();
 
         const internals = adapter as unknown as {
-          abortPublisherStreamsForRequest(requestId: bigint): Promise<boolean>;
+          abortPublisherStreamsForRequest(requestId: bigint): Promise<true | string>;
           outgoingStreams: Map<bigint, unknown>;
           openSubgroupsByRequest: Map<bigint, Set<bigint>>;
         };
         const start = Date.now();
-        const allReset = await internals.abortPublisherStreamsForRequest(1n);
+        const outcome = await internals.abortPublisherStreamsForRequest(1n);
         expect(Date.now() - start).toBeLessThan(4000);
         // The reset could NOT be proven — the caller must not send PUBLISH_DONE.
-        expect(allReset).toBe(false);
+        expect(outcome).toMatch(/aborts still queued after \d+ms/);
         // Ownership transfer still happened synchronously.
         expect(internals.outgoingStreams.has(streamId)).toBe(false);
         expect(internals.openSubgroupsByRequest.has(1n)).toBe(false);

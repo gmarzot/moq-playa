@@ -15,23 +15,47 @@
  * @module
  */
 
-import type { MoqtObject } from '@moqt/transport';
-import type { LocHeaders, LocHeaderOptions } from '@moqt/loc';
-import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
-import type { DraftVersion } from '@moqt/transport';
+import type { MoqtObject } from '@openmoq/transport';
+import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
+import { parseLocHeaders, locWireProfileForDraft, stripLocPrivateProperties } from '@openmoq/loc';
+import type { DraftVersion } from '@openmoq/transport';
+import type { CaptureTimes, TimestampTrackResult } from './capture-time.js';
+import {
+  propertyCaptureUs, readLocmafPrftUs, readObjectTimestamp, readPrftUs, undeclaredTimestampError,
+} from './capture-time.js';
 
 /**
  * Packaging type for container format dispatch.
  * @see draft-ietf-moq-msf-00 §5.1.12 Table 3
  * @see draft-ietf-moq-msf-00 §8 (eventtimeline)
+ * @see draft-einarsson-moq-locmaf-01 §5 (locmaf)
  */
-export type TrackPackaging = 'loc' | 'cmaf' | 'init' | 'mediatimeline' | 'eventtimeline';
+export type TrackPackaging = 'loc' | 'cmaf' | 'locmaf' | 'init' | 'mediatimeline' | 'eventtimeline';
 
 /** Track registration info. */
 interface TrackInfo {
   readonly trackName: string;
   readonly mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
   readonly packaging: TrackPackaging;
+  readonly context?: TrackContext;
+}
+
+/** What a track declares outside its objects. */
+export interface TrackContext {
+  /** Units of the track's object Timestamps (TIMESCALE track property). */
+  readonly timescale?: bigint;
+  /** LOC decoder configuration from the catalog's initialization data (MSF §5.1.7). */
+  readonly initConfig?: Uint8Array;
+  /** MOQT timestamp Track Properties, or why they are malformed. */
+  readonly timestamps?: TimestampTrackResult;
+}
+
+interface PendingLocmafTransform {
+  readonly alias: bigint;
+  readonly groupId: bigint;
+  readonly source: unknown;
+  readonly bytes: number;
+  valid: boolean;
 }
 
 /**
@@ -40,6 +64,14 @@ interface TrackInfo {
 export class SubscriptionManager {
   /** Map of track alias (bigint) → track info. */
   private readonly tracks = new Map<bigint, TrackInfo>();
+  /** LOC tracks whose objects carry their own decoder configuration. */
+  private readonly objectConfigSeen = new Set<bigint>();
+  /** Tracks whose timestamp properties proved malformed; ignored until re-registered. */
+  private readonly timingErrors = new Map<bigint, string>();
+  private readonly pendingLocmafTransforms = new Set<PendingLocmafTransform>();
+  private pendingLocmafTransformBytes = 0;
+  private static readonly MAX_LOCMAF_TRANSFORMS = 256;
+  private static readonly MAX_LOCMAF_TRANSFORM_BYTES = 8 * 1024 * 1024;
 
   /**
    * Object transform: applied to every MoqtObject before routing.
@@ -71,6 +103,13 @@ export class SubscriptionManager {
   extensionParser: ((extensions: Uint8Array | undefined) => LocHeaders) | null = null;
 
   /**
+   * LOC payloads arrive as the bare frame, without the leading Private
+   * Properties block (compat `loc-bare`).
+   * @see draft-ietf-moq-loc-04 §2.2
+   */
+  locBare = false;
+
+  /**
    * Callback: LOC object routed to pipeline.
    * Called with (mediaType, trackName, object, parsedHeaders).
    * @see draft-ietf-moq-loc-01 §2.3
@@ -86,7 +125,10 @@ export class SubscriptionManager {
 
   /**
    * Callback: CMAF object routed to MediaSource adapter.
-   * Called with (mediaType, trackName, object). No LOC header parsing.
+   * Called with (mediaType, trackName, object, parsedHeaders). The payload
+   * carries its own timing; the headers carry MOQ object properties, which
+   * are transport-level annotations independent of payload packaging — a
+   * capture timestamp on a CMSF object measures wire latency.
    * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging)
    */
   onCmafObject:
@@ -94,6 +136,23 @@ export class SubscriptionManager {
         mediaType: 'video' | 'audio',
         trackName: string,
         obj: MoqtObject,
+        headers: LocHeaders,
+      ) => void)
+    | null = null;
+
+  /**
+   * Callback: LOCMAF object (a compacted CMAF chunk) for reconstruction.
+   * Called with (mediaType, trackName, object, headers) after objectTransform.
+   * LOCMAF carries its fields in the object payload; the object properties are
+   * transport annotations only, as for CMAF.
+   * @see draft-einarsson-moq-locmaf-01 §7 (Object Encoding)
+   */
+  onLocmafObject:
+    | ((
+        mediaType: 'video' | 'audio' | 'eventtimeline',
+        trackName: string,
+        obj: MoqtObject,
+        headers: LocHeaders,
       ) => void)
     | null = null;
 
@@ -184,8 +243,10 @@ export class SubscriptionManager {
     trackName: string,
     mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline',
     packaging: TrackPackaging = 'loc',
+    context?: TrackContext,
   ): void {
-    this.tracks.set(trackAlias, { trackName, mediaType, packaging });
+    this.unregisterTrack(trackAlias);
+    this.tracks.set(trackAlias, { trackName, mediaType, packaging, ...(context ? { context } : {}) });
   }
 
   /**
@@ -194,6 +255,33 @@ export class SubscriptionManager {
    */
   unregisterTrack(trackAlias: bigint): void {
     this.tracks.delete(trackAlias);
+    this.objectConfigSeen.delete(trackAlias);
+    this.timingErrors.delete(trackAlias);
+    for (const pending of this.pendingLocmafTransforms) {
+      if (pending.alias === trackAlias) pending.valid = false;
+    }
+  }
+
+  /** In-flight work received before a reset cannot re-anchor its group afterwards. */
+  invalidateLocmafGroup(alias: bigint, groupId: bigint, source?: unknown): void {
+    for (const pending of this.pendingLocmafTransforms) {
+      if (pending.alias === alias && pending.groupId === groupId && pending.source === source) {
+        pending.valid = false;
+      }
+    }
+  }
+
+  clear(): void {
+    this.tracks.clear();
+    this.objectConfigSeen.clear();
+    this.timingErrors.clear();
+    for (const pending of this.pendingLocmafTransforms) pending.valid = false;
+  }
+
+  private retireLocmafTransform(pending: PendingLocmafTransform): void {
+    pending.valid = false;
+    // Invalid work still owns its input until the application transform settles.
+    if (this.pendingLocmafTransforms.delete(pending)) this.pendingLocmafTransformBytes -= pending.bytes;
   }
 
   /**
@@ -205,13 +293,59 @@ export class SubscriptionManager {
   }
 
   /**
+   * Capture times for a routed object, as `media_object` event fields.
+   * Malformed timestamp properties are reported and ignored; playout never uses them.
+   */
+  captureTimeFields(obj: MoqtObject, headers: LocHeaders): { captureTimes?: CaptureTimes; timingError?: string } {
+    const alias = BigInt(obj.trackAlias);
+    const info = this.tracks.get(alias);
+    if (!info || obj.kind !== 'data') return {};
+
+    let property: bigint | undefined;
+    let error = this.timingErrors.get(alias);
+    if (error === undefined) {
+      const declared = info.context?.timestamps;
+      if (!declared) {
+        error = undeclaredTimestampError(headers.unknown);
+      } else if ('error' in declared) {
+        error = declared.error;
+      } else {
+        const read = readObjectTimestamp(obj.properties ?? obj.extensions,
+          locWireProfileForDraft(this.draftVersion ?? 18));
+        const r = read.error !== undefined ? read
+          : propertyCaptureUs(declared, BigInt(obj.groupId), BigInt(obj.objectId), read.value);
+        error = r.error;
+        property = r.value;
+      }
+      if (error !== undefined) this.timingErrors.set(alias, error);
+    }
+
+    // A group's first object carries the prft.
+    const first = BigInt(obj.objectId) === 0n;
+    const prft = !first ? undefined
+      : info.packaging === 'cmaf' ? readPrftUs(obj.payload)
+        : info.packaging === 'locmaf' ? readLocmafPrftUs(obj.payload) : undefined;
+    const captureTimes: CaptureTimes = {
+      ...(property !== undefined ? { property: Number(property) } : {}),
+      ...(headers.timestampIsWallClock && headers.captureTimestamp !== undefined
+        ? { loc: Number(headers.captureTimestamp) } : {}),
+      ...(prft !== undefined ? { prft: Number(prft) } : {}),
+    };
+    return {
+      ...(Object.keys(captureTimes).length > 0 ? { captureTimes } : {}),
+      ...(error !== undefined ? { timingError: error } : {}),
+    };
+  }
+
+  /**
    * Route a MoqtObject to the correct pipeline.
    *
    * 1. Look up the track alias
    * 2. Apply objectTransform (E2EE insertion point)
    * 3. Branch on packaging:
    *    - LOC: Parse LOC headers → onObject callback
-   *    - CMAF: Skip header parsing → onCmafObject callback
+   *    - CMAF: Parse properties leniently → onCmafObject callback
+   *    - LOCMAF: Parse properties leniently → onLocmafObject callback
    *    - mediatimeline: raw JSON → onTimelineObject callback
    *    - eventtimeline: raw JSON → onEventTimelineObject callback
    *
@@ -237,6 +371,7 @@ export class SubscriptionManager {
     // malformed old-session object recovers against ITS session, not the current.
     const draft = sourceDraft ?? this.draftVersion;
     const source = sourceConnection;
+    let pendingTransform: PendingLocmafTransform | undefined;
 
     try {
       // §7: Mediatimeline objects bypass E2EE transform — metadata is not encrypted.
@@ -270,36 +405,81 @@ export class SubscriptionManager {
       // Supports both sync and async transforms (crypto.subtle.decrypt is async)
       let transformed: MoqtObject | null = obj;
       if (this.objectTransform) {
+        if (info.packaging === 'locmaf') {
+          const bytes = obj.kind === 'data' ? obj.payload.byteLength + (obj.extensions?.byteLength ?? 0) : 0;
+          if (this.pendingLocmafTransforms.size >= SubscriptionManager.MAX_LOCMAF_TRANSFORMS
+              || this.pendingLocmafTransformBytes + bytes > SubscriptionManager.MAX_LOCMAF_TRANSFORM_BYTES) {
+            throw new Error('LOCMAF object transform capacity exceeded');
+          }
+          pendingTransform = { alias, groupId: BigInt(obj.groupId), source, bytes, valid: true };
+          this.pendingLocmafTransforms.add(pendingTransform);
+          this.pendingLocmafTransformBytes += bytes;
+        }
         const result = this.objectTransform(obj);
         transformed = result instanceof Promise ? await result : result;
+        if (pendingTransform && !pendingTransform.valid) return;
         if (!transformed) return; // Transform dropped the object
       }
 
-      if (info.packaging === 'cmaf') {
-        // CMAF path: skip LOC header parsing, route directly to MediaSource
-        // §3.3: payload contains moof+mdat pairs
-        this.onCmafObject?.(mediaType, info.trackName, transformed);
+      // Object properties ride LOC and CMAF: LOC needs them to decode,
+      // CMAF carries its own payload timing but still reports transport
+      // annotations (capture timestamp, frame marking) through them.
+      const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
+      // Draft-aware property wire profile: draft-14 absolute QUIC-varint,
+      // draft-16 delta QUIC-varint, draft-18 delta vi64. draft-18's vi64 codec
+      // diverges from the QUIC varint at value 64, so it MUST be selected
+      // explicitly — deltaEncoded alone cannot express it. Unset draftVersion
+      // keeps today's draft-16 default.
+      // @see draft-ietf-moq-transport-14 §1.4.2
+      // @see draft-ietf-moq-transport-16 §1.4.2
+      // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
+      // A declared track timescale makes object Timestamps media time (LOC-04 §2.3.1.2).
+      const timescale = info.context?.timescale;
+      const opts: LocHeaderOptions | undefined =
+        draft !== undefined || timescale !== undefined
+          ? {
+            ...(draft !== undefined ? { wireProfile: locWireProfileForDraft(draft) } : {}),
+            ...(timescale !== undefined ? { track: { timescale } } : {}),
+          }
+          : undefined;
+      const parse = this.extensionParser
+        ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
+
+      if (info.packaging === 'cmaf' || info.packaging === 'locmaf') {
+        // CMAF and LOCMAF carry their own timing: a malformed property block
+        // loses the annotations, not the track.
+        let headers: ReturnType<typeof parse>;
+        try { headers = parse(extensions); } catch { headers = {}; }
+        if (info.packaging === 'locmaf') {
+          // An event-only track (§14) is registered as 'eventtimeline' and takes
+          // the same path; the player dispatches on the media type.
+          // @see draft-einarsson-moq-locmaf-01 §7, §15
+          this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, headers);
+        } else {
+          // §3.3: payload contains moof+mdat pairs — routed to MediaSource
+          // rather than the decode pipeline.
+          this.onCmafObject?.(mediaType, info.trackName, transformed, headers);
+        }
       } else {
-        // LOC path: parse extension headers and route to PlaybackPipeline
-        const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
-        // Draft-aware property wire profile: draft-14 absolute QUIC-varint,
-        // draft-16 delta QUIC-varint, draft-18 delta vi64. draft-18's vi64 codec
-        // diverges from the QUIC varint at value 64, so it MUST be selected
-        // explicitly — deltaEncoded alone cannot express it. Unset draftVersion
-        // keeps today's draft-16 default.
-        // @see draft-ietf-moq-transport-14 §1.4.2
-        // @see draft-ietf-moq-transport-16 §1.4.2
-        // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
-        const opts: LocHeaderOptions | undefined =
-          draft !== undefined
-            ? { wireProfile: locWireProfileForDraft(draft) }
-            : undefined;
-        const parse = this.extensionParser
-          ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
-        const headers = parse(extensions);
+        let headers = parse(extensions);
+        // The catalog's decoder configuration stands in until objects carry their own,
+        // so two differing configurations never alternate.
+        const initConfig = info.context?.initConfig;
+        if (initConfig) {
+          const key = mediaType === 'video' ? 'videoConfig' : 'audioConfig';
+          if (headers[key]) this.objectConfigSeen.add(alias);
+          else if (!this.objectConfigSeen.has(alias)) headers = { ...headers, [key]: initConfig };
+        }
+        // The payload is the Private Properties block, then the frame (LOC-04 §2.2).
+        // An empty payload carries neither; a custom extensionParser means not LOC.
+        if (!this.locBare && !this.extensionParser
+            && transformed.kind === 'data' && transformed.payload.byteLength > 0) {
+          transformed = { ...transformed, payload: stripLocPrivateProperties(transformed.payload) };
+        }
         this.onObject?.(mediaType, info.trackName, transformed, headers);
       }
     } catch (error) {
+      if (pendingTransform && !pendingTransform.valid) return;
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
       // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(
@@ -309,7 +489,8 @@ export class SubscriptionManager {
         error instanceof Error ? error : new Error(String(error)),
         source,
       );
+    } finally {
+      if (pendingTransform) this.retireLocmafTransform(pendingTransform);
     }
   }
 }
-

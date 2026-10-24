@@ -38,6 +38,17 @@ as group 0; the relay caches it for late joiners. One-time prerequisite: generat
 the relay's cert (`pnpm --filter @moqt/example-node-relay gen-cert`) — the publisher
 pins its hash to connect (`RELAY_CERT` env to override the cert path).
 
+`--pace-media` uses each track's parsed CMAF decode timestamps and final chunk
+duration instead of `PACE_MS`. It rejects fixtures without usable single-track,
+self-contained timing before publishing. Audio and video may have different
+fragment durations; looping tracks are scheduled independently from one monotonic
+start time. The browser acceptance harness uses this mode.
+
+Each CMAF object uses its own subgroup stream, followed by FIN, as required by
+MSF-00/01 section 6 (and inherited by CMSF-01 section 2). Within a group, subgroup
+and object IDs both run from zero upward; only the final stream has END_OF_GROUP.
+Catalog versions, payloads, and group/object numbering are unchanged.
+
 ## 3. Publish in loop mode (endless live demo)
 
 `--loop` publishes the catalog once, establishes each media track once, then keeps
@@ -56,7 +67,7 @@ pnpm --filter @moqt/example-node-publisher publish-fixture --loop https://127.0.
 
 ## 3b. Modern CMSF-01 / MSF-01 catalog (init-by-reference) + live delta
 
-By default the publisher emits an **MSF-00** catalog (numeric `version: 1`, each
+By default CMAF publication emits an **MSF-00** catalog (numeric `version: 1`, each
 init segment inline as base64 `initData`). `--catalog-format cmsf-01` (alias
 `--msf01`) instead emits the modern standards shape Playa now consumes end-to-end:
 
@@ -78,6 +89,21 @@ op-array delta path. It is a catalog-level demo: no media is published for the c
 
 ```bash
 pnpm --filter @moqt/example-node-publisher publish-fixture --loop --catalog-format cmsf-01 --emit-delta \
+  https://127.0.0.1:4433/moq fixtures/test-pattern
+```
+
+`--packaging locmaf` (alias `--locmaf`) sends every media chunk as a **LOCMAF**
+Object (draft-einarsson-moq-locmaf-01) instead of raw CMAF: same groups and object
+IDs, a full header on each group's first object, deltas after it, and the catalog
+signals `packaging: "locmaf"` with `locmafVersion: "0.3"`. All objects in a
+LOCMAF group share subgroup zero and one ordered stream, followed by FIN
+(LOCMAF section 3). This differs from CMAF's one-stream-per-object mapping.
+LOCMAF defaults to the CMSF-01 catalog with root `initDataList` and per-track
+`initRef` required by section 6; an explicit `--catalog-format msf-00` is rejected
+before connecting. It needs a real fixture (the synthetic one has no CMAF Header).
+
+```bash
+pnpm --filter @moqt/example-node-publisher publish-fixture --loop --catalog-format cmsf-01 --packaging locmaf \
   https://127.0.0.1:4433/moq fixtures/test-pattern
 ```
 
@@ -149,7 +175,7 @@ Troubleshooting:
 publishes a catalog + 5 **synthetic** tracks (fake bytes, same shapes/IDs as a real
 fixture — not decodable by MSE), then verifies the parsed catalog and every chunk's
 payload + group/object IDs through the relay. Useful as a fast end-to-end protocol
-check with no FFmpeg involved. `probe` prints which `@moqt/*` capabilities the
+check with no FFmpeg involved. `probe` prints which `@openmoq/*` capabilities the
 publisher uses; `typecheck` runs `tsc --noEmit`.
 
 ## Limitations / development notes

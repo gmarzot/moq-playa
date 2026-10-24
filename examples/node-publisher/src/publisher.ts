@@ -3,22 +3,24 @@
  *
  *   1. catalog track first — `buildCatalog()` with each track's metadata and base64
  *      initData; one object (group 0, object 0).
- *   2. each media track — one PUBLISH, then group 0 as a single subgroup with one
- *      object per chunk (objectId 0..N-1, `firstObject: true` on open). This is the
- *      same group/object scheme the future real-fixture path will use (group =
- *      fragment sequence; the 2s fixture is one group).
+ *   2. each media track — one PUBLISH, then one object per chunk. CMAF uses one
+ *      subgroup per object (MSF section 6); LOCMAF uses one per group (LOCMAF section 3).
  *
  * Pacing: `paceMs > 0` sleeps between chunks (timestamp-style pacing for a live
  * demo); the smoke uses 0 (as fast as possible).
  */
-import { buildCatalog, CATALOG_TRACK_NAME } from '@moqt/msf';
-import type { MoqtConnection } from '@moqt/webtransport';
+import { buildCatalog, CATALOG_TRACK_NAME } from '@openmoq/msf';
+import { LOCMAF_VERSION } from '@openmoq/locmaf';
+import type { MoqtConnection } from '@openmoq/webtransport';
 import type { LoadedFixture, LoadedTrack } from './fixture.js';
-import { analyzeLoopSpan, rebaseTfdtCopy } from './cmaf-loop-rebase.js';
+import { TrackObjectSource, type MediaPackaging } from './track-packager.js';
+import { analyzeCmafTimeline, type CmafTimeline } from './cmaf-loop-rebase.js';
+
+export type { MediaPackaging } from './track-packager.js';
 
 /**
  * Catalog wire shape to emit:
- *  - `msf-00`  (default): numeric `version: 1`, inline per-track base64 `initData`.
+ *  - `msf-00` (CMAF default): numeric `version: 1`, inline per-track base64 `initData`.
  *  - `cmsf-01`: string `version: "1"`, a root `initDataList`, and per-track
  *    `initRef` (the modern MSF-01/CMSF-01 init-by-reference form Playa resolves).
  */
@@ -48,7 +50,7 @@ function waitForPublishAccept(conn: MoqtConnection, requestId: bigint, timeoutMs
 }
 
 /** PUBLISH a track (request + acceptance) ONCE; group sends reuse the alias. */
-async function establishTrack(
+export async function establishTrack(
   conn: MoqtConnection,
   namespace: readonly string[],
   track: string,
@@ -60,11 +62,9 @@ async function establishTrack(
 }
 
 /**
- * Send `objects` as ONE group on an established track: a single subgroup
- * (groupId, subgroup 0) carrying objects 0..N-1, then FIN. `firstObject` is set on
- * the open because object 0 genuinely is the first object ever published in THIS
- * subgroup — FIRST_OBJECT is per-subgroup (§11.4.2), and every (group, subgroup 0)
- * here is a fresh subgroup, including each loop iteration's new group.
+ * Send one group. LOCMAF keeps delta-dependent objects on one ordered stream;
+ * CMAF uses one stream per object (MSF section 6).
+ * FIRST_OBJECT describes the first object in each subgroup, not object ID zero.
  */
 async function sendGroup(
   conn: MoqtConnection,
@@ -72,17 +72,32 @@ async function sendGroup(
   groupId: bigint,
   objects: readonly Uint8Array[],
   paceMs: number,
+  opts: { timeline?: CmafTimeline; startMs?: number; packaging?: MediaPackaging } = {},
 ): Promise<void> {
-  const sid = await conn.openSubgroup(alias, groupId, 0n, { publisherPriority: 128, firstObject: true });
+  const waitUntil = async (target: number) => {
+    const delay = target - performance.now();
+    if (delay > 0) await sleep(delay);
+  };
+  const sharedStream = opts.packaging === 'locmaf' && objects.length > 0
+    ? await conn.openSubgroup(alias, groupId, 0n, {
+        publisherPriority: 128, firstObject: true, endOfGroup: true,
+      })
+    : null;
   for (let i = 0; i < objects.length; i++) {
+    if (opts.timeline) await waitUntil(opts.startMs! + opts.timeline.offsetsMs[i]!);
+    const sid = sharedStream ?? await conn.openSubgroup(alias, groupId, BigInt(i), {
+      publisherPriority: 128, firstObject: true, endOfGroup: i === objects.length - 1,
+    });
     await conn.sendObject(sid, BigInt(i), objects[i]!);
-    if (paceMs > 0 && i < objects.length - 1) await sleep(paceMs);
+    if (sharedStream === null) await conn.closeSubgroup(sid);
+    if (!opts.timeline && paceMs > 0 && i < objects.length - 1) await sleep(paceMs);
   }
-  await conn.closeSubgroup(sid);
+  if (sharedStream !== null) await conn.closeSubgroup(sharedStream);
+  if (opts.timeline) await waitUntil(opts.startMs! + opts.timeline.durationMs);
 }
 
 /** PUBLISH one track and send `objects` as group 0 / objects 0..N-1 (one-shot). */
-async function publishObjects(
+export async function publishObjects(
   conn: MoqtConnection,
   namespace: readonly string[],
   track: string,
@@ -99,16 +114,32 @@ async function publishObjects(
  * Map fixture metadata → MSF catalog bytes. In `msf-00` mode each init segment
  * rides inline as base64 `initData`; in `cmsf-01` mode the init segments become a
  * root `initDataList` and tracks reference them by `initRef` (no per-track inline
- * init). Both are built with the same @moqt/msf `buildCatalog`.
+ * init). Both are built with the same @openmoq/msf `buildCatalog`.
+ *
+ * `packaging` `locmaf` signals every track as `packaging: "locmaf"` with
+ * `locmafVersion` (draft-einarsson-moq-locmaf-01 section 5); the init is
+ * referenced through the CMSF initDataList/initRef form required by section 6.
  */
-export function buildFixtureCatalog(fixture: LoadedFixture, format: CatalogFormat = 'msf-00'): Uint8Array {
+export function buildFixtureCatalog(
+  fixture: LoadedFixture,
+  format: CatalogFormat = 'msf-00',
+  packaging: MediaPackaging = 'cmaf',
+): Uint8Array {
+  if (packaging === 'locmaf' && format !== 'cmsf-01') {
+    throw new Error('LOCMAF publication requires a CMSF-01 catalog with initDataList/initRef');
+  }
   const common = (t: LoadedTrack) => ({
     name: t.meta.name,
-    packaging: t.meta.packaging,
+    ...(packaging === 'locmaf'
+      ? { packaging: 'locmaf' as const, locmafVersion: LOCMAF_VERSION }
+      : { packaging: t.meta.packaging }),
     isLive: true as const,
     role: t.meta.role,
     codec: t.meta.codec,
     renderGroup: fixture.manifest.renderGroup,
+    ...(t.meta.altGroup !== undefined ? { altGroup: t.meta.altGroup } : {}),
+    ...(t.meta.lang !== undefined ? { lang: t.meta.lang } : {}),
+    ...(t.meta.label !== undefined ? { label: t.meta.label } : {}),
     ...(t.meta.width !== undefined ? { width: t.meta.width } : {}),
     ...(t.meta.height !== undefined ? { height: t.meta.height } : {}),
     ...(t.meta.framerate !== undefined ? { framerate: t.meta.framerate } : {}),
@@ -158,23 +189,34 @@ export function buildFixtureDelta(fixture: LoadedFixture): Uint8Array | null {
  * track's chunks as a NEW group (groupId 0, 1, 2, …; object IDs 0..N-1 within each
  * group) — never a replay of group 0, so the relay's latest-group cache and the
  * player timeline stay sane. `Infinity` loops until killed.
+ *
+ * `packaging` (default `cmaf`) selects the media Object format for every track;
+ * `locmaf` sends each (rebased) CMAF chunk as one LOCMAF Object with the same
+ * group/object numbering, and fails before anything is published when a track
+ * has no usable CMAF Header.
  */
 export async function publishFixture(
   conn: MoqtConnection,
   fixture: LoadedFixture,
-  opts: { paceMs?: number; loops?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number } = {},
+  opts: { paceMs?: number; paceByMediaTime?: boolean; loops?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number; packaging?: MediaPackaging } = {},
 ): Promise<void> {
   const paceMs = opts.paceMs ?? 0;
   const loops = opts.loops ?? 1;
-  const catalogFormat = opts.catalogFormat ?? 'msf-00';
+  const packaging = opts.packaging ?? 'cmaf';
+  const catalogFormat = opts.catalogFormat ?? (packaging === 'locmaf' ? 'cmsf-01' : 'msf-00');
   const ns = fixture.manifest.namespace;
   const deltaBytes = opts.deltaAfterMs !== undefined ? buildFixtureDelta(fixture) : null;
   if (opts.deltaAfterMs !== undefined && deltaBytes === null) {
     throw new Error('cannot emit catalog delta: fixture has no video track to clone');
   }
 
-  const catalogBytes = buildFixtureCatalog(fixture, catalogFormat);
-  log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks (${catalogFormat})`);
+  // Built before anything is sent: in locmaf mode this rejects a fixture without CMAF Headers.
+  const sources = fixture.tracks.map((t) => new TrackObjectSource(t, packaging));
+  const timelines = opts.paceByMediaTime ? fixture.tracks.map((t) => analyzeCmafTimeline(t.initData, t.chunks)) : null;
+  if (timelines?.some((t) => t === null)) throw new Error('Media-time pacing requires valid CMAF timing for every track');
+
+  const catalogBytes = buildFixtureCatalog(fixture, catalogFormat, packaging);
+  log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks (${catalogFormat}, ${packaging})`);
   await publishObjects(conn, ns, CATALOG_TRACK_NAME, 10n, [catalogBytes], 0);
 
   // Optional live op-array delta: after `deltaAfterMs`, publish a catalog
@@ -188,11 +230,13 @@ export async function publishFixture(
       })()
     : null;
 
-  if (loops === 1) {
-    // One-shot (unchanged behavior): each track established + group 0 sent.
+  if (loops === 1 && !timelines) {
+    // One-shot: each track established and group 0 sent.
     let alias = 11n;
-    for (const t of fixture.tracks) {
-      await publishObjects(conn, ns, t.meta.name, alias++, t.chunks, paceMs);
+    for (const s of sources) {
+      const a = alias++;
+      await establishTrack(conn, ns, s.name, a);
+      await sendGroup(conn, a, 0n, s.objectsForGroup(0), paceMs, { packaging });
     }
     if (deltaTask) await deltaTask; // finite run: don't exit before the delta lands
     log('fixture fully published');
@@ -205,30 +249,37 @@ export async function publishFixture(
   // one endless stream instead of replaying timestamps (which wedges MSE
   // players at the seam — the timeline-overlap dropper discards replays).
   let alias = 11n;
-  const handles: { track: string; alias: bigint; chunks: readonly Uint8Array[]; spanTicks: bigint | null }[] = [];
-  for (const t of fixture.tracks) {
+  const handles: { alias: bigint; source: TrackObjectSource }[] = [];
+  for (const s of sources) {
     const a = alias++;
-    await establishTrack(conn, ns, t.meta.name, a);
-    const spanTicks = t.meta.packaging === 'cmaf' ? analyzeLoopSpan(t.chunks) : null;
-    if (t.meta.packaging === 'cmaf' && spanTicks === null) {
-      log(`NOTE: ${t.meta.name} chunks are not parseable CMAF (synthetic fixture?) — loop will replay timestamps`);
-    } else if (spanTicks !== null) {
-      log(`${t.meta.name}: loop span ${spanTicks} ticks — tfdt rebased per iteration`);
+    await establishTrack(conn, ns, s.name, a);
+    if (s.spanTicks === null) {
+      log(`NOTE: ${s.name} chunks are not parseable CMAF (synthetic fixture?) — loop will replay timestamps`);
+    } else {
+      log(`${s.name}: loop span ${s.spanTicks} ticks — tfdt rebased per iteration`);
     }
-    handles.push({ track: t.meta.name, alias: a, chunks: t.chunks, spanTicks });
+    handles.push({ alias: a, source: s });
   }
   log(`loop mode: ${handles.length} tracks established; sending ${loops === Infinity ? 'endless' : loops} group(s)`);
 
-  for (let g = 0; g < loops; g++) {
-    // Tracks send each group concurrently so one loop iteration ≈ one group duration.
-    await Promise.all(handles.map((h) => {
-      const chunks = (g === 0 || h.spanTicks === null)
-        ? h.chunks
-        // Always rebase from the ORIGINAL bytes — offsets never compound.
-        : h.chunks.map((c) => rebaseTfdtCopy(c, h.spanTicks! * BigInt(g)));
-      return sendGroup(conn, h.alias, BigInt(g), chunks, paceMs);
+  if (timelines) {
+    const startMs = performance.now();
+    log(`media epoch_ms=${Date.now()}`);
+    await Promise.all(handles.map(async (h, index) => {
+      const timeline = timelines[index]!;
+      if (!timeline) throw new Error('Missing track timing');
+      for (let g = 0; g < loops; g++) {
+        await sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), 0, {
+          timeline, startMs: startMs + g * timeline.durationMs,
+          packaging,
+        });
+      }
     }));
-    log(`group ${g} sent on ${handles.length} track(s)`);
+  } else {
+    for (let g = 0; g < loops; g++) {
+      await Promise.all(handles.map((h) => sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), paceMs, { packaging })));
+      log(`group ${g} sent on ${handles.length} track(s)`);
+    }
   }
   if (deltaTask) await deltaTask; // finite loop count: ensure the delta landed
   log('loop publishing finished');

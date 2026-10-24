@@ -1,8 +1,8 @@
 /**
- * @moqt/player — Convenience facade for MOQT playback.
+ * @openmoq/player — Convenience facade for MOQT playback.
  *
- * Wires together the sans-I/O core packages (@moqt/transport,
- * @moqt/webtransport, @moqt/msf, @moqt/loc, @moqt/playback)
+ * Wires together the sans-I/O core packages (@openmoq/transport,
+ * @openmoq/webtransport, @openmoq/msf, @openmoq/loc, @openmoq/playback)
  * into a simple load()/play()/pause()/destroy() API.
  *
  * @see draft-ietf-moq-transport-16 §3 (Session)
@@ -14,7 +14,7 @@
 // ─── Player ──────────────────────────────────────────────────────────
 
 export { MoqtPlayer } from './player.js';
-export type { SubscribeIntent, QualitySwitchIntent } from './player.js';
+export type { SubscribeIntent, QualitySwitchIntent, SubscriptionStatus, VideoTrackInfo, VideoViewInfo, AudioTrackInfo, ProgramInfo } from './player.js';
 
 // ─── Capability Detection ─────────────────────────────────────────────
 
@@ -29,7 +29,9 @@ export type {
   SessionConnectingEvent,
   SessionEstablishedEvent,
   SessionGoawayEvent,
+  RequestGoawayEvent,
   SessionClosedEvent,
+  SessionReconnectingEvent,
   SessionErrorEvent,
   PlayerErrorEvent,
   CatalogRawEvent,
@@ -50,9 +52,16 @@ export type {
   StallEvent,
   GapJumpEvent,
   QualitySwitchedEvent,
+  ViewChangedEvent,
+  AudioTrackChangedEvent,
+  AudioTrackSwitchFailedEvent,
+  ProgramChangedEvent,
   CatchUpChangedEvent,
   StateChangedEvent,
+  NamespaceState,
+  NamespaceStateEvent,
 } from './events.js';
+export type { BootstrapPhase } from './catalog-bootstrap.js';
 
 // ─── Errors ──────────────────────────────────────────────────────────
 
@@ -89,6 +98,9 @@ export type { PlayerStateValue } from './state.js';
 // ─── Config ──────────────────────────────────────────────────────────
 
 export type { MoqtPlayerConfig } from './config.js';
+export type { PlayerAuthorization } from './config.js';
+export { catToken, AuthorizationError } from '@openmoq/webtransport';
+export type { AuthorizationToken, AuthorizationContext, AuthorizationProvider, AuthorizationOperation } from '@openmoq/webtransport';
 export {
   DEFAULT_GAP_TIMEOUT_MS,
   DEFAULT_DRIFT_THRESHOLD_MS,
@@ -100,6 +112,7 @@ export {
 export type {
   KnownTrackConfig,
   ConnectionConfig,
+  PlayerCompat,
   PlaybackTuningConfig,
   LatencyConfig,
   QualityConfig,
@@ -117,6 +130,7 @@ export type {
   VideoDecoderLike,
   AudioDecoderLike,
   VideoRendererLike,
+  VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
 } from './interfaces.js';
@@ -141,9 +155,14 @@ export { CatalogManager } from './catalog-manager.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { QualityController } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
-export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
+export type { QualityControllerConfig, SelectionConstraints, SelectedTracks, VideoView, CatalogProgram } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
+export { pickCaptureTime, parseTimestampTrack, TIMESTAMP_PROPERTY } from './capture-time.js';
+export type { CaptureTimes, CaptureTimeSource, TimestampTrack, TimestampMapping } from './capture-time.js';
+export type { TrackPackaging } from './subscription-manager.js';
+export { isMsePackaging, usesMsePath } from './packaging.js';
+export type { LocmafDecoding } from './packaging.js';
 
 // ─── Watchdog (diagnostics) ─────────────────────────────────────────
 

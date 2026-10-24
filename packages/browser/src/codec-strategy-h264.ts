@@ -96,6 +96,10 @@ export class H264Strategy implements CodecStrategy {
     return `type=${chunkType}|bytes=${data.byteLength}|idr=${inspection.hasKeyframe}|nals=[${nalStr}]`;
   }
 
+  descriptionFromKeyframe(data: Uint8Array): Uint8Array | null {
+    return avccFromParameterSets(data);
+  }
+
   describeConfig(description: Uint8Array | undefined): string {
     if (!description || description.byteLength < 7 || description[0] !== 0x01) {
       return description ? `non-avcc(bytes=${description.byteLength})` : 'none';
@@ -118,6 +122,47 @@ export class H264Strategy implements CodecStrategy {
  *
  * @see ISO/IEC 14496-15 §5.3.3.1.2
  */
+/**
+ * An avcC record with 4-byte lengths, built from the SPS and PPS NAL units in
+ * an Annex B or length-prefixed access unit; null unless it has both.
+ * @see ISO/IEC 14496-15 §5.3.3.1 (AVCDecoderConfigurationRecord)
+ */
+export function avccFromParameterSets(data: Uint8Array): Uint8Array | null {
+  const framed = isValidLengthPrefixed(data, 4) ? data
+    : isAnnexB(data) ? annexBToLengthPrefixed(data, 4) : null;
+  if (!framed) return null;
+  const sps: Uint8Array[] = [];
+  const pps: Uint8Array[] = [];
+  let pos = 0;
+  while (pos + 4 <= framed.byteLength) {
+    const len = ((framed[pos]! << 24) | (framed[pos + 1]! << 16) | (framed[pos + 2]! << 8) | framed[pos + 3]!) >>> 0;
+    pos += 4;
+    if (len === 0 || pos + len > framed.byteLength) return null;
+    const nal = framed.subarray(pos, pos + len);
+    const type = nal[0]! & 0x1F;
+    if (type === NAL_SPS && sps.length < 31) sps.push(nal);
+    else if (type === NAL_PPS && pps.length < 255) pps.push(nal);
+    pos += len;
+  }
+  const first = sps[0];
+  if (!first || first.byteLength < 4 || pps.length === 0) return null;
+  const sets = (list: Uint8Array[]) => list.reduce((n, s) => n + 2 + s.byteLength, 0);
+  const out = new Uint8Array(6 + sets(sps) + 1 + sets(pps));
+  // version 1, profile, constraint flags, level, lengthSizeMinusOne = 3, SPS count.
+  out.set([1, first[1]!, first[2]!, first[3]!, 0xFF, 0xE0 | sps.length]);
+  let w = 6;
+  const put = (s: Uint8Array) => {
+    out[w++] = s.byteLength >> 8;
+    out[w++] = s.byteLength & 0xFF;
+    out.set(s, w);
+    w += s.byteLength;
+  };
+  sps.forEach(put);
+  out[w++] = pps.length;
+  pps.forEach(put);
+  return out;
+}
+
 export function getAvccLengthSize(description: Uint8Array | undefined): number {
   if (!description || description.byteLength < 5 || description[0] !== 0x01) {
     return 4;

@@ -10,6 +10,22 @@
  */
 
 import type { CatalogTrack, CatalogState, RenderGroup, AltGroup, TrackConstraints } from './types.js';
+import { SUPPORTED_LOCMAF_VERSIONS } from './types.js';
+
+/**
+ * Whether a receiver may subscribe to this track given its packaging version.
+ *
+ * Returns false only for a `locmaf` track whose `locmafVersion` is not in
+ * {@link SUPPORTED_LOCMAF_VERSIONS}: such a track MUST NOT be subscribed, but the
+ * catalog remains valid and an alternative packaging of the same source MAY be
+ * selected instead. Every other packaging is reported supported here (codec
+ * capability is a separate, runtime concern).
+ * @see draft-einarsson-moq-locmaf-01 §5
+ */
+export function isTrackPackagingSupported(track: CatalogTrack): boolean {
+    if (track.packaging !== 'locmaf') return true;
+    return track.locmafVersion !== undefined && SUPPORTED_LOCMAF_VERSIONS.includes(track.locmafVersion);
+}
 
 /**
  * Group tracks by renderGroup.
@@ -78,6 +94,25 @@ export function groupByAlt(
     }
 
     return { groups, ungrouped };
+}
+
+/**
+ * Select one video switching set. Callers filter unsupported tracks first.
+ * Omission preserves first-group selection and the legacy ungrouped ladder.
+ * An explicit group never falls back to another view.
+ * @see draft-ietf-moq-msf-01 §5.2.12
+ */
+export function selectVideoAltGroup(
+    tracks: readonly CatalogTrack[],
+    altGroup?: number,
+): CatalogTrack[] {
+    const { groups } = groupByAlt(tracks);
+    if (altGroup !== undefined) {
+        const group = groups.find(g => g.altGroup === altGroup);
+        if (!group) throw new Error(`Unknown video altGroup: ${altGroup}`);
+        return [...group.tracks];
+    }
+    return groups.length > 0 ? [...groups[0]!.tracks] : [...tracks];
 }
 
 /**

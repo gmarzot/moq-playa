@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@moqt/transport';
-import type { IncomingPublish, MoqtConnection } from '@moqt/webtransport';
+import { RequestError18, SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
+import { MoqtConnection, type IncomingPublish } from '@openmoq/webtransport';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { Relay } from './relay.js';
+import { publishFixture } from '../../node-publisher/src/publisher.js';
+import { videoInit } from '../../../packages/locmaf/test-support/cmaf.js';
+import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 
 interface SubscriberHarness {
   readonly conn: MoqtConnection;
+  readonly acceptSubscribe: ReturnType<typeof vi.fn>;
+  readonly rejectSubscribe: ReturnType<typeof vi.fn>;
   readonly openSubgroup: ReturnType<typeof vi.fn>;
   readonly sendObject: ReturnType<typeof vi.fn>;
   readonly closeSubgroup: ReturnType<typeof vi.fn>;
@@ -29,9 +34,12 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
     activeStreams -= 1;
   });
   const close = vi.fn(async () => undefined);
+  const acceptSubscribe = vi.fn(async () => undefined);
+  const rejectSubscribe = vi.fn(async () => undefined);
   const conn = {
     draftVersion: 18,
-    acceptSubscribe: vi.fn(async () => undefined),
+    acceptSubscribe,
+    rejectSubscribe,
     session: {
       getIncomingSubscription: vi.fn(() => ({ remoteFilterType: 'AbsoluteStart' })),
     },
@@ -42,6 +50,8 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
   } as unknown as MoqtConnection;
   return {
     conn,
+    acceptSubscribe,
+    rejectSubscribe,
     openSubgroup,
     sendObject,
     closeSubgroup,
@@ -51,10 +61,13 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
   };
 }
 
-function incomingPublish(alias = 9n): IncomingPublish {
+function incomingPublish(
+  alias = 9n,
+  namespace: readonly string[] = DEMO_NAMESPACE,
+): IncomingPublish {
   return {
     requestId: 1n,
-    trackNamespace: nsBytes(DEMO_NAMESPACE),
+    trackNamespace: nsBytes([...namespace]),
     trackName: te(DEMO_TRACK),
     trackAlias: alias,
     onObject: null,
@@ -67,26 +80,28 @@ function object(
   groupId: bigint,
   objectId = 0n,
   properties?: Uint8Array,
+  subgroupId = 0n,
 ): MoqtObjectData {
   return {
     kind: 'data',
     trackAlias: alias,
     groupId,
-    subgroupId: 0n,
+    subgroupId,
     objectId,
     publisherPriority: 128,
+    isFirstObjectInSubgroup: objectId === 0n,
     properties,
     extensions: properties,
     payload: new Uint8Array([Number(groupId & 0xffn)]),
   };
 }
 
-function subgroupHeader(alias: bigint, groupId: bigint): SubgroupHeader {
+function subgroupHeader(alias: bigint, groupId: bigint, subgroupId = 0n): SubgroupHeader {
   return {
     typeByte: 0x10,
     trackAlias: alias,
     groupId,
-    subgroupId: 0n,
+    subgroupId,
     publisherPriority: 128,
     hasExtensions: false,
     isEndOfGroup: false,
@@ -100,6 +115,239 @@ async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<
 }
 
 describe('Relay subgroup lifecycle', () => {
+  it('does not treat a slash inside a namespace field as a tuple separator', async () => {
+    const relay = new Relay({ registeredNamespaces: [['game', 'player-0']] });
+    const subscriber = subscriberHarness(1);
+    await relay.handleSubscribe(subscriber.conn, 2n, nsBytes(['game/player-0']), te(DEMO_TRACK));
+    expect(subscriber.acceptSubscribe).not.toHaveBeenCalled();
+    expect(subscriber.rejectSubscribe).toHaveBeenCalledWith(2n, RequestError18.DOES_NOT_EXIST, 'unknown track');
+  });
+
+  it('compares track names byte-for-byte rather than stripping a UTF-8 BOM', async () => {
+    const relay = new Relay();
+    const subscriber = subscriberHarness(1);
+    const track = new Uint8Array([0xef, 0xbb, 0xbf, ...te(DEMO_TRACK)]);
+    await relay.handleSubscribe(subscriber.conn, 2n, nsBytes(DEMO_NAMESPACE), track);
+    expect(subscriber.acceptSubscribe).not.toHaveBeenCalled();
+    expect(subscriber.rejectSubscribe).toHaveBeenCalledWith(2n, RequestError18.DOES_NOT_EXIST, 'unknown track');
+  });
+
+  it('routes explicitly registered namespaces and rejects other namespaces', async () => {
+    const relay = new Relay({
+      registeredNamespaces: [
+        ['game', 'player-0'],
+        ['game', 'player-1'],
+      ],
+    });
+    const accepted = subscriberHarness(1);
+    const rejected = subscriberHarness(1);
+
+    await relay.handleSubscribe(
+      accepted.conn,
+      2n,
+      nsBytes(['game', 'player-1']),
+      te(DEMO_TRACK),
+    );
+    await relay.handleSubscribe(
+      rejected.conn,
+      4n,
+      nsBytes(['game', 'player-2']),
+      te(DEMO_TRACK),
+    );
+
+    expect(accepted.acceptSubscribe).toHaveBeenCalledOnce();
+    expect(accepted.rejectSubscribe).not.toHaveBeenCalled();
+    expect(rejected.acceptSubscribe).not.toHaveBeenCalled();
+    expect(rejected.rejectSubscribe).toHaveBeenCalledWith(
+      4n,
+      RequestError18.DOES_NOT_EXIST,
+      'unknown track',
+    );
+  });
+
+  it('does not cross-route objects between registered namespaces', async () => {
+    const firstNamespace = ['game', 'player-0'];
+    const secondNamespace = ['game', 'player-1'];
+    const relay = new Relay({
+      registeredNamespaces: [firstNamespace, secondNamespace],
+    });
+    const first = subscriberHarness(1);
+    const second = subscriberHarness(1);
+    await relay.handleSubscribe(first.conn, 2n, nsBytes(firstNamespace), te(DEMO_TRACK));
+    await relay.handleSubscribe(second.conn, 4n, nsBytes(secondNamespace), te(DEMO_TRACK));
+    const firstPublish = incomingPublish(9n, firstNamespace);
+    const secondPublish = incomingPublish(10n, secondNamespace);
+    await acceptPublisher(relay, firstPublish);
+    await acceptPublisher(relay, secondPublish);
+
+    const firstObject = object(firstPublish.trackAlias, 1n, 0n, undefined, 11n);
+    const secondObject = object(secondPublish.trackAlias, 2n, 0n, undefined, 22n);
+    firstPublish.onObject?.(firstObject);
+    secondPublish.onObject?.(secondObject);
+    firstPublish.onSubgroupClosed?.(subgroupHeader(firstPublish.trackAlias, 1n, 11n));
+    secondPublish.onSubgroupClosed?.(subgroupHeader(secondPublish.trackAlias, 2n, 22n));
+
+    await vi.waitFor(() => {
+      expect(first.sendObject).toHaveBeenCalledOnce();
+      expect(second.sendObject).toHaveBeenCalledOnce();
+      expect(first.closeSubgroup).toHaveBeenCalledOnce();
+      expect(second.closeSubgroup).toHaveBeenCalledOnce();
+    });
+    expect(first.sendObject.mock.calls[0]?.[1]).toBe(firstObject.objectId);
+    expect(first.sendObject.mock.calls[0]?.[2]).toBe(firstObject.payload);
+    expect(second.sendObject.mock.calls[0]?.[1]).toBe(secondObject.objectId);
+    expect(second.sendObject.mock.calls[0]?.[2]).toBe(secondObject.payload);
+    expect(first.openSubgroup.mock.calls[0]?.[1]).toBe(1n);
+    expect(first.openSubgroup.mock.calls[0]?.[2]).toBe(11n);
+    expect(second.openSubgroup.mock.calls[0]?.[1]).toBe(2n);
+    expect(second.openSubgroup.mock.calls[0]?.[2]).toBe(22n);
+  });
+
+  it('drops queued forwarding on cancellation without sending FIN to an unfinished subgroup', async () => {
+    const relay = new Relay();
+    const sub = subscriberHarness(2);
+    let release!: () => void;
+    sub.sendObject.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    await relay.handleSubscribe(sub.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n), subgroupContainsEndOfGroup: true });
+    await vi.waitFor(() => expect(sub.sendObject).toHaveBeenCalledOnce());
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 1n), subgroupContainsEndOfGroup: true });
+    relay.removeSubscription(sub.conn, 2n);
+    release();
+    await flush();
+    publish.onSubgroupClosed?.({ ...subgroupHeader(publish.trackAlias, 1n), isEndOfGroup: true });
+    await flush();
+    expect(sub.sendObject).toHaveBeenCalledOnce();
+    expect(sub.closeSubgroup).not.toHaveBeenCalled();
+    expect(sub.close).not.toHaveBeenCalled();
+  });
+
+  it.each([18, 22] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
+    const { a, b } = createLoopback();
+    const client = new MoqtConnection(draft);
+    const server = new MoqtConnection(draft, { role: 'server' });
+    const errors: Error[] = [];
+    client.onError = server.onError = (error) => errors.push(error);
+    const relay = new Relay();
+    server.onSubscribe = (requestId, namespace, name) => { void relay.handleSubscribe(server, requestId, namespace, name); };
+    server.onSubscribeClosed = (requestId) => relay.removeSubscription(server, requestId);
+    try {
+      await Promise.all([client.connect(a), server.connect(b)]);
+      const subscription = await client.subscribeTrack(nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+      const publish = incomingPublish();
+      await acceptPublisher(relay, publish);
+      publish.onObject?.({ ...object(publish.trackAlias, 1n), subgroupContainsEndOfGroup: true });
+      await vi.waitFor(() => expect(b.uniOut).toHaveLength(2));
+      await flush();
+      const stream = b.uniOut[1]!;
+      expect(stream.writeClosed).toBe(false);
+      expect(stream.writeAborted).toBe(false);
+      await subscription.unsubscribe();
+      await vi.waitFor(() => expect(stream.writeAborted).toBe(true));
+      expect(stream.writeClosed).toBe(false);
+      expect(errors).toEqual([]);
+    } finally { await client.close(); await server.close(); }
+  });
+
+  it('preserves the incoming END_OF_GROUP header through live forwarding and cache replay', async () => {
+    const relay = new Relay();
+    const live = subscriberHarness(4);
+    await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 5n), isFirstObjectInSubgroup: true,
+      subgroupContainsEndOfGroup: true });
+    await vi.waitFor(() => expect(live.sendObject).toHaveBeenCalledOnce());
+    expect(live.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ endOfGroup: true });
+    publish.onSubgroupClosed?.({ ...subgroupHeader(publish.trackAlias, 1n), isEndOfGroup: true });
+    await vi.waitFor(() => expect(live.closeSubgroup).toHaveBeenCalledOnce());
+    const late = subscriberHarness(4);
+    await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await vi.waitFor(() => expect(late.closeSubgroup).toHaveBeenCalledOnce());
+    expect(late.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ endOfGroup: true });
+  });
+
+  it('forwards the fixture publisher single-object subgroups with FIRST_OBJECT on each stream', async () => {
+    const relay = new Relay();
+    const live = subscriberHarness(4);
+    await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publications = new Map<bigint, IncomingPublish>();
+    const streams = new Map<bigint, { alias: bigint; group: bigint; subgroup: bigint; first: boolean }>();
+    let nextRequest = 0n;
+    const origin = {
+      onMessage: undefined as ((m: { type: string; requestId: bigint }) => void) | undefined,
+      async publish(namespace: Uint8Array[], name: Uint8Array, alias: bigint) {
+        const requestId = nextRequest++;
+        const p: IncomingPublish = { requestId, trackNamespace: namespace, trackName: name,
+          trackAlias: alias, onObject: null, onSubgroupClosed: null };
+        publications.set(alias, p);
+        await acceptPublisher(relay, p);
+        setTimeout(() => origin.onMessage?.({ type: 'REQUEST_OK', requestId }), 0);
+        return requestId;
+      },
+      async openSubgroup(alias: bigint, group: bigint, subgroup: bigint, opts: { firstObject?: boolean }) {
+        const id = BigInt(streams.size + 1);
+        streams.set(id, { alias, group, subgroup, first: opts.firstObject === true });
+        return id;
+      },
+      async sendObject(id: bigint, objectId: bigint, payload: Uint8Array) {
+        const s = streams.get(id)!;
+        publications.get(s.alias)!.onObject?.({ ...object(s.alias, s.group, objectId),
+          subgroupId: s.subgroup, payload, isFirstObjectInSubgroup: s.first });
+        s.first = false;
+      },
+      async closeSubgroup(id: bigint) {
+        const s = streams.get(id)!;
+        publications.get(s.alias)!.onSubgroupClosed?.({ ...subgroupHeader(s.alias, s.group), subgroupId: s.subgroup });
+      },
+    };
+    const meta = { name: DEMO_TRACK, role: 'video', packaging: 'cmaf', codec: 'avc1.42c01e',
+      init: 'init.mp4', chunks: [] } as const;
+    await publishFixture(origin as unknown as MoqtConnection, {
+      manifest: { namespace: DEMO_NAMESPACE, renderGroup: 1, chunkDurationMs: 500, tracks: [meta] },
+      tracks: [{ meta, initData: videoInit(), chunks: [1, 2, 3].map((v) => new Uint8Array([v])) }],
+    }, { catalogFormat: 'cmsf-01' });
+    await vi.waitFor(() => expect(live.sendObject).toHaveBeenCalledTimes(3));
+    expect(live.openSubgroup.mock.calls.map((c) => c[3])).toEqual([
+      { publisherPriority: 128, firstObject: true, hasExtensions: false },
+      { publisherPriority: 128, firstObject: true, hasExtensions: false },
+      { publisherPriority: 128, firstObject: true, hasExtensions: false },
+    ]);
+    expect(live.sendObject.mock.calls.map((c) => c[1])).toEqual([0n, 1n, 2n]);
+    const late = subscriberHarness(4);
+    await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await vi.waitFor(() => expect(late.sendObject).toHaveBeenCalledTimes(3));
+    expect(late.openSubgroup.mock.calls.map((c) => c[3])).toEqual(live.openSubgroup.mock.calls.map((c) => c[3]));
+  });
+
+  it('preserves nonzero FIRST_OBJECT evidence during live forwarding and cache replay', async () => {
+    const relay = new Relay();
+    const live = subscriberHarness(2);
+    await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 5n), subgroupId: 1n, isFirstObjectInSubgroup: true });
+    await vi.waitFor(() => expect(live.sendObject).toHaveBeenCalledOnce());
+    expect(live.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: true });
+    const late = subscriberHarness(2);
+    await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await vi.waitFor(() => expect(late.sendObject).toHaveBeenCalledOnce());
+    expect(late.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: true });
+  });
+
+  it('does not invent FIRST_OBJECT when the decoded evidence is false', async () => {
+    const relay = new Relay();
+    const sub = subscriberHarness(2);
+    await relay.handleSubscribe(sub.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n), isFirstObjectInSubgroup: false });
+    await vi.waitFor(() => expect(sub.sendObject).toHaveBeenCalledOnce());
+    expect(sub.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: false });
+  });
+
   it('lets an independent subgroup advance while another subgroup write is blocked', async () => {
     const relay = new Relay({ maxConcurrentSubgroupsPerSubscription: 2 });
     const subscriber = subscriberHarness(2);

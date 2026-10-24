@@ -6,7 +6,7 @@
  * timing-sensitive CI assertion: correctness is enforced in both runs and the
  * measured durations are printed for comparison.
  */
-import type { MoqtConnection, TrackSubscription } from '@moqt/webtransport';
+import type { MoqtConnection, TrackSubscription } from '@openmoq/webtransport';
 import { startRelayServer } from './server.js';
 import { connectClient, type ClientHandle } from './client.js';
 import { publishGroupObjects, publishTrack, PUB_ALIAS } from './publisher.js';
@@ -89,7 +89,7 @@ async function run(maxConcurrentSubgroupsPerSubscription: number): Promise<numbe
     return elapsedMs;
   } finally {
     await closeAll([...viewers, ...(publisher ? [publisher] : [])]);
-    srv.stop();
+    await srv.stop();
   }
 }
 

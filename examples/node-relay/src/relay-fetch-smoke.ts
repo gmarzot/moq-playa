@@ -19,7 +19,7 @@ import { connectClient, beginSubscribe } from './client.js';
 import { publishDemo } from './publisher.js';
 import { certsExist } from './cert.js';
 import { DEMO_EXTENSIONS, DEMO_NAMESPACE, DEMO_TRACK, DEMO_PAYLOADS, nsBytes, te, td } from './demo.js';
-import { RequestError18, varint, type ControlMessage, type MoqtObject, type RequestErrorMsg } from '@moqt/transport';
+import { RequestError18, varint, type ControlMessage, type MoqtObject, type RequestErrorMsg } from '@openmoq/transport';
 
 const log = (...a: unknown[]) => console.log('[relay-fetch-smoke]', ...a);
 
@@ -131,7 +131,7 @@ async function main(): Promise<number> {
   } finally {
     await viewer.close().catch(() => { /* teardown */ });
     await pub.close().catch(() => { /* teardown */ });
-    srv.stop();
+    await srv.stop();
   }
 }
 

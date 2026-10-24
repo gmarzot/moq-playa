@@ -78,6 +78,15 @@ export class WebCodecsVideoEncoder {
       framerate?: number;
       keyframeInterval?: number;
       latencyMode?: 'quality' | 'realtime';
+      /**
+       * `constant` holds output near the target instead of letting complex
+       * frames and keyframes burst, which is what turns into transient
+       * queuing delay and late frames on a latency-sensitive path. The spec
+       * default is `variable`.
+       */
+      bitrateMode?: 'constant' | 'variable';
+      /** H.264: parameter sets in every keyframe (Annex B), and no description. */
+      annexb?: boolean;
     },
   ): void {
     this.keyframeInterval = options?.keyframeInterval ?? DEFAULT_KEYFRAME_INTERVAL;
@@ -124,6 +133,8 @@ export class WebCodecsVideoEncoder {
       bitrate: options?.bitrate ?? DEFAULT_BITRATE,
       framerate: options?.framerate ?? 30,
       latencyMode: options?.latencyMode ?? 'realtime',
+      ...(options?.bitrateMode ? { bitrateMode: options.bitrateMode } : {}),
+      ...(options?.annexb && codec.startsWith('avc') ? { avc: { format: 'annexb' as const } } : {}),
     };
 
     this.encoder.configure(config);
@@ -143,6 +154,11 @@ export class WebCodecsVideoEncoder {
     const isKeyframe = this.frameCount % this.keyframeInterval === 0;
     this.encoder.encode(frame, { keyFrame: isKeyframe });
     this.frameCount++;
+  }
+
+  /** Encode the next frame as a keyframe; the interval counts from it. */
+  requestKeyframe(): void {
+    this.frameCount = 0;
   }
 
   /** Flush pending frames. */

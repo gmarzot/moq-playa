@@ -2,16 +2,16 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/transport
+# @openmoq/transport
 
-Sans-I/O protocol core for Media over QUIC Transport (MoQT): wire codec and session state machine for draft-14/16/18, with no I/O.
+Sans-I/O protocol core for Media over QUIC Transport (MoQT): wire codec and session state machine for draft-14/16/18/22, with no I/O.
 
 Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implementation of Media over QUIC (MoQ). See the [project README](https://github.com/openmoq/moq-playa#readme) for architecture and API documentation.
 
 ## Install
 
 ```sh
-npm install @moqt/transport
+npm install @openmoq/transport
 ```
 
 ## License

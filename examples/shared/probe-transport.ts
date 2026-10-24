@@ -3,7 +3,7 @@
  *
  * Acceptance behavior deliberately MIRRORS the shared factory in
  * packages/browser/src/webtransport-factory.ts — same cert-hash pinning,
- * same WT-Available-Protocols offer (`moqt-<v>` for v ≥ 15, `moqt-16` by
+ * same WT-Available-Protocols offer (`moqt-<v>` for v ≥ 15, moqt-22/18/16 by
  * default, none for draft 14), same strict-UA retry without protocols — so
  * probes and real connections apply the same compatibility rules.
  * The duplication is intentional: discovery is an example convenience, and
@@ -20,7 +20,7 @@ export interface ProbeOptions {
   /** SHA-256 certificate hash for self-signed relays. */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version, controlling the WT protocols offer. */
-  readonly draftVersion?: 14 | 16 | 18;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
   /** Abort the handshake: closes the connecting transport, rejects with `signal.reason`. */
   readonly signal?: AbortSignal;
 }
@@ -40,13 +40,14 @@ function buildOptions(options: ProbeOptions | undefined, withProtocols: boolean)
   if (options?.draftVersion && options.draftVersion >= 15) {
     opts.protocols = [`moqt-${options.draftVersion}`];
   } else if (!options?.draftVersion) {
-    opts.protocols = ['moqt-16'];
+    opts.protocols = ['moqt-22', 'moqt-18', 'moqt-16'];
   }
   // draft 14: no protocols — h3 ALPN with in-band CLIENT_SETUP negotiation.
   return opts;
 }
 
 interface TransportLike {
+  readonly protocol?: string;
   readonly ready: Promise<void>;
   readonly closed?: { catch?: (fn: (reason: unknown) => void) => unknown };
   close(info?: { closeCode?: number; reason?: string }): void;
@@ -118,9 +119,9 @@ export async function probeTransport(url: string, options?: ProbeOptions): Promi
   } catch (err) {
     // An abort must never be misread as a protocol-negotiation failure.
     if (signal?.aborted) throw signal.reason;
-    if (!offersProtocols) throw err;
-    // Strict-UA fallback (mirrors the shared factory): MOQT negotiates its
-    // version in-band via CLIENT_SETUP, so retry once without offering.
+    if (!offersProtocols || options?.draftVersion === 22) throw err;
+    // Older-draft compatibility retry, matching the shared factory. Draft 22
+    // requires WT protocol negotiation (6.2.1), so never retry it bare.
     try {
       transport = await attempt(url, options, false);
     } catch (retryErr) {
@@ -131,6 +132,10 @@ export async function probeTransport(url: string, options?: ProbeOptions): Promi
     }
   }
 
+  if (options?.draftVersion === 22 && transport.protocol !== 'moqt-22') {
+    safeClose(transport);
+    throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+  }
   let closed = false;
   return {
     close: () => {

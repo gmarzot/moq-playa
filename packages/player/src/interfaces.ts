@@ -14,7 +14,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit } from '@moqt/loc';
+import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -64,8 +64,12 @@ export interface VideoDecoderLike {
    */
   readonly queueDepth: number;
 
-  /** Callback: decoded frame ready for rendering. */
-  onFrame: ((frame: unknown, renderTimeUs: number) => void) | null;
+  /**
+   * Callback: decoded frame ready for rendering. Optional source time belongs to
+   * this output's decode input; null/omitted means unavailable, never guessed from
+   * the latest input or catalog. It is not a render observation or track identity.
+   */
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -110,8 +114,12 @@ export interface AudioDecoderLike {
   /** Current decode queue depth. */
   readonly queueDepth: number;
 
-  /** Callback: decoded audio data ready for playout. */
-  onData: ((data: unknown, renderTimeUs: number) => void) | null;
+  /**
+   * Callback: decoded audio data ready for playout. `captureUs` is the
+   * submitted chunk's timestamp: decoders may rebase the output timestamp
+   * (Chrome's AAC decoder emits first-chunk time plus decoded samples).
+   */
+  onData: ((data: unknown, renderTimeUs: number, captureUs?: number) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -122,6 +130,16 @@ export interface AudioDecoderLike {
 
 // ─── Layer 4: Renderer and Audio Output (Swappable) ──────────────────
 
+/** Historical render evidence, not a content playhead or seek-completion signal. */
+export interface VideoPresentation {
+  /** Decoded frame timestamp in microseconds; null if numeric precision is unavailable. */
+  readonly frameTimestampUs: bigint | null;
+  /** The decoder timestamp's origin is not inferred from its value. */
+  readonly timestampDomain: 'unknown';
+  /** Renderer monotonic clock sampled after the successful draw call returns, in microseconds. */
+  readonly renderedAtUs: number;
+}
+
 /**
  * Video renderer interface — draws decoded frames to a display surface.
  *
@@ -129,6 +147,9 @@ export interface AudioDecoderLike {
  * MUST call frame.close() after rendering (GPU memory management).
  */
 export interface VideoRendererLike {
+  /** Most recent successful render observation; null when draw order or timing is unavailable. */
+  readonly videoPresentation?: VideoPresentation | null;
+
   /** Enqueue a decoded frame for presentation at the specified time. */
   enqueue(frame: unknown, renderTimeUs: number): void;
 
@@ -163,8 +184,11 @@ export interface VideoRendererLike {
  * Implementations: WebAudio AudioContext, MediaRecorder, NullOutput.
  */
 export interface AudioOutputLike {
-  /** Schedule an audio chunk for playout. */
-  schedule(data: unknown, renderTimeUs: number): void;
+  /**
+   * Schedule an audio chunk for playout. `captureUs`, when given, is the
+   * chunk's capture timestamp; prefer it over the decoded data's own.
+   */
+  schedule(data: unknown, renderTimeUs: number, captureUs?: number): void;
 
   /** Cancel all scheduled audio. */
   flush(): void;
@@ -277,6 +301,9 @@ export interface MediaSourceLike {
    * @param codec Codec string for the new mime type
    *              (e.g. `"hvc1.1.6.L93.90"`).
    * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
+   *
+   * The SourceBuffer keeps its timestampOffset: the player's CMAF assembler
+   * already places the new track's fragments on the running timeline.
    */
   changeType?(
     mediaType: 'video' | 'audio',
@@ -310,6 +337,18 @@ export interface MediaSourceLike {
    * currentTime now outside all buffered ranges).
    */
   getBufferAheadUs?(): number | null;
+
+  /**
+   * Whether the media element has attached the MediaSource (MSE
+   * `sourceopen`), i.e. SourceBuffers exist and appendChunk() can take
+   * effect. Browsers defer that attachment while the document is hidden
+   * (background tab). `undefined` means the implementation does not report
+   * attachment and is treated as always attached.
+   */
+  readonly attached?: boolean;
+
+  /** Callback: the MediaSource became attached (SourceBuffers created). */
+  onAttached?: (() => void) | null;
 
   /** Callback: first frame rendered by the media element. */
   onFirstFrame: (() => void) | null;
@@ -355,12 +394,18 @@ export interface MediaSourceLike {
    * must not begin its startup positioning/play sequence until intent is true;
    * withdrawing intent pauses playback that has already started.
    *
-   * Optional for backward compatibility: an adapter that does not implement it
-   * keeps its previous behavior. The player only states an intent it has
-   * actually been given — a player whose play()/pause() was never called leaves
-   * the adapter's own default untouched.
+   * Optional: an adapter that does not implement it keeps its own behavior.
+   * The player always states its current intent on a new adapter; undeclared
+   * means not playing.
    */
   setPlaybackIntent?(intent: boolean): void;
+
+  /**
+   * Playout cushion target in seconds: where live-edge and gap-jump seeks
+   * land, and the set point of the soft rate chase. Derived from
+   * `targetLatencyMs` or the catalog's targetLatency.
+   */
+  setTargetAheadSec?(sec: number): void;
 
   /** Release all resources (MediaSource, SourceBuffers, object URLs). */
   destroy(): void;
@@ -373,9 +418,9 @@ export interface MediaSourceLike {
  *
  * Pairs moof+mdat objects into complete segments, patches tfdt
  * baseMediaDecodeTime to zero-based, and emits via onSegment.
- * The concrete implementation lives in @moqt/browser.
+ * The concrete implementation lives in @openmoq/browser.
  *
- * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging — moof+mdat)
+ * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
 export interface CmafAssemblerLike {
   push(
@@ -395,6 +440,13 @@ export interface CmafAssemblerLike {
    * sample-table surgery may ignore the call.
    */
   setInitSegment?(mediaType: 'video' | 'audio', initBytes: Uint8Array): void;
+  /**
+   * Commit the track that may feed one media type after a successful switch.
+   * Implementations may use this to discard late objects from the retired
+   * track. Optional for compatibility with assemblers that do not retain
+   * cross-object track state.
+   */
+  selectTrack?(mediaType: 'video' | 'audio', trackName: string): void;
   getEpoch(mediaType: 'video' | 'audio'): bigint | null;
   /**
    * Drop pending half-pairs (moof without mdat) for one media type, leaving
@@ -405,6 +457,11 @@ export interface CmafAssemblerLike {
    * state may ignore the call.
    */
   clearPending?(mediaType: 'video' | 'audio'): void;
+  /**
+   * Delivery resumes after a pause: the paused interval is not missing media.
+   * Optional; assemblers without ordering state may ignore it.
+   */
+  resumeAfterPause?(): void;
   reset(): void;
   destroy(): void;
 }

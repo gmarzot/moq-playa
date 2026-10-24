@@ -37,12 +37,111 @@ afterEach(() => {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 describe('createWebTransport', () => {
-  it('auto-negotiate offers moqt-16 only (safe default)', async () => {
+  it('does not construct a transport after startup is cancelled', async () => {
+    const construct = vi.fn();
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); constructor() { construct(); } });
+    const controller = new AbortController();
+    const reason = new Error('stopped');
+    controller.abort(reason);
+    await expect(createWebTransport({ signal: controller.signal })('https://r/moq')).rejects.toBe(reason);
+    expect(construct).not.toHaveBeenCalled();
+  });
+
+  it('closes a connecting transport on cancellation without retrying', async () => {
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    const close = vi.fn();
+    const construct = vi.fn();
+    vi.stubGlobal('WebTransport', class { ready = ready; close = close; constructor() { construct(); } });
+    const controller = new AbortController();
+    const reason = new Error('stopped');
+    const pending = createWebTransport({ signal: controller.signal })('https://r/moq');
+    void pending.catch(() => {});
+    try {
+      controller.abort(reason);
+      await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+      await expect(pending).rejects.toBe(reason);
+      expect(construct).toHaveBeenCalledTimes(1);
+    } finally { release(); }
+  });
+
+  it('removes its startup listener and does not close an established transport on late abort', async () => {
+    const close = vi.fn();
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); close = close; });
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, 'addEventListener');
+    const remove = vi.spyOn(controller.signal, 'removeEventListener');
+    await createWebTransport({ signal: controller.signal })('https://r/moq');
+    controller.abort();
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled();
+  });
+  it('proves a reset when abort rejects the pending FIN with its own reason (§7.4)', async () => {
+    let rejectFin!: (reason: unknown) => void;
+    let completeReset!: () => void;
+    const resetCompletion = new Promise<void>((resolve) => { completeReset = resolve; });
+    let reset = false;
+    const stream = new WritableStream<Uint8Array>({
+      start(controller) {
+        controller.signal.addEventListener('abort', () => {
+          // WebTransport rejects PendingOperation only AFTER resetting the stream.
+          void resetCompletion.then(() => {
+            reset = true;
+            rejectFin(controller.signal.reason);
+          });
+        });
+      },
+      close: () => new Promise<void>((_, reject) => { rejectFin = reject; }),
+    });
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      createUnidirectionalStream = async () => stream;
+    });
+    const transport = await createWebTransport()('https://r/moq');
+    const writer = (await transport.createUnidirectionalStream!()).getWriter();
+    const fin = writer.close();
+    const reason = new Error('subscription cancelled');
+    const finOutcome = fin.catch((error) => error);
+    await Promise.resolve();
+    let settled = false;
+    const resetting = transport.resetSendStream!(writer, reason, fin).then(() => { settled = true; });
+    await Promise.resolve(); await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(reset).toBe(false);
+    completeReset();
+    await expect(resetting).resolves.toBeUndefined();
+    expect(reset).toBe(true);
+    expect(await finOutcome).toBe(reason);
+  });
+
+  it.each(['different reason', 'no pending FIN', 'fulfilled FIN', 'different FIN reason'])('does not normalize an abort rejection with %s', async (mode) => {
+    const reason = new Error('subscription cancelled');
+    const error = mode === 'different reason' ? new Error('network failure') : reason;
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); });
+    const transport = await createWebTransport()('https://r/moq');
+    const writer = { abort: vi.fn().mockRejectedValue(error) } as unknown as WritableStreamDefaultWriter<Uint8Array>;
+    const fin = mode === 'no pending FIN' ? undefined
+      : mode === 'fulfilled FIN' ? Promise.resolve()
+      : Promise.reject(mode === 'different FIN reason' ? new Error('FIN failed') : reason);
+    fin?.catch(() => {});
+    await expect(transport.resetSendStream!(writer, reason, fin)).rejects.toBe(error);
+    expect(writer.abort).toHaveBeenCalledExactlyOnceWith(reason);
+  });
+
+  it('accepts a normally fulfilled abort without a pending FIN', async () => {
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); });
+    const transport = await createWebTransport()('https://r/moq');
+    const writer = new WritableStream<Uint8Array>().getWriter();
+    await expect(transport.resetSendStream!(writer, new Error('cancelled'))).resolves.toBeUndefined();
+  });
+
+  it('auto-negotiate offers every draft, newest first', async () => {
     const factory = createWebTransport();
     await factory('https://relay.example.com/moq');
 
     expect(capturedUrl).toBe('https://relay.example.com/moq');
-    expect(capturedOptions.protocols).toEqual(['moqt-16']);
+    expect(capturedOptions.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
   });
 
   it('draft-14: no protocols sent (h3 ALPN fallback)', async () => {
@@ -64,6 +163,32 @@ describe('createWebTransport', () => {
     await factory('https://relay.example.com/moq');
 
     expect(capturedOptions.protocols).toEqual(['moqt-18']);
+  });
+
+  it('passes congestionControl to the constructor, and omits it when unset', async () => {
+    await createWebTransport({ draftVersion: 18, congestionControl: 'low-latency' })(
+      'https://relay.example.com/moq');
+    expect(capturedOptions.congestionControl).toBe('low-latency');
+
+    await createWebTransport({ draftVersion: 18 })('https://relay.example.com/moq');
+    expect('congestionControl' in capturedOptions).toBe(false);
+  });
+
+  it('reports the congestion-control class the browser applied', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = 'moqt-18';
+      congestionControl = 'default'; // the hint was not honored
+      constructor(_url: string, _options?: any) {}
+    });
+    const wt = await createWebTransport({ draftVersion: 18, congestionControl: 'low-latency' })(
+      'https://relay.example.com/moq');
+    expect(wt.congestionControl).toBe('default');
+  });
+
+  it('leaves congestionControl absent when the browser does not report it', async () => {
+    const wt = await createWebTransport({ draftVersion: 18 })('https://relay.example.com/moq');
+    expect('congestionControl' in wt).toBe(false);
   });
 
   it('returned wrapper exposes incomingBidirectionalStreams when the transport has it', async () => {
@@ -95,13 +220,13 @@ describe('createWebTransport', () => {
     expect(capturedOptions.protocols).toBeUndefined();
   });
 
-  it('cert hash without draftVersion offers moqt-16', async () => {
+  it('cert hash without draftVersion offers the auto list', async () => {
     const hash = new Uint8Array([0x01, 0x02]).buffer;
     const factory = createWebTransport({ certHash: hash });
     await factory('https://localhost:4443');
 
     expect(capturedOptions.serverCertificateHashes).toBeDefined();
-    expect(capturedOptions.protocols).toEqual(['moqt-16']);
+    expect(capturedOptions.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
   });
 
   it('returned transport has handshakeRttMs', async () => {
@@ -123,6 +248,30 @@ describe('createWebTransport', () => {
 // offering before giving up.
 
 describe('createWebTransport protocol fallback', () => {
+  it('does not retry draft 22 without its protocol offer', async () => {
+    stubWebTransport({ rejectWithProtocols: true });
+    await expect(createWebTransport({ draftVersion: 22 })('https://r:4433')).rejects.toThrow();
+    expect(constructed).toHaveLength(1);
+    expect(constructed[0]!.options.protocols).toEqual(['moqt-22']);
+  });
+
+  it('accepts a negotiated draft-22 session', async () => {
+    stubWebTransport({});
+    expect((await createWebTransport({ draftVersion: 22 })('https://r:4433')).protocol).toBe('moqt-22');
+    expect(constructed).toHaveLength(1);
+  });
+
+  it.each([undefined, '', 'moqt-18'])('closes a ready transport that selected %s instead of moqt-22', async (protocol) => {
+    const close = vi.fn();
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      closed = Promise.resolve();
+      protocol = protocol;
+      close = close;
+    });
+    await expect(createWebTransport({ draftVersion: 22 })('https://r:4433')).rejects.toThrow(/moqt-22/);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
   interface Constructed { options: any; closedCatches: number; }
   let constructed: Constructed[];
 
@@ -158,12 +307,12 @@ describe('createWebTransport protocol fallback', () => {
     expect(transport.protocol).toBe('moqt-16'); // negotiated value passes through
   });
 
-  it('retries once without protocols when the offering attempt fails', async () => {
+  it('auto mode retries once without protocols when the offering attempt fails', async () => {
     stubWebTransport({ rejectWithProtocols: true });
-    const transport = await createWebTransport({ draftVersion: 16 })('https://r:4433');
+    const transport = await createWebTransport()('https://r:4433');
 
     expect(constructed).toHaveLength(2);
-    expect(constructed[0]!.options.protocols).toEqual(['moqt-16']);
+    expect(constructed[0]!.options.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
     expect(constructed[1]!.options.protocols).toBeUndefined();
     // No negotiated protocol on the fallback path — the adapter
     // negotiates in-band via CLIENT_SETUP.
@@ -173,7 +322,7 @@ describe('createWebTransport protocol fallback', () => {
   it('preserves the cert hash on the fallback attempt', async () => {
     stubWebTransport({ rejectWithProtocols: true });
     const hash = new Uint8Array([0xAB]).buffer;
-    await createWebTransport({ draftVersion: 16, certHash: hash })('https://r:4433');
+    await createWebTransport({ certHash: hash })('https://r:4433');
 
     expect(constructed[1]!.options.serverCertificateHashes).toEqual([{
       algorithm: 'sha-256',
@@ -183,9 +332,19 @@ describe('createWebTransport protocol fallback', () => {
 
   it('throws an error mentioning both attempts when the bare retry also fails', async () => {
     stubWebTransport({ rejectAlways: true });
-    await expect(createWebTransport({ draftVersion: 16 })('https://r:4433'))
-      .rejects.toThrow(/protocols=\[moqt-16\][\s\S]*retry without protocols/);
+    await expect(createWebTransport()('https://r:4433'))
+      .rejects.toThrow(/protocols=\[moqt-22,moqt-18,moqt-16\][\s\S]*retry without protocols/);
     expect(constructed).toHaveLength(2);
+  });
+
+  // A pinned draft-16+ session negotiates its version only via WT-Protocol;
+  // a bare session would carry no draft, and a draft-18 uni stream on it is
+  // a protocol violation (moxygen aborts), so the pin never retries bare.
+  it.each([16, 18] as const)('an explicit draft-%i pin never retries without protocols', async (v) => {
+    stubWebTransport({ rejectWithProtocols: true });
+    await expect(createWebTransport({ draftVersion: v })('https://r:4433'))
+      .rejects.toThrow(new RegExp(`protocols=\\[moqt-${v}\\]`));
+    expect(constructed).toHaveLength(1);
   });
 
   it('does not retry when no protocols were offered (draft-14 path)', async () => {
@@ -197,9 +356,53 @@ describe('createWebTransport protocol fallback', () => {
 
   it('parks closed on every constructed transport (no unhandled rejection spam)', async () => {
     stubWebTransport({ rejectWithProtocols: true });
-    await createWebTransport({ draftVersion: 16 })('https://r:4433');
+    await createWebTransport()('https://r:4433');
     for (const rec of constructed) {
       expect(rec.closedCatches).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('getStats forwarding', () => {
+  it('forwards getStats when the implementation has it', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+      getStats = async (): Promise<Record<string, unknown>> => ({ rtt: 12 });
+    });
+    const transport = await createWebTransport()('https://r:4433');
+    expect(typeof transport.getStats).toBe('function');
+    await expect(transport.getStats!()).resolves.toEqual({ rtt: 12 });
+  });
+
+  it('omits getStats when the implementation has none', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+    });
+    const transport = await createWebTransport()('https://r:4433');
+    expect(transport.getStats).toBeUndefined();
+  });
+});
+
+describe('relay URL scheme', () => {
+  it('rejects moqt:// before dialling', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+      constructor() { throw new Error('should never be constructed'); }
+    });
+    await expect(createWebTransport()('moqt://relay.example.com:4433/moq'))
+      .rejects.toThrow(/must be an https:\/\/ WebTransport endpoint/);
+  });
+
+  it('rejects a bare host:port before dialling', async () => {
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+      constructor() { throw new Error('should never be constructed'); }
+    });
+    await expect(createWebTransport()('relay.example.com:4433'))
+      .rejects.toThrow(/must be an https:\/\/ WebTransport endpoint/);
   });
 });
