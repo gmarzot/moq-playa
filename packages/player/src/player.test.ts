@@ -10359,12 +10359,13 @@ describe('MSE playhead-wedge escalation', () => {
     ],
   });
 
-  async function cmafPlayer() {
+  async function cmafPlayer(msOverrides: Record<string, unknown> = {}) {
     const adapter = createMockAdapter();
     const mockMs: any = {
       initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(),
       reset: vi.fn(), mediaElement: null, destroy: vi.fn(),
       onFirstFrame: null, onError: null, onStall: null,
+      ...msOverrides,
     };
     const player = new MoqtPlayer({
       ...createConfig(adapter),
@@ -10420,6 +10421,56 @@ describe('MSE playhead-wedge escalation', () => {
     expect(errors[0]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'fatal' });
     expect(errors[0].message).toContain('audio init-append');
     expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('an audio pipeline failure rebuilds the MediaSource once, video only; a second failure is fatal', async () => {
+    const { player, mockMs } = await cmafPlayer({ rebuild: vi.fn() });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const failure = Object.assign(
+      new Error('MSE pipeline failed on the audio init-append: Opus AudioSampleEntry sample rate mismatch (code=4)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'audio' },
+    );
+
+    mockMs.onError(failure);
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize).toHaveBeenCalledTimes(2);
+    const reinit = mockMs.initialize.mock.calls[1][0];
+    expect(reinit.video).toBeDefined();
+    expect(reinit.audio).toBeUndefined();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'degraded' });
+    expect(errors[0].message).toContain('Audio disabled');
+    expect(errors[0].context).toMatchObject({ mediaType: 'audio', recovery: 'video-only' });
+    expect(player.state).not.toBe(PlayerState.ERROR);
+
+    mockMs.onError(Object.assign(new Error('MSE pipeline failed: again'), { name: 'MediaPipelineFailedError' }));
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    expect(errors[1]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'fatal' });
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('a video pipeline failure rebuilds the MediaSource with both tracks', async () => {
+    const { player, mockMs } = await cmafPlayer({ rebuild: vi.fn() });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    mockMs.onError(Object.assign(
+      new Error('MSE pipeline failed on the video append: CHUNK_DEMUXER_ERROR_APPEND_FAILED (code=3)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'video' },
+    ));
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    const reinit = mockMs.initialize.mock.calls[1][0];
+    expect(reinit.video).toBeDefined();
+    expect(reinit.audio).toBeDefined();
+    expect(errors[0]).toMatchObject({ severity: 'degraded', context: { recovery: 'rebuilt' } });
+    expect(player.state).not.toBe(PlayerState.ERROR);
     await player.destroy();
   });
 

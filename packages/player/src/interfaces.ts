@@ -323,6 +323,12 @@ export interface MediaSourceLike {
   reset(): void;
 
   /**
+   * Replace a failed MediaSource with a new one on the same element, keeping
+   * callbacks and playback intent. initialize() must be called again.
+   */
+  rebuild?(): void;
+
+  /**
    * The underlying media element. Used by the player for integration
    * (e.g., reading currentTime, attaching to DOM).
    */
