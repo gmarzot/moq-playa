@@ -1,0 +1,158 @@
+name: player-soak
+
+# Plays live streams in headless Chrome for minutes per case and records
+# whole-run QoE (scripts/player-soak/README.md). A case fails when it does not
+# play or its advertised audio is never heard.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per case
+        default: '5'
+      only:
+        description: 'Run only this RELAY:CASE, e.g. aiomoqt-relay:cmaf (empty: all)'
+        default: ''
+      broadcast:
+        description: Also soak synthetic g5-broadcast streams
+        type: boolean
+        default: true
+  schedule:
+    - cron: '30 7 * * *'
+  # A change to the soak itself gets a one-minute smoke run.
+  pull_request:
+    paths:
+      - 'scripts/player-soak/**'
+      - '.github/workflows/player-soak.yml'
+
+permissions:
+  contents: read
+
+# One group per trigger and ref, so a nightly run never displaces a pending PR run.
+concurrency:
+  group: player-soak-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MINUTES: ${{ inputs.minutes || (github.event_name == 'pull_request' && '1') || '5' }}
+  SOAK_TAG: ${{ github.run_id }}
+
+jobs:
+  # The matrices come from scripts/player-soak/cases.json; `only` must name one of its cases.
+  cases:
+    runs-on: ubuntu-latest
+    outputs:
+      mtt: ${{ steps.cases.outputs.mtt }}
+      broadcast: ${{ steps.cases.outputs.broadcast }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: cases
+        env:
+          ONLY: ${{ inputs.only }}
+          BROADCAST: ${{ github.event_name != 'workflow_dispatch' || inputs.broadcast }}
+        run: |
+          node -e '
+            const c = require("./scripts/player-soak/cases.json");
+            const only = process.env.ONLY;
+            const mtt = c.mtt.map((g) => `${g.relay}:${g.id ?? g.packaging}`);
+            const broadcast = process.env.BROADCAST === "true" ? c.broadcast.map((b) => `${b.relay}:${b.packaging}`) : [];
+            if (only && !mtt.includes(only) && !broadcast.includes(only)) {
+              console.error(`::error::unknown case ${only}; cases: ${[...mtt, ...broadcast].join(" ")}`);
+              process.exit(1);
+            }
+            const pick = (list) => JSON.stringify(only ? list.filter((k) => k === only) : list);
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `mtt=${pick(mtt)}\nbroadcast=${pick(broadcast)}\n`);
+          '
+
+  # One runner per stream, so concurrent players do not share a CPU.
+  test-tracks:
+    needs: cases
+    if: needs.cases.outputs.mtt != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.mtt) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Soak moq-test-tracks ${{ matrix.case }}
+        env:
+          MTT_API_KEY: ${{ secrets.MTT_API_KEY }}
+        run: |
+          if [ -z "$MTT_API_KEY" ]; then
+            echo "::notice::MTT_API_KEY is not set; moq-test-tracks cases skipped"
+            exit 0
+          fi
+          node scripts/player-soak/run.mjs --mtt --only "${{ matrix.case }}" --concurrency 1 --minutes "$MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-test-tracks-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Broadcaster and player run on separate runners, so one machine's encode
+  # and decode do not compete; the player waits for the broadcast to appear.
+  broadcaster:
+    needs: cases
+    if: needs.cases.outputs.broadcast != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.broadcast) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Broadcast ${{ matrix.case }}
+        run: node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --minutes "$MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-broadcaster-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  broadcast-player:
+    needs: cases
+    if: needs.cases.outputs.broadcast != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.broadcast) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Play broadcast ${{ matrix.case }}
+        run: node scripts/player-soak/run.mjs --broadcast-player "${{ matrix.case }}" --minutes "$MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-player-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30

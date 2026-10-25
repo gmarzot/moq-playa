@@ -1,0 +1,132 @@
+{
+  "relays": {
+    "moqx-main": {
+      "url": "https://moqx-main.ci.openmoq.org:4433/moq-relay",
+      "publishDraft": 18,
+      "playDrafts": [
+        18
+      ]
+    },
+    "aiomoqt-relay": {
+      "url": "https://aiomoqt-relay.marzresearch.net:4443/",
+      "publishDraft": 22,
+      "playDrafts": [
+        22,
+        18
+      ]
+    }
+  },
+  "mtt": [
+    {
+      "relay": "moqx-main",
+      "packaging": "loc"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "locmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "loc"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "locmaf"
+    },
+    {
+      "relay": "moqx-main",
+      "id": "bbb_4k60",
+      "packaging": "cmaf",
+      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/60/6750/2000/0/aac/2/128/1/0/clip/0",
+      "expected": {
+        "videoWidth": 1920,
+        "videoHeight": 1080,
+        "videoFps": 60
+      }
+    },
+    {
+      "relay": "moqx-main",
+      "id": "akamai_cmaf",
+      "packaging": "loc",
+      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/msf/loc/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clip/0",
+      "expected": {
+        "videoWidth": 1280,
+        "videoHeight": 720,
+        "videoFps": 30
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "id": "bbb_4k60",
+      "packaging": "cmaf",
+      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/60/6750/2000/0/aac/2/128/1/0/clip/0",
+      "expected": {
+        "videoWidth": 1920,
+        "videoHeight": 1080,
+        "videoFps": 60
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "id": "akamai_cmaf",
+      "packaging": "loc",
+      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/msf/loc/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clip/0",
+      "expected": {
+        "videoWidth": 1280,
+        "videoHeight": 720,
+        "videoFps": 30
+      }
+    }
+  ],
+  "mttNamespace": "openmoq/mtt/aiomoqt/moq_test_tracks_00/msf/{packaging}/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clock/0",
+  "mttExpected": {
+    "videoWidth": 1280,
+    "videoHeight": 720,
+    "videoFps": 30
+  },
+  "broadcast": [
+    {
+      "relay": "moqx-main",
+      "packaging": "loc"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "locmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "loc"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "locmaf"
+    }
+  ],
+  "broadcastParams": {
+    "height": 720,
+    "fps": 30,
+    "bitrate": 2500,
+    "target": 200
+  },
+  "broadcastExpected": {
+    "videoWidth": 1280,
+    "videoHeight": 720,
+    "videoFps": 30
+  }
+}
