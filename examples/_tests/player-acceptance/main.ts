@@ -22,6 +22,7 @@ const pinHex = params.get('hash');
 if (pinHex !== null && !/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Malformed certificate pin');
 const pin = pinHex === null ? undefined : Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
 const DRAFTS: Record<string, 14 | 16 | 18 | 22> = { '14': 14, '16': 16, '18': 18, '22': 22 };
+const soak = params.has('soak');
 const draft = DRAFTS[params.get('v') ?? '18'] ?? 18;
 const createTransport = createWebTransport({ ...(pin ? { certHash: pin } : {}), draftVersion: draft });
 const transports: WebTransportLike[] = [];
@@ -50,7 +51,8 @@ const player = new Player(null, {
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : 'none',
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
-    audioConstraints: { lang: params.get('lang') ?? 'en' },
+    // The fixtures label their audio `en`; a soak stream's audio may carry no language.
+    ...(soak && !params.has('lang') ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
     createConnection: () => {
       const connection = new MoqtConnection(draft);
@@ -77,7 +79,6 @@ for (const type of ['ready', 'playing', 'statechange', 'error', 'stall'] as cons
 
 // ?soak: the session and recovery events too, and per-object latency from the
 // objects' capture times, drained by the soak runner each second.
-const soak = params.has('soak');
 const latencyMs = new Map<string, number[]>();
 if (soak) {
   for (const type of ['stall_recovered', 'session_closed', 'session_reconnecting', 'session_established',
