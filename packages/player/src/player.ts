@@ -4224,7 +4224,15 @@ export class MoqtPlayer {
   }
 
   /**
-   * Send REQUEST_UPDATE with FORWARD parameter to all active subscriptions.
+   * Whether SUBSCRIBE_OK arrived. A REQUEST_UPDATE before it races the
+   * request's first response (§9.7 makes SUBSCRIBE_OK the first one).
+   */
+  private isSubscriptionEstablished(requestId: bigint): boolean {
+    return !this.pendingMediaSubs.has(requestId);
+  }
+
+  /**
+   * Send REQUEST_UPDATE with FORWARD parameter to all established subscriptions.
    *
    * Each call is independent — a failure on one subscription must not
    * prevent the update from being sent to others. Errors are surfaced
@@ -4238,6 +4246,7 @@ export class MoqtPlayer {
   private sendForwardUpdate(forward: 0 | 1): void {
     if (!this.connection) return;
     for (const [requestId] of this.activeSubscriptions) {
+      if (!this.isSubscriptionEstablished(requestId)) continue;
       this.connection.requestUpdate(varint(requestId), { forward }).catch((err: unknown) => {
         const cause = err instanceof Error ? err : new Error(String(err));
         this.log.warn('REQUEST_UPDATE forward:%d failed for reqId=%s: %s', forward, requestId, cause.message);
@@ -4318,6 +4327,7 @@ export class MoqtPlayer {
       for (const [requestId] of this.activeSubscriptions) {
         // Skip the timeline subscription — it should continue receiving updates
         if (requestId === this.timelineRequestId) continue;
+        if (!this.isSubscriptionEstablished(requestId)) continue;
 
         this.connection.requestUpdate(varint(requestId), {
           subscriptionFilter: {
@@ -9931,7 +9941,8 @@ export class MoqtPlayer {
     if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
     const matching = [...this.activeSubscriptions.entries()]
-      .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId);
+      .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId
+        && this.isSubscriptionEstablished(requestId));
 
     for (const [requestId, sub] of matching) {
       this.connection.requestUpdate(varint(requestId), {
