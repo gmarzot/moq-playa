@@ -189,7 +189,7 @@ export class CmafAssembler {
   /**
    * Segments held for decode order, per media type. Audio usually travels one
    * frame per group and a group's video tail can trail the next group's
-   * keyframe, each group on its own stream, so adjacent frames race. MSE never
+   * keyframe, each group or subgroup on its own stream, so adjacent frames race. MSE never
    * plays audio appended after its successor, and after a video append that
    * goes back in decode time it drops video until the next keyframe. A segment
    * that starts past the emitted end waits for the gap to fill, until the
