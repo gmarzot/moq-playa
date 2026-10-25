@@ -1218,7 +1218,9 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         videoBitrate,
         targetLatencyMs,
         packaging,
-        ...(audio ? { audio: { ...audio, codec: activeAudioCodec, bitrate: audioBitrate } } : {}),
+        // Opus is decoded at 48 kHz whatever the capture rate (RFC 7845 §5.1); the encoder resamples.
+        ...(audio ? { audio: { ...audio, ...(activeAudioCodec === 'opus' ? { sampleRate: 48_000 } : {}),
+          codec: activeAudioCodec, bitrate: audioBitrate } } : {}),
         ...(audio && packaging === 'loc' ? { locAudioConfig: audioConfigFor(activeAudioCodec, audio) } : {}),
       };
       sessionCatalog = catalog;

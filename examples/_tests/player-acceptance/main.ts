@@ -50,6 +50,7 @@ const player = new Player(null, {
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : 'none',
+    ...(params.get('warmStart') === '1' ? { warmStartCurrentGroup: true } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
     // The fixtures label their audio `en`; a soak stream's audio may carry no language.
     ...(soak && !params.has('lang') ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),

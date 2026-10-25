@@ -323,6 +323,12 @@ export interface MediaSourceLike {
   reset(): void;
 
   /**
+   * Replace a failed MediaSource with a new one on the same element, keeping
+   * callbacks and playback intent. initialize() must be called again.
+   */
+  rebuild?(): void;
+
+  /**
    * The underlying media element. Used by the player for integration
    * (e.g., reading currentTime, attaching to DOM).
    */
@@ -423,11 +429,13 @@ export interface MediaSourceLike {
  * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
 export interface CmafAssemblerLike {
+  /** `subgroupId`, when known, lets a gap wait for another subgroup's stream. */
   push(
     mediaType: 'video' | 'audio',
     trackName: string,
     groupId: bigint,
     payload: Uint8Array,
+    subgroupId?: bigint,
   ): void;
   /**
    * Hand the assembler an init segment so it can extract trex defaults

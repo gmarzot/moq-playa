@@ -544,6 +544,13 @@ export class MoqtPlayer {
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
 
+  /** The MediaSource was rebuilt after a pipeline failure (once per pipeline set). */
+  private mseRebuilt = false;
+  /** A rebuilt MediaSource has not rendered a frame yet. */
+  private mseRebuildAwaitingFrame = false;
+  /** Why MSE audio was dropped, or null while it plays. */
+  private mseAudioDropped: string | null = null;
+
   /**
    * Wall-clock time `cmaf_init` fulfilled, i.e. when the `cmaf_first_frame`
    * watchdog expectation was first armed. Used to bound how long video
@@ -2182,7 +2189,8 @@ export class MoqtPlayer {
 
     if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
-    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes);
+    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes,
+      obj.subgroupId === undefined ? undefined : BigInt(obj.subgroupId));
   }
 
   /** Count reconstruction and pre-init rawBoxes validation through the same group-health policy. */
@@ -3637,7 +3645,8 @@ export class MoqtPlayer {
       if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload);
+      this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload,
+        obj.subgroupId === undefined ? undefined : BigInt(obj.subgroupId));
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
@@ -4217,7 +4226,15 @@ export class MoqtPlayer {
   }
 
   /**
-   * Send REQUEST_UPDATE with FORWARD parameter to all active subscriptions.
+   * Whether SUBSCRIBE_OK arrived. A REQUEST_UPDATE before it races the
+   * request's first response (§9.7 makes SUBSCRIBE_OK the first one).
+   */
+  private isSubscriptionEstablished(requestId: bigint): boolean {
+    return !this.pendingMediaSubs.has(requestId);
+  }
+
+  /**
+   * Send REQUEST_UPDATE with FORWARD parameter to all established subscriptions.
    *
    * Each call is independent — a failure on one subscription must not
    * prevent the update from being sent to others. Errors are surfaced
@@ -4231,6 +4248,7 @@ export class MoqtPlayer {
   private sendForwardUpdate(forward: 0 | 1): void {
     if (!this.connection) return;
     for (const [requestId] of this.activeSubscriptions) {
+      if (!this.isSubscriptionEstablished(requestId)) continue;
       this.connection.requestUpdate(varint(requestId), { forward }).catch((err: unknown) => {
         const cause = err instanceof Error ? err : new Error(String(err));
         this.log.warn('REQUEST_UPDATE forward:%d failed for reqId=%s: %s', forward, requestId, cause.message);
@@ -4311,6 +4329,7 @@ export class MoqtPlayer {
       for (const [requestId] of this.activeSubscriptions) {
         // Skip the timeline subscription — it should continue receiving updates
         if (requestId === this.timelineRequestId) continue;
+        if (!this.isSubscriptionEstablished(requestId)) continue;
 
         this.connection.requestUpdate(varint(requestId), {
           subscriptionFilter: {
@@ -6751,6 +6770,9 @@ export class MoqtPlayer {
     this.locmafWarned.clear();
     this.locmafBadInit.clear();
     this.cmafInitDeadlineArmed = false;
+    this.mseRebuilt = false;
+    this.mseRebuildAwaitingFrame = false;
+    this.mseAudioDropped = null;
     this.cmafFirstFrameDeadlineStartedAt = undefined;
     this.cmafFirstFrameHiddenAt = undefined;
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
@@ -8547,6 +8569,12 @@ export class MoqtPlayer {
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
       onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
+        if (this.mseRebuildAwaitingFrame) {
+          this.mseRebuildAwaitingFrame = false;
+          this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
+          this.log.info('First frame rendered on the rebuilt MediaSource');
+          return;
+        }
         this._stats.recordFirstFrameRendered();
         this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
         this.log.info('First frame rendered');
@@ -8668,6 +8696,7 @@ export class MoqtPlayer {
         }
 
         if (error.name === 'MediaPipelineFailedError') {
+          if (this.rebuildMediaSource(error)) return;
           this.emitError(createPlayerError(
             'fatal', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED, error.message,
             { cause: error, context: { mediaType } },
@@ -8932,6 +8961,38 @@ export class MoqtPlayer {
   }
 
   /**
+   * Recover a failed MSE pipeline in-session: rebuild the MediaSource once and
+   * re-initialize from the retained init segments, without audio when audio
+   * failed and video can play alone. False when no rebuild applies.
+   */
+  private rebuildMediaSource(error: Error & { mediaType?: 'video' | 'audio' }): boolean {
+    const ms = this.mediaSource;
+    const pending = this.cmafPendingInit;
+    if (this.mseRebuilt || !ms?.rebuild || !pending || !this.cmafInitialized) return false;
+    this.mseRebuilt = true;
+    const dropAudio = error.mediaType === 'audio' && pending.audio !== undefined && pending.video !== undefined;
+    if (dropAudio) {
+      this.mseAudioDropped = error.message;
+      delete pending.audio;
+    }
+    this.log.warn('%s; rebuilding the MediaSource%s', error.message, dropAudio ? ' without audio' : '');
+    this.cmafAssembler?.destroy();
+    this.cmafAssembler = null;
+    this.cmafInitialized = false;
+    this.cmafVideoSynced = false;
+    for (const decoder of this.locmafDecoders.values()) decoder.reset();
+    ms.rebuild();
+    this.mseRebuildAwaitingFrame = true;
+    this.maybeApplyCmafInit();
+    this.emitError(createPlayerError(
+      'degraded', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED,
+      dropAudio ? `Audio disabled, playing video only: ${error.message}` : `MediaSource rebuilt: ${error.message}`,
+      { cause: error, context: { mediaType: error.mediaType, recovery: dropAudio ? 'video-only' : 'rebuilt' } },
+    ));
+    return true;
+  }
+
+  /**
    * The CMAF MediaSource just attached (MSE `sourceopen` → SourceBuffers).
    * If media was held while unattached, everything the assembler had seen
    * was dropped before MSE: start its timeline over on what will actually be
@@ -9051,6 +9112,7 @@ export class MoqtPlayer {
     }
     this.cmafAssembler = this.config.createCmafAssembler({
       onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
+        if (mediaType === 'audio' && this.mseAudioDropped !== null) return;
         if (!timestampOffsetSet[mediaType]) {
           timestampOffsetSet[mediaType] = true;
           if ('setTimestampOffset' in ms) {
@@ -9881,7 +9943,8 @@ export class MoqtPlayer {
     if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
     const matching = [...this.activeSubscriptions.entries()]
-      .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId);
+      .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId
+        && this.isSubscriptionEstablished(requestId));
 
     for (const [requestId, sub] of matching) {
       this.connection.requestUpdate(varint(requestId), {

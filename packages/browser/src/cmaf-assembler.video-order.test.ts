@@ -1,6 +1,7 @@
 /**
  * CmafAssembler video decode order: a group's late tail is placed before the
- * next group's keyframe, a skip inside a group is not held, video that starts
+ * next group's keyframe, a gap another subgroup can fill is held, a skip
+ * inside one subgroup is not, video that starts
  * before what was emitted is dropped rather than appended, and in-order video
  * that ends early is kept.
  */
@@ -108,9 +109,10 @@ function setup(videoAheadMs?: () => number | null) {
   const onSegment = vi.fn();
   const assembler = new CmafAssembler({ onSegment, ...(videoAheadMs ? { videoAheadMs } : {}) });
   assembler.setInitSegment('video', videoInit());
-  /** Video frame n at decode time n × FRAME, in `group`. */
-  const push = (n: number, group: number) => assembler.push('video', 'video0', BigInt(group),
-    concat(buildMoof(n * FRAME, n + 1, FRAME), buildMdat(new Uint8Array([n]))));
+  /** Video frame n at decode time n × FRAME, in `group` (and `subgroup`, when given). */
+  const push = (n: number, group: number, subgroup?: number) => assembler.push('video', 'video0', BigInt(group),
+    concat(buildMoof(n * FRAME, n + 1, FRAME), buildMdat(new Uint8Array([n]))),
+    subgroup === undefined ? undefined : BigInt(subgroup));
   const emitted = () => onSegment.mock.calls.map(
     (c) => Number(readBaseMediaDecodeTime(c[1] as Uint8Array)!) / FRAME);
   return { assembler, push, emitted };
@@ -133,6 +135,28 @@ describe('CmafAssembler — video decode order', () => {
     try {
       const { push, emitted } = setup(() => 200);
       push(0, 0); push(1, 0); push(3, 0);
+      expect(emitted()).toEqual([0, 1, 3]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds a gap inside a group for the subgroup stream that fills it', () => {
+    const { assembler, push, emitted } = setup();
+    push(0, 0, 0);
+    push(2, 0, 2);           // its own subgroup's stream won the race
+    expect(emitted()).toEqual([0]);
+    push(1, 0, 1);
+    expect(emitted()).toEqual([0, 1, 2]);
+    expect(assembler.videoOrderStats).toMatchObject({ restored: 1, missing: 0, late: 0 });
+  });
+
+  it('does not hold a skipped frame inside one subgroup', () => {
+    vi.useFakeTimers();
+    try {
+      const { push, emitted } = setup(() => 200);
+      push(0, 0, 0); push(1, 0, 0); push(3, 0, 0);
       expect(emitted()).toEqual([0, 1, 3]);
       expect(vi.getTimerCount()).toBe(0);
     } finally {

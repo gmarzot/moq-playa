@@ -453,6 +453,18 @@ describe('CommandDispatcher', () => {
     }
   });
 
+  it('reports an unsupported audio configuration without feeding recovery', () => {
+    const audioDecoder = createMockAudioDecoder();
+    const onError = vi.fn();
+    const feedbacks: DecoderFeedback[] = [];
+    new CommandDispatcher({ audioDecoder, onError, onFeedback: (fb) => feedbacks.push(fb) });
+
+    audioDecoder.onError!(Object.assign(new Error('audio decoder does not support opus'), { name: 'NotSupportedError' }));
+
+    expect(onError).toHaveBeenCalledWith('audio', expect.objectContaining({ name: 'NotSupportedError' }));
+    expect(feedbacks.filter((f) => f.type === 'decode_error')).toEqual([]);
+  });
+
   it('catches synchronous throw from audioDecoder.decode() and routes to error callbacks', () => {
     const audioDecoder = createMockAudioDecoder();
     const onError = vi.fn();

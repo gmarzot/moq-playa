@@ -139,7 +139,8 @@ async function playCase(browser, webUrl, c, impair = null) {
   const consoleFile = join(dir, 'console.jsonl');
   page.on('console', (m) => void appendFile(consoleFile, `${json({ t: Date.now(), type: m.type(), text: m.text() })}\n`));
   page.on('pageerror', (e) => void appendFile(consoleFile, `${json({ t: Date.now(), type: 'pageerror', text: e.message })}\n`));
-  const query = new URLSearchParams({ url: c.url, ns: c.namespace, v: String(c.draft), soak: '1' });
+  // Viewers start as G5 does: from the current group.
+  const query = new URLSearchParams({ url: c.url, ns: c.namespace, v: String(c.draft), soak: '1', warmStart: '1' });
   if (c.packaging === 'loc') query.set('output', 'canvas');
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
   const startup = { attempts: 0 };

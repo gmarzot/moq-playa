@@ -984,6 +984,64 @@ describe('MseMediaSource — pipeline failure', () => {
         expect(errors[0]!.message).toContain('removed from its MediaSource');
         warn.mockRestore();
     });
+
+    it('names the failing media type and operation on the error', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const errors: Array<Error & { mediaType?: string; operation?: string }> = [];
+        adapter.onError = (e) => errors.push(e);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        vsb.errorNextAppend = true;
+        adapter.appendChunk('video', segment(0), 't');
+        await flush();
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toMatchObject({ name: 'MediaPipelineFailedError', mediaType: 'video', operation: 'append' });
+        warn.mockRestore();
+    });
+
+    it('attributes an element error to the media type its message names', async () => {
+        const { adapter, video } = await makeReadyAdapter();
+        const errors: Array<Error & { mediaType?: string; operation?: string }> = [];
+        adapter.onError = (e) => errors.push(e);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        video.error = { code: 3, message: 'PIPELINE_ERROR_DECODE: audio decoder initialization failed' };
+        video.fire('error');
+
+        expect(errors).toHaveLength(1);
+        expect(errors[0]!.mediaType).toBe('audio');
+        expect(errors[0]!.operation).toBeUndefined();
+        warn.mockRestore();
+    });
+
+    it('rebuild() attaches a new MediaSource that takes a fresh initialize() and appends', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        const errors: Error[] = [];
+        adapter.onError = (e) => errors.push(e);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        video.error = { code: 3, message: 'PIPELINE_ERROR_DECODE' };
+        video.fire('error');
+        const failed = currentMs;
+
+        currentMs = new MockMediaSource();
+        adapter.rebuild();
+        expect(adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } })).toBe(true);
+        currentMs.open();
+        await flush();
+        const rebuilt = currentMs.videoBuffer;
+        const afterInit = rebuilt.appendedPayloads.length;
+        adapter.appendChunk('video', segment(0), 't');
+        await flush();
+
+        expect(currentMs).not.toBe(failed);
+        expect(rebuilt).not.toBe(vsb);
+        expect(afterInit).toBeGreaterThan(0);
+        expect(rebuilt.appendedPayloads.length).toBe(afterInit + 1);
+        expect(errors).toHaveLength(1);
+        warn.mockRestore();
+    });
 });
 
 describe('MseMediaSource — changeType', () => {

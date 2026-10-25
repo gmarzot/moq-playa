@@ -1579,6 +1579,10 @@ describe('MoqtPlayer', () => {
         payload: new TextEncoder().encode(CATALOG_JSON),
       } as MoqtObject);
 
+      // REQUEST_UPDATE goes only to subscriptions that have their SUBSCRIBE_OK.
+      await vi.waitFor(() => expect(vi.mocked(adapter.subscribe).mock.calls.length).toBeGreaterThanOrEqual(3));
+      await ackMedia(adapter);
+
       return player;
     }
 
@@ -2025,7 +2029,7 @@ describe('MoqtPlayer', () => {
   // ─── Play/Pause REQUEST_UPDATE (§9.11) ─────────────────────
 
   describe('play/pause REQUEST_UPDATE (§9.11)', () => {
-    async function loadCatalogAndSubscribe(adapter: ReturnType<typeof createMockAdapter>) {
+    async function loadCatalogAndSubscribe(adapter: ReturnType<typeof createMockAdapter>, { ack = true } = {}) {
       const player = new MoqtPlayer(createConfig(adapter));
       const loadPromise = player.load();
       await resolveConnect(adapter);
@@ -2043,8 +2047,27 @@ describe('MoqtPlayer', () => {
         payload: new TextEncoder().encode(CATALOG_JSON),
       } as MoqtObject);
 
+      // REQUEST_UPDATE goes only to subscriptions that have their SUBSCRIBE_OK.
+      await vi.waitFor(() => expect(vi.mocked(adapter.subscribe).mock.calls.length).toBeGreaterThanOrEqual(3));
+      if (ack) await ackMedia(adapter);
+
       return player;
     }
+
+    it('sends no REQUEST_UPDATE to a subscription still waiting for its SUBSCRIBE_OK (§9.7)', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+      player.play();
+      (adapter.requestUpdate as any).mockClear();
+
+      player.pause();
+
+      const media = await Promise.all(vi.mocked(adapter.subscribe).mock.results.slice(1).map((r) => r.value));
+      const updated = vi.mocked(adapter.requestUpdate).mock.calls.map((c) => c[0]);
+      expect(media.length).toBeGreaterThan(0);
+      for (const id of media) expect(updated).not.toContainEqual(id);
+      await player.destroy();
+    });
 
     it('pause() sends REQUEST_UPDATE with forward:0 for active subscriptions', async () => {
       const adapter = createMockAdapter();
@@ -2469,6 +2492,10 @@ describe('MoqtPlayer', () => {
         trackAlias: varint(42n),
         parameters: new Map(),
         trackExtensions: [],
+      } as ControlMessage);
+      const audioReqId = await (adapter.subscribe as any).mock.results[2]?.value;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: audioReqId, trackAlias: varint(43n), parameters: new Map(), trackExtensions: [],
       } as ControlMessage);
 
       // Transform throws → malformed track → UNSUBSCRIBE (non-LOC error path)
@@ -9669,6 +9696,7 @@ describe('MoqtPlayer', () => {
       const renderer = createMockRenderer();
       const decoder = createMockVideoDecoder();
       const player = await loadWithAbr(adapter, renderer, decoder);
+      await ackMedia(adapter);
 
       const recoveryEvents: any[] = [];
       player.on('recovery_action' as any, (evt: any) => recoveryEvents.push(evt));
@@ -10359,12 +10387,13 @@ describe('MSE playhead-wedge escalation', () => {
     ],
   });
 
-  async function cmafPlayer() {
+  async function cmafPlayer(msOverrides: Record<string, unknown> = {}) {
     const adapter = createMockAdapter();
     const mockMs: any = {
       initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(),
       reset: vi.fn(), mediaElement: null, destroy: vi.fn(),
       onFirstFrame: null, onError: null, onStall: null,
+      ...msOverrides,
     };
     const player = new MoqtPlayer({
       ...createConfig(adapter),
@@ -10420,6 +10449,56 @@ describe('MSE playhead-wedge escalation', () => {
     expect(errors[0]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'fatal' });
     expect(errors[0].message).toContain('audio init-append');
     expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('an audio pipeline failure rebuilds the MediaSource once, video only; a second failure is fatal', async () => {
+    const { player, mockMs } = await cmafPlayer({ rebuild: vi.fn() });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const failure = Object.assign(
+      new Error('MSE pipeline failed on the audio init-append: Opus AudioSampleEntry sample rate mismatch (code=4)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'audio' },
+    );
+
+    mockMs.onError(failure);
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize).toHaveBeenCalledTimes(2);
+    const reinit = mockMs.initialize.mock.calls[1][0];
+    expect(reinit.video).toBeDefined();
+    expect(reinit.audio).toBeUndefined();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'degraded' });
+    expect(errors[0].message).toContain('Audio disabled');
+    expect(errors[0].context).toMatchObject({ mediaType: 'audio', recovery: 'video-only' });
+    expect(player.state).not.toBe(PlayerState.ERROR);
+
+    mockMs.onError(Object.assign(new Error('MSE pipeline failed: again'), { name: 'MediaPipelineFailedError' }));
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    expect(errors[1]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'fatal' });
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('a video pipeline failure rebuilds the MediaSource with both tracks', async () => {
+    const { player, mockMs } = await cmafPlayer({ rebuild: vi.fn() });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    mockMs.onError(Object.assign(
+      new Error('MSE pipeline failed on the video append: CHUNK_DEMUXER_ERROR_APPEND_FAILED (code=3)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'video' },
+    ));
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    const reinit = mockMs.initialize.mock.calls[1][0];
+    expect(reinit.video).toBeDefined();
+    expect(reinit.audio).toBeDefined();
+    expect(errors[0]).toMatchObject({ severity: 'degraded', context: { recovery: 'rebuilt' } });
+    expect(player.state).not.toBe(PlayerState.ERROR);
     await player.destroy();
   });
 

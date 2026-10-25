@@ -220,6 +220,8 @@ export class CommandDispatcher {
     if (this.audioDecoder) {
       this.audioDecoder.onError = (err) => {
         opts.onError?.('audio', err);
+        // An unsupported configuration is not a stream fault: recovery cannot fix it.
+        if (err.name === 'NotSupportedError') return;
         this.onFeedback?.({ type: 'decode_error', mediaType: 'audio', message: err.message });
       };
     }

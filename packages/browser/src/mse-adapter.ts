@@ -408,6 +408,8 @@ function safeBuffered(buffer: SourceBuffer): TimeRanges | null {
  */
 export class MseMediaSource implements MediaSourceLike {
   private ms: MediaSource;
+  /** Implementation chosen at construction; rebuild() creates another of it. */
+  private readonly msConstructor: typeof MediaSource;
   private videoBuffer: SourceBuffer | null = null;
   private audioBuffer: SourceBuffer | null = null;
 
@@ -942,6 +944,7 @@ export class MseMediaSource implements MediaSourceLike {
     const usingManaged = MMS !== undefined && MSConstructor === MMS;
     this.selectedImplementation = usingManaged ? 'managed' : 'standard';
     this.implementationRequested = options.mseImplementation ?? 'auto';
+    this.msConstructor = MSConstructor;
     this.ms = new MSConstructor();
 
     // Attachment is INDEPENDENT of the implementation. `auto` keeps the
@@ -1485,6 +1488,30 @@ export class MseMediaSource implements MediaSourceLike {
     this.resetPlaybackRate();
   }
 
+  /**
+   * Replace a failed MediaSource with a new one on the same element. Callbacks,
+   * options and playback intent carry over; initialize() must be called again.
+   */
+  rebuild(): void {
+    if (this.destroyed) return;
+    this.cancelStallEpisode();
+    this.reset();
+    this.playTriggered = false;
+    this.firstFrameFired = false;
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = null;
+    }
+    this.ms = new this.msConstructor();
+    if (this.selectedAttachment === 'src-object') {
+      (this.video as any).srcObject = this.ms;
+    } else {
+      this.objectUrl = URL.createObjectURL(this.ms);
+      this.video.src = this.objectUrl;
+    }
+    this.diag('rebuild: new MediaSource (buffer generation %d)', this.bufferGen);
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.cancelStallEpisode();
@@ -1847,14 +1874,18 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * The pipeline is dead: stop every further mutation and report it once,
-   * naming the operation that failed and the browser's reason. Only a new
-   * MediaSource (reset()) recovers.
+   * naming the operation that failed and the browser's reason. Only rebuild()
+   * recovers.
    */
-  private failPipeline(reason: string): void {
+  private failPipeline(reason: string, namedType?: 'video' | 'audio'): void {
     if (this.pipelineFailure) return;
     const op = this.failedOp;
-    const err = new Error(`MSE pipeline failed${op ? ` on the ${op.mediaType} ${op.cause}` : ''}: ${reason}`);
+    const mediaType = op?.mediaType ?? namedType;
+    const err: Error & { mediaType?: 'video' | 'audio'; operation?: BufferOpCause } = new Error(
+      `MSE pipeline failed${op ? ` on the ${op.mediaType} ${op.cause}` : ''}: ${reason}`);
     err.name = 'MediaPipelineFailedError';
+    if (mediaType) err.mediaType = mediaType;
+    if (op) err.operation = op.cause;
     this.pipelineFailure = err;
     this.appendErrored = { video: true, audio: true };
     this.pendingVideoRanges = [];
@@ -3392,6 +3423,10 @@ export class MseMediaSource implements MediaSourceLike {
     this.pendingAudioRanges = [];
     this.dumpRingOnFailure('<video> element error');
     const e = this.video.error;
-    this.failPipeline(`${e?.message || 'media element error'} (code=${e?.code ?? 'unknown'})`);
+    // With no failed append, the browser's message is the only attribution.
+    const message = e?.message ?? '';
+    const audio = /audio/i.test(message);
+    const named = audio === /video/i.test(message) ? undefined : audio ? 'audio' : 'video';
+    this.failPipeline(`${message || 'media element error'} (code=${e?.code ?? 'unknown'})`, named);
   };
 }

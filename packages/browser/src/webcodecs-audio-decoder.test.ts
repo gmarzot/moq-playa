@@ -213,6 +213,32 @@ describe('WebCodecsAudioDecoder', () => {
     decoder.destroy();
   });
 
+  it('configures Opus at 48 kHz whatever rate the catalog names; AAC keeps its rate', () => {
+    const decoder = new WebCodecsAudioDecoder();
+    decoder.configure(new Uint8Array(0), 'opus', 44100, 2);
+    expect(createdDecoders.at(-1)!.lastConfig!.sampleRate).toBe(48000);
+    decoder.configure(new Uint8Array(0), 'mp4a.40.2', 44100, 2);
+    expect(createdDecoders.at(-1)!.lastConfig!.sampleRate).toBe(44100);
+  });
+
+  it('reports an unsupported configuration once and does not rebuild until reconfigured', () => {
+    const decoder = configuredDecoder();
+    const errors: Error[] = [];
+    decoder.onError = (e) => errors.push(e);
+    const created = createdDecoders.length;
+
+    createdDecoders.at(-1)!.error(new DOMException('Unsupported configuration.', 'NotSupportedError'));
+    decoder.decode(chunk(0), 0);
+    decoder.reset();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.name).toBe('NotSupportedError');
+    expect(errors[0]!.message).toContain('opus at 48000 Hz');
+    expect(createdDecoders).toHaveLength(created);
+    decoder.configure(new Uint8Array(0), 'opus', 48000, 2);
+    expect(createdDecoders).toHaveLength(created + 1);
+  });
+
   it('resets and reports on decode queue overflow instead of dropping silently', () => {
     const decoder = configuredDecoder();
     const received: number[] = [];
