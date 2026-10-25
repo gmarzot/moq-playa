@@ -180,7 +180,8 @@ function broadcastCase(cases, spec) {
   const [relay, packaging] = spec.split(':');
   const relayInfo = cases.relays[relay];
   if (!relayInfo) throw new Error(`unknown relay ${relay}`);
-  return { relay, packaging, relayInfo, namespace: `soak-${tag}-${packaging}-${relay.replace(/[^a-z0-9]/gi, '')}` };
+  // One element per field, under a prefix that marks CI traffic on the public relays.
+  return { relay, packaging, relayInfo, namespace: `ci/player-soak/${tag}/${relay}/${packaging}` };
 }
 
 /** Publish a synthetic g5-broadcast until the players have had their minutes. */
