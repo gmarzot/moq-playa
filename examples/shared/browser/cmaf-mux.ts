@@ -198,7 +198,8 @@ export function buildAudioInit(t: CmafAudioTrack): Uint8Array {
           u32(0), u32(0),                                  // max, avg bitrate
           descriptor(0x05, t.config ?? aacAudioSpecificConfig(t.sampleRate, t.channels))),
         descriptor(0x06, u8(0x02))))                       // SLConfig: MP4
-    : box('dOps', u8(0), u8(t.channels), u16(t.preSkip ?? 0), u32(t.sampleRate), u16(0), u8(0));
+    // InputSampleRate is informational; Chrome rejects one that differs from the sample entry's 48 kHz.
+    : box('dOps', u8(0), u8(t.channels), u16(t.preSkip ?? 0), u32(48_000), u16(0), u8(0));
   const sampleRate = aac ? t.sampleRate : 48000;           // Opus: 48 kHz
   const sampleEntry = box(aac ? 'mp4a' : 'Opus',
     zeros(6), u16(1),                       // reserved, data_reference_index

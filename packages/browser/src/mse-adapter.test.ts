@@ -233,13 +233,19 @@ class MockMediaSource extends MockEventTarget {
     audioBuffer = new MockSourceBuffer();
     /** Mime types passed to addSourceBuffer, for created-nothing assertions. */
     readonly addSourceBufferCalls: string[] = [];
+    /** The attached buffers, as MediaSource.sourceBuffers lists them. */
+    readonly sourceBuffers: MockSourceBuffer[] = [];
     addSourceBuffer(mimeType: string): MockSourceBuffer {
         this.addSourceBufferCalls.push(mimeType);
         const sb = new MockSourceBuffer();
         if (mimeType.startsWith('video/')) this.videoBuffer = sb; else this.audioBuffer = sb;
+        this.sourceBuffers.push(sb);
         return sb;
     }
-    removeSourceBuffer(_sb: unknown): void { /* no-op */ }
+    removeSourceBuffer(sb: MockSourceBuffer): void {
+        const i = this.sourceBuffers.indexOf(sb);
+        if (i >= 0) this.sourceBuffers.splice(i, 1);
+    }
     endOfStream(): void { this.readyState = 'ended'; }
     open(): void {
         this.readyState = 'open';
@@ -931,6 +937,54 @@ describe('MseMediaSource — timeline-owned append integration', () => {
 });
 
 // ─── changeType (codec switch) ───────────────────────────────────
+
+describe('MseMediaSource — pipeline failure', () => {
+    const segment = (i: number) => makeSegment({ bmd: i * 500, defaultDur: 100, sampleCount: 5 });
+
+    it('stops every later mutation after a media element error and reports it once, with the browser reason', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        const errors: Error[] = [];
+        adapter.onError = (e) => errors.push(e);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const before = vsb.appendedPayloads.length;
+
+        vsb.errorNextAppend = true;
+        adapter.appendChunk('video', segment(0), 't');
+        await flush();
+        video.error = { code: 4, message: 'CHUNK_DEMUXER_ERROR_APPEND_FAILED: Failure parsing MP4' };
+        video.fire('error');
+        await new Promise((r) => setTimeout(r, 0));
+        for (let i = 1; i <= 5; i++) adapter.appendChunk('video', segment(i), 't');
+        adapter.setTimestampOffset('video', 1);
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(before + 1);
+        expect(vsb.timestampOffset).toBe(0);
+        expect(errors).toHaveLength(1);
+        expect(errors[0]!.name).toBe('MediaPipelineFailedError');
+        expect(errors[0]!.message).toContain('video append');
+        expect(errors[0]!.message).toContain('CHUNK_DEMUXER_ERROR_APPEND_FAILED');
+        warn.mockRestore();
+    });
+
+    it('fails once when a SourceBuffer has left its MediaSource, instead of throwing on each append', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const errors: Error[] = [];
+        adapter.onError = (e) => errors.push(e);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const before = vsb.appendedPayloads.length;
+
+        currentMs.removeSourceBuffer(vsb);
+        for (let i = 0; i < 3; i++) adapter.appendChunk('video', segment(i), 't');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(before);
+        expect(errors).toHaveLength(1);
+        expect(errors[0]!.name).toBe('MediaPipelineFailedError');
+        expect(errors[0]!.message).toContain('removed from its MediaSource');
+        warn.mockRestore();
+    });
+});
 
 describe('MseMediaSource — changeType', () => {
     it('drains queue, calls SourceBuffer.changeType, appends new init', async () => {
