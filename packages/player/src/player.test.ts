@@ -10404,6 +10404,25 @@ describe('MSE playhead-wedge escalation', () => {
     await player.destroy();
   });
 
+  it('a dead MSE pipeline is one FATAL public error naming its cause', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+    const failure = Object.assign(
+      new Error('MSE pipeline failed on the audio init-append: Opus AudioSampleEntry sample rate mismatch (code=4)'),
+      { name: 'MediaPipelineFailedError' },
+    );
+
+    mockMs.onError(failure);
+    mockMs.onError(failure);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ code: PlayerErrorCode.MEDIA_PIPELINE_FAILED, severity: 'fatal' });
+    expect(errors[0].message).toContain('audio init-append');
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
   it('ordinary MSE errors remain degraded decoder errors (no escalation)', async () => {
     const { player, mockMs } = await cmafPlayer();
     const errors: any[] = [];

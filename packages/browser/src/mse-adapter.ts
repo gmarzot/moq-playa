@@ -868,6 +868,17 @@ export class MseMediaSource implements MediaSourceLike {
   private appendErrored: { video: boolean; audio: boolean } = { video: false, audio: false };
 
   /**
+   * Set once the media pipeline is dead (a media element error, or a
+   * SourceBuffer removed from its MediaSource): no further mutations until
+   * reset(), and onError fires once with a MediaPipelineFailedError.
+   */
+  private pipelineFailure: Error | null = null;
+  /** The SourceBuffer operation whose error preceded the failure, if any. */
+  private failedOp: { mediaType: 'video' | 'audio'; cause: BufferOpCause } | null = null;
+  /** Mutations skipped since the failure; reported with the next reset. */
+  private skippedAfterFailure = 0;
+
+  /**
    * Lifecycle gate for `changeType()`. While true for a given media type:
    *   - `appendChunk()` queues incoming data instead of dispatching.
    *   - `drainQueue()` is a no-op (queue stays parked until the type change finishes).
@@ -1320,6 +1331,10 @@ export class MseMediaSource implements MediaSourceLike {
   setTimestampOffset(mediaType: 'video' | 'audio', offset: number): void {
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) return;
+    if (this.pipelineFailure) {
+      this.skippedAfterFailure++;
+      return;
+    }
     try {
       if (!buffer.updating) {
         buffer.timestampOffset = offset;
@@ -1443,6 +1458,12 @@ export class MseMediaSource implements MediaSourceLike {
     this.pendingVideoGroupId = undefined;
     this.pendingAudioGroupId = undefined;
     this.appendErrored = { video: false, audio: false };
+    if (this.pipelineFailure && this.skippedAfterFailure > 0) {
+      this.diag('reset after pipeline failure: %d mutations skipped', this.skippedAfterFailure);
+    }
+    this.pipelineFailure = null;
+    this.failedOp = null;
+    this.skippedAfterFailure = 0;
     this.changingType.video = false;
     this.changingType.audio = false;
     this.videoTrex = undefined;
@@ -1784,6 +1805,7 @@ export class MseMediaSource implements MediaSourceLike {
   private runMutation(
     mediaType: 'video' | 'audio', cause: BufferOpCause, mutate: () => void,
   ): number {
+    if (this.pipelineFailure) throw this.pipelineFailure;
     const id = this.markBufferOp(mediaType, cause);
     try {
       mutate();
@@ -1814,6 +1836,31 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.inFlightOp[mediaType]?.id === id) this.inFlightOp[mediaType] = null;
     this.diag('mutation-sync-failure op=%d %s: %s', id, mediaType,
       err instanceof Error ? err.message : String(err));
+  }
+
+  /** Whether `buffer` still belongs to a MediaSource that has not closed (an ended one reopens on append). */
+  private bufferUsable(buffer: SourceBuffer): boolean {
+    if (this.ms.readyState === 'closed') return false;
+    const attached = (this.ms as { sourceBuffers?: ArrayLike<SourceBuffer> }).sourceBuffers;
+    return attached === undefined || Array.from(attached).includes(buffer);
+  }
+
+  /**
+   * The pipeline is dead: stop every further mutation and report it once,
+   * naming the operation that failed and the browser's reason. Only a new
+   * MediaSource (reset()) recovers.
+   */
+  private failPipeline(reason: string): void {
+    if (this.pipelineFailure) return;
+    const op = this.failedOp;
+    const err = new Error(`MSE pipeline failed${op ? ` on the ${op.mediaType} ${op.cause}` : ''}: ${reason}`);
+    err.name = 'MediaPipelineFailedError';
+    this.pipelineFailure = err;
+    this.appendErrored = { video: true, audio: true };
+    this.pendingVideoRanges = [];
+    this.pendingAudioRanges = [];
+    this.logWarn('[MSE] %s', err.message);
+    this.onError?.(err);
   }
 
   // ─── ManagedSourceBuffer observation (diagnostics only) ──────────
@@ -1874,13 +1921,19 @@ export class MseMediaSource implements MediaSourceLike {
       const failing = this.inFlightOp[mediaType];
       if (failing) failing.errored = true;
       this.diag('sourcebuffer-error %s op=%s', mediaType, failing ? String(failing.id) : 'none');
-      const e = this.video.error;
       this.appendErrored[mediaType] = true;
       if (mediaType === 'video') this.pendingVideoRanges = [];
       else this.pendingAudioRanges = [];
+      this.failedOp ??= { mediaType, cause: failing?.cause ?? 'append' };
       this.dumpRingOnFailure(`${mediaType} SourceBuffer error`);
+      // A failed append ends the stream with a decode error (MSE append error
+      // algorithm), so the element's error, carrying the browser's reason,
+      // follows; fail on it, or here if it never comes.
       const label = mediaType === 'video' ? 'Video' : 'Audio';
-      this.onError?.(new Error(`${label} SourceBuffer error (code=${e?.code}, ${e?.message ?? 'unknown'})`));
+      setTimeout(() => {
+        const e = this.video.error;
+        this.failPipeline(e ? `${e.message || 'media element error'} (code=${e.code})` : `${label} SourceBuffer error`);
+      }, 0);
     });
     buffer.addEventListener('updateend', () => {
       if (this.isSuperseded(mediaType, buffer, gen)) {
@@ -2695,6 +2748,14 @@ export class MseMediaSource implements MediaSourceLike {
     trackName: string,
     groupId?: bigint,
   ): void {
+    if (this.pipelineFailure) {
+      this.skippedAfterFailure++;
+      return;
+    }
+    if (!this.bufferUsable(buffer)) {
+      this.failPipeline(`${mediaType} SourceBuffer removed from its MediaSource (readyState=${this.ms.readyState})`);
+      return;
+    }
     // ── Step 1: parse + tri-state decide ─────────────────────────
     const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
     const ranges = readSegmentTimeRanges(data, trex, (kind, detail) => {
@@ -3331,10 +3392,6 @@ export class MseMediaSource implements MediaSourceLike {
     this.pendingAudioRanges = [];
     this.dumpRingOnFailure('<video> element error');
     const e = this.video.error;
-    this.onError?.(
-      new Error(
-        `HTMLMediaElement error (code=${e?.code ?? 'unknown'}, ${e?.message ?? 'no message'})`,
-      ),
-    );
+    this.failPipeline(`${e?.message || 'media element error'} (code=${e?.code ?? 'unknown'})`);
   };
 }
