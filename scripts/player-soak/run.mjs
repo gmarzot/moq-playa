@@ -2,7 +2,7 @@
  * Player soak: plays live streams in headless Chrome for minutes per case and
  * records whole-run QoE (scripts/player-soak/README.md).
  *
- *   --mtt                          moq-test-tracks streams, started through its API (MTT_API_KEY)
+ *   --mtt [--only RELAY:PACKAGING,…]   moq-test-tracks streams, started through its API (MTT_API_KEY)
  *   --broadcaster RELAY:PACKAGING  publish a synthetic g5-broadcast for --minutes + --lead-minutes
  *   --broadcast-player RELAY:PACKAGING   wait for that broadcast and play it
  */
@@ -147,7 +147,7 @@ async function playCase(browser, webUrl, c) {
 async function runMtt(browser, webUrl, cases) {
   const client = new MttClient({ key: process.env.MTT_API_KEY, base: process.env.MTT_API_BASE });
   const groups = cases.mtt
-    .filter((g) => !args.only || `${g.packaging}-${g.relay}`.includes(args.only))
+    .filter((g) => !args.only || args.only.split(',').includes(`${g.relay}:${g.packaging}`))
     .map((g) => ({ ...g, relayInfo: cases.relays[g.relay], namespace: cases.mttNamespace.replace('{packaging}', g.packaging) }));
   const results = [];
   const queue = [...groups];
@@ -180,7 +180,7 @@ function broadcastCase(cases, spec) {
   const [relay, packaging] = spec.split(':');
   const relayInfo = cases.relays[relay];
   if (!relayInfo) throw new Error(`unknown relay ${relay}`);
-  return { relay, packaging, relayInfo, namespace: `soak-${tag}-${packaging}-${relay.replace(/_/g, '')}` };
+  return { relay, packaging, relayInfo, namespace: `soak-${tag}-${packaging}-${relay.replace(/[^a-z0-9]/gi, '')}` };
 }
 
 /** Publish a synthetic g5-broadcast until the players have had their minutes. */

@@ -10,7 +10,7 @@ on:
         description: Minutes per case
         default: '5'
       only:
-        description: 'Test-track cases containing this text, e.g. cmaf-moqarena (empty: all)'
+        description: 'Run only this RELAY:PACKAGING case, e.g. aiomoqt-relay:cmaf (empty: all)'
         default: ''
       broadcast:
         description: Also soak synthetic g5-broadcast streams
@@ -36,9 +36,14 @@ env:
   SOAK_TAG: ${{ github.run_id }}
 
 jobs:
+  # One runner per stream, so concurrent players do not share a CPU.
   test-tracks:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [moqx-main:loc, moqx-main:cmaf, moqx-main:locmaf, aiomoqt-relay:loc, aiomoqt-relay:cmaf, aiomoqt-relay:locmaf]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -48,20 +53,20 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chrome
-      - name: Soak moq-test-tracks streams
+      - name: Soak moq-test-tracks ${{ matrix.case }}
+        if: ${{ !inputs.only || inputs.only == matrix.case }}
         env:
           MTT_API_KEY: ${{ secrets.MTT_API_KEY }}
-          ONLY: ${{ inputs.only }}
         run: |
           if [ -z "$MTT_API_KEY" ]; then
             echo "::notice::MTT_API_KEY is not set; moq-test-tracks cases skipped"
             exit 0
           fi
-          node scripts/player-soak/run.mjs --mtt --minutes "$MINUTES" ${ONLY:+--only "$ONLY"}
+          node scripts/player-soak/run.mjs --mtt --only "${{ matrix.case }}" --concurrency 1 --minutes "$MINUTES"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: player-soak-${{ github.run_id }}-test-tracks
+          name: player-soak-${{ github.run_id }}-test-tracks-${{ strategy.job-index }}
           path: reports/player-soak/
           if-no-files-found: warn
           retention-days: 30
@@ -75,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [moqx_main:loc, moqx_main:cmaf, moqx_main:locmaf, moqarena:loc, moqarena:cmaf, moqarena:locmaf]
+        case: [moqx-main:loc, moqx-main:cmaf, moqx-main:locmaf, aiomoqt-relay:loc, aiomoqt-relay:cmaf, aiomoqt-relay:locmaf]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -90,6 +95,7 @@ jobs:
           sudo apt-get install -y ffmpeg
           pnpm exec playwright install --with-deps chrome
       - name: Broadcast ${{ matrix.case }}
+        if: ${{ !inputs.only || inputs.only == matrix.case }}
         run: node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --minutes "$MINUTES"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -106,7 +112,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [moqx_main:loc, moqx_main:cmaf, moqx_main:locmaf, moqarena:loc, moqarena:cmaf, moqarena:locmaf]
+        case: [moqx-main:loc, moqx-main:cmaf, moqx-main:locmaf, aiomoqt-relay:loc, aiomoqt-relay:cmaf, aiomoqt-relay:locmaf]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -117,6 +123,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chrome
       - name: Play broadcast ${{ matrix.case }}
+        if: ${{ !inputs.only || inputs.only == matrix.case }}
         run: node scripts/player-soak/run.mjs --broadcast-player "${{ matrix.case }}" --minutes "$MINUTES"
       - uses: actions/upload-artifact@v4
         if: always()

@@ -9,11 +9,11 @@ capture times (draft-frindell timestamps, LOC Timestamp or prft).
 ```bash
 pnpm install --frozen-lockfile
 pnpm exec playwright install chrome
-# moq-test-tracks streams, started through the service API (two jobs at a time)
-MTT_API_KEY=… pnpm test:player:soak --mtt --minutes 5 [--only cmaf-moqarena]
+# moq-test-tracks streams, started through the service API
+MTT_API_KEY=… pnpm test:player:soak --mtt --minutes 5 [--only aiomoqt-relay:cmaf]
 # a synthetic g5-broadcast (fake camera and microphone, needs ffmpeg) and its player
-pnpm test:player:soak --broadcaster moqarena:loc --tag t1 &
-pnpm test:player:soak --broadcast-player moqarena:loc --tag t1
+pnpm test:player:soak --broadcaster aiomoqt-relay:loc --tag t1 &
+pnpm test:player:soak --broadcast-player aiomoqt-relay:loc --tag t1
 ```
 
 Relays, packagings and the test-track namespace are in `cases.json`; each

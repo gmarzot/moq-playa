@@ -68,7 +68,7 @@ describe('moq-test-tracks client', () => {
     ];
     const fetchImpl = vi.fn(async () => replies.shift()!);
     const client = new MttClient({ key: 'k', base: 'https://mtt.example/', fetchImpl });
-    const started = client.start({ namespace: 'ns', relay: 'moqx_main', draft: 18 });
+    const started = client.start({ namespace: 'ns', relay: 'moqx-main', draft: 18 });
     await vi.advanceTimersByTimeAsync(5_000);
     expect((await started).id).toBe('j1');
     await expect(client.waitRunning('j1')).resolves.toMatchObject({ state: 'running' });
