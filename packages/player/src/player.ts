@@ -2189,7 +2189,8 @@ export class MoqtPlayer {
 
     if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
-    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes);
+    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes,
+      obj.subgroupId === undefined ? undefined : BigInt(obj.subgroupId));
   }
 
   /** Count reconstruction and pre-init rawBoxes validation through the same group-health policy. */
@@ -3644,7 +3645,8 @@ export class MoqtPlayer {
       if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload);
+      this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload,
+        obj.subgroupId === undefined ? undefined : BigInt(obj.subgroupId));
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
