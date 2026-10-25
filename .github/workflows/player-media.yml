@@ -47,14 +47,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           pnpm exec playwright install --with-deps chrome
-      - name: Diagnose first-case buffer gap
-        env:
-          PLAYER_ACCEPT_DEBUG: '1'
-        run: |
-          PLAYER_ACCEPT_JOIN_DELAY_MS=0 pnpm test:player:browser --case moving-video-and-audio || true
-          for d in 0 700 1100 1500 1900 2300; do
-            PLAYER_ACCEPT_JOIN_DELAY_MS=$d pnpm test:player:browser --case moving-video-and-audio --skip-build || true
-          done
+      - name: Media playback and negative controls
+        run: pnpm test:player:browser
       - name: Retain playback evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -221,7 +221,6 @@ try {
     result.cases.push(caseResult);
     try {
       const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
-      if (process.env.PLAYER_ACCEPT_DEBUG) query.set('debug', '1');
       if (scenario.version) { query.set('output', 'canvas'); query.set('debug', 'render'); }
       if (scenario.mixed) {
         query.set('audio', scenario.mixed === 'video' ? 'webcodecs' : 'mse');
@@ -243,8 +242,6 @@ try {
         caseResult.observed = await checkExampleViews(page, webUrl, query, artifacts, scenario.name, Boolean(scenario.version));
         caseResult.assessment = { passed: true, failures: [] };
       } else {
-        const joinDelayMs = Number(process.env.PLAYER_ACCEPT_JOIN_DELAY_MS ?? 0);
-        if (joinDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, joinDelayMs));
         await page.goto(`${webUrl}_tests/player-acceptance/?${query}`, { waitUntil: 'domcontentloaded' });
         await page.locator('#start').click();
         const startupStart = performance.now();
