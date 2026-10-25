@@ -32,7 +32,7 @@ const { values: args } = parseArgs({ options: {
   concurrency: { type: 'string', default: '2' },
   broadcaster: { type: 'string' },
   'broadcast-player': { type: 'string' },
-  'lead-minutes': { type: 'string', default: '6' },
+  'lead-minutes': { type: 'string', default: '10' },
   'wait-s': { type: 'string', default: '420' },
   tag: { type: 'string', default: process.env.SOAK_TAG ?? randomUUID().slice(0, 8) },
   'skip-build': { type: 'boolean', default: false },
@@ -180,6 +180,7 @@ async function playCase(browser, webUrl, c, impair = null) {
     };
     const observedAt = Date.now();
     const end = observedAt + minutes * 60_000;
+    let publisherEnded = null;
     while (Date.now() < end) {
       await sleep(1000);
       if (active && Date.now() - active.startEpochMs >= active.plannedMs) await finishDisruption();
@@ -193,12 +194,20 @@ async function playCase(browser, webUrl, c, impair = null) {
       ticks.push(tick);
       await appendFile(join(dir, 'samples.jsonl'), d.samples.map((s) => `${json(s)}\n`).join(''));
       await appendFile(join(dir, 'ticks.jsonl'), `${json(tick)}\n`);
+      // The publisher ended the track (PUBLISH_DONE): stop rather than record a freeze.
+      if (c.profile?.variant !== 'restart' && d.events.some((e) => e.type === 'track_unsubscribed'
+          && !/resubscribe failed/.test(String(e.data?.reason ?? '')))) {
+        publisherEnded = { atS: Math.round((Date.now() - observedAt) / 1000) };
+        log(c.name, `publisher ended the track after ${publisherEnded.atS} s`);
+        break;
+      }
     }
     if (active) await finishDisruption();
     await page.evaluate(() => window.playerAcceptance.finish());
     if (impair) await writeFile(join(dir, 'tc.json'), `${json(await impair.stats())}\n`);
     const summary = { name: c.name, url: c.url, namespace: c.namespace, draft: c.draft, packaging: c.packaging,
       ...(c.profileName ? { profile: c.profileName } : {}),
+      ...(publisherEnded ? { publisherEnded } : {}),
       ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile) }) };
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
@@ -321,7 +330,8 @@ async function report(results) {
       + `| ${lat ? `${Math.round(lat.p50)} / ${Math.round(lat.p95)} / ${Math.round(lat.driftMs)}` : '—'} `
       + `| ${r.player ? `${r.player.framesDropped} / ${r.player.audioUnderruns}` : '—'} `
       + `| ${recoveryCell(r.recovery)} | ${startupCell(r.startup?.breakdownMs)} `
-      + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80) : ''} |`;
+      + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80)
+        : r.publisherEnded ? `publisher ended at ${r.publisherEnded.atS} s` : ''} |`;
   });
   const md = [`### Player soak ${runId} (${minutes} min per case)`, '',
     '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms '
