@@ -8667,6 +8667,16 @@ export class MoqtPlayer {
           return;
         }
 
+        if (error.name === 'MediaPipelineFailedError') {
+          this.emitError(createPlayerError(
+            'fatal', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED, error.message,
+            { cause: error, context: { mediaType } },
+          ));
+          if (!this.isTerminalState()) this.transitionState(PlayerState.ERROR);
+          this.stopTicking();
+          return;
+        }
+
         if (error.name === 'PlayheadWedgeError') {
           this.emitError(createPlayerError(
             'fatal', 'decoder', PlayerErrorCode.MEDIA_ELEMENT_WEDGED, error.message,

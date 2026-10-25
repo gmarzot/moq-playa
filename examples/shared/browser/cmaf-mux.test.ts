@@ -92,6 +92,21 @@ describe('cmaf-mux', () => {
     expect([...aacAudioSpecificConfig(rate, ch)]).toEqual(bytes);
   });
 
+  it('writes 48 kHz in both the Opus sample entry and its dOps, whatever the capture rate', () => {
+    const init = buildAudioInit({ trackId: 2, timescale: TS, codec: 'opus', sampleRate: 44_100, channels: 2 });
+    const view = new DataView(init.buffer, init.byteOffset, init.byteLength);
+    const at = (type: string) => {
+      for (let i = 4; i + 4 <= init.byteLength; i++) {
+        if (new TextDecoder().decode(init.subarray(i, i + 4)) === type) return i - 4;
+      }
+      throw new Error(`no ${type}`);
+    };
+    // Opus sample entry: header 8, reserved 6, data_reference_index 2, reserved 8, channels 2, size 2, 4, then 16.16 rate.
+    expect(view.getUint32(at('Opus') + 32) >>> 16).toBe(48_000);
+    // dOps: header 8, version 1, channels 1, pre-skip 2, then InputSampleRate.
+    expect(view.getUint32(at('dOps') + 12)).toBe(48_000);
+  });
+
   it('writes an OpusHead the Opus pre-skip reader agrees with', () => {
     const head = opusHead(48_000, 2);
     expect(head.byteLength).toBe(19);
