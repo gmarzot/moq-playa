@@ -43,7 +43,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [moqx-main:loc, moqx-main:cmaf, moqx-main:locmaf, aiomoqt-relay:loc, aiomoqt-relay:cmaf, aiomoqt-relay:locmaf]
+        case: [moqx-main:loc, moqx-main:cmaf, moqx-main:locmaf, aiomoqt-relay:loc, aiomoqt-relay:cmaf, aiomoqt-relay:locmaf,
+          moqx-main:bbb_4k60, aiomoqt-relay:bbb_4k60, moqx-main:akamai_cmaf, aiomoqt-relay:akamai_cmaf]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

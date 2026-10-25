@@ -16,7 +16,8 @@ pnpm test:player:soak --broadcaster aiomoqt-relay:loc --tag t1 &
 pnpm test:player:soak --broadcast-player aiomoqt-relay:loc --tag t1
 ```
 
-Relays, packagings and the test-track namespace are in `cases.json`; each
+Relays, packagings and the test-track namespaces are in `cases.json` (a case
+with an `id` and its own `namespace` is a clip; `--only RELAY:ID`); each
 relay's `playDrafts` lists the drafts its players use (draft 18 against the
 draft-22 relay is the relay-versus-draft A/B). Synthetic broadcasts publish as
 `ci/player-soak/<run>/<relay>/<packaging>`. `--skip-build` reuses built

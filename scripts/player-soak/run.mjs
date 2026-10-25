@@ -147,15 +147,16 @@ async function playCase(browser, webUrl, c) {
 async function runMtt(browser, webUrl, cases) {
   const client = new MttClient({ key: process.env.MTT_API_KEY, base: process.env.MTT_API_BASE });
   const groups = cases.mtt
-    .filter((g) => !args.only || args.only.split(',').includes(`${g.relay}:${g.packaging}`))
-    .map((g) => ({ ...g, relayInfo: cases.relays[g.relay], namespace: cases.mttNamespace.replace('{packaging}', g.packaging) }));
+    .filter((g) => !args.only || args.only.split(',').includes(`${g.relay}:${g.id ?? g.packaging}`))
+    .map((g) => ({ ...g, relayInfo: cases.relays[g.relay],
+      namespace: g.namespace ?? cases.mttNamespace.replace('{packaging}', g.packaging) }));
   const results = [];
   const queue = [...groups];
   const worker = async () => {
     for (let g = queue.shift(); g; g = queue.shift()) {
       const plays = g.relayInfo.playDrafts.map((draft) => ({
-        name: `mtt-${g.packaging}-${g.relay}-d${draft}`, url: g.relayInfo.url, namespace: g.namespace, draft,
-        packaging: g.packaging, expected: cases.mttExpected,
+        name: `mtt-${g.id ?? g.packaging}-${g.relay}-d${draft}`, url: g.relayInfo.url, namespace: g.namespace, draft,
+        packaging: g.packaging, expected: g.expected ?? cases.mttExpected,
       }));
       let job;
       try {
