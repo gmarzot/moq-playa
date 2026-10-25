@@ -44,14 +44,19 @@ export class Impairment {
     });
     await sudo(['ip', 'link', 'add', IFB, 'type', 'ifb']);
     await sudo(['ip', 'link', 'set', IFB, 'up']);
-    await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'handle', 'ffff:', 'ingress']);
+    // Hosted runners may already hook ingress with clsact; reuse it rather than replace it.
+    const qdiscs = await sudo(['tc', 'qdisc', 'show', 'dev', this.dev]);
+    const ingress = /qdisc clsact ffff:/.test(qdiscs) ? 'ffff:fff2' : 'ffff:';
+    if (!/qdisc (clsact|ingress) ffff:/.test(qdiscs)) {
+      await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'handle', 'ffff:', 'ingress']);
+    }
     await sudo(['tc', 'qdisc', 'add', 'dev', IFB, 'root', 'netem', ...split(PASS)]);
     // Band 4 takes only the filtered relay traffic; the priomap keeps the rest in 1-3.
-    await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'root', 'handle', '1:', 'prio', 'bands', '4',
+    await sudo(['tc', 'qdisc', 'replace', 'dev', this.dev, 'root', 'handle', '1:', 'prio', 'bands', '4',
       'priomap', '1', '2', '2', '2', '1', '2', '0', '0', '1', '1', '1', '1', '1', '1', '1', '1']);
     await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'parent', '1:4', 'handle', '40:', 'netem', ...split(PASS)]);
     for (const a of this.addresses) {
-      await sudo(['tc', 'filter', 'add', 'dev', this.dev, 'parent', 'ffff:', 'protocol', 'ip', 'u32',
+      await sudo(['tc', 'filter', 'add', 'dev', this.dev, 'parent', ingress, 'protocol', 'ip', 'u32',
         'match', 'ip', 'src', `${a}/32`, 'action', 'mirred', 'egress', 'redirect', 'dev', IFB]);
       await sudo(['tc', 'filter', 'add', 'dev', this.dev, 'parent', '1:', 'protocol', 'ip', 'prio', '1', 'u32',
         'match', 'ip', 'dst', `${a}/32`, 'flowid', '1:4']);
