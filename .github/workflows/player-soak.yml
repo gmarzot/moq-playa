@@ -2,7 +2,8 @@ name: player-soak
 
 # Plays live streams in headless Chrome for minutes per case and records
 # whole-run QoE (scripts/player-soak/README.md). A case fails when it does not
-# play or its advertised audio is never heard.
+# play or its advertised audio is never heard; an adverse-profile case also
+# fails when playback never resumes after a disruption.
 on:
   workflow_dispatch:
     inputs:
@@ -10,12 +11,19 @@ on:
         description: Minutes per case
         default: '5'
       only:
-        description: 'Run only this RELAY:CASE, e.g. aiomoqt-relay:cmaf (empty: all)'
+        description: 'Run only this RELAY:CASE or adverse profile, e.g. aiomoqt-relay:cmaf or blackouts (empty: all)'
         default: ''
       broadcast:
         description: Also soak synthetic g5-broadcast streams
         type: boolean
         default: true
+      adverse:
+        description: Also play the broadcasts under the adverse profiles
+        type: boolean
+        default: true
+      adverse_minutes:
+        description: Minutes per broadcast under an adverse profile
+        default: '3'
   schedule:
     - cron: '30 7 * * *'
   # A change to the soak itself gets a one-minute smoke run.
@@ -34,33 +42,54 @@ concurrency:
 
 env:
   MINUTES: ${{ inputs.minutes || (github.event_name == 'pull_request' && '1') || '5' }}
+  ADVERSE_MINUTES: ${{ inputs.adverse_minutes || (github.event_name == 'pull_request' && '2') || '3' }}
   SOAK_TAG: ${{ github.run_id }}
 
 jobs:
-  # The matrices come from scripts/player-soak/cases.json; `only` must name one of its cases.
+  # The matrices come from scripts/player-soak/cases.json; `only` must name one of its
+  # cases or profiles. Broadcasters run for every broadcast a player or profile needs;
+  # a pull request plays only the profiles marked smoke.
   cases:
     runs-on: ubuntu-latest
     outputs:
       mtt: ${{ steps.cases.outputs.mtt }}
-      broadcast: ${{ steps.cases.outputs.broadcast }}
+      broadcaster: ${{ steps.cases.outputs.broadcaster }}
+      player: ${{ steps.cases.outputs.player }}
+      adverse: ${{ steps.cases.outputs.adverse }}
+      restart: ${{ steps.cases.outputs.restart }}
+      adverse_broadcasts: ${{ steps.cases.outputs.adverse_broadcasts }}
     steps:
       - uses: actions/checkout@v4
       - id: cases
         env:
           ONLY: ${{ inputs.only }}
           BROADCAST: ${{ github.event_name != 'workflow_dispatch' || inputs.broadcast }}
+          ADVERSE: ${{ github.event_name != 'workflow_dispatch' || inputs.adverse }}
+          SMOKE: ${{ github.event_name == 'pull_request' }}
         run: |
           node -e '
             const c = require("./scripts/player-soak/cases.json");
             const only = process.env.ONLY;
+            const key = (b) => `${b.relay}:${b.packaging}`;
             const mtt = c.mtt.map((g) => `${g.relay}:${g.id ?? g.packaging}`);
-            const broadcast = process.env.BROADCAST === "true" ? c.broadcast.map((b) => `${b.relay}:${b.packaging}`) : [];
-            if (only && !mtt.includes(only) && !broadcast.includes(only)) {
-              console.error(`::error::unknown case ${only}; cases: ${[...mtt, ...broadcast].join(" ")}`);
+            const broadcast = process.env.BROADCAST === "true" ? c.broadcast.map(key) : [];
+            const profiles = process.env.ADVERSE === "true" ? Object.keys(c.profiles)
+              .filter((p) => process.env.SMOKE !== "true" || c.profiles[p].smoke) : [];
+            const all = [...mtt, ...broadcast, ...profiles];
+            if (only && !all.includes(only)) {
+              console.error(`::error::unknown case ${only}; cases: ${all.join(" ")}`);
               process.exit(1);
             }
-            const pick = (list) => JSON.stringify(only ? list.filter((k) => k === only) : list);
-            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `mtt=${pick(mtt)}\nbroadcast=${pick(broadcast)}\n`);
+            const pick = (list) => (only ? list.filter((k) => k === only) : list);
+            const player = pick(broadcast);
+            const adverse = pick(profiles);
+            const needed = new Set(player);
+            if (adverse.some((p) => !c.profiles[p].variant)) c.adverse.broadcasts.forEach((b) => needed.add(b));
+            const restart = adverse.some((p) => c.profiles[p].variant === "restart") ? c.adverse.broadcasts : [];
+            const out = { mtt: pick(mtt), broadcaster: c.broadcast.map(key).filter((b) => needed.has(b)), player, adverse,
+              restart, adverse_broadcasts: c.adverse.broadcasts.join(",") };
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT,
+              Object.entries(out).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}\n`).join(""));
           '
 
   # One runner per stream, so concurrent players do not share a CPU.
@@ -103,13 +132,13 @@ jobs:
   # and decode do not compete; the player waits for the broadcast to appear.
   broadcaster:
     needs: cases
-    if: needs.cases.outputs.broadcast != '[]'
+    if: needs.cases.outputs.broadcaster != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        case: ${{ fromJSON(needs.cases.outputs.broadcast) }}
+        case: ${{ fromJSON(needs.cases.outputs.broadcaster) }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -120,7 +149,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chrome
       - name: Broadcast ${{ matrix.case }}
-        run: node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --minutes "$MINUTES"
+        env:
+          ADVERSE: ${{ needs.cases.outputs.adverse != '[]' }}
+        run: |
+          node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --minutes "$MINUTES" \
+            --adverse-minutes "$([ "$ADVERSE" = true ] && echo "$ADVERSE_MINUTES" || echo 0)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -131,13 +164,13 @@ jobs:
 
   broadcast-player:
     needs: cases
-    if: needs.cases.outputs.broadcast != '[]'
+    if: needs.cases.outputs.player != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        case: ${{ fromJSON(needs.cases.outputs.broadcast) }}
+        case: ${{ fromJSON(needs.cases.outputs.player) }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -153,6 +186,69 @@ jobs:
         if: always()
         with:
           name: player-soak-${{ github.run_id }}-player-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # A broadcaster that stops and starts again every restartEveryS, on its own namespace.
+  restart-broadcaster:
+    needs: cases
+    if: needs.cases.outputs.restart != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.cases.outputs.restart) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Broadcast ${{ matrix.case }} with restarts
+        run: |
+          node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --variant restart \
+            --minutes "$MINUTES" --adverse-minutes "$ADVERSE_MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-restart-broadcaster-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # One runner per profile: its shaping covers the whole machine's relay traffic,
+  # so the broadcasts play one after another. GitHub-hosted only (tc needs sudo).
+  adverse-player:
+    needs: cases
+    if: needs.cases.outputs.adverse != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(needs.cases.outputs.adverse) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Play the broadcasts under ${{ matrix.profile }}
+        run: |
+          node scripts/player-soak/run.mjs --broadcast-player "${{ needs.cases.outputs.adverse_broadcasts }}" \
+            --profile "${{ matrix.profile }}" --minutes "$ADVERSE_MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-adverse-${{ matrix.profile }}
           path: reports/player-soak/
           if-no-files-found: warn
           retention-days: 30

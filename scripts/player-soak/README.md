@@ -33,5 +33,41 @@ drift, and the player's dropped frames, audio underruns, gaps, A/V skew and
 cushion. Report-only, except that the run fails when a case does not play, or
 when its catalog lists an audio track that is never heard (`no-audio`).
 
+## Adverse profiles
+
+`--profile NAME` plays each broadcast it is given (comma-separated, one after
+another, first play draft only) under a profile from `cases.json`:
+
+| profile | what |
+|---|---|
+| `lossy` | 2% loss, 40 ± 10 ms each way |
+| `jitter` | 60 ± 20 ms, normal distribution (reorders) |
+| `capped` | 3 Mbit/s down with a 200-packet queue, 30 ms each way |
+| `wifi` | netem slots (bursts every 20–60 ms), 0.5% loss |
+| `blackouts` | all relay traffic dropped for 3 s at 30 s and 10 s at 75 s |
+| `hidden-tab` | tab hidden for 5 s at 30 s and 20 s at 75 s |
+| `republish` | plays `…/<packaging>/restart`, whose broadcaster (`--variant restart`) stops and starts every `restartEveryS` |
+
+Shaping uses `tc` netem through sudo (`impair.mjs`): only traffic with the
+relays' IPv4 addresses, ingress through an IFB device. It is for disposable CI
+runners, never a shared host. A hidden tab is a page brought to front over the
+player, or an emulated visibility state where headless Chrome keeps the covered
+page visible (`method` in the evidence).
+
+Per disruption (or, without scheduled ones, per frozen picture; one still open
+in the run's last 15 s is left out) the summary
+gives the first fresh frame after it ends, the picture outage, and when video
+latency settles: 5 s in a row within 1.2 × its pre-disruption median + 50 ms.
+It also gives the startup breakdown (transport, setup, catalog, first object,
+first frame, ms after load). A profile case fails as `unrecovered` when no fresh
+frame follows a disruption.
+
+```bash
+pnpm test:player:soak --broadcaster aiomoqt-relay:cmaf --tag t1 --adverse-minutes 3 &
+pnpm test:player:soak --broadcast-player aiomoqt-relay:cmaf --tag t1 --profile blackouts --minutes 3
+```
+
 CI: `.github/workflows/player-soak.yml`, on demand and nightly; it needs the
 `MTT_API_KEY` repository secret (a moq-test-tracks key with the `run` role).
+Each profile gets one runner for the `adverse.broadcasts`; a pull request runs
+only the profiles marked `smoke`.

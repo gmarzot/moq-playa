@@ -1,12 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { PlaybackSample } from '../player-acceptance/assessment.mjs';
-import { assessSoak, latencyReport, quietIntervals } from './assess.mjs';
+import { assessSoak, latencyReport, quietIntervals, recoveryReport } from './assess.mjs';
 import { MttClient } from './mtt.mjs';
+
+const T0 = 1_000_000;
 
 /** 250 ms samples; `frame(i)` gives the varying fields of sample i. */
 function samples(n: number, frame: (i: number) => Partial<PlaybackSample>): PlaybackSample[] {
   return Array.from({ length: n }, (_, i) => ({
-    outputKind: 'video', wallMs: i * 250, mediaTimeS: i * 0.25, presentedMediaTimeS: i * 0.25,
+    outputKind: 'video', wallMs: i * 250, wallEpochMs: T0 + i * 250, mediaTimeS: i * 0.25, presentedMediaTimeS: i * 0.25,
     presentedFrames: i * 7.5, pictureDigest: String(i), pictureChange: 5, markerRgb: [0, 0, 0],
     videoWidth: 1280, videoHeight: 720, audioRms: 0.2, audioPeakHz: 440, paused: false, seeking: false,
     visibility: 'visible', bufferedRanges: [], ...frame(i),
@@ -67,6 +69,54 @@ describe('player soak assessment', () => {
     const r = assessSoak({ samples: samples(8, () => ({})), ticks });
     expect(r.player).toMatchObject({ stallCount: 1, stallDurationMs: 500, framesDropped: 4, audioUnderruns: 0, gapCount: 2, framesRendered: 30 });
     expect(r.player.avSkewMs).toEqual({ p50: 4, max: 8 });
+  });
+});
+
+describe('player soak recovery', () => {
+  /** The picture holds sample `from`'s frame through `to` (exclusive), or to the end. */
+  const frozenBetween = (from: number, to = Infinity) => (i: number) => (i > from && i < to
+    ? { pictureDigest: String(from), presentedFrames: from * 7.5 } : {});
+  /** One tick per second with video p50 latency `p50(second)`. */
+  const ticks = (n: number, p50: (s: number) => number) => Array.from({ length: n }, (_, s) => ({
+    wallEpochMs: T0 + s * 1000, latency: { 'video/property': { n: 30, min: 50, p50: p50(s), p95: p50(s), max: p50(s) } },
+  }));
+
+  it('measures a blackout: first fresh frame, picture outage, and when latency settles', () => {
+    const s = samples(120, frozenBetween(40, 60));
+    const t = ticks(30, (sec) => (sec >= 10 && sec < 18 ? 400 : 100));
+    const blackout = { kind: 'blackout', startEpochMs: T0 + 10_000, endEpochMs: T0 + 13_000 };
+    const r = assessSoak({ samples: s, ticks: t, disruptions: [blackout], adverse: true });
+    expect(r.verdict).toBe('played');
+    expect(r.recovery.events).toEqual([expect.objectContaining({
+      kind: 'blackout', durationMs: 3000, freshFrameAfterMs: 2000, outageMs: 5000,
+      stableLatencyAfterMs: 5000, baselineLatencyMs: 100 })]);
+    expect(r.recovery).toMatchObject({ unrecovered: 0, unsettled: 0, freshFrameAfterMsMax: 2000 });
+  });
+
+  it('fails an adverse case whose picture never resumes; a clean run only reports it', () => {
+    const s = samples(200, frozenBetween(40));
+    const blackout = { kind: 'blackout', startEpochMs: T0 + 10_000, endEpochMs: T0 + 13_000 };
+    const adverse = assessSoak({ samples: s, ticks: [], disruptions: [blackout], adverse: true });
+    expect(adverse.verdict).toBe('unrecovered');
+    expect(adverse.recovery.events[0]!.freshFrameAfterMs).toBeNull();
+    const clean = assessSoak({ samples: s, ticks: [] });
+    expect(clean.verdict).toBe('played');
+    expect(clean.recovery.unrecovered).toBe(1);
+  });
+
+  it('leaves out a freeze still open in the run\'s last seconds', () => {
+    const s = samples(80, frozenBetween(70));
+    expect(assessSoak({ samples: s, ticks: [], adverse: true })).toMatchObject({ verdict: 'played', recovery: { events: [] } });
+  });
+
+  it('counts each freeze as a disruption when none was scheduled', () => {
+    const s = samples(80, frozenBetween(40, 48));
+    const frozen = quietIntervals(s, (() => {
+      let prev: PlaybackSample | undefined;
+      return (x: PlaybackSample) => { const c = !prev || x.pictureDigest !== prev.pictureDigest; prev = x; return c; };
+    })(), 1500);
+    expect(recoveryReport(s, [], [], frozen)).toEqual([expect.objectContaining({
+      kind: 'freeze', freshFrameAfterMs: 1750, stableLatencyAfterMs: null })]);
   });
 });
 
