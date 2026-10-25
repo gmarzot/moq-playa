@@ -544,6 +544,13 @@ export class MoqtPlayer {
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
 
+  /** The MediaSource was rebuilt after a pipeline failure (once per pipeline set). */
+  private mseRebuilt = false;
+  /** A rebuilt MediaSource has not rendered a frame yet. */
+  private mseRebuildAwaitingFrame = false;
+  /** Why MSE audio was dropped, or null while it plays. */
+  private mseAudioDropped: string | null = null;
+
   /**
    * Wall-clock time `cmaf_init` fulfilled, i.e. when the `cmaf_first_frame`
    * watchdog expectation was first armed. Used to bound how long video
@@ -6751,6 +6758,9 @@ export class MoqtPlayer {
     this.locmafWarned.clear();
     this.locmafBadInit.clear();
     this.cmafInitDeadlineArmed = false;
+    this.mseRebuilt = false;
+    this.mseRebuildAwaitingFrame = false;
+    this.mseAudioDropped = null;
     this.cmafFirstFrameDeadlineStartedAt = undefined;
     this.cmafFirstFrameHiddenAt = undefined;
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
@@ -8547,6 +8557,12 @@ export class MoqtPlayer {
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
       onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
+        if (this.mseRebuildAwaitingFrame) {
+          this.mseRebuildAwaitingFrame = false;
+          this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
+          this.log.info('First frame rendered on the rebuilt MediaSource');
+          return;
+        }
         this._stats.recordFirstFrameRendered();
         this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
         this.log.info('First frame rendered');
@@ -8668,6 +8684,7 @@ export class MoqtPlayer {
         }
 
         if (error.name === 'MediaPipelineFailedError') {
+          if (this.rebuildMediaSource(error)) return;
           this.emitError(createPlayerError(
             'fatal', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED, error.message,
             { cause: error, context: { mediaType } },
@@ -8932,6 +8949,38 @@ export class MoqtPlayer {
   }
 
   /**
+   * Recover a failed MSE pipeline in-session: rebuild the MediaSource once and
+   * re-initialize from the retained init segments, without audio when audio
+   * failed and video can play alone. False when no rebuild applies.
+   */
+  private rebuildMediaSource(error: Error & { mediaType?: 'video' | 'audio' }): boolean {
+    const ms = this.mediaSource;
+    const pending = this.cmafPendingInit;
+    if (this.mseRebuilt || !ms?.rebuild || !pending || !this.cmafInitialized) return false;
+    this.mseRebuilt = true;
+    const dropAudio = error.mediaType === 'audio' && pending.audio !== undefined && pending.video !== undefined;
+    if (dropAudio) {
+      this.mseAudioDropped = error.message;
+      delete pending.audio;
+    }
+    this.log.warn('%s; rebuilding the MediaSource%s', error.message, dropAudio ? ' without audio' : '');
+    this.cmafAssembler?.destroy();
+    this.cmafAssembler = null;
+    this.cmafInitialized = false;
+    this.cmafVideoSynced = false;
+    for (const decoder of this.locmafDecoders.values()) decoder.reset();
+    ms.rebuild();
+    this.mseRebuildAwaitingFrame = true;
+    this.maybeApplyCmafInit();
+    this.emitError(createPlayerError(
+      'degraded', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED,
+      dropAudio ? `Audio disabled, playing video only: ${error.message}` : `MediaSource rebuilt: ${error.message}`,
+      { cause: error, context: { mediaType: error.mediaType, recovery: dropAudio ? 'video-only' : 'rebuilt' } },
+    ));
+    return true;
+  }
+
+  /**
    * The CMAF MediaSource just attached (MSE `sourceopen` → SourceBuffers).
    * If media was held while unattached, everything the assembler had seen
    * was dropped before MSE: start its timeline over on what will actually be
@@ -9051,6 +9100,7 @@ export class MoqtPlayer {
     }
     this.cmafAssembler = this.config.createCmafAssembler({
       onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
+        if (mediaType === 'audio' && this.mseAudioDropped !== null) return;
         if (!timestampOffsetSet[mediaType]) {
           timestampOffsetSet[mediaType] = true;
           if ('setTimestampOffset' in ms) {
