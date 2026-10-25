@@ -22,9 +22,10 @@ export function assessVideoPresentation(samples) {
     if (observation.timestampDomain !== 'unknown') failures.add('inferred-timestamp-origin');
     if (!Number.isFinite(observation.renderedAtUs)) failures.add('invalid-render-clock');
     if (!Number.isFinite(sample.nativeDrawTimeMs)) failures.add('missing-native-draw-clock');
-    // The harness factory's AudioAlignedClock maps to performance.now(). Allow
-    // 20 ms for that correlation and sampling overhead, not arbitrary custom clocks.
-    else if (Math.abs(observation.renderedAtUs / 1000 - sample.nativeDrawTimeMs) > 20) {
+    // The harness factory's AudioAlignedClock maps to performance.now() up to a
+    // constant offset of whole audio device buffers (0, 10 or 20 ms in CI, each
+    // stable within 1 ms). 50 ms still rejects any other clock domain.
+    else if (Math.abs(observation.renderedAtUs / 1000 - sample.nativeDrawTimeMs) > 50) {
       failures.add('draw-clock-mismatch');
     }
   }

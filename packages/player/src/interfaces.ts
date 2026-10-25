@@ -423,11 +423,13 @@ export interface MediaSourceLike {
  * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
 export interface CmafAssemblerLike {
+  /** `subgroupId`, when known, lets a gap wait for another subgroup's stream. */
   push(
     mediaType: 'video' | 'audio',
     trackName: string,
     groupId: bigint,
     payload: Uint8Array,
+    subgroupId?: bigint,
   ): void;
   /**
    * Hand the assembler an init segment so it can extract trex defaults

@@ -93,6 +93,7 @@ interface HeldSegment {
   segment: Uint8Array;
   trackName: string;
   groupId: bigint;
+  subgroupId: bigint | undefined;
   start: bigint;
   end: bigint;
 }
@@ -105,13 +106,14 @@ interface DecodeOrder {
   resumed: boolean;
   /** Group of the newest segment emitted. */
   lastGroup: bigint | null;
-  /** Latest decode start emitted. */
+  /** Latest decode start emitted, and the subgroup it came from. */
   lastStart: bigint | null;
+  lastSubgroup: bigint | null;
 }
 
 const newDecodeOrder = (): DecodeOrder => ({
   held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0 }, resumed: false, lastGroup: null,
-  lastStart: null,
+  lastStart: null, lastSubgroup: null,
 });
 
 /**
@@ -355,12 +357,14 @@ export class CmafAssembler {
    * @param groupId MoQ group ID — ensures moof+mdat from different groups
    *                don't cross-contaminate when streams interleave
    * @param payload Raw MoQ object payload (moof, mdat, or combined CMAF chunks)
+   * @param subgroupId MoQ subgroup ID, when known: another subgroup's stream may fill a gap
    */
   push(
     mediaType: 'video' | 'audio',
     trackName: string,
     groupId: bigint,
     payload: Uint8Array,
+    subgroupId?: bigint,
   ): void {
     const selectedTrackName = mediaType === 'video'
       ? this.selectedVideoTrackName
@@ -421,7 +425,7 @@ export class CmafAssembler {
           }
           pos += size;
         }
-        this.emitInOrder(mediaType, segment, trackName, groupId);
+        this.emitInOrder(mediaType, segment, trackName, groupId, subgroupId);
         this.flushStartupGeometry();
         return;
       }
@@ -444,7 +448,7 @@ export class CmafAssembler {
 
       // Concatenate moof + mdat
       const segment = concatBuffers(pending, payload);
-      this.emitInOrder(mediaType, segment, trackName, groupId);
+      this.emitInOrder(mediaType, segment, trackName, groupId, subgroupId);
       this.flushStartupGeometry();
       return;
     }
@@ -556,6 +560,7 @@ export class CmafAssembler {
     segment: Uint8Array,
     trackName: string,
     groupId: bigint,
+    subgroupId: bigint | undefined,
   ): void {
     const o = this.order[mediaType];
     const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
@@ -563,7 +568,7 @@ export class CmafAssembler {
     const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
     if (span === null || emittedEnd === null || !timescale || o.resumed) {
       o.resumed = false;
-      this.emitSegment(mediaType, segment, trackName, groupId);
+      this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
       return;
     }
     // Video is late when it starts before the latest start emitted (MSE would
@@ -575,22 +580,23 @@ export class CmafAssembler {
       o.stats.late++;
       const lateMs = (Number(emittedEnd - span.start) * 1000) / timescale;
       if (lateMs > o.stats.worstLateMs) o.stats.worstLateMs = lateMs;
-      if (mediaType === 'audio') this.emitSegment(mediaType, segment, trackName, groupId);
+      if (mediaType === 'audio') this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
       return;
     }
     // Half a segment of slack: timestamp rounding is not a missing frame. A
-    // group's video arrives in order on one stream, so a gap inside the group
-    // is a skipped frame; only a newer group can be ahead of a late tail.
+    // subgroup's video arrives in order on one stream, so a gap behind it is a
+    // skipped frame; only a newer group or another subgroup can fill it.
     const gap = span.start - emittedEnd > (span.end - span.start) / 2n;
-    const mayFill = mediaType === 'audio' || o.lastGroup === null || groupId > o.lastGroup;
+    const mayFill = mediaType === 'audio' || o.lastGroup === null || groupId > o.lastGroup
+      || (groupId === o.lastGroup && subgroupId !== undefined && subgroupId !== o.lastSubgroup);
     if (gap && mayFill) {
-      o.held.push({ segment, trackName, groupId, ...span });
+      o.held.push({ segment, trackName, groupId, subgroupId, ...span });
       o.held.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
       this.armHeldTimer(mediaType);
       return;
     }
     if (o.held.length > 0) o.stats.restored++;
-    this.emitSegment(mediaType, segment, trackName, groupId);
+    this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
     this.releaseHeld(mediaType, false);
   }
 
@@ -609,7 +615,7 @@ export class CmafAssembler {
         o.stats.missing += duration > 0n ? Math.max(1, Math.round(Number(gap) / Number(duration))) : 1;
       }
       o.held.shift();
-      this.emitSegment(mediaType, head.segment, head.trackName, head.groupId);
+      this.emitSegment(mediaType, head.segment, head.trackName, head.groupId, head.subgroupId);
     }
     if (o.timer !== null) {
       clearTimeout(o.timer);
@@ -673,6 +679,7 @@ export class CmafAssembler {
     segment: Uint8Array,
     trackName: string,
     groupId: bigint,
+    subgroupId: bigint | undefined,
   ): void {
     const output = this.maybeStripRaslSamples(mediaType, segment);
     const o = this.order[mediaType];
@@ -685,7 +692,10 @@ export class CmafAssembler {
         (min, range) => range.startTime < min ? range.startTime : min,
         ranges[0]!.startTime,
       );
-      if (o.lastStart === null || start > o.lastStart) o.lastStart = start;
+      if (o.lastStart === null || start > o.lastStart) {
+        o.lastStart = start;
+        o.lastSubgroup = subgroupId ?? null;
+      }
       const end = ranges.reduce(
         (max, range) => range.endTime > max ? range.endTime : max,
         ranges[0]!.endTime,
@@ -736,6 +746,7 @@ export class CmafAssembler {
       o.resumed = false;
       o.lastGroup = null;
       o.lastStart = null;
+      o.lastSubgroup = null;
     }
     this.videoEpoch = null;
     this.audioEpoch = null;
