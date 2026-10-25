@@ -35,6 +35,16 @@ describe('player soak assessment', () => {
       .toBe('no-playback');
   });
 
+  it('is no-audio when the catalog lists audio that is never heard', () => {
+    const silent = samples(20, () => ({ audioRms: 0 }));
+    const catalog = (roles: string[]) => [{ wallEpochMs: 0, events: [{ timeMs: 0, type: 'catalog_received',
+      data: { catalog: { tracks: roles.map((role) => ({ name: role, role })) } } }] }];
+    expect(assessSoak({ samples: silent, ticks: catalog(['video', 'audio']) }).verdict).toBe('no-audio');
+    expect(assessSoak({ samples: silent, ticks: catalog(['video']) }).verdict).toBe('played');
+    expect(assessSoak({ samples: samples(20, () => ({})), ticks: catalog(['video', 'audio']) }).audio)
+      .toEqual({ advertised: true, audible: true });
+  });
+
   it('summarizes latency per minute and its drift', () => {
     const ticks = Array.from({ length: 180 }, (_, i) => ({
       wallEpochMs: 1_000_000 + i * 1000,

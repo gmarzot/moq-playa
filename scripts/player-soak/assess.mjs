@@ -2,7 +2,8 @@
  * Soak metrics from a case's observation stream: 250 ms page samples (see
  * scripts/player-acceptance/assessment.mjs for their fields) and 1 s ticks
  * carrying the player's stats, per-object latency summaries and events.
- * Report-only: the verdict fails only when nothing played.
+ * Report-only, except the verdict: no-playback when nothing played, no-audio
+ * when the catalog lists an audio track that is never heard.
  */
 
 const STALL_MS = 500;
@@ -116,8 +117,12 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {} }) {
 
   const resolution = last ? { width: last.videoWidth, height: last.videoHeight } : null;
   const played = samples.length > 0 && fpsMean > 0 && last.mediaTimeS > first.mediaTimeS;
+  const catalog = ticks.flatMap((t) => t.events ?? []).find((e) => e.type === 'catalog_received')?.data?.catalog;
+  const advertisesAudio = Array.isArray(catalog?.tracks) && catalog.tracks.some((t) => t.role === 'audio');
+  const audible = samples.some((s) => s.audioRms > AUDIBLE_RMS);
   return {
-    verdict: played ? 'played' : 'no-playback',
+    verdict: !played ? 'no-playback' : advertisesAudio && !audible ? 'no-audio' : 'played',
+    audio: { advertised: advertisesAudio, audible },
     durationS: Math.round(durationMs / 1000),
     samples: samples.length,
     startup,

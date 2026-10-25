@@ -22,7 +22,8 @@ export function assessSoak(input: {
   expected?: { videoWidth?: number; videoHeight?: number; videoFps?: number };
   startup?: Record<string, unknown>;
 }): {
-  verdict: 'played' | 'no-playback';
+  verdict: 'played' | 'no-playback' | 'no-audio';
+  audio: { advertised: boolean; audible: boolean };
   durationS: number;
   samples: number;
   playback: {

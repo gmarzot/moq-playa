@@ -28,7 +28,8 @@ Evidence goes to `reports/player-soak/<run>/`: per case `samples.jsonl`,
 `summary.md`. Metrics: startup time, stalls and rebuffer ratio, frozen picture,
 audio gaps, frame rate per minute, latency p50/p95/max per minute and its
 drift, and the player's dropped frames, audio underruns, gaps, A/V skew and
-cushion. Report-only: the run fails only when a case does not play.
+cushion. Report-only, except that the run fails when a case does not play, or
+when its catalog lists an audio track that is never heard (`no-audio`).
 
 CI: `.github/workflows/player-soak.yml`, on demand and nightly; it needs the
 `MTT_API_KEY` repository secret (a moq-test-tracks key with the `run` role).
