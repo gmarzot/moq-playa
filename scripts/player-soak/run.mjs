@@ -280,36 +280,44 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
   const query = new URLSearchParams({ url: b.relayInfo.url, ns: b.namespace, v: String(b.relayInfo.publishDraft),
     packaging: b.packaging, height: String(p.height), fps: String(p.fps), bitrate: String(p.bitrate), target: String(p.target),
     clockUrl: 'https://aiomoqt-relay.marzresearch.net/time' });
-  await page.goto(`${webUrl}g5-broadcast/?${query}`, { waitUntil: 'domcontentloaded' });
-  const goLive = async () => {
-    await page.locator('#start-camera').click();
-    await page.waitForFunction(() => document.querySelector('#state')?.textContent === 'live', null, { timeout: 60_000 });
-    return Date.now();
-  };
-  let liveAt = await goLive();
-  log('broadcaster', b.namespace, 'live');
-  const end = Date.now() + totalMinutes * 60_000;
-  while (Date.now() < end) {
-    await sleep(5000);
-    if (restartEveryS > 0 && Date.now() - liveAt >= restartEveryS * 1000) {
-      const stoppedAt = Date.now();
-      await page.locator('#stop').click();
-      await page.waitForFunction(() => !document.querySelector('#start-camera')?.disabled, null, { timeout: 30_000 });
-      liveAt = await goLive();
-      log('broadcaster', b.namespace, `restarted: live again after ${liveAt - stoppedAt} ms`);
-      await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: liveAt, restart: { stoppedAt, liveAt } })}\n`);
+  let wentLive = false;
+  try {
+    await page.goto(`${webUrl}g5-broadcast/?${query}`, { waitUntil: 'domcontentloaded' });
+    const goLive = async () => {
+      await page.locator('#start-camera').click();
+      await page.waitForFunction(() => document.querySelector('#state')?.textContent === 'live', null, { timeout: 60_000 });
+      return Date.now();
+    };
+    let liveAt = await goLive();
+    wentLive = true;
+    log('broadcaster', b.namespace, 'live');
+    const end = Date.now() + totalMinutes * 60_000;
+    while (Date.now() < end) {
+      await sleep(5000);
+      if (restartEveryS > 0 && Date.now() - liveAt >= restartEveryS * 1000) {
+        const stoppedAt = Date.now();
+        await page.locator('#stop').click();
+        await page.waitForFunction(() => !document.querySelector('#start-camera')?.disabled, null, { timeout: 30_000 });
+        liveAt = await goLive();
+        log('broadcaster', b.namespace, `restarted: live again after ${liveAt - stoppedAt} ms`);
+        await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: liveAt, restart: { stoppedAt, liveAt } })}\n`);
+      }
+      const cells = await page.evaluate(() => ({
+        state: document.querySelector('#state')?.textContent,
+        cells: Object.fromEntries([...document.querySelectorAll('#diag-grid .cell, #adv-grid .cell')]
+          .map((c) => [c.firstChild?.textContent ?? '', c.querySelector('b')?.textContent ?? ''])),
+      }));
+      await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...cells })}\n`);
     }
-    const cells = await page.evaluate(() => ({
-      state: document.querySelector('#state')?.textContent,
-      cells: Object.fromEntries([...document.querySelectorAll('#diag-grid .cell, #adv-grid .cell')]
-        .map((c) => [c.firstChild?.textContent ?? '', c.querySelector('b')?.textContent ?? ''])),
-    }));
-    await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...cells })}\n`);
+  } finally {
+    // The page's own log is the only record of why a broadcast did not go live.
+    const pageLog = await page.locator('#log').textContent().catch(() => null) ?? '';
+    await writeFile(join(dir, 'log.txt'), pageLog);
+    if (!wentLive) log('broadcaster', b.namespace, `never went live; page log:\n${pageLog.slice(-2000)}`);
+    await page.locator('#stop').click().catch(() => {});
+    await sleep(1000);
+    await browser.close();
   }
-  await writeFile(join(dir, 'log.txt'), await page.locator('#log').textContent() ?? '');
-  await page.locator('#stop').click().catch(() => {});
-  await sleep(1000);
-  await browser.close();
 }
 
 const recoveryCell = (rec) => {
