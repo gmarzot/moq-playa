@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:player:browser": "node scripts/player-acceptance/run.mjs",
+    "test:player:soak": "node scripts/player-soak/run.mjs",
     "test:corpus": "vitest run conformance/media/runner",
     "test:soak": "SCENARIO_SEEDS=2000 SCENARIO_STEPS=200 vitest run scenario-d18.test.ts",
     "test:soak:legacy": "SCENARIO_SEEDS=300 SCENARIO_STEPS=120 vitest run scenario-legacy.test.ts",

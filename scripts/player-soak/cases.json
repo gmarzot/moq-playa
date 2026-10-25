@@ -1,0 +1,26 @@
+{
+  "relays": {
+    "moqx_main": { "url": "https://moqx-main.ci.openmoq.org:4433/moq-relay", "publishDraft": 18, "playDrafts": [18] },
+    "moqarena": { "url": "https://aiomoqt-relay.marzresearch.net:4443/", "publishDraft": 22, "playDrafts": [22, 18] }
+  },
+  "mtt": [
+    { "relay": "moqx_main", "packaging": "loc" },
+    { "relay": "moqx_main", "packaging": "cmaf" },
+    { "relay": "moqx_main", "packaging": "locmaf" },
+    { "relay": "moqarena", "packaging": "loc" },
+    { "relay": "moqarena", "packaging": "cmaf" },
+    { "relay": "moqarena", "packaging": "locmaf" }
+  ],
+  "mttNamespace": "openmoq/mtt/aiomoqt/moq_test_tracks_00/msf/{packaging}/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clock/0",
+  "mttExpected": { "videoWidth": 1280, "videoHeight": 720, "videoFps": 30 },
+  "broadcast": [
+    { "relay": "moqx_main", "packaging": "loc" },
+    { "relay": "moqx_main", "packaging": "cmaf" },
+    { "relay": "moqx_main", "packaging": "locmaf" },
+    { "relay": "moqarena", "packaging": "loc" },
+    { "relay": "moqarena", "packaging": "cmaf" },
+    { "relay": "moqarena", "packaging": "locmaf" }
+  ],
+  "broadcastParams": { "height": 720, "fps": 30, "bitrate": 2500, "target": 200 },
+  "broadcastExpected": { "videoWidth": 1280, "videoHeight": 720, "videoFps": 30 }
+}

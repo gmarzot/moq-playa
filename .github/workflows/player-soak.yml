@@ -1,0 +1,127 @@
+name: player-soak
+
+# Plays live streams in headless Chrome for minutes per case and records
+# whole-run QoE (scripts/player-soak/README.md). Report-only: a case fails
+# only when nothing plays.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per case
+        default: '5'
+      only:
+        description: 'Test-track cases containing this text, e.g. cmaf-moqarena (empty: all)'
+        default: ''
+      broadcast:
+        description: Also soak synthetic g5-broadcast streams
+        type: boolean
+        default: true
+  schedule:
+    - cron: '30 7 * * *'
+  # A change to the soak itself gets a one-minute smoke run.
+  pull_request:
+    paths:
+      - 'scripts/player-soak/**'
+      - '.github/workflows/player-soak.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: player-soak
+  cancel-in-progress: false
+
+env:
+  MINUTES: ${{ inputs.minutes || (github.event_name == 'pull_request' && '1') || '5' }}
+  SOAK_TAG: ${{ github.run_id }}
+
+jobs:
+  test-tracks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Soak moq-test-tracks streams
+        env:
+          MTT_API_KEY: ${{ secrets.MTT_API_KEY }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          if [ -z "$MTT_API_KEY" ]; then
+            echo "::notice::MTT_API_KEY is not set; moq-test-tracks cases skipped"
+            exit 0
+          fi
+          node scripts/player-soak/run.mjs --mtt --minutes "$MINUTES" ${ONLY:+--only "$ONLY"}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-test-tracks
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Broadcaster and player run on separate runners, so one machine's encode
+  # and decode do not compete; the player waits for the broadcast to appear.
+  broadcaster:
+    if: github.event_name != 'workflow_dispatch' || inputs.broadcast
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [moqx_main:loc, moqx_main:cmaf, moqx_main:locmaf, moqarena:loc, moqarena:cmaf, moqarena:locmaf]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install media and browser tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pnpm exec playwright install --with-deps chrome
+      - name: Broadcast ${{ matrix.case }}
+        run: node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --minutes "$MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-broadcaster-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  broadcast-player:
+    if: github.event_name != 'workflow_dispatch' || inputs.broadcast
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [moqx_main:loc, moqx_main:cmaf, moqx_main:locmaf, moqarena:loc, moqarena:cmaf, moqarena:locmaf]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Play broadcast ${{ matrix.case }}
+        run: node scripts/player-soak/run.mjs --broadcast-player "${{ matrix.case }}" --minutes "$MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-player-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
