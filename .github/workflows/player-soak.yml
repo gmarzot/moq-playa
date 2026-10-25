@@ -89,11 +89,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Install media and browser tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          pnpm exec playwright install --with-deps chrome
+      - run: pnpm exec playwright install --with-deps chrome
       - name: Broadcast ${{ matrix.case }}
         if: ${{ !inputs.only || inputs.only == matrix.case }}
         run: node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --minutes "$MINUTES"

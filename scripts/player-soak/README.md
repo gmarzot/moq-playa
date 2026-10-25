@@ -11,7 +11,7 @@ pnpm install --frozen-lockfile
 pnpm exec playwright install chrome
 # moq-test-tracks streams, started through the service API
 MTT_API_KEY=… pnpm test:player:soak --mtt --minutes 5 [--only aiomoqt-relay:cmaf]
-# a synthetic g5-broadcast (fake camera and microphone, needs ffmpeg) and its player
+# a synthetic g5-broadcast (generated fake camera and microphone) and its player
 pnpm test:player:soak --broadcaster aiomoqt-relay:loc --tag t1 &
 pnpm test:player:soak --broadcast-player aiomoqt-relay:loc --tag t1
 ```
