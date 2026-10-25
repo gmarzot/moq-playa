@@ -11,7 +11,7 @@ import { Player, pickCaptureTime } from '@openmoq/playa';
 import type { CaptureTimeSource } from '@openmoq/playa';
 import { initBuildInfo } from '../shared/build-info.js';
 import {
-  namespace, certHash, draftVersion, catalogBootstrap, warmStart,
+  namespace, certHash, draftVersion, catalogBootstrap,
   renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
 } from '../shared/cert.js';
 import { parseCompat } from '../shared/compat.js';
@@ -28,6 +28,8 @@ const compatParam = parseCompat(new URLSearchParams(location.search).get('compat
 
 /** `?locmaf=frame`: LOCMAF tracks through WebCodecs instead of MSE (the default). */
 const locmafFrame = new URLSearchParams(location.search).get('locmaf') === 'frame';
+/** G5 starts from the current group unless `?warmStart=0`. */
+const warmStart = new URLSearchParams(location.search).get('warmStart') !== '0';
 
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
@@ -172,7 +174,7 @@ function log(msg: string): void {
     fCushionMax.value = p.get('cushionMax') ?? '';
     fCatchUp.value = p.get('catchUp') ?? '';
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
-    fWarmStart.checked = p.get('warmStart') === '1';
+    fWarmStart.checked = p.get('warmStart') !== '0';
     fCc.value = p.get('congestionControl') ?? '';
     fAuthority.value = p.get('authority') ?? '';
     fHash.value = p.get('hash') ?? '';
@@ -213,7 +215,7 @@ function log(msg: string): void {
     set('cushionMax', fCushionMax.value.trim());
     set('catchUp', fCatchUp.value.trim());
     set('catalogBootstrap', fBootstrap.value);
-    if (fWarmStart.checked) next.set('warmStart', '1');
+    if (!fWarmStart.checked) next.set('warmStart', '0');
     set('congestionControl', fCc.value);
     set('authority', fAuthority.value.trim());
     set('hash', fHash.value.trim());
