@@ -227,7 +227,8 @@ async function report(results) {
     return `| ${r.name} | ${r.verdict} | ${r.startup?.readyMs ?? '—'} | ${pb ? `${pb.stalls.count} / ${pb.stalls.totalMs} ms` : '—'} `
       + `| ${pb ? `${pb.frozen.count} / ${pb.audioGaps.count}` : '—'} | ${pb?.fps.mean ?? '—'} `
       + `| ${lat ? `${Math.round(lat.p50)} / ${Math.round(lat.p95)} / ${Math.round(lat.driftMs)}` : '—'} `
-      + `| ${r.player ? `${r.player.framesDropped} / ${r.player.audioUnderruns}` : '—'} | ${r.error ? r.error.slice(0, 80) : ''} |`;
+      + `| ${r.player ? `${r.player.framesDropped} / ${r.player.audioUnderruns}` : '—'} `
+      + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80) : ''} |`;
   });
   const md = [`### Player soak ${runId} (${minutes} min per case)`, '',
     '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms | dropped / underruns | error |',

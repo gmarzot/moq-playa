@@ -41,6 +41,9 @@ describe('player soak assessment', () => {
       data: { catalog: { tracks: roles.map((role) => ({ name: role, role })) } } }] }];
     expect(assessSoak({ samples: silent, ticks: catalog(['video', 'audio']) }).verdict).toBe('no-audio');
     expect(assessSoak({ samples: silent, ticks: catalog(['video']) }).verdict).toBe('played');
+    const roleless = [{ wallEpochMs: 0, events: [{ timeMs: 0, type: 'catalog_received',
+      data: { catalog: { tracks: [{ name: 'v', codec: 'avc1.64001f' }, { name: 'a', codec: 'opus' }] } } }] }];
+    expect(assessSoak({ samples: silent, ticks: roleless }).verdict).toBe('no-audio');
     expect(assessSoak({ samples: samples(20, () => ({})), ticks: catalog(['video', 'audio']) }).audio)
       .toEqual({ advertised: true, audible: true });
   });
@@ -68,11 +71,12 @@ describe('player soak assessment', () => {
 });
 
 describe('moq-test-tracks client', () => {
-  it('retries a job over a cap, then waits for it to run', async () => {
+  it('retries a job over a cap and a 5xx while waiting, then waits for it to run', async () => {
     vi.useFakeTimers();
     const replies = [
       new Response('{"error":"cap"}', { status: 429 }),
       new Response('{"id":"j1","state":"starting","joined":false}', { status: 201 }),
+      new Response('busy', { status: 503 }),
       new Response('{"id":"j1","state":"running"}', { status: 200 }),
       new Response(null, { status: 204 }),
     ];
@@ -81,12 +85,15 @@ describe('moq-test-tracks client', () => {
     const started = client.start({ namespace: 'ns', relay: 'moqx-main', draft: 18 });
     await vi.advanceTimersByTimeAsync(5_000);
     expect((await started).id).toBe('j1');
-    await expect(client.waitRunning('j1')).resolves.toMatchObject({ state: 'running' });
+    const running = client.waitRunning('j1');
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(running).resolves.toMatchObject({ state: 'running' });
     await client.stop('j1');
     const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
     expect(calls.map(([url, init]) => `${init.method} ${url}`)).toEqual([
       'POST https://mtt.example/api/v1/jobs', 'POST https://mtt.example/api/v1/jobs',
-      'GET https://mtt.example/api/v1/jobs/j1', 'DELETE https://mtt.example/api/v1/jobs/j1',
+      'GET https://mtt.example/api/v1/jobs/j1', 'GET https://mtt.example/api/v1/jobs/j1',
+      'DELETE https://mtt.example/api/v1/jobs/j1',
     ]);
     expect((calls[0]![1].headers as Record<string, string>).authorization).toBe('Bearer k');
     vi.useRealTimers();

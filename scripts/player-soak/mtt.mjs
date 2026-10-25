@@ -42,7 +42,19 @@ export class MttClient {
   async waitRunning(id, { timeoutMs = 600_000 } = {}) {
     const end = Date.now() + timeoutMs;
     for (;;) {
-      const { status, json, text } = await this.request('GET', `/api/v1/jobs/${id}`);
+      let reply;
+      try {
+        reply = await this.request('GET', `/api/v1/jobs/${id}`);
+      } catch (error) {
+        if (Date.now() > end) throw error;
+        await sleep(2_000);
+        continue;
+      }
+      const { status, json, text } = reply;
+      if (status >= 500 && Date.now() <= end) {
+        await sleep(2_000);
+        continue;
+      }
       if (status !== 200) throw new Error(`test-tracks job ${id}: ${status} ${text.slice(0, 300)}`);
       if (json.state === 'running') return json;
       if (['failed', 'stopped', 'done', 'expired'].includes(json.state)) {

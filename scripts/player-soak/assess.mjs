@@ -10,6 +10,7 @@ const STALL_MS = 500;
 const FROZEN_MS = 1500;
 const AUDIO_GAP_MS = 500;
 const AUDIBLE_RMS = 0.015;
+const AUDIO_CODEC = /^(mp4a|opus|ac-3|ec-3|flac|vorbis|alac|ulaw|alaw|pcm)/i;
 
 const median = (values) => {
   if (values.length === 0) return null;
@@ -118,7 +119,8 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {} }) {
   const resolution = last ? { width: last.videoWidth, height: last.videoHeight } : null;
   const played = samples.length > 0 && fpsMean > 0 && last.mediaTimeS > first.mediaTimeS;
   const catalog = ticks.flatMap((t) => t.events ?? []).find((e) => e.type === 'catalog_received')?.data?.catalog;
-  const advertisesAudio = Array.isArray(catalog?.tracks) && catalog.tracks.some((t) => t.role === 'audio');
+  const advertisesAudio = Array.isArray(catalog?.tracks) && catalog.tracks.some((t) => t.role === 'audio'
+    || (t.role === undefined && AUDIO_CODEC.test(t.codec ?? '')));
   const audible = samples.some((s) => s.audioRms > AUDIBLE_RMS);
   return {
     verdict: !played ? 'no-playback' : advertisesAudio && !audible ? 'no-audio' : 'played',
