@@ -284,14 +284,17 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
   let wentLive = false;
   try {
     await page.goto(`${webUrl}g5-broadcast/?${query}`, { waitUntil: 'domcontentloaded' });
+    // Published once the relay accepts the namespace; "live" waits for a catalog subscriber,
+    // which moqx-main sends only when a viewer arrives.
     const goLive = async () => {
       await page.locator('#start-camera').click();
-      await page.waitForFunction(() => document.querySelector('#state')?.textContent === 'live', null, { timeout: 60_000 });
+      await page.waitForFunction(() => ['live', 'awaiting subscribe'].includes(document.querySelector('#state')?.textContent ?? ''),
+        null, { timeout: 60_000 });
       return Date.now();
     };
     let liveAt = await goLive();
     wentLive = true;
-    log('broadcaster', b.namespace, 'live');
+    log('broadcaster', b.namespace, 'published');
     const end = Date.now() + totalMinutes * 60_000;
     while (Date.now() < end) {
       await sleep(5000);
@@ -300,7 +303,7 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
         await page.locator('#stop').click();
         await page.waitForFunction(() => !document.querySelector('#start-camera')?.disabled, null, { timeout: 30_000 });
         liveAt = await goLive();
-        log('broadcaster', b.namespace, `restarted: live again after ${liveAt - stoppedAt} ms`);
+        log('broadcaster', b.namespace, `restarted: published again after ${liveAt - stoppedAt} ms`);
         await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: liveAt, restart: { stoppedAt, liveAt } })}\n`);
       }
       const cells = await page.evaluate(() => ({
@@ -311,10 +314,10 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
       await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...cells })}\n`);
     }
   } finally {
-    // The page's own log is the only record of why a broadcast did not go live.
+    // The page's own log is the only record of why a broadcast did not publish.
     const pageLog = await page.locator('#log').textContent().catch(() => null) ?? '';
     await writeFile(join(dir, 'log.txt'), pageLog);
-    if (!wentLive) log('broadcaster', b.namespace, `never went live; page log:\n${pageLog.slice(-2000)}`);
+    if (!wentLive) log('broadcaster', b.namespace, `never published; page log:\n${pageLog.slice(-2000)}`);
     await page.locator('#stop').click().catch(() => {});
     await sleep(1000);
     await browser.close();
