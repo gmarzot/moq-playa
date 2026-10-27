@@ -823,6 +823,7 @@ export class MoqtConnection {
     this.pendingJoinFetches.clear();
     // Receiver terminal tracker (tombstone TTL timers) + seen counts.
     for (const alias of [...this.terminatedAliases.keys()]) this.clearTerminatedAlias(alias);
+    this.reusedAliasGuards.clear();
     this.aliasStreamsSeen.clear();
     this.aliasTerminalTotals.clear();
     for (const retained of this.terminalSubscribers.values()) retained.cancelTimer();
@@ -1340,7 +1341,15 @@ export class MoqtConnection {
     strict: boolean;
     /** Track of the subscription the alias belonged to; undefined when not known. */
     trackKey?: string;
+    /** When the TTL ends (Date.now() clock). */
+    expiresAtMs: number;
   }>();
+  /**
+   * An old generation's window, kept when the same track took its alias over
+   * (§11.1): its late streams now reach the new subscription, so the alias
+   * stays closed to other tracks until the window ends.
+   */
+  private readonly reusedAliasGuards = new Map<bigint, { trackKey: string; untilMs: number }>();
   /**
    * Terminal-alias-guard lifetime (constructor option, default 10s). §10.11: a late
    * stream should be discarded for at least the effective delivery timeout after
@@ -2399,6 +2408,7 @@ export class MoqtConnection {
     }
     // (3) Accepted — bind routing, resolve, surface, and run replenish actions.
     const stampedOk = { ...message, requestId } as ControlMessage;
+    this.carryReusedAliasGuard(alias);
     // The old generation's complete guard (if any) is safe to clear now.
     this.clearTerminatedAlias(alias);
     const suppress = this.handleRawSubControlMessage(stampedOk);
@@ -2449,6 +2459,9 @@ export class MoqtConnection {
    * tombstone, or a COMPLETE strict one (remaining 0 — its generation finished).
    */
   private aliasReuseSafe(alias: bigint, trackKey?: string): boolean {
+    const carried = this.reusedAliasGuards.get(alias);
+    if (carried && carried.untilMs <= Date.now()) this.reusedAliasGuards.delete(alias);
+    else if (carried && carried.trackKey !== trackKey) return false;
     if (this.drainingAliases.has(alias)) return false; // drain window in progress
     const live = this.session.getSubscriberRequestsForAlias(alias);
     for (const { sub } of this.terminalSubscribers.values()) {
@@ -2674,14 +2687,14 @@ export class MoqtConnection {
     const teardownAlias = !retained && alias != null
       && !this.deliverySubscribers22(alias).some((sub) => sub.requestId !== requestId)
       && (!raw || this.rawAliasMaps.get(alias) === raw) ? alias : null;
-    if (teardownAlias !== null) this.armSubscriberAliasTeardown(teardownAlias);
+    if (teardownAlias !== null) this.armSubscriberAliasTeardown(teardownAlias, requestId);
     this.cancelPendingAliasReplaysForRequest(requestId);
     const cancelledFills = !retained && (alias == null || !this.drainingAliases.has(alias)) ? this.cancelFill(requestId) : Promise.resolve();
     const closeActions = this.session.handleOutboundRequestClosed(requestId);
     await cancelledFills;
     await this.executeActions(closeActions);
-    // Unless a newer subscription re-bound the alias meanwhile.
-    if (teardownAlias !== null && !this.rawAliasMaps.has(teardownAlias)) {
+    // Unless a newer subscription took the alias over meanwhile.
+    if (teardownAlias !== null && !this.aliasHeldByOther(teardownAlias, requestId)) {
       await this.discardOpenStreamsForAlias(teardownAlias);
     }
     if (raw) {
@@ -3430,9 +3443,9 @@ export class MoqtConnection {
    * request-stream paths that DO early-discard open streams use
    * {@link discardOpenStreamsForAlias} afterward.
    */
-  private armSubscriberAliasTeardown(alias: bigint): void {
+  private armSubscriberAliasTeardown(alias: bigint, requestId: bigint): void {
     this.refreshAliasDeliveryTimeout(alias); // §8: reflect any accepted REQUEST_UPDATE before arming
-    this.armTerminatedAlias(alias, null, /* strict */ false); // TTL-only; refuses reuse until it expires
+    this.armTerminatedAlias(alias, null, /* strict */ false, requestId); // TTL-only; refuses other tracks until it expires
     this.rawAliasMaps.delete(alias);
     this.sharedAliasSubs.delete(alias);
   }
@@ -3442,6 +3455,20 @@ export class MoqtConnection {
     for (const [sid, a] of [...this.incomingSubgroupAliases]) {
       if (a === alias) await this.stopIncomingSubgroupStream(sid);
     }
+  }
+
+  /** Before a same-track takeover clears a live tombstone, keep its window closed to other tracks. */
+  private carryReusedAliasGuard(alias: bigint): void {
+    const t = this.terminatedAliases.get(alias);
+    if (!t || t.trackKey === undefined || (t.strict && t.remaining === 0n)) return;
+    const untilMs = Math.max(t.expiresAtMs, this.reusedAliasGuards.get(alias)?.untilMs ?? 0);
+    this.reusedAliasGuards.set(alias, { trackKey: t.trackKey, untilMs });
+  }
+
+  /** Whether a subscription other than `requestId` holds `alias` now (taken over during a teardown). */
+  private aliasHeldByOther(alias: bigint, requestId: bigint): boolean {
+    return this.rawAliasMaps.has(alias)
+      || this.session.getSubscriberRequestsForAlias(alias).some((sub) => sub.requestId !== requestId);
   }
 
   /** Clear an alias tombstone (cancel its TTL timer) and its seen-count. */
@@ -3488,8 +3515,8 @@ export class MoqtConnection {
    * governs count-driven clearing and the no-downgrade rule below. A tombstone
    * always carries a TTL so it is bounded regardless.
    */
-  private armTerminatedAlias(alias: bigint, remaining: bigint | null, strict: boolean): void {
-    const owner = this.rawAliasMaps.get(alias)?.requestId;
+  private armTerminatedAlias(alias: bigint, remaining: bigint | null, strict: boolean, requestId?: bigint): void {
+    const owner = this.rawAliasMaps.get(alias)?.requestId ?? requestId;
     const ownerTrack = owner === undefined ? undefined : this.session.getSubscription(owner)?.trackKey;
     // No more objects routed for this alias — drop BOTH routing maps (an alias
     // lives in one or the other): the inbound-PUBLISH map AND the outbound-
@@ -3512,7 +3539,9 @@ export class MoqtConnection {
     const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
     const cancelTimer = this.armGuardTimer(ttlMs, () => this.clearTerminatedAlias(alias));
     const trackKey = ownerTrack ?? existing?.trackKey;
-    this.terminatedAliases.set(alias, { remaining, cancelTimer, strict, ...(trackKey !== undefined ? { trackKey } : {}) });
+    this.terminatedAliases.set(alias, {
+      remaining, cancelTimer, strict, expiresAtMs: Date.now() + ttlMs, ...(trackKey !== undefined ? { trackKey } : {}),
+    });
   }
 
   /**
@@ -3612,7 +3641,7 @@ export class MoqtConnection {
     const remaining: bigint | null = streamCount === unknown
       ? null // §9.15 sentinel: exact count unknown — rely on the TTL only
       : (streamCount - seen > 0n ? streamCount - seen : 0n);
-    this.armTerminatedAlias(alias, remaining, /* strict */ true);
+    this.armTerminatedAlias(alias, remaining, /* strict */ true, owningRequestId);
     // 2) Early-discard every stream currently open for the alias.
     for (const [sid, a] of [...this.incomingSubgroupAliases]) {
       if (a === alias) await this.stopIncomingSubgroupStream(sid);
@@ -3874,7 +3903,7 @@ export class MoqtConnection {
       && this.deliverySubscribers22(alias).some((sub) => sub.requestId !== requestId);
     if (alias != null && this.session.getSubscription(requestId)) this.recordSubscriberTerminal(alias, null);
     if (raw) this.detachSharedAlias(raw);
-    if (!aliasStillShared && alias != null) this.armSubscriberAliasTeardown(alias);
+    if (!aliasStillShared && alias != null) this.armSubscriberAliasTeardown(alias, requestId);
 
     // draft-22 §3.4: the fill ends with its subscription.
     const cancelledFills = this.cancelFill(requestId);
@@ -3888,7 +3917,7 @@ export class MoqtConnection {
       await this.uniPair!.cancelRequest(requestId);
       // Tombstone already armed above; now early-discard open streams, unless
       // the same track's new subscription took the alias over meanwhile.
-      if (!aliasStillShared && alias != null && !this.rawAliasMaps.has(alias)) {
+      if (!aliasStillShared && alias != null && !this.aliasHeldByOther(alias, requestId)) {
         await this.discardOpenStreamsForAlias(alias);
       }
     }
