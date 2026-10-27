@@ -142,7 +142,7 @@ export async function acceptCatalogSubscribe(
   requestId: bigint,
   alias: bigint,
   params: BroadcastCatalogParams,
-  wire: { draft: DraftVersion; terminalCloseDeadlineMs?: number; groupId?: bigint },
+  wire: { draft: DraftVersion; terminalCloseDeadlineMs?: number; groupId?: bigint; publisherPriority?: number },
 ): Promise<number> {
   // Build BEFORE accepting: a build failure must never leave a subscription
   // ESTABLISHED with nothing to send it. The request is still ANSWERED —
@@ -190,7 +190,7 @@ export async function publishCatalogGroup(
   connection: CatalogPublishConnection,
   alias: bigint,
   payload: Uint8Array,
-  wire: { draft: DraftVersion; groupId?: bigint },
+  wire: { draft: DraftVersion; groupId?: bigint; publisherPriority?: number },
   deadlineMs: number = DEFAULT_TERMINAL_CLOSE_DEADLINE_MS,
   onStreamOpen?: (streamId: bigint) => void,
 ): Promise<void> {
@@ -199,7 +199,8 @@ export async function publishCatalogGroup(
     {
       hasExtensions: false,
       endOfGroup: true,
-      defaultPriority: true,
+      // Without one, the subgroup takes the subscription's priority.
+      ...(wire.publisherPriority !== undefined ? { publisherPriority: wire.publisherPriority } : { defaultPriority: true }),
       subgroupIdMode: SubgroupIdMode.ZERO,
       ...(isRequestStreamDraft(wire.draft) ? { firstObject: true } : {}),
     },
