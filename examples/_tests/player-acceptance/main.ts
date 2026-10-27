@@ -49,7 +49,7 @@ const player = new Player(null, {
   startLevel: Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   moqtPlayerConfig: {
-    logLevel: params.has('debug') ? 'debug' : 'none',
+    logLevel: params.has('debug') ? 'debug' : (['error', 'warn', 'info'] as const).find((l) => l === params.get('log')) ?? 'none',
     ...(params.get('warmStart') === '1' ? { warmStartCurrentGroup: true } : {}),
     ...(params.get('followNamespace') === '1' ? { followNamespace: true } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',

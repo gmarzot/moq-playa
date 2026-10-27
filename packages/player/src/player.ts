@@ -57,7 +57,7 @@ import { createLogger, LOG_LEVELS, type LoggerLike } from './logger.js';
 import { checkSupport as detectSupport } from './support.js';
 import type { SupportReport } from './support.js';
 import { CatalogManager } from './catalog-manager.js';
-import { QualityController } from './quality-controller.js';
+import { QualityController, type SelectedTracks } from './quality-controller.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
 import { isMsePackaging, mediaTrackPackaging, usesMsePath } from './packaging.js';
 
@@ -268,6 +268,9 @@ interface PendingAudioSwitch {
 function codecsCompatible(a: string, b: string): boolean {
   return a === b;
 }
+
+/** Why a media track is re-subscribed. */
+type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration';
 
 function defaultMediaSubscriptionFilter(isLive: boolean) {
   if (isLive) {
@@ -829,6 +832,8 @@ export class MoqtPlayer {
   private static readonly MAX_RECOVERY_PARKED_EVENTS = 64;
   private static readonly MAX_RECOVERY_PARKED_ALIASES = 64;
   private recoveryAttempted = false;
+  /** Tracks the session played when a migration committed; consumed by resumeMigratedMedia. */
+  private migratedMedia: { video: string | undefined; audio: string | undefined } | null = null;
 
   /**
    * FAIL-CLOSED pre-alias stream lifecycle record: close events for streams
@@ -2329,6 +2334,60 @@ export class MoqtPlayer {
     if (audio) qc.commitAudioTrack(audio);
     // Re-ladder buffer ABR where it runs; the knownTracks path never had it.
     if (this.bufferAbrController) this.syncBufferAbrController();
+  }
+
+  /** Release the current session's media subscriptions; returns the tracks they played. */
+  private retireSessionMedia(): { video: string | undefined; audio: string | undefined } {
+    const playing = { video: this.activeTrackName('video'), audio: this.activeTrackName('audio') };
+    const conn = this.connection;
+    if (conn) {
+      for (const [requestId, sub] of [...this.activeSubscriptions]) {
+        if (sub.mediaType === 'video' || sub.mediaType === 'audio') this.retireMediaSubscription(requestId, conn);
+      }
+    }
+    return playing;
+  }
+
+  /**
+   * After a migration, subscribe the new session to the tracks the old one
+   * played, or to the current selection where none played.
+   */
+  private resumeMigratedMedia(selected: SelectedTracks): void {
+    const playing = this.migratedMedia;
+    this.migratedMedia = null;
+    const tracks = this._catalogState?.tracks;
+    if (!playing || !tracks) return;
+    for (const mediaType of ['video', 'audio'] as const) {
+      if (this.activeTrackName(mediaType) !== undefined) continue;
+      const kept = playing[mediaType];
+      const name = kept !== undefined && tracks.some((t: CatalogTrack) => t.name === kept)
+        ? kept : selected[mediaType]?.name;
+      if (name === undefined) continue;
+      if (mediaType === 'video') this.qualityController?.commitVideoTrack(name);
+      else this.qualityController?.commitAudioTrack(name);
+      this.replaceSubscription(name, 'migration', () => this.scheduleResubscribe(name, 'migration'));
+    }
+    this.syncBufferAbrController();
+  }
+
+  /**
+   * Warm start (§5.1.3) for a re-subscription, as far as the SUBSCRIBE alone
+   * carries it: a new group for live MSE video, the current group as a
+   * draft-22 fill for live LOC. LOC on older drafts needs a Joining FETCH for
+   * that, so it starts at the next group.
+   */
+  private warmResubscribeOptions(
+    track: CatalogTrack, packaging: string, mediaType: 'video' | 'audio', conn: MoqtConnection,
+  ): { options: object; fill: boolean } | null {
+    if (this.config.warmStartCurrentGroup !== true || track.isLive !== true) return null;
+    if (isMsePackaging(packaging)) {
+      return mediaType === 'video' && conn.draftVersion !== 14
+        ? { options: { ...defaultMediaSubscriptionFilter(true), newGroupRequest: 0n }, fill: false }
+        : null;
+    }
+    return isDraft22(conn.draftVersion)
+      ? { options: { subscriptionFilter: { type: 'LargestObject' as const }, fill: CURRENT_GROUP_FILL }, fill: true }
+      : null;
   }
 
   /**
@@ -4442,6 +4501,7 @@ export class MoqtPlayer {
       const candidateOptions = candidateMode === 'joining-fetch'
         ? {
             subscriptionFilter: { type: 'LargestObject' as const },
+            ...(this.usesCatalogFill(newConnection) ? { fill: CATALOG_FILL } : {}),
             onRequestId: (id: bigint) => { candidateReqId = id; },
             terminalDelivery: 'drain' as const,
             onDrained: candidateDrained,
@@ -4640,9 +4700,17 @@ export class MoqtPlayer {
     // still be awaiting SUBSCRIBE_OK (its staged response replays after this).
     this.pendingAliasBinds.clear();
     this.pendingAliasBinds.add(catalogReqId);
-    // Audio and program switches in flight belong to the old session too.
+    // Switches in flight belong to the old session too.
+    this.clearVideoSwitchTimers();
+    this.pendingVideoSwitch = null;
+    this.switchInProgress = false;
+    this.switchStagingBuffer = [];
+    this.cmafSwitchStagingBuffer = [];
     this.pendingAudioSwitch = null;
     this.pendingProgramSwitch = null;
+    // Media subscriptions die with the old session; resumeMigratedMedia re-makes
+    // them once the new session's catalog arrives.
+    this.migratedMedia = this.retireSessionMedia();
     this.connection = newConnection;
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
     void this.followNamespace(newConnection);
@@ -5490,7 +5558,8 @@ export class MoqtPlayer {
     if (this._destroyed || this.isTerminalState() || this.connection !== conn || this.bootstrapGeneration !== gen) return;
     this.log.info('Catalog received (bootstrap): %d tracks', catalogState.tracks.length);
     if (this.pipelinesCreated) {
-      // knownTracks path — pipelines already exist, media already subscribed.
+      // Pipelines already exist: media was subscribed from knownTracks, or
+      // is re-subscribed here after a migration.
       const previousController = this.qualityController;
       this.qualityController = new QualityController({
         autoQuality: this.config.autoQuality!,
@@ -5501,9 +5570,10 @@ export class MoqtPlayer {
         qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
         clock: this.clock,
       });
-      this.selectCatalogTracks(catalogState);
+      const selected = this.selectCatalogTracks(catalogState);
       this.validateKnownTracks(catalogState);
       this.alignControllerWithPlayingTracks(previousController);
+      this.resumeMigratedMedia(selected);
     } else {
       this.subscribeToMediaTracks(catalogState).catch((err: unknown) => {
         if (this.connection !== conn || this.bootstrapGeneration !== gen) return;
@@ -7209,10 +7279,14 @@ export class MoqtPlayer {
           return;
         }
         if (classified.severity === 'fatal') this.cancelCatalogBootstrap();
+        // A session the player reconnects is degraded, not lost; scheduleReconnect
+        // reports fatal if the reconnect gives up.
+        const reconnecting = classified.severity === 'fatal' && this.canReconnect();
         this.emitError(createPlayerError(
-          classified.severity, 'connection', classified.code, error.message,
+          reconnecting ? 'degraded' : classified.severity, 'connection', classified.code, error.message,
           defined({ cause: error, context: classified.context }),
         ));
+        if (reconnecting) this.scheduleReconnect(error.message);
       },
 
       onObject: stageable((streamId, obj) => {
@@ -8028,7 +8102,7 @@ export class MoqtPlayer {
         if (retriable) {
           this.log.warn('PUBLISH_DONE(0x%s) "%s": %s — resubscribing from live edge',
             statusCode.toString(16), trackName, errorReason || '(no reason)');
-          this.schedulePublishDoneResubscribe(
+          this.scheduleResubscribe(
             trackName, statusCode === tooFarBehind ? 'too_far_behind' : 'publish_done');
           return;
         }
@@ -8496,7 +8570,8 @@ export class MoqtPlayer {
         if (!live()) return;
 
         if (this.pipelinesCreated) {
-          // knownTracks path — pipelines already exist, media already subscribed.
+          // Pipelines already exist: media was subscribed from knownTracks, or
+          // is re-subscribed here after a migration.
           // Initialize QualityController for future ABR switches and validate.
           const previousController = this.qualityController;
           this.qualityController = new QualityController({
@@ -8508,9 +8583,10 @@ export class MoqtPlayer {
             qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
             clock: this.clock,
           });
-          this.selectCatalogTracks(catalogState);
+          const selected = this.selectCatalogTracks(catalogState);
           this.validateKnownTracks(catalogState);
           this.alignControllerWithPlayingTracks(previousController);
+          this.resumeMigratedMedia(selected);
         } else {
           // Standard path — catalog-first: create pipelines and subscribe
           this.subscribeToMediaTracks(catalogState).catch((err) => {
@@ -9881,10 +9957,7 @@ export class MoqtPlayer {
    * RECONNECT_MAX_ATTEMPTS. Each failed attempt rolls back cleanly.
    */
   private scheduleReconnect(closeReason: string): void {
-    if (this._destroyed || this.currentMigration) return;
-    if (!this.config.createConnection || !this.config.createTransport) return;
-    const state = this.stateMachine.state;
-    if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED) return;
+    if (!this.canReconnect()) return;
     const r = this.reconnect ??= { attempt: 0, timer: null, closeReason };
     if (r.timer !== null) return;
     if (r.attempt >= MoqtPlayer.RECONNECT_MAX_ATTEMPTS) {
@@ -9907,6 +9980,14 @@ export class MoqtPlayer {
       r.timer = null;
       this.attemptReconnect(r);
     }, delayMs);
+  }
+
+  /** Whether a closed session would be reconnected now. */
+  private canReconnect(): boolean {
+    if (this._destroyed || this.currentMigration) return false;
+    if (!this.config.createConnection || !this.config.createTransport) return false;
+    const state = this.stateMachine.state;
+    return state === PlayerState.PLAYING || state === PlayerState.PAUSED;
   }
 
   private attemptReconnect(r: NonNullable<MoqtPlayer['reconnect']>): void {
@@ -10336,17 +10417,15 @@ export class MoqtPlayer {
       // the request stream may have died with the delivery path.
       void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
     }
-    this.replaceSubscription(track.trackName, 'liveness');
+    this.replaceSubscription(track.trackName, 'liveness',
+      () => this.scheduleResubscribe(track.trackName, 'liveness'));
   }
 
   /**
-   * Resubscribe after a retriable PUBLISH_DONE: at once, then with doubling
-   * backoff, one pending retry per track; parked while the document is hidden.
+   * Resubscribe a track at once, then with doubling backoff, one pending retry
+   * per track; parked while the document is hidden.
    */
-  private schedulePublishDoneResubscribe(
-    trackName: string,
-    cause: 'too_far_behind' | 'publish_done',
-  ): void {
+  private scheduleResubscribe(trackName: string, cause: ResubscribeCause): void {
     const nowMs = performance.now();
     let retry = this.publishDoneRetries.get(trackName);
     if (!retry) {
@@ -10365,9 +10444,10 @@ export class MoqtPlayer {
     const conn = this.connection;
     const fire = (): void => {
       state.timer = null;
-      // A reconnect or migration resubscribes every track itself.
-      if (this._destroyed || this.connection !== conn || this.reconnect !== null) return;
-      if (this.documentHidden()) {
+      // A migration re-subscribes the replaced session's tracks itself.
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      // A reconnect in flight either replaces this session or has just made it.
+      if (this.reconnect !== null || this.documentHidden()) {
         state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
         return;
       }
@@ -10375,7 +10455,7 @@ export class MoqtPlayer {
         if (sub.trackName === trackName) return;
       }
       this.replaceSubscription(trackName, cause,
-        () => this.schedulePublishDoneResubscribe(trackName, cause));
+        () => this.scheduleResubscribe(trackName, cause));
     };
     if (delayMs === 0) fire();
     else state.timer = setTimeout(fire, delayMs);
@@ -10395,7 +10475,7 @@ export class MoqtPlayer {
    */
   private replaceSubscription(
     trackName: string,
-    cause: 'too_far_behind' | 'publish_done' | 'liveness',
+    cause: ResubscribeCause,
     onFailed?: () => void,
   ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
@@ -10438,6 +10518,7 @@ export class MoqtPlayer {
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(trackName);
     const filter = defaultMediaSubscriptionFilter(isLive);
+    const warm = cause === 'migration' ? this.warmResubscribeOptions(track, packaging, mediaType, this.connection) : null;
 
     // Pre-send ownership (§9.10): a same-tick SUBSCRIBE_OK must find the
     // pending entry; the EVENT still waits for the send to succeed.
@@ -10456,11 +10537,17 @@ export class MoqtPlayer {
     // player, and `this.connection` is mutable. Announcing afterwards also
     // makes the event's contract true — the replacement has really started.
     const pending = resubConn.subscribe(nsBytes, nameBytes,
-      { ...(filter ?? {}), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
+      { ...(warm?.options ?? filter), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
       if (!this.subscriptionManager) return;
       registerResub(reqIdBigInt);
+      // The fill stream carries the SUBSCRIBE's Request ID, as at load.
+      if (warm?.fill && this.connection === resubConn) {
+        this.registerMediaFetch(reqIdBigInt, {
+          trackName, mediaType, subscriptionRequestId: reqIdBigInt, trackAlias: null, warmStart: true,
+        });
+      }
 
       this.log.info('Resubscribed %s "%s" requestId=%s after %s',
         mediaType, trackName, reqIdBigInt, cause);

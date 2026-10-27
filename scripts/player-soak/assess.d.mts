@@ -45,6 +45,8 @@ export function assessSoak(input: {
   recovery: {
     events: Recovery[];
     unrecovered: number;
+    /** How long the picture has been frozen at the end, when 15 s or more. */
+    endedFrozenMs: number | null;
     unsettled: number;
     freshFrameAfterMsMax: number | null;
     stableLatencyAfterMsMax: number | null;
