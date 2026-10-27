@@ -12240,6 +12240,149 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     await player.destroy();
   });
 
+  /** A playing player with catalog, video and audio established on `first`. */
+  async function playingWithMedia(first: ReturnType<typeof createMockAdapter>) {
+    const ctx = await loaded(first, { playing: true });
+    ackCatalog(first);
+    first._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    await vi.waitFor(() => expect(vi.mocked(first.subscribe).mock.calls.length).toBeGreaterThanOrEqual(3));
+    await ackMedia(first);
+    if (ctx.player.state !== PlayerState.PLAYING) (ctx.player as any).transitionState(PlayerState.PLAYING);
+    const media = await Promise.all(vi.mocked(first.subscribe).mock.results.slice(1, 3).map((r) => r.value));
+    return { ...ctx, media };
+  }
+
+  const subscribedNames = (adapter: ReturnType<typeof createMockAdapter>) =>
+    vi.mocked(adapter.subscribe).mock.calls.map((c) => new TextDecoder().decode(c[1] as Uint8Array));
+
+  /** Reconnect onto `second` and deliver its catalog. */
+  async function reconnectOnto(
+    player: MoqtPlayer, second: ReturnType<typeof createMockAdapter>, close: () => void,
+  ): Promise<void> {
+    const migrated = vi.fn();
+    player.on('session_migrated', migrated);
+    vi.useFakeTimers();
+    close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.useRealTimers();
+    await resolveConnect(second);
+    await vi.waitFor(() => expect(migrated).toHaveBeenCalledOnce());
+    ackCatalog(second);
+    second._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+  }
+
+  it('re-subscribes the media the lost session played on the new session, without UNSUBSCRIBE there', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    expect(second.unsubscribe).not.toHaveBeenCalled();
+    const subs = [...(player as any).activeSubscriptions.values()] as Array<{ mediaType: string }>;
+    expect(subs.map((sub) => sub.mediaType).sort()).toEqual(['audio', 'video']);
+    await player.destroy();
+  });
+
+  it('subscribes video and audio after reconnecting from a publisher that ended its tracks', async () => {
+    const first = createMockAdapter();
+    const { player, next, media } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    const endTracks = () => {
+      for (const requestId of media) {
+        first._triggerMessage({
+          type: 'PUBLISH_DONE', requestId, statusCode: varint(0x2), streamCount: varint(0), errorReason: 'track ended',
+        } as unknown as ControlMessage);
+      }
+      expect((player as any).activeSubscriptions.size).toBe(0);
+    };
+
+    await reconnectOnto(player, second, endTracks);
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    await player.destroy();
+  });
+
+  it('retries a media re-subscription that fails', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    let ids = 1n;
+    let refused = false;
+    vi.mocked(second.subscribe).mockImplementation(async (_ns: unknown, name: unknown) => {
+      if (new TextDecoder().decode(name as Uint8Array) === 'video' && !refused) {
+        refused = true;
+        throw new Error('track alias 2 is still guarded by a terminating prior subscription');
+      }
+      return varint(ids++);
+    });
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).filter((n) => n === 'video')).toHaveLength(2));
+    await vi.waitFor(() => expect((player as any).activeTrackName('video')).toBe('video'));
+    await player.destroy();
+  });
+
+  it('reports a lost session it reconnects as degraded, and starts the reconnect', async () => {
+    const first = createMockAdapter();
+    const { player } = await loaded(first, { playing: true });
+    vi.useFakeTimers();
+    const errors: PlayerError[] = [];
+    const reconnecting: unknown[] = [];
+    player.on('error', (e) => errors.push(e.error));
+    player.on('session_reconnecting', (e) => reconnecting.push(e));
+
+    first._triggerError(new MoqtConnectionError('Connection lost.', { errorSource: 'transport', isFatal: true }));
+    first._triggerClose(0x2, 'Connection lost.');
+
+    expect(errors.map((e) => [e.severity, e.code])).toEqual([['degraded', PlayerErrorCode.CONNECTION_LOST]]);
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+    expect(player.state).toBe(PlayerState.PLAYING);
+    await player.destroy();
+  });
+
+  it('keeps a lost session fatal when the player cannot reconnect', async () => {
+    const first = createMockAdapter();
+    const { player } = await loaded(first, { playing: false });
+    const errors: PlayerError[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    first._triggerError(new MoqtConnectionError('Connection lost.', { errorSource: 'transport', isFatal: true }));
+
+    expect(errors.map((e) => e.severity)).toEqual(['fatal']);
+    await player.destroy();
+  });
+
+  it('carries warm start on re-subscriptions where the SUBSCRIBE alone can', () => {
+    const player = new MoqtPlayer({ ...createConfig(createMockAdapter()), warmStartCurrentGroup: true });
+    const cold = new MoqtPlayer(createConfig(createMockAdapter()));
+    const live = (name: string, packaging: string, role: string) => ({ name, packaging, role, isLive: true });
+    const warm = (p: MoqtPlayer, track: object, packaging: string, mediaType: string, draftVersion: number) =>
+      (p as any).warmResubscribeOptions(track, packaging, mediaType, { draftVersion });
+
+    expect(warm(player, live('v', 'cmaf', 'video'), 'cmaf', 'video', 18))
+      .toEqual({ options: { subscriptionFilter: { type: 'NextGroupStart' }, newGroupRequest: 0n }, fill: false });
+    expect(warm(player, live('v', 'cmaf', 'video'), 'cmaf', 'video', 14)).toBeNull();
+    expect(warm(player, live('a', 'cmaf', 'audio'), 'cmaf', 'audio', 18)).toBeNull();
+    expect(warm(player, live('v', 'loc', 'video'), 'loc', 'video', 22)).toEqual({
+      options: { subscriptionFilter: { type: 'LargestObject' }, fill: { filter: { type: 'RelativeStart', groups: 1n } } },
+      fill: true,
+    });
+    expect(warm(player, live('v', 'loc', 'video'), 'loc', 'video', 18)).toBeNull();
+    expect(warm(cold, live('v', 'cmaf', 'video'), 'cmaf', 'video', 18)).toBeNull();
+  });
+
   it('destroy() cancels a pending reconnect', async () => {
     const first = createMockAdapter();
     const { player, createConnection } = await loaded(first, { playing: true });
