@@ -3061,6 +3061,32 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     });
   }
 
+  it('a PUBLISH_DONE that leaves an update unanswered fails the update, ends the subscription and keeps the session', async () => {
+    const { client, server, a, errors } = await connectedPair(18);
+    let rid = -1n; server.onSubscribe = (r) => { rid = r; };
+    const msgs: ControlMessage[] = [];
+    client.onMessage = (m) => msgs.push(m);
+    const reqId = await client.subscribe(ns('live'), nm('vid'));
+    await flush();
+    await server.acceptSubscribe(rid, 7n);
+    await flush();
+    // The publisher never answers the update.
+    const inbound = server as unknown as { dispatchInboundRequestMessage: (m: { type: string }, c: unknown) => unknown };
+    const dispatch = inbound.dispatchInboundRequestMessage.bind(server);
+    inbound.dispatchInboundRequestMessage = (m, c) => (m.type === 'REQUEST_UPDATE' ? undefined : dispatch(m, c));
+
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush();
+    a.bidiOut[0]!.in.injectRead(rawDone(0n));
+    await flush();
+
+    expect(msgs.some((m) => m.type === 'PUBLISH_DONE')).toBe(true);
+    expect(client.session.state).toBe(SessionState.ESTABLISHED);
+    expect(client.session.getSubscription(BigInt(reqId))).toBeUndefined();
+    expect(client.unansweredUpdateCount).toBe(1);
+    expect(errors.map((e) => [(e as { isFatal?: boolean }).isFatal, /unanswered/.test(e.message)])).toEqual([[false, true]]);
+  });
+
   // Cancellation during the header write must not resurrect the stream.
   it('cancellation while the subgroup HEADER WRITE is held aborts the writer and rejects; the stream is still counted', async () => {
     const { client, server, subReqId } = await (async () => {

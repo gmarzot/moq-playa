@@ -290,11 +290,17 @@ async function main(): Promise<void> {
   /** Compat activity, logged when it changes (the engine's own warnings go to the console). */
   let compatReported = '';
   const reportCompat = (): void => {
-    if (!compatParam.compat.length) return;
+    const unanswered: number = (player as any).engine?.connection?.unansweredUpdateCount ?? 0;
+    if (!compatParam.compat.length && !unanswered) return;
     const credit = (player as any).engine?.connection?.session?.uncappedRequestCredit;
-    const line = `requests sent without credit ${credit?.requests ?? 0}`
-      + (credit?.active ? ' (relay has granted none)' : '')
-      + ` · empty media objects skipped ${(player as any).engine?.emptyMediaObjectsSkipped ?? 0}`;
+    const flagged = compatParam.compat.length
+      ? `requests sent without credit ${credit?.requests ?? 0}`
+        + (credit?.active ? ' (relay has granted none)' : '')
+        + ` · empty media objects skipped ${(player as any).engine?.emptyMediaObjectsSkipped ?? 0}`
+      : '';
+    // Tolerated by default: the relay ended a subscription before answering its updates.
+    const line = [flagged, unanswered ? `updates left unanswered by PUBLISH_DONE ${unanswered}` : '']
+      .filter(Boolean).join(' · ');
     if (line === compatReported) return;
     compatReported = line;
     log(`compat: ${line}`);
