@@ -4700,7 +4700,12 @@ export class MoqtPlayer {
     // still be awaiting SUBSCRIBE_OK (its staged response replays after this).
     this.pendingAliasBinds.clear();
     this.pendingAliasBinds.add(catalogReqId);
-    // Audio and program switches in flight belong to the old session too.
+    // Switches in flight belong to the old session too.
+    this.clearVideoSwitchTimers();
+    this.pendingVideoSwitch = null;
+    this.switchInProgress = false;
+    this.switchStagingBuffer = [];
+    this.cmafSwitchStagingBuffer = [];
     this.pendingAudioSwitch = null;
     this.pendingProgramSwitch = null;
     // Media subscriptions die with the old session; resumeMigratedMedia re-makes
@@ -10439,9 +10444,10 @@ export class MoqtPlayer {
     const conn = this.connection;
     const fire = (): void => {
       state.timer = null;
-      // A reconnect or migration resubscribes every track itself.
-      if (this._destroyed || this.connection !== conn || this.reconnect !== null) return;
-      if (this.documentHidden()) {
+      // A migration re-subscribes the replaced session's tracks itself.
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      // A reconnect in flight either replaces this session or has just made it.
+      if (this.reconnect !== null || this.documentHidden()) {
         state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
         return;
       }

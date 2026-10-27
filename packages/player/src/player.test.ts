@@ -12260,7 +12260,7 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
 
   /** Reconnect onto `second` and deliver its catalog. */
   async function reconnectOnto(
-    player: MoqtPlayer, second: ReturnType<typeof createMockAdapter>, close: () => void,
+    player: MoqtPlayer, second: ReturnType<typeof createMockAdapter>, close: () => void, beforeCatalog?: () => void,
   ): Promise<void> {
     const migrated = vi.fn();
     player.on('session_migrated', migrated);
@@ -12270,6 +12270,7 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     vi.useRealTimers();
     await resolveConnect(second);
     await vi.waitFor(() => expect(migrated).toHaveBeenCalledOnce());
+    beforeCatalog?.();
     ackCatalog(second);
     second._triggerObject(0n, {
       kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
@@ -12331,6 +12332,49 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
 
     await vi.waitFor(() => expect(subscribedNames(second).filter((n) => n === 'video')).toHaveLength(2));
     await vi.waitFor(() => expect((player as any).activeTrackName('video')).toBe('video'));
+    await player.destroy();
+  });
+
+  it('holds a failed re-subscription while the reconnect is still settling', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    let ids = 1n;
+    let refused = false;
+    vi.mocked(second.subscribe).mockImplementation(async (_ns: unknown, name: unknown) => {
+      if (new TextDecoder().decode(name as Uint8Array) === 'video' && !refused) {
+        refused = true;
+        throw new Error('refused');
+      }
+      return varint(ids++);
+    });
+    const videoSubscribes = () => subscribedNames(second).filter((n) => n === 'video').length;
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'), () => {
+      (player as any).reconnect = { attempt: 1, timer: null, closeReason: 'Connection lost.' };
+    });
+    await vi.waitFor(() => expect(refused).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(videoSubscribes()).toBe(1);
+
+    (player as any).reconnect = null;
+    await vi.waitFor(() => expect(videoSubscribes()).toBe(2), { timeout: 3_000 });
+    await player.destroy();
+  });
+
+  it('re-subscribes the old track of a video switch the reconnect interrupted', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    (player as any).pendingVideoSwitch = { oldTrackName: 'video', newTrackName: 'video-hd' };
+    (player as any).switchInProgress = true;
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    expect((player as any).pendingVideoSwitch).toBeNull();
     await player.destroy();
   });
 
