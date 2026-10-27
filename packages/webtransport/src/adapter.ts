@@ -395,6 +395,9 @@ export class MoqtConnection {
   /** The underlying sans-I/O session state machine. Set by {@link configureForVersion}. */
   session!: Session;
 
+  /** REQUEST_UPDATEs a publisher left unanswered by ending the subscription (§10.9). */
+  unansweredUpdateCount = 0;
+
   /** Draft version this connection was created with. */
   get draftVersion(): DraftVersion {
     return this.session.draftVersion;
@@ -1507,6 +1510,15 @@ export class MoqtConnection {
       this.uniPair.onRequestGoawayViolation = (reason, message) => {
         this.qlogGoaway(message as Goaway);
         this.handleControlStreamViolation(reason);
+      };
+      // A publisher's PUBLISH_DONE before the responses it owed (§10.9): counted
+      // and reported once; the updates are dropped, the subscription ends normally.
+      this.uniPair.onUnansweredUpdates = (requestId, count) => {
+        this.unansweredUpdateCount += count;
+        this.onError?.(new MoqtConnectionError(
+          `PUBLISH_DONE for request ${requestId} left ${count} REQUEST_UPDATE(s) unanswered (§10.9)`,
+          { errorSource: 'control', isFatal: false },
+        ));
       };
       // A later control-stream message (draft-18 GOAWAY, §10.4): feed it to the
       // session (→ DRAINING, or close on a violation) and surface it to the app.

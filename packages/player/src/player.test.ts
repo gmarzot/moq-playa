@@ -12428,6 +12428,35 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     expect(warm(cold, live('v', 'cmaf', 'video'), 'cmaf', 'video', 18)).toBeNull();
   });
 
+  it('a track the relay keeps ending resubscribes with backoff on the same session, never reconnecting', async () => {
+    const first = createMockAdapter();
+    const { player, createConnection } = await playingWithMedia(first);
+    const reconnecting = vi.fn();
+    player.on('session_reconnecting', reconnecting);
+    const videoSubscribes = () => subscribedNames(first).filter((n) => n === 'video').length;
+    const before = videoSubscribes();
+    vi.useFakeTimers();
+
+    // For 10 s the relay ends every video subscription (INTERNAL_ERROR) as soon as it exists.
+    for (let t = 0; t < 10_000; t += 100) {
+      for (const [requestId, sub] of [...(player as any).activeSubscriptions] as Array<[bigint, { trackName: string }]>) {
+        if (sub.trackName !== 'video') continue;
+        first._triggerMessage({
+          type: 'PUBLISH_DONE', requestId: varint(requestId), statusCode: varint(0x0), streamCount: varint(0),
+          errorReason: 'Failed to create uni stream.',
+        } as unknown as ControlMessage);
+      }
+      await vi.advanceTimersByTimeAsync(100);
+    }
+
+    // Retries at 0, 1, 2 and 4 s apart: four in 10 s, one pending at a time.
+    expect(videoSubscribes() - before).toBeLessThanOrEqual(4);
+    expect(videoSubscribes() - before).toBeGreaterThanOrEqual(3);
+    expect(reconnecting).not.toHaveBeenCalled();
+    expect(createConnection).toHaveBeenCalledTimes(1);
+    await player.destroy();
+  });
+
   it('destroy() cancels a pending reconnect', async () => {
     const first = createMockAdapter();
     const { player, createConnection } = await loaded(first, { playing: true });
