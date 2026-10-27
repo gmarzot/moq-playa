@@ -12213,6 +12213,33 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     expect(player.state).toBe(PlayerState.ERROR);
   });
 
+  it('reconnects when a live publisher ends all its media tracks and no namespace is followed', async () => {
+    const first = createMockAdapter();
+    const { player } = await loaded(first, { playing: true });
+    ackCatalog(first);
+    first._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    await vi.waitFor(() => expect(vi.mocked(first.subscribe).mock.calls.length).toBeGreaterThanOrEqual(3));
+    await ackMedia(first);
+    if (player.state !== PlayerState.PLAYING) (player as any).transitionState(PlayerState.PLAYING);
+    const media = await Promise.all(vi.mocked(first.subscribe).mock.results.slice(1, 3).map((r) => r.value));
+    const reconnecting: unknown[] = [];
+    player.on('session_reconnecting', (e) => reconnecting.push(e));
+    vi.useFakeTimers();
+    const done = (requestId: unknown) => first._triggerMessage({
+      type: 'PUBLISH_DONE', requestId, statusCode: varint(0x2), streamCount: varint(0), errorReason: 'track ended',
+    } as unknown as ControlMessage);
+
+    done(media[0]);
+    expect(reconnecting).toEqual([]);
+    done(media[1]);
+
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+    await player.destroy();
+  });
+
   it('destroy() cancels a pending reconnect', async () => {
     const first = createMockAdapter();
     const { player, createConnection } = await loaded(first, { playing: true });

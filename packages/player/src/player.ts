@@ -8041,6 +8041,14 @@ export class MoqtPlayer {
           trackName,
           reason: errorReason,
         });
+        // A live publisher that ended all its media may come back on the same
+        // namespace. Without a namespace to follow, retry as a reconnect does.
+        const liveTrack = this._catalogState?.tracks.some((t) => t.name === trackName && t.isLive === true);
+        const mediaLeft = [...this.activeSubscriptions.values()]
+          .some((s) => s.mediaType === 'video' || s.mediaType === 'audio');
+        if (!this.config.followNamespace && liveTrack && !mediaLeft) {
+          this.scheduleReconnect(`the publisher ended its tracks (${errorReason || 'PUBLISH_DONE'})`);
+        }
       },
       onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
         this._mediaSubsOk++;
