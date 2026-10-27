@@ -145,6 +145,8 @@ async function playCase(browser, webUrl, c, impair = null) {
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
+  // The disruption in progress; cleared only once its stop() succeeds.
+  let active = null;
   try {
     for (;;) {
       startup.attempts++;
@@ -172,11 +174,10 @@ async function playCase(browser, webUrl, c, impair = null) {
     const ticks = [];
     const disruptions = [];
     const events = [...(c.profile?.events ?? [])];
-    let active = null;
     const finishDisruption = async () => {
       const { stop, ...record } = active;
-      active = null;
       await stop();
+      active = null;
       disruptions.push({ ...record, endEpochMs: Date.now() });
     };
     const observedAt = Date.now();
@@ -218,6 +219,8 @@ async function playCase(browser, webUrl, c, impair = null) {
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
   } finally {
+    // A failed case must not leave the next one blacked out or hidden.
+    if (active) await active.stop().catch((e) => log(c.name, `disruption cleanup failed: ${e}`));
     await Promise.race([page.evaluate(() => window.playerAcceptance?.destroy()), sleep(10_000)]).catch(() => {});
     await context.close().catch(() => {});
   }
