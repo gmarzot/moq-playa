@@ -45,8 +45,8 @@ export interface BroadcastSessionConnection extends MediaPublishConnection {
   };
 }
 
-/** The priority a catalog subgroup inherits when it omits one (§12.4). */
-const CATALOG_PRIORITY = 128;
+/** Catalog publisher priority on every path (live, FETCH, fill): level with audio (64), ahead of video (128). */
+const CATALOG_PRIORITY = 64;
 /** FETCH parameter carrying the requested Group Order; 2 is Descending. */
 const GROUP_ORDER_PARAM = 0x22n;
 /** SUBSCRIBE_OK / REQUEST_UPDATE_OK parameter carrying the Largest Location (§10.2.11). */
@@ -246,7 +246,8 @@ export class BroadcastSession {
       }
       const groupId = this.nextCatalogGroup();
       void publishCatalogGroup(
-        this.connection as never, alias, payload, { draft: this.opts.publisher.draft, groupId },
+        this.connection as never, alias, payload,
+        { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY },
       ).then(() => {
         this.noteCatalogGroup(groupId);
         if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
@@ -371,7 +372,7 @@ export class BroadcastSession {
     const groupId = this.nextCatalogGroup();
     const work = acceptCatalogSubscribe(
       this.connection as never, requestId, alias, this.opts.catalog,
-      { draft: this.opts.publisher.draft, groupId })
+      { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY })
       .then((bytes) => {
         this.noteCatalogGroup(groupId);
         this.safeLog(`Catalog published (${bytes} bytes)`);
@@ -711,7 +712,8 @@ export class BroadcastSession {
     }
     const groupId = this.nextCatalogGroup();
     const work = publishCatalogGroup(
-      this.connection as never, alias, payload, { draft: this.opts.publisher.draft, groupId },
+      this.connection as never, alias, payload,
+      { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY },
     ).then(() => {
       this.noteCatalogGroup(groupId);
       if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogGroup === groupId) this.noteCatalogPayload(payload);

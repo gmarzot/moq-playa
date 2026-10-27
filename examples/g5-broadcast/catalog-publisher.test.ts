@@ -81,6 +81,16 @@ describe('broadcast catalog subscription lifecycle', () => {
     expect(conn.calls).toContain('closeSubgroup');
   });
 
+  it('sends the catalog subgroup at the given publisher priority, else inherits the subscription\'s', async () => {
+    const conn = recordingConnection();
+    await acceptCatalogSubscribe(conn, 1n, 1n, PARAMS, { ...D16, publisherPriority: 64 });
+    await acceptCatalogSubscribe(conn, 2n, 2n, PARAMS, D16);
+
+    expect(conn.openOptions[0]).toMatchObject({ publisherPriority: 64 });
+    expect(conn.openOptions[0]).not.toHaveProperty('defaultPriority');
+    expect(conn.openOptions[1]).toMatchObject({ defaultPriority: true });
+  });
+
   it('builds the catalog BEFORE accepting: a build failure never leaves an accepted subscription', async () => {
     const conn = recordingConnection();
     // Fail during the BUILD phase specifically: the params are read while
