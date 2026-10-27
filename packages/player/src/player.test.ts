@@ -5379,9 +5379,10 @@ describe('MoqtPlayer', () => {
         payload: withLocPrivateProperties(new Uint8Array([1, 2, 3])),
       });
 
-      // Video objects log at info level with [OBJ] prefix for debugging
-      const infoCalls = spyInfo.mock.calls.map(c => c[0]);
-      expect(infoCalls.some((c: string) => typeof c === 'string' && c.includes('[OBJ]'))).toBe(true);
+      // Video objects log at debug level with the [OBJ] prefix, never at info
+      const hasObj = (calls: unknown[][]) => calls.some((c) => typeof c[0] === 'string' && c[0].includes('[OBJ]'));
+      expect(hasObj(spyDebug.mock.calls)).toBe(true);
+      expect(hasObj(spyInfo.mock.calls)).toBe(false);
 
       vi.restoreAllMocks();
     });

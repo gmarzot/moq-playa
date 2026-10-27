@@ -3087,6 +3087,157 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     expect(errors.map((e) => [(e as { isFatal?: boolean }).isFatal, /unanswered/.test(e.message)])).toEqual([[false, true]]);
   });
 
+  // §11.1 forbids one alias for two different tracks, not for the same track.
+  for (const kind of ['remaining=1', 'sentinel'] as const) {
+    it(`alias reuse for the SAME track while the old generation (${kind}) is guarded is accepted; its late stream reaches the new subscription`, async () => {
+      const { client, server, a, b } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
+      let rid1 = -1n; server.onSubscribe = (r) => { rid1 = r; };
+      const p1 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: () => { /* sub1 */ } });
+      await flush();
+      await server.acceptSubscribe(rid1, 7n);
+      await p1;
+      const s1 = await rawSubgroup(b, 7n, 1n); await s1.w.close();
+      await flush();
+      a.bidiOut[0]!.in.injectRead(rawDone(kind === 'sentinel' ? STREAM_COUNT_UNKNOWN : 2n));
+      await flush();
+      const internals = client as unknown as { terminatedAliases: Map<bigint, unknown> };
+      expect(internals.terminatedAliases.has(7n)).toBe(true);
+
+      const d2: string[] = [];
+      let rid2 = -1n; server.onSubscribe = (r) => { rid2 = r; };
+      const p2 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: (o) => d2.push(`${o.groupId}:${o.objectId}`) });
+      await flush();
+      await server.acceptSubscribe(rid2, 7n);
+      await p2;
+      expect(internals.terminatedAliases.has(7n)).toBe(false);
+      expect(client.session.state).toBe(SessionState.ESTABLISHED);
+
+      const late = await rawSubgroup(b, 7n, 99n); await late.w.close();
+      await flush();
+      expect(d2).toEqual(['99:0']);
+    });
+  }
+
+  it('a same-track resubscribe that takes over the alias during the old unsubscribe keeps its open stream', async () => {
+    const { client, server, b } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
+    let rid = -1n; server.onSubscribe = (r) => { rid = r; };
+    const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => { /* old */ } });
+    await flush();
+    await server.acceptSubscribe(rid, 7n);
+    const sub = await subP;
+
+    // The cancel reaches the publisher; the old unsubscribe is held before its open-stream discard.
+    let releaseCancel!: () => void;
+    const gate = new Promise<void>((r) => { releaseCancel = r; });
+    const uniPair = (client as unknown as { uniPair: { cancelRequest: (id: bigint) => Promise<void> } }).uniPair;
+    const origCancel = uniPair.cancelRequest.bind(uniPair);
+    const oldRid = rid;
+    uniPair.cancelRequest = async (id: bigint) => { await origCancel(id); if (id === oldRid) await gate; };
+    const unsubP = sub.unsubscribe();
+    await flush();
+
+    const got: string[] = [];
+    const p2 = client.subscribeTrack(ns('live'), nm('vid'), { onObject: (o) => got.push(`${o.groupId}:${o.objectId}`) });
+    await flush();
+    expect(rid).not.toBe(oldRid);
+    await server.acceptSubscribe(rid, 7n);
+    await p2;
+    const open = await rawSubgroup(b, 7n, 4n);
+    await flush();
+
+    releaseCancel();
+    await unsubP;
+    await open.w.write(encodeSubgroupObject18(
+      { objectId: 1n, payload: new Uint8Array([2]), extensions: undefined, status: undefined }, false, 0n, false));
+    await open.w.close();
+    await flush();
+    expect(got).toEqual(['4:0', '4:1']);
+  });
+
+  /** A client whose generic subscribe() SUBSCRIBE_OKs and objects are recorded. */
+  async function genericClient(ttlMs = 10_000) {
+    const pair = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: ttlMs } });
+    const oks: bigint[] = [];
+    const objs: string[] = [];
+    pair.client.onMessage = (m) => { if (m.type === 'SUBSCRIBE_OK') oks.push(BigInt((m as { requestId: bigint }).requestId)); };
+    pair.client.onObject = (_sid, o) => objs.push(`${o.groupId}:${o.objectId}`);
+    const ids = { server: -1n };
+    pair.server.onSubscribe = (r) => { ids.server = r; };
+    const sub = async (track: string, alias: bigint) => {
+      const id = BigInt(await pair.client.subscribe(ns('live'), nm(track)));
+      await flush();
+      await pair.server.acceptSubscribe(ids.server, alias);
+      await flush();
+      return id;
+    };
+    return { ...pair, oks, objs, sub };
+  }
+
+  it('generic subscribe(): a same-track resubscribe after an unsubscribe takes the alias over at once', async () => {
+    const { client, b, oks, objs, sub } = await genericClient();
+    const id1 = await sub('vid', 7n);
+    await client.unsubscribe(varint(id1));
+    await flush();
+    const id2 = await sub('vid', 7n);
+    expect(oks).toEqual([id1, id2]);
+    const s1 = await rawSubgroup(b, 7n, 5n); await s1.w.close();
+    await flush();
+    expect(objs).toEqual(['5:0']);
+  });
+
+  it('generic subscribe(): a same-track resubscribe after an incomplete PUBLISH_DONE takes the alias over', async () => {
+    const { a, b, oks, sub } = await genericClient();
+    const id1 = await sub('vid', 7n);
+    const s1 = await rawSubgroup(b, 7n, 1n); await s1.w.close();
+    await flush();
+    a.bidiOut[0]!.in.injectRead(rawDone(2n));
+    await flush();
+    const id2 = await sub('vid', 7n);
+    expect(oks).toEqual([id1, id2]);
+  });
+
+  it('after a same-track takeover, another track stays refused until the old generation\'s window ends', async () => {
+    const { a, b, oks, sub } = await genericClient(300);
+    const id1 = await sub('v1', 7n);
+    const s1 = await rawSubgroup(b, 7n, 1n); await s1.w.close();
+    await flush();
+    a.bidiOut[0]!.in.injectRead(rawDone(2n)); // one old stream still outstanding
+    await flush();
+    const id2 = await sub('v1', 7n);
+    a.bidiOut[1]!.in.injectRead(rawDone(0n)); // the new generation ends complete
+    await flush();
+    const refused = await sub('v2', 7n);
+    expect(oks).toEqual([id1, id2]);
+    expect(oks).not.toContain(refused);
+
+    await new Promise((r) => setTimeout(r, 350));
+    const later = await sub('v2', 7n);
+    expect(oks).toEqual([id1, id2, later]);
+  });
+
+  it('generic subscribe(): a same-track takeover during the old unsubscribe keeps its open stream', async () => {
+    const { client, b, objs, sub } = await genericClient();
+    const id1 = await sub('vid', 7n);
+    let releaseCancel!: () => void;
+    const gate = new Promise<void>((r) => { releaseCancel = r; });
+    const uniPair = (client as unknown as { uniPair: { cancelRequest: (id: bigint) => Promise<void> } }).uniPair;
+    const origCancel = uniPair.cancelRequest.bind(uniPair);
+    uniPair.cancelRequest = async (id: bigint) => { await origCancel(id); if (id === id1) await gate; };
+    const unsubP = client.unsubscribe(varint(id1));
+    await flush();
+
+    await sub('vid', 7n);
+    const open = await rawSubgroup(b, 7n, 4n);
+    await flush();
+    releaseCancel();
+    await unsubP;
+    await open.w.write(encodeSubgroupObject18(
+      { objectId: 1n, payload: new Uint8Array([2]), extensions: undefined, status: undefined }, false, 0n, false));
+    await open.w.close();
+    await flush();
+    expect(objs).toEqual(['4:0', '4:1']);
+  });
+
   // Cancellation during the header write must not resurrect the stream.
   it('cancellation while the subgroup HEADER WRITE is held aborts the writer and rejects; the stream is still counted', async () => {
     const { client, server, subReqId } = await (async () => {

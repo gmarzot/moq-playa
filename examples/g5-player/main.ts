@@ -1235,8 +1235,8 @@ async function main(): Promise<void> {
     return [w, h];
   }
 
-  /** Samples further apart than this are drawn as a gap (a hidden page, a stalled tick). */
-  const CHART_GAP_MS = 4 * TICK_MS;
+  /** Samples further apart than this are drawn as a gap (a stalled tick); a hidden page ticks at 1 Hz. */
+  const CHART_GAP_MS = 2_000;
 
   /** x for a time on a chart of width `w` ending at `nowMs`. */
   const chartX = (atMs: number, nowMs: number, w: number) =>
@@ -1416,16 +1416,16 @@ async function main(): Promise<void> {
     const aMs = byKind ? byKind.audio
       : (((player as any).audioOutput?.scheduledAheadSec ?? null) != null
         ? (player as any).audioOutput.scheduledAheadSec * 1000 : null);
-    // A hidden page's ticks are clamped to 1 Hz or slower and measure the clamp,
-    // so they leave a gap on the charts instead of a sample.
-    const sampling = !document.hidden;
+    // A hidden page ticks at 1 Hz or slower. Queue depths and the drift fit would
+    // measure that throttle, so they skip it; latency and jitter come from arrivals.
+    const hidden = document.hidden;
 
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
     const latRaw = latWindow.map(([, v]) => v);
     // Remove the clock divergence. The constant offset stays: one-way delay
     // cannot separate it from transit.
-    if (sampling && latRaw.length) clockDrift.addSample(tickNowMs, Math.min(...latRaw));
+    if (!hidden && latRaw.length) clockDrift.addSample(tickNowMs, Math.min(...latRaw));
     const drift = clockDrift.estimate(tickNowMs);
     clockDriftMsPerMin = drift?.msPerMin ?? null;
     clockDriftApplied = drift?.applied ?? false;
@@ -1444,20 +1444,17 @@ async function main(): Promise<void> {
     cmafPlayoutMs = playoutWindow.length ? percentile(playoutWindow.map(([, v]) => v), 0.5) : null;
     while (screenWindow.length && tickNowMs - screenWindow[0]![0] > LAT_WINDOW_MS) screenWindow.shift();
     const screenVals = screenWindow.map(([, v]) => v - driftCorrectionMs);
-    // Every series takes a value on every sampled tick, NaN where there is
-    // nothing to report, so all of them index the same sample times.
-    if (sampling) {
-      const have = latVals.length > 0;
-      const active = player.state !== 'idle';
-      sampleAtMs.push(tickNowMs);
-      latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
-      latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
-      latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) ? tickWorstRawMs - driftCorrectionMs : NaN);
-      jitSamples.push(prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
-      queuedASamples.push(active ? (aMs ?? NaN) : NaN);
-      queuedVSamples.push(active ? (vMs ?? NaN) : NaN);
-    }
-    // Arrivals while hidden are not charted.
+    // Every series takes a value on every tick, NaN where there is nothing to
+    // report, so all of them index the same sample times.
+    const have = latVals.length > 0;
+    const queued = player.state !== 'idle' && !hidden;
+    sampleAtMs.push(tickNowMs);
+    latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
+    latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
+    latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) ? tickWorstRawMs - driftCorrectionMs : NaN);
+    jitSamples.push(prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
+    queuedASamples.push(queued ? (aMs ?? NaN) : NaN);
+    queuedVSamples.push(queued ? (vMs ?? NaN) : NaN);
     tickWorstRawMs = -Infinity;
     trimSamples(tickNowMs);
 
