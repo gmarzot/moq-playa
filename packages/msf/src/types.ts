@@ -195,6 +195,12 @@ export interface CatalogTrack {
  * Independent (non-delta) catalog.
  * @see draft-ietf-moq-msf-00 §5.1
  */
+/** A track left out of a parsed catalog because its packaging is not one the parser knows. */
+export interface IgnoredTrack {
+    readonly name: string;
+    readonly packaging: string;
+}
+
 export interface Catalog {
     /** @see draft-ietf-moq-msf-00 §5.1.1 — Required; normalized to 1 (accepts "1"/"draft-01") */
     readonly version: number;
@@ -213,6 +219,8 @@ export interface Catalog {
     readonly contentProtections?: readonly CmsfContentProtection[];
     /** @see draft-ietf-moq-msf-01 §5.1.5 — publish (reverse-direction) track objects */
     readonly publishTracks?: readonly CatalogTrack[];
+    /** Tracks with an unknown packaging; the other tracks stay playable. */
+    readonly ignoredTracks?: readonly IgnoredTrack[];
 }
 
 /**
@@ -298,6 +306,8 @@ export interface CatalogState {
     readonly contentProtections?: readonly CmsfContentProtection[];
     /** @see draft-ietf-moq-msf-01 §5.1.5 — publish (reverse-direction) track objects */
     readonly publishTracks?: readonly CatalogTrack[];
+    /** Tracks with an unknown packaging; the other tracks stay playable. */
+    readonly ignoredTracks?: readonly IgnoredTrack[];
 }
 
 // ─── Selection types ──────────────────────────────────────────────────
