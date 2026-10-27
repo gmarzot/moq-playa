@@ -62,8 +62,33 @@ jobs:
       adverse_broadcasts: ${{ steps.cases.outputs.adverse_broadcasts }}
     steps:
       - uses: actions/checkout@v4
+      # A scheduled run is skipped when GitHub starts it more than an hour late
+      # or when moq-test already has jobs running: shared hosts host trials.
+      - id: guard
+        if: github.event_name == 'schedule'
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          MTT_API_KEY: ${{ secrets.MTT_API_KEY }}
+        run: |
+          read -r min hour _ <<< "$SCHEDULE"
+          due=$(date -u -d "$(date -u +%F) ${hour}:${min}" +%s)
+          late=$(( ( $(date -u +%s) - due ) / 60 ))
+          if [ "$late" -gt 60 ]; then
+            echo "::notice::scheduled soak skipped: started ${late} min late"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -n "$MTT_API_KEY" ]; then
+            active=$(curl -sf -H "Authorization: Bearer $MTT_API_KEY" \
+              "https://moq-test.ci.openmoq.org/api/v1/jobs?active=true" \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s||"[]");console.log((Array.isArray(j)?j:j.jobs??[]).length)})' || echo 0)
+            if [ "$active" -gt 0 ]; then
+              echo "::notice::scheduled soak skipped: moq-test has ${active} active job(s)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
       - id: cases
         env:
+          SKIP: ${{ steps.guard.outputs.skip }}
           ONLY: ${{ inputs.only }}
           BROADCAST: ${{ github.event_name != 'workflow_dispatch' || inputs.broadcast }}
           ADVERSE: ${{ github.event_name != 'workflow_dispatch' || inputs.adverse }}
@@ -77,6 +102,7 @@ jobs:
             const broadcast = process.env.BROADCAST === "true" ? c.broadcast.map(key) : [];
             const profiles = process.env.ADVERSE === "true" ? Object.keys(c.profiles)
               .filter((p) => process.env.SMOKE !== "true" || c.profiles[p].smoke) : [];
+            if (process.env.SKIP === "true") { mtt.length = 0; broadcast.length = 0; profiles.length = 0; }
             const all = [...mtt, ...broadcast, ...profiles];
             if (only && !all.includes(only)) {
               console.error(`::error::unknown case ${only}; cases: ${all.join(" ")}`);
