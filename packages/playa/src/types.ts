@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig } from '@openmoq/player';
+import type { MoqtPlayerConfig, TTFFBreakdown } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -145,6 +145,8 @@ export interface PlayerStats {
   readonly latencyMs: number;
   readonly stallCount: number;
   readonly timeToFirstFrameMs: number | null;
+  /** Startup milestones, ms after load(); null before load(). */
+  readonly ttffBreakdown: TTFFBreakdown | null;
   readonly resolution: { readonly width: number; readonly height: number } | null;
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;

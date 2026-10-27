@@ -128,5 +128,58 @@
     "videoWidth": 1280,
     "videoHeight": 720,
     "videoFps": 30
+  },
+  "adverse": {
+    "broadcasts": [
+      "moqx-main:cmaf",
+      "moqx-main:loc",
+      "aiomoqt-relay:cmaf",
+      "aiomoqt-relay:loc"
+    ]
+  },
+  "restartEveryS": 75,
+  "profiles": {
+    "lossy": {
+      "netem": "delay 40ms 10ms loss 2%",
+      "smoke": true
+    },
+    "jitter": {
+      "netem": "delay 60ms 20ms distribution normal"
+    },
+    "capped": {
+      "down": "delay 30ms rate 3mbit limit 200",
+      "up": "delay 30ms"
+    },
+    "wifi": {
+      "netem": "delay 10ms 5ms slot 20ms 60ms loss 0.5%"
+    },
+    "blackouts": {
+      "events": [
+        {
+          "atS": 30,
+          "blackoutS": 3
+        },
+        {
+          "atS": 75,
+          "blackoutS": 10
+        }
+      ],
+      "smoke": true
+    },
+    "hidden-tab": {
+      "events": [
+        {
+          "atS": 30,
+          "hiddenS": 5
+        },
+        {
+          "atS": 75,
+          "hiddenS": 20
+        }
+      ]
+    },
+    "republish": {
+      "variant": "restart"
+    }
   }
 }

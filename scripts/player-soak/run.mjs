@@ -4,7 +4,11 @@
  *
  *   --mtt [--only RELAY:PACKAGING,…]   moq-test-tracks streams, started through its API (MTT_API_KEY)
  *   --broadcaster RELAY:PACKAGING  publish a synthetic g5-broadcast for --minutes + --lead-minutes
- *   --broadcast-player RELAY:PACKAGING   wait for that broadcast and play it
+ *   --broadcast-player RELAY:PACKAGING[,…]   wait for each broadcast in turn and play it
+ *   --profile NAME   play under an adverse profile from cases.json (network shaping, blackouts,
+ *                    hidden tab, publisher restarts); first play draft only
+ *   --variant restart   the broadcaster restarts every cases.restartEveryS; players use its namespace
+ *   --adverse-minutes M   keep a broadcaster up for the adverse players too
  */
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
@@ -17,6 +21,7 @@ import { chromium } from 'playwright';
 import { MttClient } from './mtt.mjs';
 import { assessSoak } from './assess.mjs';
 import { prepareCamera } from './fixture.mjs';
+import { Impairment } from './impair.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const { values: args } = parseArgs({ options: {
@@ -27,10 +32,13 @@ const { values: args } = parseArgs({ options: {
   concurrency: { type: 'string', default: '2' },
   broadcaster: { type: 'string' },
   'broadcast-player': { type: 'string' },
-  'lead-minutes': { type: 'string', default: '6' },
+  'lead-minutes': { type: 'string', default: '10' },
   'wait-s': { type: 'string', default: '420' },
   tag: { type: 'string', default: process.env.SOAK_TAG ?? randomUUID().slice(0, 8) },
   'skip-build': { type: 'boolean', default: false },
+  profile: { type: 'string' },
+  variant: { type: 'string' },
+  'adverse-minutes': { type: 'string', default: '0' },
 } });
 
 const minutes = Number(args.minutes);
@@ -78,8 +86,52 @@ async function startPages() {
 
 const browserArgs = ['--autoplay-policy=no-user-gesture-required'];
 
+/**
+ * Hide or show the player's tab: a page brought to front over it, or, where
+ * headless Chrome keeps the covered page visible, an emulated visibility state.
+ */
+async function setHidden(context, page, hidden, state) {
+  if (hidden) {
+    state.cover = await context.newPage();
+    await state.cover.bringToFront();
+    state.method = await page.evaluate(() => document.visibilityState) === 'hidden' ? 'covered' : 'emulated';
+  } else {
+    await page.bringToFront();
+    await state.cover?.close();
+    state.cover = null;
+  }
+  if (state.method !== 'emulated') return;
+  await page.evaluate((h) => {
+    if (h) {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    } else {
+      delete document.visibilityState;
+      delete document.hidden;
+    }
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+}
+
+/** Start a profile event; resolves to its record, which `stop` completes. */
+async function startDisruption(e, { impair, context, page }) {
+  if (e.blackoutS) {
+    if (!impair) throw new Error('blackout needs network shaping');
+    await impair.blackout();
+    return { kind: 'blackout', plannedMs: e.blackoutS * 1000, startEpochMs: Date.now(),
+      stop: () => impair.restore() };
+  }
+  if (e.hiddenS) {
+    const state = {};
+    await setHidden(context, page, true, state);
+    return { kind: 'hidden', method: state.method, plannedMs: e.hiddenS * 1000, startEpochMs: Date.now(),
+      stop: () => setHidden(context, page, false, state) };
+  }
+  throw new Error(`unknown profile event ${JSON.stringify(e)}`);
+}
+
 /** Play one stream for `minutes` and write its observation stream and summary. */
-async function playCase(browser, webUrl, c) {
+async function playCase(browser, webUrl, c, impair = null) {
   const dir = join(out, c.name);
   await mkdir(dir, { recursive: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -87,12 +139,15 @@ async function playCase(browser, webUrl, c) {
   const consoleFile = join(dir, 'console.jsonl');
   page.on('console', (m) => void appendFile(consoleFile, `${json({ t: Date.now(), type: m.type(), text: m.text() })}\n`));
   page.on('pageerror', (e) => void appendFile(consoleFile, `${json({ t: Date.now(), type: 'pageerror', text: e.message })}\n`));
-  // Viewers start as G5 does: from the current group.
-  const query = new URLSearchParams({ url: c.url, ns: c.namespace, v: String(c.draft), soak: '1', warmStart: '1' });
+  // Viewers play as G5 does: from the current group, following the namespace.
+  const query = new URLSearchParams({ url: c.url, ns: c.namespace, v: String(c.draft), soak: '1', warmStart: '1',
+    followNamespace: '1' });
   if (c.packaging === 'loc') query.set('output', 'canvas');
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
+  // The disruption in progress; cleared only once its stop() succeeds.
+  let active = null;
   try {
     for (;;) {
       startup.attempts++;
@@ -118,19 +173,45 @@ async function playCase(browser, webUrl, c) {
     await page.evaluate(() => window.playerAcceptance.begin(false));
     const samples = [];
     const ticks = [];
-    const end = Date.now() + minutes * 60_000;
+    const disruptions = [];
+    const events = [...(c.profile?.events ?? [])];
+    const finishDisruption = async () => {
+      const { stop, ...record } = active;
+      await stop();
+      active = null;
+      disruptions.push({ ...record, endEpochMs: Date.now() });
+    };
+    const observedAt = Date.now();
+    const end = observedAt + minutes * 60_000;
+    let publisherEnded = null;
     while (Date.now() < end) {
       await sleep(1000);
+      if (active && Date.now() - active.startEpochMs >= active.plannedMs) await finishDisruption();
+      if (!active && events.length && Date.now() - observedAt >= events[0].atS * 1000) {
+        active = await startDisruption(events.shift(), { impair, context, page });
+        log(c.name, `${active.kind} for ${active.plannedMs} ms`);
+      }
       const d = await page.evaluate(() => window.playerAcceptance.drain());
       samples.push(...d.samples);
       const tick = { wallEpochMs: d.wallEpochMs, state: d.state, stats: d.stats, latency: d.latency, events: d.events };
       ticks.push(tick);
       await appendFile(join(dir, 'samples.jsonl'), d.samples.map((s) => `${json(s)}\n`).join(''));
       await appendFile(join(dir, 'ticks.jsonl'), `${json(tick)}\n`);
+      // The publisher ended the track (PUBLISH_DONE): stop rather than record a freeze.
+      if (c.profile?.variant !== 'restart' && d.events.some((e) => e.type === 'track_unsubscribed'
+          && !/resubscribe failed/.test(String(e.data?.reason ?? '')))) {
+        publisherEnded = { atS: Math.round((Date.now() - observedAt) / 1000) };
+        log(c.name, `publisher ended the track after ${publisherEnded.atS} s`);
+        break;
+      }
     }
+    if (active) await finishDisruption();
     await page.evaluate(() => window.playerAcceptance.finish());
+    if (impair) await writeFile(join(dir, 'tc.json'), `${json(await impair.stats())}\n`);
     const summary = { name: c.name, url: c.url, namespace: c.namespace, draft: c.draft, packaging: c.packaging,
-      ...assessSoak({ samples, ticks, expected: c.expected, startup }) };
+      ...(c.profileName ? { profile: c.profileName } : {}),
+      ...(publisherEnded ? { publisherEnded } : {}),
+      ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile) }) };
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
   } catch (error) {
@@ -139,6 +220,8 @@ async function playCase(browser, webUrl, c) {
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
   } finally {
+    // A failed case must not leave the next one blacked out or hidden.
+    if (active) await active.stop().catch((e) => log(c.name, `disruption cleanup failed: ${e}`));
     await Promise.race([page.evaluate(() => window.playerAcceptance?.destroy()), sleep(10_000)]).catch(() => {});
     await context.close().catch(() => {});
   }
@@ -178,16 +261,17 @@ async function runMtt(browser, webUrl, cases) {
   return results;
 }
 
-function broadcastCase(cases, spec) {
+function broadcastCase(cases, spec, variant) {
   const [relay, packaging] = spec.split(':');
   const relayInfo = cases.relays[relay];
   if (!relayInfo) throw new Error(`unknown relay ${relay}`);
   // One element per field, under a prefix that marks CI traffic on the public relays.
-  return { relay, packaging, relayInfo, namespace: `ci/player-soak/${tag}/${relay}/${packaging}` };
+  const namespace = `ci/player-soak/${tag}/${relay}/${packaging}${variant ? `/${variant}` : ''}`;
+  return { relay, packaging, relayInfo, namespace, spec };
 }
 
 /** Publish a synthetic g5-broadcast until the players have had their minutes. */
-async function runBroadcaster(webUrl, b, totalMinutes) {
+async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
   const dir = join(out, `broadcaster-${b.packaging}-${b.relay}`);
   const camera = await prepareCamera(join(out, 'camera'));
   const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: [...browserArgs,
@@ -201,25 +285,57 @@ async function runBroadcaster(webUrl, b, totalMinutes) {
   const query = new URLSearchParams({ url: b.relayInfo.url, ns: b.namespace, v: String(b.relayInfo.publishDraft),
     packaging: b.packaging, height: String(p.height), fps: String(p.fps), bitrate: String(p.bitrate), target: String(p.target),
     clockUrl: 'https://aiomoqt-relay.marzresearch.net/time' });
-  await page.goto(`${webUrl}g5-broadcast/?${query}`, { waitUntil: 'domcontentloaded' });
-  await page.locator('#start-camera').click();
-  await page.waitForFunction(() => document.querySelector('#state')?.textContent === 'live', null, { timeout: 60_000 });
-  log('broadcaster', b.namespace, 'live');
-  const end = Date.now() + totalMinutes * 60_000;
-  while (Date.now() < end) {
-    await sleep(5000);
-    const cells = await page.evaluate(() => ({
-      state: document.querySelector('#state')?.textContent,
-      cells: Object.fromEntries([...document.querySelectorAll('#diag-grid .cell, #adv-grid .cell')]
-        .map((c) => [c.firstChild?.textContent ?? '', c.querySelector('b')?.textContent ?? ''])),
-    }));
-    await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...cells })}\n`);
+  let wentLive = false;
+  try {
+    await page.goto(`${webUrl}g5-broadcast/?${query}`, { waitUntil: 'domcontentloaded' });
+    // Published once the relay accepts the namespace; "live" waits for a catalog subscriber,
+    // which moqx-main sends only when a viewer arrives.
+    const goLive = async () => {
+      await page.locator('#start-camera').click();
+      await page.waitForFunction(() => ['live', 'awaiting subscribe'].includes(document.querySelector('#state')?.textContent ?? ''),
+        null, { timeout: 60_000 });
+      return Date.now();
+    };
+    let liveAt = await goLive();
+    wentLive = true;
+    log('broadcaster', b.namespace, 'published');
+    const end = Date.now() + totalMinutes * 60_000;
+    while (Date.now() < end) {
+      await sleep(5000);
+      if (restartEveryS > 0 && Date.now() - liveAt >= restartEveryS * 1000) {
+        const stoppedAt = Date.now();
+        await page.locator('#stop').click();
+        await page.waitForFunction(() => !document.querySelector('#start-camera')?.disabled, null, { timeout: 30_000 });
+        liveAt = await goLive();
+        log('broadcaster', b.namespace, `restarted: published again after ${liveAt - stoppedAt} ms`);
+        await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: liveAt, restart: { stoppedAt, liveAt } })}\n`);
+      }
+      const cells = await page.evaluate(() => ({
+        state: document.querySelector('#state')?.textContent,
+        cells: Object.fromEntries([...document.querySelectorAll('#diag-grid .cell, #adv-grid .cell')]
+          .map((c) => [c.firstChild?.textContent ?? '', c.querySelector('b')?.textContent ?? ''])),
+      }));
+      await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...cells })}\n`);
+    }
+  } finally {
+    // The page's own log is the only record of why a broadcast did not publish.
+    const pageLog = await page.locator('#log').textContent().catch(() => null) ?? '';
+    await writeFile(join(dir, 'log.txt'), pageLog);
+    if (!wentLive) log('broadcaster', b.namespace, `never published; page log:\n${pageLog.slice(-2000)}`);
+    await page.locator('#stop').click().catch(() => {});
+    await sleep(1000);
+    await browser.close();
   }
-  await writeFile(join(dir, 'log.txt'), await page.locator('#log').textContent() ?? '');
-  await page.locator('#stop').click().catch(() => {});
-  await sleep(1000);
-  await browser.close();
 }
+
+const recoveryCell = (rec) => {
+  if (!rec || rec.events.length === 0) return '—';
+  const flags = [rec.unrecovered ? `${rec.unrecovered} unrecovered` : '', rec.unsettled ? `${rec.unsettled} unsettled` : '']
+    .filter(Boolean).join(', ');
+  return `${rec.events.length}, ${rec.freshFrameAfterMsMax ?? '—'} / ${rec.stableLatencyAfterMsMax ?? '—'}${flags ? ` (${flags})` : ''}`;
+};
+const startupCell = (b) => (b ? [b.transportConnectedMs, b.setupCompleteMs, b.catalogReceivedMs, b.firstObjectReceivedMs,
+  b.firstFrameRenderedMs].map((v) => (v == null ? '—' : Math.round(v))).join(' / ') : '—');
 
 async function report(results) {
   const rows = results.map((r) => {
@@ -229,11 +345,14 @@ async function report(results) {
       + `| ${pb ? `${pb.frozen.count} / ${pb.audioGaps.count}` : '—'} | ${pb?.fps.mean ?? '—'} `
       + `| ${lat ? `${Math.round(lat.p50)} / ${Math.round(lat.p95)} / ${Math.round(lat.driftMs)}` : '—'} `
       + `| ${r.player ? `${r.player.framesDropped} / ${r.player.audioUnderruns}` : '—'} `
-      + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80) : ''} |`;
+      + `| ${recoveryCell(r.recovery)} | ${startupCell(r.startup?.breakdownMs)} `
+      + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80)
+        : r.publisherEnded ? `publisher ended at ${r.publisherEnded.atS} s` : ''} |`;
   });
   const md = [`### Player soak ${runId} (${minutes} min per case)`, '',
-    '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms | dropped / underruns | error |',
-    '|---|---|---|---|---|---|---|---|---|', ...rows, ''].join('\n');
+    '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms '
+      + '| dropped / underruns | recovery: events, max fresh / settled ms | startup: connect / setup / catalog / object / frame ms | error |',
+    '|---|---|---|---|---|---|---|---|---|---|---|', ...rows, ''].join('\n');
   await writeFile(join(out, 'summary.md'), md);
   await writeFile(join(out, 'summary.json'), `${json({ runId, minutes, results })}\n`);
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, `${md}\n`);
@@ -248,18 +367,36 @@ try {
   await buildOnce();
   const webUrl = await startPages();
   if (args.broadcaster) {
-    const b = { ...broadcastCase(cases, args.broadcaster), params: cases.broadcastParams };
-    const playMinutes = b.relayInfo.playDrafts.length * (minutes + 1);
-    await runBroadcaster(webUrl, b, playMinutes + Number(args['lead-minutes']));
+    const b = { ...broadcastCase(cases, args.broadcaster, args.variant), params: cases.broadcastParams };
+    const adverseMinutes = Number(args['adverse-minutes']);
+    const adverse = adverseMinutes > 0 && cases.adverse.broadcasts.includes(args.broadcaster)
+      ? cases.adverse.broadcasts.length * (adverseMinutes + 1) : 0;
+    const playMinutes = args.variant ? adverse : Math.max(b.relayInfo.playDrafts.length * (minutes + 1), adverse);
+    await runBroadcaster(webUrl, b, playMinutes + Number(args['lead-minutes']),
+      args.variant === 'restart' ? cases.restartEveryS : 0);
   } else {
     const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: browserArgs });
     let results = [];
     if (args.mtt) results = await runMtt(browser, webUrl, cases);
     if (args['broadcast-player']) {
-      const b = broadcastCase(cases, args['broadcast-player']);
-      for (const draft of b.relayInfo.playDrafts) {
-        results.push(await playCase(browser, webUrl, { name: `g5-${b.packaging}-${b.relay}-d${draft}`, url: b.relayInfo.url,
-          namespace: b.namespace, draft, packaging: b.packaging, expected: cases.broadcastExpected, waitS: Number(args['wait-s']) }));
+      const profile = args.profile ? cases.profiles[args.profile] : null;
+      if (args.profile && !profile) throw new Error(`unknown profile ${args.profile}`);
+      const specs = args['broadcast-player'].split(',');
+      let impair = null;
+      if (profile && (profile.netem || profile.down || profile.up || profile.events?.some((e) => e.blackoutS))) {
+        impair = await Impairment.forRelays(specs.map((spec) => broadcastCase(cases, spec).relayInfo.url));
+        await impair.setup();
+        await impair.apply(profile);
+        log(`profile ${args.profile}: shaping ${impair.addresses.join(', ')} on ${impair.dev}`);
+      }
+      for (const spec of specs) {
+        const b = broadcastCase(cases, spec, profile?.variant);
+        for (const draft of profile ? b.relayInfo.playDrafts.slice(0, 1) : b.relayInfo.playDrafts) {
+          const prefix = profile ? `${args.profile}-` : '';
+          results.push(await playCase(browser, webUrl, { name: `${prefix}g5-${b.packaging}-${b.relay}-d${draft}`,
+            url: b.relayInfo.url, namespace: b.namespace, draft, packaging: b.packaging, expected: cases.broadcastExpected,
+            waitS: Number(args['wait-s']), profile, profileName: args.profile }, impair));
+        }
       }
     }
     await browser.close();

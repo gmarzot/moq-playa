@@ -3,7 +3,8 @@
  * scripts/player-acceptance/assessment.mjs for their fields) and 1 s ticks
  * carrying the player's stats, per-object latency summaries and events.
  * Report-only, except the verdict: no-playback when nothing played, no-audio
- * when the catalog lists an audio track that is never heard.
+ * when the catalog lists an audio track that is never heard, and, under an
+ * adverse profile, unrecovered when no fresh frame follows a disruption.
  */
 
 const STALL_MS = 500;
@@ -73,9 +74,62 @@ export function latencyReport(ticks) {
   return out;
 }
 
+/** A freeze still open this close to the end of the run is still recovering, not unrecovered. */
+const OPEN_GRACE_MS = 15_000;
+/** Latency is stable again once this many consecutive seconds sit near the baseline. */
+const STABLE_S = 5;
+const stableBound = (baseline) => baseline * 1.2 + 50;
+
+/**
+ * Recovery from each disruption: the first fresh frame after it ends, the
+ * picture outage around it, and when video latency settles back near its
+ * pre-disruption median. Without scheduled disruptions, each frozen interval
+ * counts as one (a publisher restart is only visible as a freeze).
+ */
+export function recoveryReport(samples, ticks, disruptions, frozen) {
+  const events = disruptions.length > 0 ? disruptions
+    : frozen.filter((f) => !f.open || f.durationMs >= OPEN_GRACE_MS).map((f) => {
+      const at = samples.find((s) => s.wallMs >= f.startMs)?.wallEpochMs;
+      return { kind: 'freeze', startEpochMs: at, endEpochMs: at };
+    }).filter((e) => e.startEpochMs !== undefined);
+  const key = Object.keys(ticks.find((t) => Object.keys(t.latency ?? {}).some((k) => k.startsWith('video/')))?.latency ?? {})
+    .find((k) => k.startsWith('video/'));
+  const series = key ? ticks.filter((t) => t.latency?.[key]?.n > 0).map((t) => ({ at: t.wallEpochMs, p50: t.latency[key].p50 })) : [];
+  const firstStart = events[0]?.startEpochMs ?? Infinity;
+  const baseline = median(series.filter((p) => p.at < firstStart).map((p) => p.p50));
+  const fresh = (s, prev) => s.presentedFrames > prev.presentedFrames && s.pictureDigest !== prev.pictureDigest;
+  return events.map((e) => {
+    let lastFresh = null;
+    let next = null;
+    for (let i = 1; i < samples.length; i++) {
+      const s = samples[i];
+      if (!fresh(s, samples[i - 1])) continue;
+      if (s.wallEpochMs < e.endEpochMs) lastFresh = s;
+      else { next = s; break; }
+    }
+    let stableAt = null;
+    if (baseline !== null) {
+      const after = series.filter((p) => p.at >= e.endEpochMs);
+      const i = after.findIndex((_, j) => after.slice(j, j + STABLE_S).length === STABLE_S
+        && after.slice(j, j + STABLE_S).every((p) => p.p50 <= stableBound(baseline)));
+      if (i >= 0) stableAt = after[i].at;
+    }
+    return {
+      kind: e.kind,
+      ...(e.method ? { method: e.method } : {}),
+      startEpochMs: e.startEpochMs,
+      durationMs: e.endEpochMs - e.startEpochMs,
+      freshFrameAfterMs: next ? next.wallEpochMs - e.endEpochMs : null,
+      outageMs: next && lastFresh ? next.wallEpochMs - lastFresh.wallEpochMs : null,
+      stableLatencyAfterMs: stableAt === null ? null : stableAt - e.endEpochMs,
+      baselineLatencyMs: baseline,
+    };
+  });
+}
+
 const COUNTERS = ['stallCount', 'stallDurationMs', 'framesDropped', 'audioUnderruns', 'gapCount', 'framesRendered'];
 
-export function assessSoak({ samples, ticks, expected = {}, startup = {} }) {
+export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false }) {
   const first = samples[0];
   const last = samples.at(-1);
   const durationMs = first && last ? last.wallMs - first.wallMs : 0;
@@ -116,6 +170,11 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {} }) {
   const events = {};
   for (const e of ticks.flatMap((t) => t.events ?? [])) events[e.type] = (events[e.type] ?? 0) + 1;
 
+  const recovery = recoveryReport(samples, ticks, disruptions, frozen);
+  const unrecovered = recovery.filter((r) => r.freshFrameAfterMs === null).length;
+  const maxOf = (values) => (values.length ? Math.max(...values) : null);
+  const breakdown = [...ticks].reverse().find((t) => t.stats?.ttffBreakdown?.firstFrameRenderedMs != null)?.stats.ttffBreakdown;
+
   const resolution = last ? { width: last.videoWidth, height: last.videoHeight } : null;
   const played = samples.length > 0 && fpsMean > 0 && last.mediaTimeS > first.mediaTimeS;
   const catalog = ticks.flatMap((t) => t.events ?? []).find((e) => e.type === 'catalog_received')?.data?.catalog;
@@ -123,11 +182,19 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {} }) {
     || (t.role === undefined && AUDIO_CODEC.test(t.codec ?? '')));
   const audible = samples.some((s) => s.audioRms > AUDIBLE_RMS);
   return {
-    verdict: !played ? 'no-playback' : advertisesAudio && !audible ? 'no-audio' : 'played',
+    verdict: !played ? 'no-playback' : advertisesAudio && !audible ? 'no-audio'
+      : adverse && unrecovered > 0 ? 'unrecovered' : 'played',
     audio: { advertised: advertisesAudio, audible },
     durationS: Math.round(durationMs / 1000),
     samples: samples.length,
-    startup,
+    startup: { ...startup, ...(breakdown ? { breakdownMs: breakdown } : {}) },
+    recovery: {
+      events: recovery,
+      unrecovered,
+      unsettled: recovery.filter((r) => r.stableLatencyAfterMs === null).length,
+      freshFrameAfterMsMax: maxOf(recovery.map((r) => r.freshFrameAfterMs).filter(Number.isFinite)),
+      stableLatencyAfterMsMax: maxOf(recovery.map((r) => r.stableLatencyAfterMs).filter(Number.isFinite)),
+    },
     playback: {
       stalls: intervalSummary(stalls),
       rebufferRatio: durationMs > 0 ? +(intervalSummary(stalls).totalMs / durationMs).toFixed(4) : null,

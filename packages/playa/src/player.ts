@@ -369,6 +369,7 @@ export class Player {
       latencyMs: s.currentLatencyMs,
       stallCount: s.stallCount,
       timeToFirstFrameMs: s.timeToFirstFrameMs,
+      ttffBreakdown: s.ttffBreakdown,
       resolution: s.currentResolution ?? null,
       videoCodec: s.currentVideoCodec ?? null,
       audioCodec: s.currentAudioCodec ?? null,
