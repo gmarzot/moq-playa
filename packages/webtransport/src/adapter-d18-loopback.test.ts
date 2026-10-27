@@ -3061,6 +3061,73 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     });
   }
 
+  // §11.1 forbids one alias for two different tracks, not for the same track.
+  for (const kind of ['remaining=1', 'sentinel'] as const) {
+    it(`alias reuse for the SAME track while the old generation (${kind}) is guarded is accepted; its late stream reaches the new subscription`, async () => {
+      const { client, server, a, b } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
+      let rid1 = -1n; server.onSubscribe = (r) => { rid1 = r; };
+      const p1 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: () => { /* sub1 */ } });
+      await flush();
+      await server.acceptSubscribe(rid1, 7n);
+      await p1;
+      const s1 = await rawSubgroup(b, 7n, 1n); await s1.w.close();
+      await flush();
+      a.bidiOut[0]!.in.injectRead(rawDone(kind === 'sentinel' ? STREAM_COUNT_UNKNOWN : 2n));
+      await flush();
+      const internals = client as unknown as { terminatedAliases: Map<bigint, unknown> };
+      expect(internals.terminatedAliases.has(7n)).toBe(true);
+
+      const d2: string[] = [];
+      let rid2 = -1n; server.onSubscribe = (r) => { rid2 = r; };
+      const p2 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: (o) => d2.push(`${o.groupId}:${o.objectId}`) });
+      await flush();
+      await server.acceptSubscribe(rid2, 7n);
+      await p2;
+      expect(internals.terminatedAliases.has(7n)).toBe(false);
+      expect(client.session.state).toBe(SessionState.ESTABLISHED);
+
+      const late = await rawSubgroup(b, 7n, 99n); await late.w.close();
+      await flush();
+      expect(d2).toEqual(['99:0']);
+    });
+  }
+
+  it('a same-track resubscribe that takes over the alias during the old unsubscribe keeps its open stream', async () => {
+    const { client, server, b } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
+    let rid = -1n; server.onSubscribe = (r) => { rid = r; };
+    const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => { /* old */ } });
+    await flush();
+    await server.acceptSubscribe(rid, 7n);
+    const sub = await subP;
+
+    // The cancel reaches the publisher; the old unsubscribe is held before its open-stream discard.
+    let releaseCancel!: () => void;
+    const gate = new Promise<void>((r) => { releaseCancel = r; });
+    const uniPair = (client as unknown as { uniPair: { cancelRequest: (id: bigint) => Promise<void> } }).uniPair;
+    const origCancel = uniPair.cancelRequest.bind(uniPair);
+    const oldRid = rid;
+    uniPair.cancelRequest = async (id: bigint) => { await origCancel(id); if (id === oldRid) await gate; };
+    const unsubP = sub.unsubscribe();
+    await flush();
+
+    const got: string[] = [];
+    const p2 = client.subscribeTrack(ns('live'), nm('vid'), { onObject: (o) => got.push(`${o.groupId}:${o.objectId}`) });
+    await flush();
+    expect(rid).not.toBe(oldRid);
+    await server.acceptSubscribe(rid, 7n);
+    await p2;
+    const open = await rawSubgroup(b, 7n, 4n);
+    await flush();
+
+    releaseCancel();
+    await unsubP;
+    await open.w.write(encodeSubgroupObject18(
+      { objectId: 1n, payload: new Uint8Array([2]), extensions: undefined, status: undefined }, false, 0n, false));
+    await open.w.close();
+    await flush();
+    expect(got).toEqual(['4:0', '4:1']);
+  });
+
   // Cancellation during the header write must not resurrect the stream.
   it('cancellation while the subgroup HEADER WRITE is held aborts the writer and rejects; the stream is still counted', async () => {
     const { client, server, subReqId } = await (async () => {

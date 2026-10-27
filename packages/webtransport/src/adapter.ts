@@ -1330,14 +1330,16 @@ export class MoqtConnection {
     cancelTimer: () => void;
     /**
      * STRICT tombstones come from a PUBLISH_DONE Stream Count; NON-strict ones
-     * are ordinary-unsubscribe / peer-close TTL-only guards. Both REFUSE alias
-     * reuse while live (see {@link aliasReuseSafe}) — §11.1 permits late objects
-     * after cancellation, so reusing an alias with any guard risks misdelivering
-     * an old stream to the new track. The only reuse-safe state is a COMPLETE
-     * strict tombstone (remaining 0: its generation finished). The `strict` flag
+     * are ordinary-unsubscribe / peer-close TTL-only guards. Both REFUSE reuse of
+     * the alias for another track while live (see {@link aliasReuseSafe}) —
+     * §11.1 permits late objects after cancellation, so it could misdeliver an
+     * old stream. Reuse is safe for the same track, or once a strict tombstone
+     * is COMPLETE (remaining 0: its generation finished). The `strict` flag
      * distinguishes the two for that check and for count-driven clearing.
      */
     strict: boolean;
+    /** Track of the subscription the alias belonged to; undefined when not known. */
+    trackKey?: string;
   }>();
   /**
    * Terminal-alias-guard lifetime (constructor option, default 10s). §10.11: a late
@@ -2356,9 +2358,10 @@ export class MoqtConnection {
    *   (1) SESSION validation FIRST — unknown request ID and a TRUE simultaneous
    *       duplicate alias get their session-level close here (through the terminal
    *       coordinator); nothing is bound or resolved on rejection;
-   *   (2) alias-reuse policy — if a prior generation's guard is still live,
-   *       refuse binding and cancel via the DRAFT-SPECIFIC mechanism (draft-14/16
-   *       UNSUBSCRIBE, draft-18 request-stream reset), never binding routing;
+   *   (2) alias-reuse policy — if a prior generation of another track still
+   *       guards the alias, refuse binding and cancel via the DRAFT-SPECIFIC
+   *       mechanism (draft-14/16 UNSUBSCRIBE, draft-18 request-stream reset),
+   *       never binding routing;
    *   (3) only on acceptance: clear a complete guard, bind routing, resolve.
    */
   private async handleSubscribeOkOrdered(message: DecodedControlMessage, requestId: bigint): Promise<void> {
@@ -2385,11 +2388,11 @@ export class MoqtConnection {
       await this.executeActions(actions);
       return;
     }
-    // (2) The session accepted + registered the alias. If a prior terminal guard
-    // is still live, reusing the alias risks misdelivering an old stream to this
-    // new track — refuse (per-track, non-fatal) via the draft-specific cancel.
+    // (2) The session accepted + registered the alias. If another track's terminal
+    // guard is still live, reusing the alias risks misdelivering an old stream to
+    // this new track — refuse (per-track, non-fatal) via the draft-specific cancel.
     const alias = BigInt((message as { trackAlias: bigint }).trackAlias);
-    if (!this.aliasReuseSafe(alias)) {
+    if (!this.aliasReuseSafe(alias, this.session.getSubscription(requestId)?.trackKey)) {
       await this.refuseAliasReuse(requestId, alias,
         `track alias ${alias} is still guarded by a terminating prior subscription (§11.1) — reuse refused`);
       return;
@@ -2445,14 +2448,16 @@ export class MoqtConnection {
    * tombstone, or any NON-strict ordinary-teardown guard. Safe when there is no
    * tombstone, or a COMPLETE strict one (remaining 0 — its generation finished).
    */
-  private aliasReuseSafe(alias: bigint): boolean {
+  private aliasReuseSafe(alias: bigint, trackKey?: string): boolean {
     if (this.drainingAliases.has(alias)) return false; // drain window in progress
     const live = this.session.getSubscriberRequestsForAlias(alias);
     for (const { sub } of this.terminalSubscribers.values()) {
       if (sub.trackAlias === alias && !live.some((owner) => owner.trackKey === sub.trackKey)) return false;
     }
     const t = this.terminatedAliases.get(alias);
-    return !t || (t.strict && t.remaining === 0n);
+    // §11.1 forbids one alias for two different tracks; late streams of the
+    // same track are that track's media.
+    return !t || (t.strict && t.remaining === 0n) || (trackKey !== undefined && t.trackKey === trackKey);
   }
 
   /**
@@ -2675,7 +2680,10 @@ export class MoqtConnection {
     const closeActions = this.session.handleOutboundRequestClosed(requestId);
     await cancelledFills;
     await this.executeActions(closeActions);
-    if (teardownAlias !== null) await this.discardOpenStreamsForAlias(teardownAlias);
+    // Unless a newer subscription re-bound the alias meanwhile.
+    if (teardownAlias !== null && !this.rawAliasMaps.has(teardownAlias)) {
+      await this.discardOpenStreamsForAlias(teardownAlias);
+    }
     if (raw) {
       this.removeRawSubscription(raw);
       // Defensive: a still-pending subscribeTrack() (no SUBSCRIBE_OK yet) must not
@@ -3475,12 +3483,14 @@ export class MoqtConnection {
    * already covered. `remaining` counts expected late streams (bigint), or
    * `null` when the count is unknown (2^62-1 sentinel) — then only the TTL clears
    * it. `strict` marks a PUBLISH_DONE Stream-Count tombstone vs an
-   * ordinary-teardown guard; both REFUSE alias reuse while live (only a COMPLETE
-   * strict tombstone is reuse-safe — see {@link aliasReuseSafe}) — the flag only
+   * ordinary-teardown guard; both refuse reuse by another track while live (see
+   * {@link aliasReuseSafe}) — the flag only
    * governs count-driven clearing and the no-downgrade rule below. A tombstone
    * always carries a TTL so it is bounded regardless.
    */
   private armTerminatedAlias(alias: bigint, remaining: bigint | null, strict: boolean): void {
+    const owner = this.rawAliasMaps.get(alias)?.requestId;
+    const ownerTrack = owner === undefined ? undefined : this.session.getSubscription(owner)?.trackKey;
     // No more objects routed for this alias — drop BOTH routing maps (an alias
     // lives in one or the other): the inbound-PUBLISH map AND the outbound-
     // subscribe map (the latter matters for a legacy control-stream PUBLISH_DONE,
@@ -3501,7 +3511,8 @@ export class MoqtConnection {
     // Chunked so a huge (but valid) timeout cannot overflow setTimeout to ~1 ms.
     const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
     const cancelTimer = this.armGuardTimer(ttlMs, () => this.clearTerminatedAlias(alias));
-    this.terminatedAliases.set(alias, { remaining, cancelTimer, strict });
+    const trackKey = ownerTrack ?? existing?.trackKey;
+    this.terminatedAliases.set(alias, { remaining, cancelTimer, strict, ...(trackKey !== undefined ? { trackKey } : {}) });
   }
 
   /**
@@ -3875,8 +3886,9 @@ export class MoqtConnection {
       // signal (a LOCAL cancel — the response handler ignores the resulting
       // RequestCancelledError, so it surfaces no onError).
       await this.uniPair!.cancelRequest(requestId);
-      if (!aliasStillShared && alias != null) {
-        // Tombstone already armed above; now early-discard open streams.
+      // Tombstone already armed above; now early-discard open streams, unless
+      // the same track's new subscription took the alias over meanwhile.
+      if (!aliasStillShared && alias != null && !this.rawAliasMaps.has(alias)) {
         await this.discardOpenStreamsForAlias(alias);
       }
     }
