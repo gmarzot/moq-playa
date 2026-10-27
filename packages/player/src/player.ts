@@ -8477,6 +8477,10 @@ export class MoqtPlayer {
         this.watchdog.fulfill('catalog_received');
         this.watchdog.expect('first_media_object', 20_000);
         this.log.info('Catalog received: %d tracks', catalogState.tracks.length);
+        if (catalogState.ignoredTracks?.length) {
+          this.log.warn('Catalog: ignoring track(s) with unsupported packaging: %s',
+            catalogState.ignoredTracks.map((t) => `"${t.name}" (${t.packaging})`).join(', '));
+        }
         this.emitter.emit('catalog_received', {
           type: 'catalog_received',
           catalog: catalogState,
