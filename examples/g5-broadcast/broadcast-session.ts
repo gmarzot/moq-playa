@@ -45,8 +45,8 @@ export interface BroadcastSessionConnection extends MediaPublishConnection {
   };
 }
 
-/** The priority a catalog subgroup inherits when it omits one (§12.4). */
-const CATALOG_PRIORITY = 128;
+/** Catalog ahead of media (audio 64, video 128), so a joiner's catalog never waits behind a video group. */
+const CATALOG_PRIORITY = 64;
 /** FETCH parameter carrying the requested Group Order; 2 is Descending. */
 const GROUP_ORDER_PARAM = 0x22n;
 /** SUBSCRIBE_OK / REQUEST_UPDATE_OK parameter carrying the Largest Location (§10.2.11). */
