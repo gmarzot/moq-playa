@@ -104,6 +104,15 @@ describe('player soak recovery', () => {
     expect(clean.recovery.unrecovered).toBe(1);
   });
 
+  it('fails an adverse case that resumes after a disruption but ends frozen', () => {
+    const s = samples(200, frozenBetween(100));
+    const blackout = { kind: 'blackout', startEpochMs: T0 + 10_000, endEpochMs: T0 + 13_000 };
+    const r = assessSoak({ samples: s, ticks: [], disruptions: [blackout], adverse: true });
+    expect(r.recovery.events[0]!.freshFrameAfterMs).toBe(0);
+    expect(r.recovery).toMatchObject({ unrecovered: 0, endedFrozenMs: 24_500 });
+    expect(r.verdict).toBe('unrecovered');
+  });
+
   it('leaves out a freeze still open in the run\'s last seconds', () => {
     const s = samples(80, frozenBetween(70));
     expect(assessSoak({ samples: s, ticks: [], adverse: true })).toMatchObject({ verdict: 'played', recovery: { events: [] } });

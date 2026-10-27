@@ -140,8 +140,9 @@ async function playCase(browser, webUrl, c, impair = null) {
   page.on('console', (m) => void appendFile(consoleFile, `${json({ t: Date.now(), type: m.type(), text: m.text() })}\n`));
   page.on('pageerror', (e) => void appendFile(consoleFile, `${json({ t: Date.now(), type: 'pageerror', text: e.message })}\n`));
   // Viewers play as G5 does: from the current group, following the namespace.
+  // The player logs at info level into console.jsonl.
   const query = new URLSearchParams({ url: c.url, ns: c.namespace, v: String(c.draft), soak: '1', warmStart: '1',
-    followNamespace: '1' });
+    followNamespace: '1', log: 'info' });
   if (c.packaging === 'loc') query.set('output', 'canvas');
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
   const startup = { attempts: 0 };
@@ -329,8 +330,9 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
 }
 
 const recoveryCell = (rec) => {
-  if (!rec || rec.events.length === 0) return '—';
-  const flags = [rec.unrecovered ? `${rec.unrecovered} unrecovered` : '', rec.unsettled ? `${rec.unsettled} unsettled` : '']
+  if (!rec || (rec.events.length === 0 && rec.endedFrozenMs == null)) return '—';
+  const flags = [rec.unrecovered ? `${rec.unrecovered} unrecovered` : '', rec.unsettled ? `${rec.unsettled} unsettled` : '',
+    rec.endedFrozenMs != null ? `ended frozen ${Math.round(rec.endedFrozenMs / 1000)} s` : '']
     .filter(Boolean).join(', ');
   return `${rec.events.length}, ${rec.freshFrameAfterMsMax ?? '—'} / ${rec.stableLatencyAfterMsMax ?? '—'}${flags ? ` (${flags})` : ''}`;
 };

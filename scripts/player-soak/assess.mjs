@@ -4,7 +4,8 @@
  * carrying the player's stats, per-object latency summaries and events.
  * Report-only, except the verdict: no-playback when nothing played, no-audio
  * when the catalog lists an audio track that is never heard, and, under an
- * adverse profile, unrecovered when no fresh frame follows a disruption.
+ * adverse profile, unrecovered when no fresh frame follows a disruption or the
+ * picture is still frozen at the end.
  */
 
 const STALL_MS = 500;
@@ -172,6 +173,8 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
 
   const recovery = recoveryReport(samples, ticks, disruptions, frozen);
   const unrecovered = recovery.filter((r) => r.freshFrameAfterMs === null).length;
+  // A picture that resumed after a disruption and froze again for good did not recover either.
+  const endedFrozenMs = frozen.find((f) => f.open && f.durationMs >= OPEN_GRACE_MS)?.durationMs ?? null;
   const maxOf = (values) => (values.length ? Math.max(...values) : null);
   const breakdown = [...ticks].reverse().find((t) => t.stats?.ttffBreakdown?.firstFrameRenderedMs != null)?.stats.ttffBreakdown;
 
@@ -183,7 +186,7 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
   const audible = samples.some((s) => s.audioRms > AUDIBLE_RMS);
   return {
     verdict: !played ? 'no-playback' : advertisesAudio && !audible ? 'no-audio'
-      : adverse && unrecovered > 0 ? 'unrecovered' : 'played',
+      : adverse && (unrecovered > 0 || endedFrozenMs !== null) ? 'unrecovered' : 'played',
     audio: { advertised: advertisesAudio, audible },
     durationS: Math.round(durationMs / 1000),
     samples: samples.length,
@@ -191,6 +194,7 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
     recovery: {
       events: recovery,
       unrecovered,
+      endedFrozenMs,
       unsettled: recovery.filter((r) => r.stableLatencyAfterMs === null).length,
       freshFrameAfterMsMax: maxOf(recovery.map((r) => r.freshFrameAfterMs).filter(Number.isFinite)),
       stableLatencyAfterMsMax: maxOf(recovery.map((r) => r.stableLatencyAfterMs).filter(Number.isFinite)),
