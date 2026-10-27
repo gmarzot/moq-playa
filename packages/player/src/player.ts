@@ -3486,9 +3486,8 @@ export class MoqtPlayer {
         return; // don't route to old pipeline — staged for later
       }
 
-      // Verbose during development — shows every video object routed
       if (mediaType === 'video') {
-        this.log.info('[OBJ] %s "%s" group=%s obj=%s alias=%s %dB',
+        this.log.debug('[OBJ] %s "%s" group=%s obj=%s alias=%s %dB',
           mediaType, trackName, obj.groupId, obj.objectId, obj.trackAlias,
           obj.kind === 'data' && obj.payload ? obj.payload.byteLength : 0);
       } else {

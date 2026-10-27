@@ -134,10 +134,11 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
   const first = samples[0];
   const last = samples.at(-1);
   const durationMs = first && last ? last.wallMs - first.wallMs : 0;
+  // A hidden page draws a canvas about once a second: the browser's throttle, not a stall.
   const advanced = (prev) => (s) => {
     const moved = prev.s === undefined || s.mediaTimeS > prev.s.mediaTimeS + 0.001;
     prev.s = s;
-    return moved;
+    return moved || s.visibility === 'hidden';
   };
   const stalls = quietIntervals(samples, advanced({}), STALL_MS);
   const frozen = quietIntervals(samples, (() => {

@@ -32,6 +32,13 @@ describe('player soak assessment', () => {
     expect(quietIntervals(s, (x) => x.audioRms > 0.015, 500)).toEqual([{ startMs: 1500, durationMs: 750, open: true }]);
   });
 
+  it('does not count a hidden page\'s once-a-second drawing as stalls', () => {
+    const steps = (i: number) => ({ mediaTimeS: Math.floor(i / 4), presentedMediaTimeS: Math.floor(i / 4) });
+    const hidden = samples(40, (i) => ({ ...steps(i), visibility: 'hidden' }));
+    expect(assessSoak({ samples: hidden, ticks: [] }).playback.stalls.count).toBe(0);
+    expect(assessSoak({ samples: samples(40, steps), ticks: [] }).playback.stalls.count).toBeGreaterThan(0);
+  });
+
   it('is no-playback when the playhead never moves', () => {
     expect(assessSoak({ samples: samples(20, () => ({ mediaTimeS: 1, presentedFrames: 3 })), ticks: [] }).verdict)
       .toBe('no-playback');
