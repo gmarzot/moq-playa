@@ -12323,10 +12323,13 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     const second = createMockAdapter();
     next.push(second);
     player.on('catalog_received', () => { throw new Error('listener bug'); });
+    const later = vi.fn();
+    player.on('catalog_received', later);
 
     await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
 
     await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    expect(later).toHaveBeenCalled();
     await player.destroy();
   });
 

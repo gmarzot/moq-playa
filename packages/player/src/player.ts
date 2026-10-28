@@ -5549,7 +5549,7 @@ export class MoqtPlayer {
   /** Announce the catalog. A throwing listener is logged: it must not skip the media subscribe that follows. */
   private emitCatalogReceived(catalog: CatalogState): void {
     try {
-      this.emitter.emit('catalog_received', { type: 'catalog_received', catalog });
+      this.emitter.emitIsolated('catalog_received', { type: 'catalog_received', catalog });
     } catch (err) {
       this.log.warn('catalog_received listener threw: %s', err instanceof Error ? err.message : String(err));
     }
