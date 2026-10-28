@@ -608,6 +608,13 @@ export class Player {
     this.frozenSinceMs = null;
     this.emitter.emit('lifecycle', { state: kind, awayMs });
     this.engine.reconnectNow();
+    // A frozen page comes back with its media element and audio context suspended.
+    if (this.state === 'playing') {
+      this.engine.resumeSuspendedPlayback();
+      if (this.audioCtx && this.audioCtx.state !== 'running' && this.audioCtx.state !== 'closed') {
+        void this.audioCtx.resume().catch(() => { /* needs a gesture */ });
+      }
+    }
     if (frozenMs >= Player.RESUME_JUMP_TO_LIVE_MS && this.state === 'playing') {
       this.engine.jumpToLive(`resumed after ${(frozenMs / 1000).toFixed(1)}s frozen`);
     }

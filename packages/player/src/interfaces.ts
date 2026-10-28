@@ -407,6 +407,12 @@ export interface MediaSourceLike {
   setPlaybackIntent?(intent: boolean): void;
 
   /**
+   * OPTIONAL: restart playback the browser paused on its own (a frozen or
+   * backgrounded page) while playback intent holds. No-op without intent.
+   */
+  resumePlayback?(): void;
+
+  /**
    * Playout cushion target in seconds: where live-edge and gap-jump seeks
    * land, and the set point of the soft rate chase. Derived from
    * `targetLatencyMs` or the catalog's targetLatency.

@@ -22,4 +22,27 @@ describe('Player — page lifecycle', () => {
       expect(reconnectNow).toHaveBeenCalledTimes(2);
     } finally { await player.destroy(); }
   });
+
+  it('resuming while playing restarts suspended media and audio; while paused it does not', async () => {
+    const player = new Player({ style: {}, appendChild: vi.fn() } as never, { url: 'https://relay.example/moq', namespace: 'test' });
+    vi.spyOn((player as any).engine, 'reconnectNow').mockImplementation(() => {});
+    const resumeMedia = vi.spyOn((player as any).engine, 'resumeSuspendedPlayback').mockImplementation(() => {});
+    const audioResume = vi.fn(async () => {});
+    (player as any).audioCtx = { state: 'suspended', resume: audioResume };
+    try {
+      (player as any)._state = 'paused';
+      (player as any).onLifecycle('resumed');
+      expect(resumeMedia).not.toHaveBeenCalled();
+      expect(audioResume).not.toHaveBeenCalled();
+
+      (player as any)._state = 'playing';
+      (player as any).onLifecycle('frozen');
+      (player as any).onLifecycle('resumed');
+      expect(resumeMedia).toHaveBeenCalledTimes(1);
+      expect(audioResume).toHaveBeenCalledTimes(1);
+    } finally {
+      (player as any).audioCtx = null;
+      await player.destroy();
+    }
+  });
 });

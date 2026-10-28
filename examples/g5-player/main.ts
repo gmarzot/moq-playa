@@ -572,6 +572,9 @@ async function main(): Promise<void> {
   });
 
   // Page suspensions otherwise look like network gaps in the log.
+  if ((document as { wasDiscarded?: boolean }).wasDiscarded) {
+    log('Page reloaded: the browser discarded this tab while it was in the background');
+  }
   player.on('lifecycle', ({ state, awayMs }) => {
     log(awayMs === undefined
       ? `Page ${state}`
