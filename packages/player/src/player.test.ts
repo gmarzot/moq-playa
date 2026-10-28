@@ -1561,8 +1561,10 @@ describe('MoqtPlayer', () => {
   // ─── PUBLISH_DONE (§9.12) ────────────────────────────────
 
   describe('PUBLISH_DONE handling (§9.12)', () => {
-    async function loadAndSubscribeMedia(adapter: ReturnType<typeof createMockAdapter>) {
-      const player = new MoqtPlayer(createConfig(adapter));
+    async function loadAndSubscribeMedia(
+      adapter: ReturnType<typeof createMockAdapter>, overrides: Partial<MoqtPlayerConfig> = {},
+    ) {
+      const player = new MoqtPlayer({ ...createConfig(adapter), ...overrides });
       const loadPromise = player.load();
       await resolveConnect(adapter);
       await loadPromise;
@@ -1953,14 +1955,14 @@ describe('MoqtPlayer', () => {
         }
       });
 
-      it('parks the retry while the document is hidden and resubscribes once visible', async () => {
+      it('autoResume off: parks the retry while the document is hidden and resubscribes once visible', async () => {
         vi.useFakeTimers();
         const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
         (globalThis as any).document = doc;
         try {
           const adapter = createMockAdapter();
           adapter.draftVersion = 18;
-          const player = await loadAndSubscribeMedia(adapter);
+          const player = await loadAndSubscribeMedia(adapter, { autoResume: false });
           const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
           const before = videoSubscribes(adapter);
           doc.visibilityState = 'hidden';

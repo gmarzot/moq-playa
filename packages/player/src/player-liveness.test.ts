@@ -411,12 +411,12 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
-  it('a hidden page holds the restart until visible', async () => {
+  it('autoResume off: a hidden page holds the restart until visible', async () => {
     const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
     (globalThis as any).document = doc;
     try {
       const adapter = createMockAdapter();
-      const { player } = await startPlaying(adapter);
+      const { player } = await startPlaying(adapter, { autoResume: false });
       const subscribesAtStart = adapter.subscribe.mock.calls.length;
 
       feedVideo(adapter); // arm
@@ -433,13 +433,13 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     }
   });
 
-  it('delivery that resumes once visible needs no restart', async () => {
+  it('autoResume off: delivery that resumes once visible needs no restart', async () => {
     const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
     (globalThis as any).document = doc;
     let feeder: ReturnType<typeof setInterval> | undefined;
     try {
       const adapter = createMockAdapter();
-      const { player } = await startPlaying(adapter);
+      const { player } = await startPlaying(adapter, { autoResume: false });
 
       feedVideo(adapter); // arm
       doc.visibilityState = 'hidden';

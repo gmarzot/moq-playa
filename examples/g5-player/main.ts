@@ -30,6 +30,8 @@ const compatParam = parseCompat(new URLSearchParams(location.search).get('compat
 const locmafFrame = new URLSearchParams(location.search).get('locmaf') === 'frame';
 /** G5 starts from the current group unless `?warmStart=0`. */
 const warmStart = new URLSearchParams(location.search).get('warmStart') !== '0';
+/** Media recovers in a background tab unless `?autoResume=0`. */
+const autoResume = new URLSearchParams(location.search).get('autoResume') !== '0';
 
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 const catchUpRate: number | undefined = (() => {
@@ -140,7 +142,7 @@ function log(msg: string): void {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
   const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'cushion', 'cushionMax',
-    'catchUp', 'catalogBootstrap', 'warmStart', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
+    'catchUp', 'catalogBootstrap', 'warmStart', 'autoResume', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const backdrop = byId('settings-backdrop');
@@ -154,6 +156,7 @@ function log(msg: string): void {
   const fCatchUp = byId<HTMLInputElement>('s-catchup');
   const fBootstrap = byId<HTMLSelectElement>('s-bootstrap');
   const fWarmStart = byId<HTMLInputElement>('s-warm-start');
+  const fAutoResume = byId<HTMLInputElement>('s-auto-resume');
   const fCc = byId<HTMLSelectElement>('s-cc');
   const fAuthority = byId<HTMLInputElement>('s-authority');
   const fHash = byId<HTMLInputElement>('s-hash');
@@ -175,6 +178,7 @@ function log(msg: string): void {
     fCatchUp.value = p.get('catchUp') ?? '';
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
     fWarmStart.checked = p.get('warmStart') !== '0';
+    fAutoResume.checked = p.get('autoResume') !== '0';
     fCc.value = p.get('congestionControl') ?? '';
     fAuthority.value = p.get('authority') ?? '';
     fHash.value = p.get('hash') ?? '';
@@ -216,6 +220,7 @@ function log(msg: string): void {
     set('catchUp', fCatchUp.value.trim());
     set('catalogBootstrap', fBootstrap.value);
     if (!fWarmStart.checked) next.set('warmStart', '0');
+    if (!fAutoResume.checked) next.set('autoResume', '0');
     set('congestionControl', fCc.value);
     set('authority', fAuthority.value.trim());
     set('hash', fHash.value.trim());
@@ -277,6 +282,7 @@ async function main(): Promise<void> {
   const engineConfig = {
     ...(catalogBootstrap ? { catalogBootstrap } : {}),
     ...(warmStart ? { warmStartCurrentGroup: true } : {}),
+    ...(autoResume ? {} : { autoResume: false }),
     ...(catchUpRate ? { maxCatchUpRate: catchUpRate } : {}),
     ...(renderCushionFloorMs ? { renderCushionFloorMs } : {}),
     ...(renderCushionMaxMs ? { renderCushionMaxMs } : {}),

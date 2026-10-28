@@ -577,6 +577,8 @@ export class MoqtPlayer {
 
   /** `visibilitychange` listener installed while the first-frame deadline is pending. */
   private visibilityListener: (() => void) | null = null;
+  /** One-shot `visibilitychange` listener holding a media resume (autoResume off). */
+  private mediaResumeListener: (() => void) | null = null;
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
@@ -2353,6 +2355,11 @@ export class MoqtPlayer {
    * played, or to the current selection where none played.
    */
   private resumeMigratedMedia(selected: SelectedTracks): void {
+    if (this.holdWhileHidden()) {
+      this.log.info('Media resume held until the page is visible (autoResume off)');
+      this.resumeWhenVisible(() => this.resumeMigratedMedia(selected));
+      return;
+    }
     const playing = this.migratedMedia;
     this.migratedMedia = null;
     const tracks = this._catalogState?.tracks;
@@ -6846,6 +6853,7 @@ export class MoqtPlayer {
     this.cmafFirstFrameHiddenAt = undefined;
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
     this.removeVisibilityListener();
+    this.cancelResumeWhenVisible();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -9116,6 +9124,34 @@ export class MoqtPlayer {
     return doc?.visibilityState === 'hidden';
   }
 
+  /** Recovery waits for a visible page: autoResume is off and the document is hidden. */
+  private holdWhileHidden(): boolean {
+    return this.config.autoResume === false && this.documentHidden();
+  }
+
+  /** Run `resume` once the page is visible, on the session current now; one pending at a time. */
+  private resumeWhenVisible(resume: () => void): void {
+    this.cancelResumeWhenVisible();
+    const doc = (globalThis as { document?: EventTarget }).document;
+    if (!doc) return;
+    const conn = this.connection;
+    const listener = (): void => {
+      if (this.documentHidden()) return;
+      this.cancelResumeWhenVisible();
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      resume();
+    };
+    this.mediaResumeListener = listener;
+    doc.addEventListener('visibilitychange', listener);
+  }
+
+  private cancelResumeWhenVisible(): void {
+    if (!this.mediaResumeListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    doc?.removeEventListener('visibilitychange', this.mediaResumeListener);
+    this.mediaResumeListener = null;
+  }
+
   /** Suspend a CMAF bootstrap deadline while the document is hidden. */
   private deferCmafFirstFrameDeadline(timeoutMs: number): void {
     if (this.cmafFirstFrameDeferredTimeoutMs === undefined) {
@@ -10288,19 +10324,19 @@ export class MoqtPlayer {
   }
 
   /**
-   * Hold a restart while the document is hidden, where it only spends request
-   * streams. Once visible: true if delivery resumed within one reset probe,
-   * else the ladder continues with a fresh budget.
+   * With autoResume off, hold a restart while the document is hidden. Once
+   * visible: true if delivery resumed within one reset probe, else the ladder
+   * continues with a fresh budget.
    */
   private async livenessHoldWhileHidden(
     track: LivenessTrack,
     restart: { attempts: number; cancelled: boolean },
   ): Promise<boolean> {
-    if (!this.documentHidden()) return false;
+    if (!this.holdWhileHidden()) return false;
     const heldAtMs = performance.now();
     this.log.info('Liveness: %s "%s" restart held while the page is hidden',
       track.mediaType, track.trackName);
-    while (this.documentHidden()) {
+    while (this.holdWhileHidden()) {
       if (!this.livenessLadderMayContinue(restart)) return false;
       await new Promise((r) => setTimeout(r, 250));
     }
@@ -10429,7 +10465,7 @@ export class MoqtPlayer {
 
   /**
    * Resubscribe a track at once, then with doubling backoff, one pending retry
-   * per track; parked while the document is hidden.
+   * per track; parked while hidden when autoResume is off.
    */
   private scheduleResubscribe(trackName: string, cause: ResubscribeCause): void {
     const nowMs = performance.now();
@@ -10453,7 +10489,7 @@ export class MoqtPlayer {
       // A migration re-subscribes the replaced session's tracks itself.
       if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
       // A reconnect in flight either replaces this session or has just made it.
-      if (this.reconnect !== null || this.documentHidden()) {
+      if (this.reconnect !== null || this.holdWhileHidden()) {
         state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
         return;
       }
