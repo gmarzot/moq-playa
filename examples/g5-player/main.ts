@@ -855,7 +855,6 @@ async function main(): Promise<void> {
   let relativeBaseMs: number | null = null;
   /** Where the video capture time behind the latency chart comes from. */
   let latencySource: CaptureTimeSource | null = null;
-  const SOURCE_SHORT: Record<CaptureTimeSource, string> = { property: 'moq-ts', loc: 'loc', prft: 'prft' };
   const SOURCE_TIP: Record<CaptureTimeSource, string> = {
     property: 'Capture time from the MOQT timestamp properties.',
     loc: 'Capture time from the LOC Timestamp.',
@@ -1576,8 +1575,7 @@ async function main(): Promise<void> {
     latVal.textContent = latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
     latP95.textContent = latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
     const clockOffset = referenceClock.offset;
-    latKind.textContent = relativeDelay ? 'relative delay'
-      : latencySource ? `latency (${SOURCE_SHORT[latencySource]})` : 'latency';
+    latKind.textContent = relativeDelay ? 'relative delay' : 'latency';
     latScreen.textContent = relativeDelay ? '—'
       : screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
       : cmafPlayoutMs != null ? `≈${cmafPlayoutMs.toFixed(0)}` : '—';
