@@ -105,7 +105,8 @@ export type PlaybackEvent =
     | BacklogShedEvent
     | PartialGroupAbandonedEvent
     | SyncReferenceFallbackEvent
-    | AudioReanchoredEvent;
+    | AudioReanchoredEvent
+    | TimelineJumpEvent;
 
 /** Advertised audio produced no referenceable frame within the bound, so
  *  video anchored the shared reference itself. */
@@ -148,6 +149,18 @@ export interface GapDetectedEvent {
     readonly groupId: bigint;
 }
 
+/**
+ * A buffered group starts far ahead in media time of the group playing (stale
+ * or partial data from before a pause or join), so the pipeline moved to it at once.
+ */
+export interface TimelineJumpEvent {
+    readonly type: 'timeline_jump';
+    readonly fromGroupId: bigint;
+    readonly toGroupId: bigint;
+    /** Capture-time distance from the newest frame of the abandoned group (µs). */
+    readonly jumpUs: number;
+}
+
 /** Skipped forward past a gap to a new group. */
 export interface SkipForwardEvent {
     readonly type: 'skip_forward';
@@ -188,6 +201,8 @@ export interface TrackEndedEvent {
 export interface RecoveryEvent {
     readonly type: 'recovery';
     readonly action: RecoveryAction;
+    /** The pipeline already moved to a buffered group: a skip needs nothing from the publisher. */
+    readonly localSkip?: boolean;
 }
 
 /**

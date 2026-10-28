@@ -42,6 +42,7 @@ export type {
   MediaObjectEvent,
   GapDetectedEvent,
   SkipForwardEvent,
+  TimelineJumpEvent,
   SyncDriftEvent,
   SyncSkewEvent,
   KeyframeWaitingEvent,

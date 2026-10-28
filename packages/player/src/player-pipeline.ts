@@ -125,7 +125,8 @@ export interface PipelineEventContext {
   syncController: SyncController | null;
   syncResetThisTick: boolean;
   setSyncResetThisTick: (value: boolean) => void;
-  recoveryHook: (action: RecoveryAction) => RecoveryAction | null;
+  /** `localSkip`: the pipeline already moved to a buffered group. */
+  recoveryHook: (action: RecoveryAction, localSkip: boolean) => RecoveryAction | null;
   /**
    * Observability-only counter hook for LOC diagnostics (stats.loc).
    * `sync_reset` is recorded exactly when the reset is actually performed,
@@ -473,6 +474,20 @@ export function handlePipelineEvent(
         fromGroupId: evt.fromGroupId, toGroupId: evt.toGroupId,
       });
       break;
+    case 'timeline_jump':
+      ctx.log.info('Timeline jump %s group=%s→%s (+%ss): playing the newer group now',
+        mediaType, evt.fromGroupId, evt.toGroupId, (evt.jumpUs / 1e6).toFixed(1));
+      // The abandoned group's timeline anchored the shared reference.
+      if (!ctx.syncResetThisTick && ctx.syncController) {
+        ctx.syncController.reset();
+        ctx.setSyncResetThisTick(true);
+        ctx.recordDiagnostic?.('sync_reset');
+      }
+      ctx.emitEvent({
+        type: 'timeline_jump', mediaType,
+        fromGroupId: evt.fromGroupId, toGroupId: evt.toGroupId, jumpMs: evt.jumpUs / 1000,
+      });
+      break;
     case 'keyframe_waiting':
       ctx.recordDiagnostic?.('keyframe_waiting');
       ctx.emitEvent({
@@ -489,7 +504,7 @@ export function handlePipelineEvent(
       });
       break;
     case 'recovery': {
-      const action = ctx.recoveryHook(evt.action);
+      const action = ctx.recoveryHook(evt.action, evt.localSkip === true);
       if (action) {
         ctx.recordDiagnostic?.('recovery_action');
         ctx.emitEvent({ type: 'recovery_action', action });
@@ -572,6 +587,7 @@ export function handleRecoveryAction(
   qualityController: QualityController | null,
   log: LoggerLike,
   callbacks: RecoveryCallbacks,
+  localSkip = false,
 ): void {
   switch (action.type) {
     case 'skip_forward':
@@ -579,6 +595,12 @@ export function handleRecoveryAction(
       // carries the next one: skipping needs no REQUEST_UPDATE.
       if (mediaType === 'audio') {
         log.debug('Recovery: skip forward audio — continue at the next group');
+        break;
+      }
+      // Re-requesting the next group would cut short the buffered group the
+      // pipeline moved to.
+      if (localSkip) {
+        log.debug('Recovery: skip forward %s — continuing at the buffered group', mediaType);
         break;
       }
       log.warn('Recovery: skip forward %s — flush pipeline and resubscribe from live edge', mediaType);

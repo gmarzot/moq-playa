@@ -100,6 +100,9 @@ export class PlaybackPipeline {
     /** Last group for which keyframe_waiting was emitted (dedup). */
     private lastKeyframeWaitingGroupId = -1n;
 
+    /** Capture timestamp of the last consumed object; null until one is consumed on the current timeline. */
+    private lastCaptureUs: bigint | null = null;
+
     /**
  * When true, the first tick syncs to whatever group is available
  * without gap detection — avoids cascading recovery on initial
@@ -135,6 +138,10 @@ export class PlaybackPipeline {
     /** Lookahead left in place when the reference walks down, so ordinary
      *  jitter does not make frames late. */
     private static readonly REFERENCE_TOLERANCE_US = 20_000;
+    /** Media-time distance past which a newer group starts a new timeline. Shorter
+     *  distances are a lost group or two at common group lengths, which the gap path
+     *  waits for and reports to recovery; a pause or a stale join is longer. */
+    private static readonly TIMELINE_JUMP_MIN_US = 5_000_000n;
 
     /**
  * Throttle flag — set by decoder feedback when queue depth is high.
@@ -152,6 +159,7 @@ export class PlaybackPipeline {
     private lastReleaseUs = 0;
     /** Max groups before shedding old ones. 0 = unlimited. */
     private readonly maxBacklogGroups: number;
+    private readonly isLive: boolean;
 
     /** Video codec string from catalog (e.g., 'avc1.42c01f'). Used for keyframe validation. */
     private _videoCodec: string | undefined;
@@ -168,6 +176,7 @@ export class PlaybackPipeline {
         this.recovery = opts.recovery;
         this._videoOnly = opts.videoOnly ?? false;
         this.getPlaybackDelayUs = opts.getPlaybackDelayUs;
+        this.isLive = opts.isLive ?? true;
 
         // Bounded release: live video defaults to 5 objects/tick + 3 max
         // backlog groups. VOD/non-live and audio are unlimited — shedding
@@ -421,6 +430,7 @@ export class PlaybackPipeline {
         this.nextExpectedObjectId = 0n;
         this.minAcceptGroupId = firstGroupId;
         this.lastKeyframeWaitingGroupId = -1n;
+        this.lastCaptureUs = null;
         this._throttled = false;
         this.activeGroupWaitStartUs = null;
         this.gapDetector.reset();
@@ -477,6 +487,7 @@ export class PlaybackPipeline {
         this.nextExpectedObjectId = 0n;
         this.minAcceptGroupId = targetGroupId ?? -1n;
         this.lastKeyframeWaitingGroupId = -1n;
+        this.lastCaptureUs = null;
         this.resetPending = true;
         this._throttled = false;
         this._trackEnded = false;
@@ -528,7 +539,24 @@ export class PlaybackPipeline {
             if (g < this.lastConsumedGroupId) this.endedGroups.delete(g);
         }
 
-        // 1. Evaluate gap state
+        // 1. A newer group far ahead in media time: move to it now.
+        const jump = this.isLive ? this.timelineJump() : null;
+        if (jump) {
+            const fromGroupId = this.lastCaptureUs !== null ? this.lastConsumedGroupId : this.buffer.peek()!.groupId;
+            if (this.mediaType === 'video' && this.lastCaptureUs !== null
+                && !this.endedGroups.has(this.lastConsumedGroupId)) {
+                this.onEvent({
+                    type: 'partial_group_abandoned',
+                    fromGroupId,
+                    toGroupId: jump.groupId,
+                    reason: 'timeline jump',
+                } as PlaybackEvent);
+            }
+            this.onEvent({ type: 'timeline_jump', fromGroupId, toGroupId: jump.groupId, jumpUs: jump.jumpUs });
+            this.moveToGroup(jump.groupId);
+        }
+
+        // 1b. Evaluate gap state
         const availableGroupIds = [...this.bufferedGroupCounts.keys()];
         const gapDecision = this.gapDetector.evaluate(this.lastConsumedGroupId, availableGroupIds);
 
@@ -558,44 +586,25 @@ export class PlaybackPipeline {
                     reason: 'gap timeout',
                 } as PlaybackEvent);
             }
-            // Clean up ended-group tracking for skipped groups
-            for (const gid of this.endedGroups) {
-                if (gid < target) this.endedGroups.delete(gid);
-            }
-
             this.onEvent({
                 type: 'skip_forward',
                 fromGroupId: this.lastConsumedGroupId,
                 toGroupId: target,
             });
 
-            // Notify recovery controller for potential escalation
+            // Notify recovery controller for potential escalation. The target is
+            // buffered, so a skip needs nothing from the publisher.
             if (this.recovery) {
                 const action = this.recovery.evaluate({ type: 'gap', groupId: target });
-                this.onEvent({ type: 'recovery', action });
+                this.onEvent({ type: 'recovery', action, localSkip: true });
             }
-
-            // Reject future pushObject() calls for groups before the target
-            this.minAcceptGroupId = target;
-
-            // Discard old groups from buffer
-            this.discardBefore(target);
 
             // NOTE: Sync reset is NOT done here. When two pipelines (audio + video)
             // share a SyncController, both would call reset() during skip_forward,
             // causing a double-reset: audio resets → re-establishes reference →
             // video resets → wipes reference. The caller (MoqtPlayer) coordinates
             // sync reset via handlePipelineEvent, resetting once per tick cycle.
-
-            // Notify decoder of gap
-            const decision = this.decoderState.notifyGap();
-            this.emitFsmDecision(decision);
-
-            // Advance consumed position so we start from the target group
-            this.lastConsumedGroupId = target - 1n;
-            this.endedGroups.add(this.lastConsumedGroupId);
-            this.nextExpectedObjectId = 0n;
-            this.activeGroupWaitStartUs = null;
+            this.moveToGroup(target);
         }
 
         // 3. Backlog shedding: runs BEFORE throttle check so backlog is
@@ -841,6 +850,7 @@ export class PlaybackPipeline {
         const key = `${obj.groupId}:${obj.objectId}`;
         const headers = this.headerMap.get(key) ?? {};
         this.headerMap.delete(key);
+        if (headers.captureTimestamp !== undefined) this.lastCaptureUs = headers.captureTimestamp;
 
         // 1. Configure decoder if the object carries codec config for this
         //    media type. DecoderStateMachine.configure dedupes equal bytes.
@@ -1038,6 +1048,69 @@ export class PlaybackPipeline {
                 mediaType: this.mediaType,
             });
         }
+    }
+
+    /**
+     * Move to the lowest buffered group past the current one whose head is in
+     * hand, dropping what precedes it. Returns that group, or null when none is.
+     */
+    skipToBufferedGroup(): bigint | null {
+        const target = this.lowestBufferedHead(this.lastConsumedGroupId);
+        if (target === null) return null;
+        this.moveToGroup(target);
+        return target;
+    }
+
+    /**
+     * The lowest buffered group past the current one whose head is in hand, when
+     * it starts more than TIMELINE_JUMP_MIN_US (or the gap timeout) past the
+     * current group's newest frame: the current group is stale or partial data
+     * from before a pause or join.
+     */
+    private timelineJump(): { groupId: bigint; jumpUs: number } | null {
+        const top = this.buffer.peek();
+        if (!top) return null;
+        const current = this.lastCaptureUs !== null ? this.lastConsumedGroupId : top.groupId;
+        const target = this.lowestBufferedHead(current);
+        if (target === null) return null;
+        const headUs = this.headerMap.get(`${target}:0`)?.captureTimestamp;
+        if (headUs === undefined) return null;
+        let newestUs = this.lastCaptureUs;
+        const prefix = `${current}:`;
+        for (const [key, h] of this.headerMap) {
+            if (h.captureTimestamp !== undefined && key.startsWith(prefix)
+                && (newestUs === null || h.captureTimestamp > newestUs)) newestUs = h.captureTimestamp;
+        }
+        if (newestUs === null) return null;
+        const gapTimeoutUs = BigInt(Math.round(this.gapDetector.gapTimeoutUs));
+        const thresholdUs = gapTimeoutUs > PlaybackPipeline.TIMELINE_JUMP_MIN_US
+            ? gapTimeoutUs : PlaybackPipeline.TIMELINE_JUMP_MIN_US;
+        const jumpUs = headUs - newestUs;
+        return jumpUs > thresholdUs ? { groupId: target, jumpUs: Number(jumpUs) } : null;
+    }
+
+    private lowestBufferedHead(after: bigint): bigint | null {
+        let lowest: bigint | null = null;
+        for (const gid of this.bufferedGroupCounts.keys()) {
+            if (gid > after && (lowest === null || gid < lowest) && this.headerMap.has(`${gid}:0`)) lowest = gid;
+        }
+        return lowest;
+    }
+
+    /** Start from `target`: drop earlier groups, refuse them in flight, and wait for its keyframe. */
+    private moveToGroup(target: bigint): void {
+        for (const gid of this.endedGroups) {
+            if (gid < target) this.endedGroups.delete(gid);
+        }
+        this.minAcceptGroupId = target;
+        this.discardBefore(target);
+        const decision = this.decoderState.notifyGap();
+        this.emitFsmDecision(decision);
+        this.lastConsumedGroupId = target - 1n;
+        this.endedGroups.add(this.lastConsumedGroupId);
+        this.nextExpectedObjectId = 0n;
+        this.activeGroupWaitStartUs = null;
+        this.lastCaptureUs = null;
     }
 
     private discardBefore(groupId: bigint): void {

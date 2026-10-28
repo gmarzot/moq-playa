@@ -258,6 +258,20 @@ export interface TrackEndedEvent {
   readonly mediaType: 'video' | 'audio';
 }
 
+/**
+ * A buffered group started far ahead in media time of the group playing (a
+ * stale or partial group served before a pause or join): playback moved to it
+ * at once and the sync reference re-anchors.
+ */
+export interface TimelineJumpEvent {
+  readonly type: 'timeline_jump';
+  readonly mediaType: 'video' | 'audio';
+  readonly fromGroupId: bigint;
+  readonly toGroupId: bigint;
+  /** Capture-time distance from the newest frame of the abandoned group (ms). */
+  readonly jumpMs: number;
+}
+
 /** A partial video GOP was abandoned before END_OF_GROUP was received. */
 export interface PartialGroupAbandonedEvent {
   readonly type: 'partial_group_abandoned';
@@ -782,6 +796,7 @@ export interface PlayerEventMap {
   keyframe_waiting: KeyframeWaitingEvent;
   track_ended: TrackEndedEvent;
   partial_group_abandoned: PartialGroupAbandonedEvent;
+  timeline_jump: TimelineJumpEvent;
 
   // Recovery
   recovery_action: RecoveryActionEvent;

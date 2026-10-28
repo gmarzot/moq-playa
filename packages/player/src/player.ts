@@ -8712,6 +8712,13 @@ export class MoqtPlayer {
           this.stallParkTimer = setTimeout(() => {
             this.stallParkTimer = null;
             if (this._destroyed || this.isTerminalState()) return;
+            // A buffered group start plays now: nothing is flushed or re-requested.
+            const buffered = this.videoPipeline?.skipToBufferedGroup() ?? null;
+            if (buffered !== null) {
+              this.syncController?.reset();
+              this.log.warn('Stall: moving to buffered group %s', buffered);
+              return;
+            }
             this.flushVideoForRecovery();
             this.applyStallRecovery(action);
           }, MoqtPlayer.STALL_PARK_MS);
@@ -9837,7 +9844,7 @@ export class MoqtPlayer {
       syncResetThisTick: this.syncResetThisTick,
       setSyncResetThisTick: (v) => { this.syncResetThisTick = v; },
       recordDiagnostic: (kind) => this._stats.recordLocDiagnostic(kind),
-      recoveryHook: (action) => {
+      recoveryHook: (action, localSkip) => {
         const result = this.hooks.onRecovery.run(action);
         if (result) {
           doRecoveryAction(result, mediaType, this.qualityController, this.log, {
@@ -9855,7 +9862,7 @@ export class MoqtPlayer {
               }
               this.stopTicking();
             },
-          });
+          }, localSkip);
         }
         return result;
       },
