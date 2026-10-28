@@ -822,10 +822,10 @@ export class MoqtPlayer {
   });
   /** Last media object: media resuming after the namespace returns needs no re-establish. */
   private lastMediaArrivalUs = -Infinity;
-  /** Delay before each reconnect attempt; later attempts reuse the last. */
-  private static readonly RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+  /** Delay before each reconnect attempt: the first is immediate; later attempts reuse the last. */
+  private static readonly RECONNECT_DELAYS_MS = [0, 1_000, 2_000, 4_000, 8_000, 15_000];
   /** Attempts before giving up: about two minutes with the delays above. */
-  private static readonly RECONNECT_MAX_ATTEMPTS = 11;
+  private static readonly RECONNECT_MAX_ATTEMPTS = 12;
 
   private static readonly MAX_RECOVERY_PARKED_OBJECTS = 256;
   private static readonly MAX_RECOVERY_PARKED_BYTES = 4 * 1024 * 1024;
