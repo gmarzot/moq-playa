@@ -962,6 +962,7 @@ async function main(): Promise<void> {
     pending: Map<string, number>;
     reorders: number; lost: number;
     settles: Array<[number, number]>;     // [arrival, settle ms]
+    rebase?: boolean;                     // resumed: the next newer id restarts the sequence
   }
   const objSeq: Record<string, ObjSeq> = {};
   const seqStat = (t: string, k: 'reorders' | 'lost'): number => objSeq[t]?.[k] ?? 0;
@@ -1005,6 +1006,13 @@ async function main(): Promise<void> {
     if (!s) {
       objSeq[t] = { group, object, pending: new Map(),
                     reorders: 0, lost: 0, settles: [] };
+      return;
+    }
+    if (s.rebase && (group > s.group || (group === s.group && object > s.object))) {
+      // Nothing was sent while paused, so the ids skipped over the pause are not loss.
+      s.rebase = false;
+      s.group = group;
+      s.object = object;
       return;
     }
     if (group > s.group || (group === s.group && object > s.object)) {
@@ -1072,6 +1080,8 @@ async function main(): Promise<void> {
   /** Holes the playhead ran through, and their total length. */
   let videoFreezes = 0;
   let videoFrozenSec = 0;
+  /** Buffered video end at the last resume: the hole starting there is the paused interval. */
+  let resumeTailSec: number | null = null;
   const noteVideoHoles = (ms: any): void => {
     const ranges: Array<[number, number]> | undefined = ms?.bufferedRanges?.('video');
     const video = playerContainer.querySelector('video');
@@ -1082,6 +1092,7 @@ async function main(): Promise<void> {
       const a = ranges[i - 1]![1];
       const b = ranges[i]![0];
       if (b < t - 1) continue;
+      if (resumeTailSec !== null && Math.abs(a - resumeTailSec) < 0.05) continue;
       const key = `${a.toFixed(2)}-${b.toFixed(2)}`;
       holes.add(key);
       if (videoHolesSeen.has(key)) continue;
@@ -1780,8 +1791,24 @@ async function main(): Promise<void> {
     else player.play();
   });
 
-  player.on('play', () => { playBtn.textContent = 'Pause'; });
-  player.on('pause', () => { playBtn.textContent = 'Play'; });
+  let pausedByUser = false;
+  player.on('play', () => {
+    playBtn.textContent = 'Pause';
+    if (!pausedByUser) return;
+    pausedByUser = false;
+    // Delivery stops while paused: neither the skipped ids nor the buffered hole is loss.
+    for (const s of Object.values(objSeq)) {
+      s.pending.clear();
+      s.rebase = true;
+    }
+    const ranges: Array<[number, number]> | undefined =
+      (player as any).engine?.mediaSource?.bufferedRanges?.('video');
+    resumeTailSec = ranges?.length ? ranges[ranges.length - 1]![1] : null;
+  });
+  player.on('pause', () => {
+    playBtn.textContent = 'Play';
+    pausedByUser = true;
+  });
 
   seekBar.addEventListener('input', () => player.seek(Number(seekBar.value)));
   volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
