@@ -1080,8 +1080,8 @@ async function main(): Promise<void> {
   /** Holes the playhead ran through, and their total length. */
   let videoFreezes = 0;
   let videoFrozenSec = 0;
-  /** Buffered video end at the last resume: the hole starting there is the paused interval. */
-  let resumeTailSec: number | null = null;
+  /** Buffered video ends at recent resumes: a hole starting at one is a paused interval. */
+  const resumeTailsSec: number[] = [];
   const noteVideoHoles = (ms: any): void => {
     const ranges: Array<[number, number]> | undefined = ms?.bufferedRanges?.('video');
     const video = playerContainer.querySelector('video');
@@ -1092,7 +1092,7 @@ async function main(): Promise<void> {
       const a = ranges[i - 1]![1];
       const b = ranges[i]![0];
       if (b < t - 1) continue;
-      if (resumeTailSec !== null && Math.abs(a - resumeTailSec) < 0.05) continue;
+      if (resumeTailsSec.some((tail) => Math.abs(a - tail) < 0.05)) continue;
       const key = `${a.toFixed(2)}-${b.toFixed(2)}`;
       holes.add(key);
       if (videoHolesSeen.has(key)) continue;
@@ -1797,13 +1797,13 @@ async function main(): Promise<void> {
     if (!pausedByUser) return;
     pausedByUser = false;
     // Delivery stops while paused: neither the skipped ids nor the buffered hole is loss.
-    for (const s of Object.values(objSeq)) {
-      s.pending.clear();
-      s.rebase = true;
-    }
+    for (const s of Object.values(objSeq)) s.rebase = true;
     const ranges: Array<[number, number]> | undefined =
       (player as any).engine?.mediaSource?.bufferedRanges?.('video');
-    resumeTailSec = ranges?.length ? ranges[ranges.length - 1]![1] : null;
+    if (ranges?.length) {
+      resumeTailsSec.push(ranges[ranges.length - 1]![1]);
+      if (resumeTailsSec.length > 8) resumeTailsSec.shift();
+    }
   });
   player.on('pause', () => {
     playBtn.textContent = 'Play';
