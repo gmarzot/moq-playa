@@ -8939,12 +8939,13 @@ export class MoqtPlayer {
       this.mediaSource.onGapJump = (info) => {
         this._stats.recordGapJump();
         this.log.warn(
-          'MSE gap-jump: skipped %ss hole %ss -> %ss (waited %sms)',
-          info.holeSec.toFixed(2), info.from.toFixed(2), info.to.toFixed(2), info.waitedMs.toFixed(0),
+          'MSE gap-jump (%s): skipped %ss hole %ss -> %ss (waited %sms)',
+          info.reason, info.holeSec.toFixed(2), info.from.toFixed(2), info.to.toFixed(2), info.waitedMs.toFixed(0),
         );
         this.emitter.emit('gap_jump', {
           type: 'gap_jump',
-          from: info.from, to: info.to, holeSec: info.holeSec, waitedMs: info.waitedMs,
+          from: info.from, to: info.to, holeStart: info.holeStart,
+          holeSec: info.holeSec, waitedMs: info.waitedMs, reason: info.reason,
         });
       };
     }
@@ -10044,6 +10045,7 @@ export class MoqtPlayer {
     const matching = [...this.activeSubscriptions.entries()]
       .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId
         && this.isSubscriptionEstablished(requestId));
+    if (matching.length > 0) this.mediaSource?.expectDiscontinuity?.();
 
     for (const [requestId, sub] of matching) {
       this.connection.requestUpdate(varint(requestId), {
@@ -10509,6 +10511,7 @@ export class MoqtPlayer {
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
+    if (isMsePackaging(packaging)) this.mediaSource?.expectDiscontinuity?.();
 
     // Reset pipeline + sync to prepare for fresh data.
     // Audio resubscribe MUST reset sync — the new subscription will

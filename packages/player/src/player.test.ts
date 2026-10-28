@@ -2190,6 +2190,19 @@ describe('MoqtPlayer', () => {
       // Both subscriptions should have been attempted (video + audio)
       expect(adapter.requestUpdate).toHaveBeenCalledTimes(2);
     });
+
+    it('a resubscribe at the live edge tells the media source the hole it leaves cannot fill', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadCatalogAndSubscribe(adapter);
+      const expectDiscontinuity = vi.fn();
+      (player as any).mediaSource = { expectDiscontinuity };
+      (adapter.requestUpdate as any).mockClear();
+
+      player.jumpToLive('test');
+
+      expect(adapter.requestUpdate).toHaveBeenCalledTimes(2);
+      expect(expectDiscontinuity).toHaveBeenCalled();
+    });
   });
 
   // ─── Datagram Routing (§10.3) ─────────────────────────────────

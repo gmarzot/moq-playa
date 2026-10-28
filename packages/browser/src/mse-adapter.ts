@@ -145,14 +145,24 @@ export interface PlayheadWedgeInfo {
   readonly droppedFrames?: number;
 }
 
+/**
+ * Why a hole was skipped: `hole` after waiting for late media to fill it;
+ * `resubscribe` a hole the player's resubscribe left, which cannot fill;
+ * `timeline` a hole wide enough to be stale media followed by live.
+ */
+export type GapJumpReason = 'hole' | 'resubscribe' | 'timeline';
+
 /** Diagnostics for one buffered-hole gap-jump (see onGapJump). */
 export interface GapJumpInfo {
   /** Playhead position before the jump (seconds). */
   readonly from: number;
   /** Landing position just inside the next buffered range (seconds). */
   readonly to: number;
+  /** Start of the skipped hole (seconds). */
+  readonly holeStart: number;
   /** Width of the skipped hole (seconds). */
   readonly holeSec: number;
+  readonly reason: GapJumpReason;
   /** How long the hole persisted before the jump (ms). */
   readonly waitedMs: number;
   /** "start-end|start-end" of the element's buffered ranges at jump time. */
@@ -739,6 +749,10 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly GAP_JUMP_WAIT_PER_HOLE_SEC_MS = 2_000;
   /** A jump whose landing never progresses escalates to a fatal after this. */
   private static readonly GAP_LANDING_FATAL_MS = 10_000;
+  /** A hole this wide (and at least gapJumpMs) is skipped at once: stale media, then live. */
+  private static readonly GAP_TIMELINE_JUMP_SEC = 5;
+  /** How long a resubscribe's discontinuity mark waits for its hole. */
+  private static readonly DISCONTINUITY_MARK_TTL_MS = 10_000;
   /** Playhead movement below this is "stuck" (gap detection only). */
   private static readonly GAP_MOVE_TOLERANCE_SEC = 0.05;
   /** Candidate identity comparison tolerance (never float equality). */
@@ -765,6 +779,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** Own last-observed playhead — never reads or writes wedgeLastTime. */
   private gapLastPlayheadTime: number | null = null;
   private lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+  /** Buffered end when the player resubscribed: the next hole after it cannot fill. */
+  private discontinuityMark: { afterSec: number; atMs: number } | null = null;
   /** Suppresses ONE seek-generated waiting/timeupdate episode after a jump. */
   private gapStallEpisode = false;
   /** Watchdog-tick fallback so an undecodable landing can't mute stalls forever. */
@@ -1485,6 +1501,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.gapEpisodeTicks = 0;
     this.retireGapLanding();
     this.lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+    this.discontinuityMark = null;
     this.resetPlaybackRate();
   }
 
@@ -2321,6 +2338,24 @@ export class MseMediaSource implements MediaSourceLike {
 
   // ─── Buffered-hole gap-jump ──────────────────────────────────────
 
+  /**
+   * The player resubscribed past what is buffered: the next hole after the
+   * current buffered end cannot fill, so it is skipped as soon as media past
+   * it is buffered instead of after the infill wait.
+   */
+  expectDiscontinuity(): void {
+    if (this.destroyed) return;
+    let end = 0;
+    try {
+      const buffered = this.video.buffered;
+      for (let i = 0; i < buffered.length; i++) end = Math.max(end, buffered.end(i));
+    } catch {
+      return;
+    }
+    this.discontinuityMark = { afterSec: end, atMs: performance.now() };
+    this.diag('discontinuity expected after t=%s', end.toFixed(3));
+  }
+
   /** Drop the armed hole candidate (wait restarts on the next sighting). */
   private disarmGap(): void {
     this.gapCandidate = null;
@@ -2416,6 +2451,10 @@ export class MseMediaSource implements MediaSourceLike {
     }
 
     if (this.destroyed || !this.playTriggered || this.gapJumpMs <= 0) return;
+    if (this.discontinuityMark !== null
+        && nowMs - this.discontinuityMark.atMs > MseMediaSource.DISCONTINUITY_MARK_TTL_MS) {
+      this.discontinuityMark = null;
+    }
     const v = this.video;
     if (v.paused || v.seeking || v.error !== null || !this.playbackIntent) {
       this.disarmGap();
@@ -2475,6 +2514,20 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
 
+    // A hole that cannot fill needs no frozen playhead or infill wait.
+    const mark = this.discontinuityMark;
+    const finalReason: GapJumpReason | null =
+      holeSec >= Math.max(MseMediaSource.GAP_TIMELINE_JUMP_SEC, this.gapJumpMs / 1000) ? 'timeline'
+      : mark !== null && curEnd! > mark.afterSec - MseMediaSource.GAP_MOVE_TOLERANCE_SEC ? 'resubscribe'
+      : null;
+    if (finalReason !== null) {
+      if (nextEnd === null || nextEnd - nextStart! <= tol) return;
+      if (nowMs - this.lastGapJumpAtMs < MseMediaSource.GAP_JUMP_MIN_INTERVAL_MS) return;
+      this.jumpGap(nowMs, ct, curEnd!, nextStart!, nextEnd, holeSec, buffered,
+        this.gapCandidate?.armedAtMs ?? nowMs, finalReason);
+      return;
+    }
+
     // Stuck check (own state — never wedgeLastTime). The first sighting
     // only records the playhead: arming needs PROOF of a frozen playhead
     // across two ticks, else a still-coasting playhead arms a candidate
@@ -2521,26 +2574,43 @@ export class MseMediaSource implements MediaSourceLike {
       this.disarmGap();
       return;
     }
+    this.jumpGap(nowMs, ct, curEnd!, nextStart!, nextEnd, holeSec, buffered, c.armedAtMs, 'hole');
+  }
+
+  /** Seek past a buffered hole. State is committed before any callback runs. */
+  private jumpGap(
+    nowMs: number, ct: number, holeStart: number, nextStart: number, nextEnd: number,
+    holeSec: number, buffered: TimeRanges, armedAtMs: number, reason: GapJumpReason,
+  ): void {
+    const v = this.video;
     // Land near the range's live edge, not its start: media that buffered
     // during the wait is liveness to reclaim, not backlog to replay. The
     // whole range is buffered, so the UA decodes from the preceding RAP.
     const to = Math.max(
-      nextStart! + Math.min(0.01, (nextEnd - nextStart!) / 2),
+      nextStart + Math.min(0.01, (nextEnd - nextStart) / 2),
       nextEnd - this.targetAheadSec,
     );
     const info: GapJumpInfo = {
       from: ct,
       to,
+      holeStart,
       holeSec,
-      waitedMs: nowMs - c.armedAtMs,
+      reason,
+      waitedMs: nowMs - armedAtMs,
       bufferedRanges: fmtRanges(buffered),
     };
-    const stallDur = nowMs - (this.stallStartTime ?? c.armedAtMs);
+    // A hole skipped before the playhead froze at it is not a stall.
+    const stalled = reason === 'hole' || this.stallStartTime !== null;
+    const stallDur = nowMs - (this.stallStartTime ?? armedAtMs);
 
     // Commit first…
     this.gapCandidate = null;
     this.gapLastPlayheadTime = null;
     this.lastGapJumpAtMs = nowMs;
+    if (this.discontinuityMark !== null
+        && holeStart > this.discontinuityMark.afterSec - MseMediaSource.GAP_MOVE_TOLERANCE_SEC) {
+      this.discontinuityMark = null;
+    }
     // The jump reports its own `media-gap` stall below; retire the ordinary
     // episode wholesale rather than leaving its timer armed.
     this.cancelStallEpisode();
@@ -2555,13 +2625,13 @@ export class MseMediaSource implements MediaSourceLike {
 
     // …publish last (no adapter work after these).
     try {
-      this.onStall?.(stallDur, 'media-gap');
+      if (stalled) this.onStall?.(stallDur, 'media-gap');
     } catch { /* listener bug — state already committed */ }
     try {
       this.onGapJump?.(info);
     } catch { /* listener bug */ }
     this.logWarn(
-      `[MSE] gap-jump: skipped ${holeSec.toFixed(2)}s hole `
+      `[MSE] gap-jump (${reason}): skipped ${holeSec.toFixed(2)}s hole `
       + `${info.from.toFixed(2)}s -> ${info.to.toFixed(2)}s after ${info.waitedMs.toFixed(0)}ms`,
     );
   }

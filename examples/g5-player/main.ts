@@ -1066,6 +1066,8 @@ async function main(): Promise<void> {
   let traceVideoInit: { timescale: number; trex?: TrexDefaults } | null = null;
   let tracePrev: { start: bigint; end: bigint; group: bigint } | null = null;
   let traceMaxEnd: bigint | null = null;
+  /** The last video group starting 5 s or more past the previous fragment, and when it arrived. */
+  let traceTimelineJump: { group: bigint; atMs: number } | null = null;
   let traceWindowMs = 0;
   let traceLines = 0;
   let traceUnlogged = 0;
@@ -1082,8 +1084,14 @@ async function main(): Promise<void> {
   /** Holes the playhead ran through, and their total length. */
   let videoFreezes = 0;
   let videoFrozenSec = 0;
-  /** Buffered video ends at recent resumes: a hole starting at one is a paused interval. */
-  const resumeTailsSec: number[] = [];
+  /** Starts of holes that are not freezes: paused intervals, and holes skipped because they could not fill. */
+  const skippedHoleStartsSec: number[] = [];
+  const noteSkippedHole = (startSec: number): void => {
+    skippedHoleStartsSec.push(startSec);
+    if (skippedHoleStartsSec.length > 8) skippedHoleStartsSec.shift();
+  };
+  const holeSkipped = (startSec: number): boolean =>
+    skippedHoleStartsSec.some((s) => Math.abs(startSec - s) < 0.05);
   const noteVideoHoles = (ms: any): void => {
     const ranges: Array<[number, number]> | undefined = ms?.bufferedRanges?.('video');
     const video = playerContainer.querySelector('video');
@@ -1094,7 +1102,7 @@ async function main(): Promise<void> {
       const a = ranges[i - 1]![1];
       const b = ranges[i]![0];
       if (b < t - 1) continue;
-      if (resumeTailsSec.some((tail) => Math.abs(a - tail) < 0.05)) continue;
+      if (holeSkipped(a)) continue;
       const key = `${a.toFixed(2)}-${b.toFixed(2)}`;
       holes.add(key);
       if (videoHolesSeen.has(key)) continue;
@@ -1107,8 +1115,10 @@ async function main(): Promise<void> {
     }
     for (const [key, [a, b]] of videoHolesSeen) {
       if (t >= b) {
-        videoFreezes++;
-        videoFrozenSec += b - a;
+        if (!holeSkipped(a)) {
+          videoFreezes++;
+          videoFrozenSec += b - a;
+        }
         videoHolesSeen.delete(key);
       } else if (!holes.has(key)) {
         videoHolesSeen.delete(key); // filled before playback reached it
@@ -1181,27 +1191,27 @@ async function main(): Promise<void> {
       traceLog(`trace video: ${where} ends ${ms(maxEnd - end)}ms inside video already received (overlap, appended) · dur ${ms(end - start)}ms · ${prevDur}`);
     } else if (start - prev.start > 2n * (prev.end - prev.start)) {
       traceJumpAtMs = nowMs;
+      if (start - prev.end >= 5n * BigInt(init.timescale)) traceTimelineJump = { group, atMs: nowMs };
       traceLog(`trace video: ${where} starts ${ms(start - prev.end)}ms after the previous fragment's end · ${prevDur}`);
     }
   };
 
   (player as any).engine?.on('media_object', (e: any) => traceVideoTimeline(e, performance.now()));
-  // Samples from groups a timeline jump abandoned measure stale data: every
-  // latency figure drops them, including ticks already charted.
-  (player as any).engine?.on('timeline_jump', (e: any) => {
-    log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
+  // Samples a timeline jump left behind measure stale data: every latency
+  // figure drops them, including ticks already charted.
+  type LatSample = [number, number, bigint | undefined];
+  const dropStaleLatency = (stale: (sample: LatSample) => boolean, video: boolean): void => {
     let firstDroppedMs = Infinity;
-    const dropAbandoned = (win: Array<[number, number, bigint | undefined]>): void => {
+    const drop = (win: LatSample[]): void => {
       for (let i = win.length - 1; i >= 0; i--) {
-        const g = win[i]![2];
-        if (g === undefined || g >= e.toGroupId) continue;
+        if (!stale(win[i]!)) continue;
         firstDroppedMs = Math.min(firstDroppedMs, win[i]![0]);
         win.splice(i, 1);
       }
     };
-    if (e.mediaType !== 'video') { dropAbandoned(audioLatWindow); return; }
-    dropAbandoned(latWindow);
-    dropAbandoned(latHistory);
+    if (!video) { drop(audioLatWindow); return; }
+    drop(latWindow);
+    drop(latHistory);
     if (firstDroppedMs === Infinity) return;
     const corrected = (from: number, to: number): number[] =>
       latHistory.filter(([t]) => t > from && t <= to).map(([, v]) => v - lastDriftCorrectionMs);
@@ -1216,6 +1226,21 @@ async function main(): Promise<void> {
       latP50Samples[i] = inWindow.length ? percentile(inWindow, 0.5) : NaN;
       latP95Samples[i] = inWindow.length ? percentile(inWindow, 0.95) : NaN;
     }
+  };
+  (player as any).engine?.on('timeline_jump', (e: any) => {
+    log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
+    dropStaleLatency(([, , g]) => g !== undefined && g < e.toGroupId, e.mediaType === 'video');
+  });
+  // MSE skipped a hole that could not fill: no freeze, and on a timeline jump
+  // the samples before the live group are stale.
+  (player as any).engine?.on('gap_jump', (e: any) => {
+    if (e.reason === 'hole') return;
+    noteSkippedHole(e.holeStart);
+    const jump = traceTimelineJump;
+    if (e.reason !== 'timeline' || jump === null) return;
+    log(`Timeline jump [cmaf]: skipped ${e.holeSec.toFixed(1)} s to group ${jump.group}`);
+    dropStaleLatency(([, , g]) => g !== undefined && g < jump.group, true);
+    dropStaleLatency(([t]) => t < jump.atMs, false);
   });
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
@@ -1802,10 +1827,7 @@ async function main(): Promise<void> {
     for (const s of Object.values(objSeq)) s.rebase = true;
     const ranges: Array<[number, number]> | undefined =
       (player as any).engine?.mediaSource?.bufferedRanges?.('video');
-    if (ranges?.length) {
-      resumeTailsSec.push(ranges[ranges.length - 1]![1]);
-      if (resumeTailsSec.length > 8) resumeTailsSec.shift();
-    }
+    if (ranges?.length) noteSkippedHole(ranges[ranges.length - 1]![1]);
   });
   player.on('pause', () => {
     playBtn.textContent = 'Play';
