@@ -267,6 +267,13 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-transport-18 §10.18
    */
   readonly followNamespace?: boolean;
+
+  /**
+   * Recover media while the page is hidden (background tab): resubscribes,
+   * liveness restarts and the media resumed after a reconnect run as when
+   * visible. False holds them until the page is visible. Default true.
+   */
+  readonly autoResume?: boolean;
 }
 
 /** Playback tuning options. */
@@ -809,6 +816,9 @@ export const DEFAULT_PLAYER_CONFIG = {
   cmafBootstrapTimeoutMs: 10_000,
   cmafFirstFrameMaxWaitMs: 60_000,
 
+  // Recovery while the page is hidden
+  autoResume: true,
+
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
   livenessResetProbeMs: 2_000,
@@ -897,6 +907,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(
       `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
     );
+  }
+
+  if (config.autoResume !== undefined && typeof config.autoResume !== 'boolean') {
+    throw new TypeError(`autoResume must be a boolean, got ${String(config.autoResume)}`);
   }
 
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
