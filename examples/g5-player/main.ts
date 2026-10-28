@@ -737,6 +737,8 @@ async function main(): Promise<void> {
   /** [arrival ms, latency ms, group]: the group lets a timeline jump take its samples back out. */
   const latWindow: Array<[number, number, bigint | undefined]> = [];
   const LAT_WINDOW_MS = 4_000;
+  /** latWindow's samples over every charted tick's window, for recomputing them after a jump. */
+  const latHistory: Array<[number, number, bigint | undefined]> = [];
   /** Clock divergence rate from the drift fit, in ms per minute. */
   let clockDriftMsPerMin: number | null = null;
   /** Fitted from the latency floor; stalls, re-anchors and returns to view unsettle it. */
@@ -1175,17 +1177,21 @@ async function main(): Promise<void> {
   // latency figure drops them, including ticks already charted.
   (player as any).engine?.on('timeline_jump', (e: any) => {
     log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
-    const win = e.mediaType === 'video' ? latWindow : audioLatWindow;
     let firstDroppedMs = Infinity;
-    for (let i = win.length - 1; i >= 0; i--) {
-      const g = win[i]![2];
-      if (g === undefined || g >= e.toGroupId) continue;
-      firstDroppedMs = Math.min(firstDroppedMs, win[i]![0]);
-      win.splice(i, 1);
-    }
-    if (e.mediaType !== 'video' || firstDroppedMs === Infinity) return;
+    const dropAbandoned = (win: Array<[number, number, bigint | undefined]>): void => {
+      for (let i = win.length - 1; i >= 0; i--) {
+        const g = win[i]![2];
+        if (g === undefined || g >= e.toGroupId) continue;
+        firstDroppedMs = Math.min(firstDroppedMs, win[i]![0]);
+        win.splice(i, 1);
+      }
+    };
+    if (e.mediaType !== 'video') { dropAbandoned(audioLatWindow); return; }
+    dropAbandoned(latWindow);
+    dropAbandoned(latHistory);
+    if (firstDroppedMs === Infinity) return;
     const corrected = (from: number, to: number): number[] =>
-      latWindow.filter(([t]) => t > from && t <= to).map(([, v]) => v - lastDriftCorrectionMs);
+      latHistory.filter(([t]) => t > from && t <= to).map(([, v]) => v - lastDriftCorrectionMs);
     const lastTickMs = sampleAtMs.length ? sampleAtMs[sampleAtMs.length - 1]! : -Infinity;
     const pending = latWindow.filter(([t]) => t > lastTickMs).map(([, v]) => v);
     tickWorstRawMs = pending.length ? Math.max(...pending) : -Infinity;
@@ -1250,7 +1256,9 @@ async function main(): Promise<void> {
       // Only a stamp too far out to be a clock difference is dropped.
       if (Math.abs(latencyMs) < 120_000) {
         const now = performance.now();
-        latWindow.push([now, latencyMs, latGroup]);
+        const sample: [number, number, bigint | undefined] = [now, latencyMs, latGroup];
+        latWindow.push(sample);
+        latHistory.push(sample);
         if (latencyMs > tickWorstRawMs) tickWorstRawMs = latencyMs;
       }
     }
@@ -1453,6 +1461,7 @@ async function main(): Promise<void> {
 
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
+    while (latHistory.length && tickNowMs - latHistory[0]![0] > CHART_SPAN_MS + LAT_WINDOW_MS) latHistory.shift();
     const latRaw = latWindow.map(([, v]) => v);
     // Remove the clock divergence. The constant offset stays: one-way delay
     // cannot separate it from transit.
