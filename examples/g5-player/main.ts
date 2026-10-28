@@ -734,7 +734,8 @@ async function main(): Promise<void> {
   const CHART_SPAN_MS = 45_000;
   /** Tick times; every chart series holds one value per entry. */
   const sampleAtMs: number[] = [];
-  const latWindow: Array<[number, number]> = [];
+  /** [arrival ms, latency ms, group]: the group lets a timeline jump take its samples back out. */
+  const latWindow: Array<[number, number, bigint | undefined]> = [];
   const LAT_WINDOW_MS = 4_000;
   /** Clock divergence rate from the drift fit, in ms per minute. */
   let clockDriftMsPerMin: number | null = null;
@@ -777,8 +778,9 @@ async function main(): Promise<void> {
   const latTickMaxSamples: number[] = [];
   /** Worst raw latency since the previous tick. */
   let tickWorstRawMs = -Infinity;
+  let lastDriftCorrectionMs = 0;
   /** Audio arrival latency, kept like latWindow: its tail is what the audio queue must absorb. */
-  const audioLatWindow: Array<[number, number]> = [];
+  const audioLatWindow: Array<[number, number, bigint | undefined]> = [];
   /** Audio arrival p50/p95/p99 over the window, drift-corrected. */
   let audioLatPct: [number, number, number] | null = null;
   /** CMAF: estimated capture-to-screen latency, arrival p50 plus the video buffered ahead. */
@@ -1169,6 +1171,33 @@ async function main(): Promise<void> {
   };
 
   (player as any).engine?.on('media_object', (e: any) => traceVideoTimeline(e, performance.now()));
+  // Samples from groups a timeline jump abandoned measure stale data: every
+  // latency figure drops them, including ticks already charted.
+  (player as any).engine?.on('timeline_jump', (e: any) => {
+    log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
+    const win = e.mediaType === 'video' ? latWindow : audioLatWindow;
+    let firstDroppedMs = Infinity;
+    for (let i = win.length - 1; i >= 0; i--) {
+      const g = win[i]![2];
+      if (g === undefined || g >= e.toGroupId) continue;
+      firstDroppedMs = Math.min(firstDroppedMs, win[i]![0]);
+      win.splice(i, 1);
+    }
+    if (e.mediaType !== 'video' || firstDroppedMs === Infinity) return;
+    const corrected = (from: number, to: number): number[] =>
+      latWindow.filter(([t]) => t > from && t <= to).map(([, v]) => v - lastDriftCorrectionMs);
+    const lastTickMs = sampleAtMs.length ? sampleAtMs[sampleAtMs.length - 1]! : -Infinity;
+    const pending = latWindow.filter(([t]) => t > lastTickMs).map(([, v]) => v);
+    tickWorstRawMs = pending.length ? Math.max(...pending) : -Infinity;
+    for (let i = sampleAtMs.length - 1; i >= 0 && sampleAtMs[i]! >= firstDroppedMs; i--) {
+      const at = sampleAtMs[i]!;
+      const inTick = corrected(i > 0 ? sampleAtMs[i - 1]! : -Infinity, at);
+      const inWindow = corrected(at - LAT_WINDOW_MS, at);
+      latTickMaxSamples[i] = inTick.length ? Math.max(...inTick) : NaN;
+      latP50Samples[i] = inWindow.length ? percentile(inWindow, 0.5) : NaN;
+      latP95Samples[i] = inWindow.length ? percentile(inWindow, 0.95) : NaN;
+    }
+  });
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
@@ -1178,9 +1207,11 @@ async function main(): Promise<void> {
     noteObject(e);
     const picked = e.kind === 'data' ? pickCaptureTime(e.captureTimes) : undefined;
     if (e.kind === 'data') noteTiming(e, picked);
+    const sampleGroup = e.groupId ?? e.group;
+    const latGroup = sampleGroup === undefined ? undefined : BigInt(sampleGroup);
     if (e.mediaType === 'audio' && picked) {
       const audioLatencyMs = wallNowMs() - picked.us / 1000;
-      if (Math.abs(audioLatencyMs) < 120_000) audioLatWindow.push([performance.now(), audioLatencyMs]);
+      if (Math.abs(audioLatencyMs) < 120_000) audioLatWindow.push([performance.now(), audioLatencyMs, latGroup]);
     }
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
@@ -1219,7 +1250,7 @@ async function main(): Promise<void> {
       // Only a stamp too far out to be a clock difference is dropped.
       if (Math.abs(latencyMs) < 120_000) {
         const now = performance.now();
-        latWindow.push([now, latencyMs]);
+        latWindow.push([now, latencyMs, latGroup]);
         if (latencyMs > tickWorstRawMs) tickWorstRawMs = latencyMs;
       }
     }
@@ -1430,6 +1461,7 @@ async function main(): Promise<void> {
     clockDriftMsPerMin = drift?.msPerMin ?? null;
     clockDriftApplied = drift?.applied ?? false;
     const driftCorrectionMs = drift?.correctionMs ?? 0;
+    lastDriftCorrectionMs = driftCorrectionMs;
     const latVals = driftCorrectionMs
       ? latRaw.map((v) => v - driftCorrectionMs) : latRaw;
     while (audioLatWindow.length && tickNowMs - audioLatWindow[0]![0] > LAT_WINDOW_MS) audioLatWindow.shift();

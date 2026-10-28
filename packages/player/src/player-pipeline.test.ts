@@ -418,6 +418,31 @@ describe('handlePipelineEvent', () => {
     }));
   });
 
+  it('a timeline jump resets sync for either media type and emits the player event', () => {
+    const emitEvent = vi.fn();
+    const syncController = { reset: vi.fn() };
+    const setSyncReset = vi.fn();
+    handlePipelineEvent('audio', { type: 'timeline_jump', fromGroupId: 100n, toGroupId: 3600n, jumpUs: 70_000_000 }, {
+      emitEvent, log: mockLog, syncController: syncController as any,
+      syncResetThisTick: false, setSyncResetThisTick: setSyncReset,
+      recoveryHook: (a: RecoveryAction) => a,
+    });
+    expect(syncController.reset).toHaveBeenCalledTimes(1);
+    expect(setSyncReset).toHaveBeenCalledWith(true);
+    expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'timeline_jump', mediaType: 'audio', fromGroupId: 100n, toGroupId: 3600n, jumpMs: 70_000,
+    }));
+  });
+
+  it('passes a local skip through to the recovery hook', () => {
+    const recoveryHook = vi.fn((a: RecoveryAction) => a);
+    handlePipelineEvent('video', { type: 'recovery', action: { type: 'skip_forward' }, localSkip: true }, {
+      emitEvent: vi.fn(), log: mockLog, syncController: null,
+      syncResetThisTick: false, setSyncResetThisTick: vi.fn(), recoveryHook,
+    });
+    expect(recoveryHook).toHaveBeenCalledWith({ type: 'skip_forward' }, true);
+  });
+
   it('emits track_ended', () => {
     const emitEvent = vi.fn();
     const evt: PlaybackEvent = { type: 'track_ended' };
@@ -449,6 +474,18 @@ describe('handleRecoveryAction', () => {
     const action: RecoveryAction = { type: 'resubscribe' };
     handleRecoveryAction(action, 'video', null, mockLog, callbacks);
     expect(callbacks.onResubscribe).toHaveBeenCalledWith('video', undefined);
+  });
+
+  it('a video skip_forward re-requests the next group', () => {
+    const callbacks = { onQualityReduced: vi.fn(), onResubscribe: vi.fn(), onTerminate: vi.fn() };
+    handleRecoveryAction({ type: 'skip_forward' }, 'video', null, mockLog, callbacks);
+    expect(callbacks.onResubscribe).toHaveBeenCalledWith('video');
+  });
+
+  it('a local video skip_forward requests nothing', () => {
+    const callbacks = { onQualityReduced: vi.fn(), onResubscribe: vi.fn(), onTerminate: vi.fn() };
+    handleRecoveryAction({ type: 'skip_forward' }, 'video', null, mockLog, callbacks, true);
+    expect(callbacks.onResubscribe).not.toHaveBeenCalled();
   });
 
   it('calls onTerminate for fatal recovery', () => {

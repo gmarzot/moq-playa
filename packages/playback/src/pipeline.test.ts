@@ -2108,6 +2108,133 @@ describe('PlaybackPipeline', () => {
     });
 });
 
+describe('PlaybackPipeline — timeline jump', () => {
+    const CFG = new Uint8Array([0x01, 0x64]);
+    const T0 = 1_000_000_000n;
+    const STALE_JUMP = 36n * 60n * 1_000_000n;
+
+    function staleGroup(pipeline: PlaybackPipeline, group: number, count: number): void {
+        for (let o = 0; o < count; o++) {
+            pipeline.pushObject(makeData(group, o),
+                videoHeaders(T0 + BigInt(o) * 33_000n, o === 0, o === 0 ? CFG : undefined));
+        }
+    }
+
+    it('a group far ahead of a stale partial group plays at once, without the gap wait', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(T0);
+        staleGroup(pipeline, 3700, 7);
+        pipeline.tick();
+        pipeline.tick();
+
+        commands.length = 0;
+        events.length = 0;
+        pipeline.pushObject(makeData(4790, 0), videoHeaders(T0 + STALE_JUMP, true, CFG));
+        pipeline.tick();
+
+        const types = events.map(e => e.type);
+        expect(types).toContain('partial_group_abandoned');
+        const abandon = events.find(e => e.type === 'partial_group_abandoned') as any;
+        expect(abandon.reason).toBe('timeline jump');
+        const jump = events.find(e => e.type === 'timeline_jump') as any;
+        expect(jump).toMatchObject({ fromGroupId: 3700n, toGroupId: 4790n });
+        expect(jump.jumpUs).toBe(Number(STALE_JUMP - 6n * 33_000n));
+        expect(types).not.toContain('skip_forward');
+        const resetIdx = commands.findIndex(c => c.type === 'reset');
+        const decodeIdx = commands.findIndex(c => c.type === 'decode_video');
+        expect(resetIdx).toBeGreaterThanOrEqual(0);
+        expect(decodeIdx).toBeGreaterThan(resetIdx);
+    });
+
+    it('a join holding both a stale group and a newer group starts at the newer one', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(T0 + STALE_JUMP);
+        staleGroup(pipeline, 3700, 7);
+        pipeline.pushObject(makeData(4790, 0), videoHeaders(T0 + STALE_JUMP, true, CFG));
+        pipeline.pushObject(makeData(4790, 1), videoHeaders(T0 + STALE_JUMP + 33_000n, false));
+        pipeline.tick();
+
+        expect(events.find(e => e.type === 'timeline_jump')).toMatchObject({ fromGroupId: 3700n, toGroupId: 4790n });
+        expect(events.map(e => e.type)).not.toContain('partial_group_abandoned');
+        const decoded = commands.filter(c => c.type === 'decode_video').length;
+        expect(decoded).toBe(2);
+        expect(pipeline.currentGroupId).toBe(4790n);
+    });
+
+    it('a lost group or two is a gap, not a timeline jump', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(T0);
+        staleGroup(pipeline, 0, 3);
+        pipeline.tick();
+        // Two 2 s groups missing: above the 200 ms gap timeout, below the 5 s floor.
+        pipeline.pushObject(makeData(3, 0), videoHeaders(T0 + 66_000n + 4_000_000n, true, CFG));
+        commands.length = 0;
+        pipeline.tick();
+
+        expect(events.map(e => e.type)).not.toContain('timeline_jump');
+        expect(commands.filter(c => c.type === 'decode_video')).toHaveLength(0);
+    });
+
+    it('audio moves past a pause at once', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands, events } = createPipeline({ mediaType: 'audio', clock });
+        pipeline.configure(new Uint8Array([1]));
+        pipeline.pushObject(makeData(100, 0), audioHeaders(T0));
+        pipeline.tick();
+        commands.length = 0;
+        pipeline.pushObject(makeData(3600, 0), audioHeaders(T0 + 70_000_000n));
+        pipeline.tick();
+
+        expect(events.find(e => e.type === 'timeline_jump')).toMatchObject({ fromGroupId: 100n, toGroupId: 3600n });
+        expect(commands.filter(c => c.type === 'decode_audio')).toHaveLength(1);
+    });
+
+    it('a gap skip marks its recovery event local', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, events, sync } = createPipeline({
+            mediaType: 'video', clock, recovery: new DefaultRecoveryController(),
+        });
+        sync.setAudioReference(T0);
+        pipeline.pushObject(makeData(0, 0), videoHeaders(T0, true, CFG));
+        pipeline.pushObject(makeGap(0, 1, ObjectStatus.END_OF_GROUP));
+        pipeline.tick();
+        pipeline.pushObject(makeData(2, 0), videoHeaders(T0 + 1_000_000n, true, CFG));
+        pipeline.tick();
+        clock.advance(500_000);
+        pipeline.tick();
+
+        const recovery = events.find(e => e.type === 'recovery') as any;
+        expect(recovery).toBeDefined();
+        expect(recovery.localSkip).toBe(true);
+    });
+
+    it('skipToBufferedGroup moves to a buffered group head, or returns null', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(T0);
+        staleGroup(pipeline, 0, 3);
+        pipeline.tick();
+        expect(pipeline.skipToBufferedGroup()).toBeNull();
+
+        pipeline.pushObject(makeData(1, 0), videoHeaders(T0 + 1_000_000n, true, CFG));
+        pipeline.tick();
+        commands.length = 0;
+        expect(pipeline.skipToBufferedGroup()).toBe(1n);
+        pipeline.tick();
+        expect(commands.filter(c => c.type === 'decode_video')).toHaveLength(1);
+        expect(pipeline.currentGroupId).toBe(1n);
+    });
+});
+
 describe('PlaybackPipeline — LOC-04 Audio Config', () => {
     it('emits configure once for repeated identical audioConfig', () => {
         const clock = new MockClock();
