@@ -270,7 +270,7 @@ function codecsCompatible(a: string, b: string): boolean {
 }
 
 /** Why a media track is re-subscribed. */
-type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration';
+type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration' | 'refused';
 
 function defaultMediaSubscriptionFilter(isLive: boolean) {
   if (isLive) {
@@ -8153,6 +8153,12 @@ export class MoqtPlayer {
             'fatal', 'subscription', PlayerErrorCode.ALL_TRACKS_REFUSED,
             'All media track subscriptions refused — no playable content',
           ));
+        }
+        // A listed track not published yet: retry with backoff while nothing else plays this media type.
+        if (BigInt(errorCode) === BigInt(RequestError.DOES_NOT_EXIST)
+            && this.activeTrackName(mediaType) === undefined
+            && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName)) {
+          this.scheduleResubscribe(trackName, 'refused');
         }
       },
       onCatalogSubscribeOk: (largest) => {

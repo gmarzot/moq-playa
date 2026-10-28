@@ -31,6 +31,8 @@ export class NamespaceFollower {
   static readonly RETURN_MIN_SPACING_US = 10_000_000;
 
   private requestId: bigint | null = null;
+  /** The session being followed, set before SUBSCRIBE_NAMESPACE is sent. */
+  private followed: MoqtConnection | null = null;
   private _state: NamespaceState | null = null;
   /** The namespace went away (withdrawn, or a track refused as not existing). */
   private lost = false;
@@ -47,12 +49,14 @@ export class NamespaceFollower {
   /** SUBSCRIBE_NAMESPACE for the followed namespace on `conn`. */
   async follow(conn: MoqtConnection): Promise<void> {
     this.requestId = null;
+    this.followed = conn;
     this.setState('pending', 'SUBSCRIBE_NAMESPACE sent');
     try {
       const reqId = await conn.subscribeNamespace(this.host.namespace());
       if (conn === this.host.connection()) this.requestId = BigInt(reqId);
     } catch (err) {
       if (conn !== this.host.connection()) return;
+      this.followed = null;
       this.setState('refused',
         `SUBSCRIBE_NAMESPACE failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -95,7 +99,7 @@ export class NamespaceFollower {
    * on `conn`; the caller then reports the failure.
    */
   awaitPublisher(conn: MoqtConnection): boolean {
-    if (conn !== this.host.connection() || this.requestId === null) return false;
+    if (conn !== this.host.connection() || conn !== this.followed) return false;
     if (this._state === 'published') this.returned();
     else this.lost = true;
     return true;
