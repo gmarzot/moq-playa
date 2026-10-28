@@ -2169,6 +2169,20 @@ describe('MoqtPlayer', () => {
       expect(err.type).toBe('error');
     });
 
+    it('play() while playing is a no-op', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadCatalogAndSubscribe(adapter);
+      player.play();
+      const errors = vi.fn();
+      player.on('error', errors);
+      (adapter.requestUpdate as any).mockClear();
+
+      expect(() => player.play()).not.toThrow();
+      expect(errors).not.toHaveBeenCalled();
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      expect(player.state).toBe(PlayerState.PLAYING);
+    });
+
     it('play() sends REQUEST_UPDATE for all subscriptions even if one fails (§9.11)', async () => {
       const adapter = createMockAdapter();
       const player = await loadCatalogAndSubscribe(adapter);
@@ -12278,6 +12292,58 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
       payload: new TextEncoder().encode(CATALOG_JSON),
     } as MoqtObject);
   }
+
+  for (const hidden of [false, true]) {
+    it(`resumes media after a reconnect when a catalog listener plays (autoplay, ${hidden ? 'hidden' : 'visible'})`, async () => {
+      if (hidden) {
+        vi.stubGlobal('document', {
+          visibilityState: 'hidden', addEventListener: () => {}, removeEventListener: () => {},
+        });
+      }
+      try {
+        const first = createMockAdapter();
+        const { player, next } = await playingWithMedia(first);
+        const second = createMockAdapter();
+        next.push(second);
+        player.on('catalog_received', () => player.play());
+
+        await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+        await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+        await player.destroy();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+  }
+
+  it('resumes media after a reconnect even when a catalog listener throws', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    player.on('catalog_received', () => { throw new Error('listener bug'); });
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    await player.destroy();
+  });
+
+  it('a frozen tab: the jump to live fails, the session closes, and the reconnect resumes media', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    player.on('catalog_received', () => player.play());
+    vi.mocked(first.requestUpdate).mockRejectedValue(new Error('The stream was aborted by the remote server'));
+    player.jumpToLive('resumed after 6.0s frozen');
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Page entered back/forward cache.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    await player.destroy();
+  });
 
   it('re-subscribes the media the lost session played on the new session, without UNSUBSCRIBE there', async () => {
     const first = createMockAdapter();
