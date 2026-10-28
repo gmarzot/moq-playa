@@ -25,6 +25,12 @@ draft-22 relay is the relay-versus-draft A/B). Synthetic broadcasts publish as
 `ci/player-soak/<run>/<relay>/<packaging>`. `--skip-build` reuses built
 workspace packages.
 
+When the relay pauses a broadcast after its viewers leave (video Forward State 0
+at least 30 s after it went live), the broadcaster job opens one 30 s viewer,
+`rejoin-g5-<packaging>-<relay>-d<draft>`, which has to resume it. Its row adds
+click → resume and resume → playing times; a broadcast never paused reports
+`not paused`, which does not fail.
+
 Evidence goes to `reports/player-soak/<run>/`: per case `samples.jsonl`,
 `ticks.jsonl`, `console.jsonl` and `summary.json`; per run `summary.json` and
 `summary.md`. Metrics: startup time, stalls and rebuffer ratio, frozen picture,

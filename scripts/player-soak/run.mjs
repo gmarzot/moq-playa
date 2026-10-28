@@ -9,6 +9,9 @@
  *                    hidden tab, publisher restarts); first play draft only
  *   --variant restart   the broadcaster restarts every cases.restartEveryS; players use its namespace
  *   --adverse-minutes M   keep a broadcaster up for the adverse players too
+ *
+ * A broadcaster the relay pauses (video Forward State 0) gets one 30 s viewer, `rejoin-…`,
+ * which has to resume it.
  */
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
@@ -130,9 +133,10 @@ async function startDisruption(e, { impair, context, page }) {
   throw new Error(`unknown profile event ${JSON.stringify(e)}`);
 }
 
-/** Play one stream for `minutes` and write its observation stream and summary. */
+/** Play one stream for `minutes` (or `c.minutes`) and write its observation stream and summary. */
 async function playCase(browser, webUrl, c, impair = null) {
   const dir = join(out, c.name);
+  const caseMinutes = c.minutes ?? minutes;
   await mkdir(dir, { recursive: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
@@ -154,6 +158,7 @@ async function playCase(browser, webUrl, c, impair = null) {
       startup.attempts++;
       await page.goto(`${webUrl}_tests/player-acceptance/?${query}`, { waitUntil: 'domcontentloaded' });
       const clickedAt = Date.now();
+      startup.clickedEpochMs = clickedAt;
       await page.locator('#start').click();
       try {
         await page.waitForFunction(() => {
@@ -170,7 +175,7 @@ async function playCase(browser, webUrl, c, impair = null) {
         await sleep(10_000);
       }
     }
-    log(c.name, `playing after ${startup.readyMs} ms; observing for ${minutes} min`);
+    log(c.name, `playing after ${startup.readyMs} ms; observing for ${caseMinutes} min`);
     await page.evaluate(() => window.playerAcceptance.begin(false));
     const samples = [];
     const ticks = [];
@@ -183,7 +188,7 @@ async function playCase(browser, webUrl, c, impair = null) {
       disruptions.push({ ...record, endEpochMs: Date.now() });
     };
     const observedAt = Date.now();
-    const end = observedAt + minutes * 60_000;
+    const end = observedAt + caseMinutes * 60_000;
     let publisherEnded = null;
     while (Date.now() < end) {
       await sleep(1000);
@@ -271,8 +276,37 @@ function broadcastCase(cases, spec, variant) {
   return { relay, packaging, relayInfo, namespace, spec };
 }
 
-/** Publish a synthetic g5-broadcast until the players have had their minutes. */
-async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
+const REJOIN_AFTER_LIVE_MS = 30_000;
+
+/** Epoch ms of the broadcaster log's first `[HH:MM:SS.mmm] <text>` line at or after `sinceMs`. */
+function broadcasterLogTime(pageLog, text, sinceMs) {
+  const day = new Date(sinceMs).toISOString().slice(0, 10);
+  for (const m of pageLog.matchAll(/^\[(\d\d:\d\d:\d\d\.\d{3})\] (.*)$/gm)) {
+    if (!m[2].startsWith(text)) continue;
+    let t = Date.parse(`${day}T${m[1]}Z`);
+    if (t > sinceMs + 43_200_000) t -= 86_400_000;
+    else if (t < sinceMs - 43_200_000) t += 86_400_000;
+    if (t >= sinceMs) return t;
+  }
+  return null;
+}
+
+/** A viewer for a broadcast the relay paused; resolves to its summary. */
+async function rejoinPaused(webUrl, c) {
+  const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: browserArgs });
+  try {
+    return await playCase(browser, webUrl, c);
+  } finally {
+    await browser.close();
+  }
+}
+
+/**
+ * Publish a synthetic g5-broadcast until the players have had their minutes. With `rejoin`,
+ * the first video Forward State 0 starts that viewer and the broadcast stays up until it ends;
+ * resolves to its summary, or a `not paused` record.
+ */
+async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin = null) {
   const dir = join(out, `broadcaster-${b.packaging}-${b.relay}`);
   const camera = await prepareCamera(join(out, 'camera'));
   const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: [...browserArgs,
@@ -287,6 +321,7 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
     packaging: b.packaging, height: String(p.height), fps: String(p.fps), bitrate: String(p.bitrate), target: String(p.target),
     clockUrl: 'https://aiomoqt-relay.marzresearch.net/time' });
   let wentLive = false;
+  let viewer = null;
   try {
     await page.goto(`${webUrl}g5-broadcast/?${query}`, { waitUntil: 'domcontentloaded' });
     // Published once the relay accepts the namespace; "live" waits for a catalog subscriber,
@@ -315,9 +350,32 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0) {
         state: document.querySelector('#state')?.textContent,
         cells: Object.fromEntries([...document.querySelectorAll('#diag-grid .cell, #adv-grid .cell')]
           .map((c) => [c.firstChild?.textContent ?? '', c.querySelector('b')?.textContent ?? ''])),
+        forward: (document.querySelector('#log')?.textContent ?? '').split('\n')
+          .filter((l) => l.includes('] video: Forward State')).join('\n'),
       }));
-      await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...cells })}\n`);
+      const { forward, ...tick } = cells;
+      await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...tick })}\n`);
+      // A pause at go-live comes before any viewer; a later one follows viewers leaving.
+      const pausedAt = rejoin && !viewer
+        ? broadcasterLogTime(forward, 'video: Forward State 0', liveAt + REJOIN_AFTER_LIVE_MS) : null;
+      if (pausedAt !== null) {
+        log('broadcaster', b.namespace, `paused by the relay ${Math.round((pausedAt - liveAt) / 1000)} s after going live; `
+          + 'a viewer rejoins');
+        viewer = rejoinPaused(webUrl, rejoin).then((summary) => ({ summary, pausedAt }));
+      }
     }
+    if (rejoin && !viewer) return { name: rejoin.name, verdict: 'not paused' };
+    if (viewer) {
+      const { summary, pausedAt: paused } = await viewer;
+      const pageLog = await page.locator('#log').textContent() ?? '';
+      const clicked = summary.startup?.clickedEpochMs;
+      const resumedAt = clicked == null ? null : broadcasterLogTime(pageLog, 'video: Forward State 1', clicked - 1000);
+      const ready = clicked == null || summary.startup?.readyMs == null ? null : clicked + summary.startup.readyMs;
+      return { ...summary, rejoin: { pausedAfterLiveS: Math.round((paused - liveAt) / 1000),
+        clickToResumeMs: resumedAt == null ? null : resumedAt - clicked,
+        resumeToPlayingMs: resumedAt == null || ready == null ? null : ready - resumedAt } };
+    }
+    return null;
   } finally {
     // The page's own log is the only record of why a broadcast did not publish.
     const pageLog = await page.locator('#log').textContent().catch(() => null) ?? '';
@@ -349,7 +407,10 @@ async function report(results) {
       + `| ${r.player ? `${r.player.framesDropped} / ${r.player.audioUnderruns}` : '—'} `
       + `| ${recoveryCell(r.recovery)} | ${startupCell(r.startup?.breakdownMs)} `
       + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80)
-        : r.publisherEnded ? `publisher ended at ${r.publisherEnded.atS} s` : ''} |`;
+        : r.publisherEnded ? `publisher ended at ${r.publisherEnded.atS} s`
+          : r.rejoin ? `paused ${r.rejoin.pausedAfterLiveS} s after live; `
+            + `click → resume ${r.rejoin.clickToResumeMs ?? '—'} ms, resume → playing ${r.rejoin.resumeToPlayingMs ?? '—'} ms`
+            : ''} |`;
   });
   const md = [`### Player soak ${runId} (${minutes} min per case)`, '',
     '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms '
@@ -374,8 +435,15 @@ try {
     const adverse = adverseMinutes > 0 && cases.adverse.broadcasts.includes(args.broadcaster)
       ? cases.adverse.broadcasts.length * (adverseMinutes + 1) : 0;
     const playMinutes = args.variant ? adverse : Math.max(b.relayInfo.playDrafts.length * (minutes + 1), adverse);
-    await runBroadcaster(webUrl, b, playMinutes + Number(args['lead-minutes']),
-      args.variant === 'restart' ? cases.restartEveryS : 0);
+    const draft = b.relayInfo.playDrafts[0];
+    const rejoin = args.variant ? null : { name: `rejoin-g5-${b.packaging}-${b.relay}-d${draft}`, url: b.relayInfo.url,
+      namespace: b.namespace, draft, packaging: b.packaging, expected: cases.broadcastExpected, minutes: 0.5, waitS: 60 };
+    const result = await runBroadcaster(webUrl, b, playMinutes + Number(args['lead-minutes']),
+      args.variant === 'restart' ? cases.restartEveryS : 0, rejoin);
+    if (result) {
+      await report([result]);
+      failed = !['played', 'not paused'].includes(result.verdict);
+    }
   } else {
     const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: browserArgs });
     let results = [];
