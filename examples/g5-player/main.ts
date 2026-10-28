@@ -579,7 +579,9 @@ async function main(): Promise<void> {
     };
   });
   player.on('session_reconnecting', ({ attempt, delayMs }) => {
-    log(`Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`);
+    log(delayMs > 0
+      ? `Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`
+      : `Reconnecting (attempt ${attempt})`);
     setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${attempt}` };
   });
   player.on('track_unsubscribed', ({ trackName, reason }) => {

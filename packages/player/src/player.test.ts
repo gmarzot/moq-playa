@@ -12171,7 +12171,7 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     return { player, createConnection, next };
   }
 
-  it('reconnects 1 s after a close during playback and reports the migration', async () => {
+  it('reconnects at once after a close during playback and reports the migration', async () => {
     const first = createMockAdapter();
     const { player, createConnection, next } = await loaded(first, { playing: true });
     const second = createMockAdapter();
@@ -12183,9 +12183,9 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     player.on('session_migrated', migrated);
 
     first._triggerClose(0x1, 'relay restarted');
-    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 0 }]);
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(0);
     expect(createConnection).toHaveBeenCalledTimes(2);
     await resolveConnect(second);
     await vi.waitFor(() => expect(migrated).toHaveBeenCalledOnce());
@@ -12207,10 +12207,10 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     first._triggerClose(0x1, 'relay restarted');
     await vi.advanceTimersByTimeAsync(130_000);
 
-    expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, ...Array(7).fill(15_000)]);
+    expect(delays).toEqual([0, 1_000, 2_000, 4_000, 8_000, ...Array(7).fill(15_000)]);
     expect(fatal).toHaveLength(1);
     expect(fatal[0]!.code).toBe(PlayerErrorCode.CONNECTION_LOST);
-    expect(fatal[0]!.message).toMatch(/relay restarted.*11 attempts/);
+    expect(fatal[0]!.message).toMatch(/relay restarted.*12 attempts/);
     expect(player.state).toBe(PlayerState.ERROR);
   });
 
@@ -12237,7 +12237,7 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     expect(reconnecting).toEqual([]);
     done(media[1]);
 
-    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 0 }]);
     await player.destroy();
   });
 
@@ -12392,7 +12392,7 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     first._triggerClose(0x2, 'Connection lost.');
 
     expect(errors.map((e) => [e.severity, e.code])).toEqual([['degraded', PlayerErrorCode.CONNECTION_LOST]]);
-    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 1_000 }]);
+    expect(reconnecting).toEqual([{ type: 'session_reconnecting', attempt: 1, delayMs: 0 }]);
     expect(player.state).toBe(PlayerState.PLAYING);
     await player.destroy();
   });
