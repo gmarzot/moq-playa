@@ -356,9 +356,10 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin
       const { forward, ...tick } = cells;
       await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: Date.now(), ...tick })}\n`);
       // A pause at go-live comes before any viewer; a later one follows viewers leaving.
+      // Only a pause no viewer has since resumed is one the rejoin can test.
       const pausedAt = rejoin && !viewer
         ? broadcasterLogTime(forward, 'video: Forward State 0', liveAt + REJOIN_AFTER_LIVE_MS) : null;
-      if (pausedAt !== null) {
+      if (pausedAt !== null && broadcasterLogTime(forward, 'video: Forward State 1', pausedAt) === null) {
         log('broadcaster', b.namespace, `paused by the relay ${Math.round((pausedAt - liveAt) / 1000)} s after going live; `
           + 'a viewer rejoins');
         viewer = rejoinPaused(webUrl, rejoin).then((summary) => ({ summary, pausedAt }));
@@ -371,7 +372,9 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin
       const clicked = summary.startup?.clickedEpochMs;
       const resumedAt = clicked == null ? null : broadcasterLogTime(pageLog, 'video: Forward State 1', clicked - 1000);
       const ready = clicked == null || summary.startup?.readyMs == null ? null : clicked + summary.startup.readyMs;
-      return { ...summary, rejoin: { pausedAfterLiveS: Math.round((paused - liveAt) / 1000),
+      // Another viewer resumed the broadcast first: playing proves nothing about a resume.
+      const verdict = summary.verdict === 'played' && resumedAt == null ? 'inconclusive' : summary.verdict;
+      return { ...summary, verdict, rejoin: { pausedAfterLiveS: Math.round((paused - liveAt) / 1000),
         clickToResumeMs: resumedAt == null ? null : resumedAt - clicked,
         resumeToPlayingMs: resumedAt == null || ready == null ? null : ready - resumedAt } };
     }
@@ -442,7 +445,7 @@ try {
       args.variant === 'restart' ? cases.restartEveryS : 0, rejoin);
     if (result) {
       await report([result]);
-      failed = !['played', 'not paused'].includes(result.verdict);
+      failed = !['played', 'not paused', 'inconclusive'].includes(result.verdict);
     }
   } else {
     const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: browserArgs });
