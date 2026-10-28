@@ -12598,6 +12598,28 @@ describe('MoqtPlayer — video views (altGroups)', () => {
   const subscribedNames = (adapter: ReturnType<typeof createMockAdapter>): string[] =>
     (adapter.subscribe as any).mock.calls.map((c: any) => new TextDecoder().decode(c[1]));
 
+  it('a CMAF video resubscribe (reconnect) waits for a keyframe again', async () => {
+    const adapter = createMockAdapter();
+    const clearPending = vi.fn();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+      }),
+      createCmafAssembler: () => ({
+        push: vi.fn(), selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null,
+        reset: vi.fn(), destroy: vi.fn(), clearPending,
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    (player as any).cmafVideoSynced = true;
+
+    (player as any).replaceSubscription('video_main', 'migration');
+
+    expect((player as any).cmafVideoSynced).toBe(false);
+    expect(clearPending).toHaveBeenCalledWith('video');
+    await player.destroy();
+  });
+
   /** SUBSCRIBE_OK the latest subscription and deliver its first keyframe object. */
   async function landLatestSubscription(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {
     const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;

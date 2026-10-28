@@ -10517,6 +10517,11 @@ export class MoqtPlayer {
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
+    if (isMsePackaging(packaging) && mediaType === 'video') {
+      // The new subscription may start mid-group: wait for a keyframe, as on init.
+      this.cmafVideoSynced = false;
+      this.cmafAssembler?.clearPending?.('video');
+    }
 
     // Reset pipeline + sync to prepare for fresh data.
     // Audio resubscribe MUST reset sync — the new subscription will
