@@ -14,6 +14,23 @@ import { programmeAudio } from './programme-audio.js';
  *  each); past it the processor drops input. */
 const AUDIO_BUFFER_FRAMES = 50;
 
+/** Camera choice: `front`, `back`, a device id, or null for the browser default. */
+export type CameraChoice = string | null;
+
+/** Video constraints for `camera` on top of `base` (size, frame rate). */
+export function cameraConstraints(base: MediaTrackConstraints | undefined, camera: CameraChoice): MediaTrackConstraints | true {
+  if (!camera) return base ?? true;
+  const choice: MediaTrackConstraints = camera === 'front' ? { facingMode: 'user' }
+    // exact: an ideal facing mode competes with the size and can still pick the front camera.
+    : camera === 'back' ? { facingMode: { exact: 'environment' } }
+      : { deviceId: { exact: camera } };
+  return { ...base, ...choice };
+}
+
+function isOverconstrained(err: unknown): boolean {
+  return (err as { name?: unknown } | null)?.name === 'OverconstrainedError';
+}
+
 /**
  * Captures media from camera or screen and delivers raw frames.
  *
@@ -42,17 +59,31 @@ export class MediaCapture {
   /** Callback: capture error. */
   onError: ((error: Error) => void) | null = null;
 
+  /** Callback: the chosen camera is not available; the default camera opened instead. */
+  onCameraFallback: ((camera: string, error: Error) => void) | null = null;
+
   /**
    * Start capturing from camera (+ microphone if available).
    *
    * @param constraints Video constraints (width, height, frameRate, etc.)
+   * @param camera Camera to open; one that cannot be satisfied falls back to the default
    * @returns The MediaStream (assign to <video>.srcObject for preview)
    */
-  async startCamera(constraints?: MediaTrackConstraints, audio: boolean | MediaTrackConstraints = true): Promise<MediaStream> {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: constraints ?? true,
-      audio: programmeAudio(audio),
-    });
+  async startCamera(
+    constraints?: MediaTrackConstraints,
+    audio: boolean | MediaTrackConstraints = true,
+    camera: CameraChoice = null,
+  ): Promise<MediaStream> {
+    const open = (video: MediaTrackConstraints | true) =>
+      navigator.mediaDevices.getUserMedia({ video, audio: programmeAudio(audio) });
+    let stream: MediaStream;
+    try {
+      stream = await open(cameraConstraints(constraints, camera));
+    } catch (err) {
+      if (!camera || !isOverconstrained(err)) throw err;
+      this.onCameraFallback?.(camera, err instanceof Error ? err : new Error(String(err)));
+      stream = await open(cameraConstraints(constraints, null));
+    }
     return this.processStream(stream);
   }
 

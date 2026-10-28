@@ -38,6 +38,7 @@ import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
 import { VOICE_AUDIO } from '../shared/browser/programme-audio.js';
+import type { CameraChoice } from '../shared/browser/media-capture.js';
 import {
   WebCodecsVideoEncoder,
   WebCodecsAudioEncoder,
@@ -463,7 +464,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     storageSet(() => localStorage, SETTINGS_KEY, qs || null);
     const next = new URLSearchParams(saved ? '' : qs);
     const current = new URLSearchParams(window.location.search);
-    for (const key of ['compat', 'minGroup', 'audioBitrate', 'audio']) {
+    for (const key of ['compat', 'minGroup', 'audioBitrate', 'audio', 'camera']) {
       const value = current.get(key);
       if (value) next.set(key, value);
     }
@@ -500,6 +501,46 @@ const layoutEl = document.getElementById('layout')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
 const startScreenBtn = document.getElementById('start-screen') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop') as HTMLButtonElement;
+const cameraSelect = document.getElementById('camera') as HTMLSelectElement;
+
+// ─── Camera choice ───────────────────────────────────────────────────
+
+/** `?camera=`: `front`, `back` or a device id; absent = the browser's default camera. */
+let cameraChoice: CameraChoice = params.get('camera') || null;
+/** Phones choose by facing; desktops by device. */
+const facingChoice = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+
+/** Fills the camera list. Device labels and ids appear only after camera permission. */
+async function refreshCameras(): Promise<void> {
+  let cameras: MediaDeviceInfo[] = [];
+  try {
+    cameras = (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === 'videoinput' && d.deviceId);
+  } catch { /* no media devices: default only */ }
+  const options: [string, string][] = [['', 'Default camera']];
+  if (facingChoice) options.push(['front', 'Front camera'], ['back', 'Back camera']);
+  else cameras.forEach((d, i) => options.push([d.deviceId, d.label || `Camera ${i + 1}`]));
+  // A saved choice not listed (yet) still shows as chosen.
+  if (cameraChoice && !options.some(([v]) => v === cameraChoice)) {
+    options.push([cameraChoice, cameraChoice === 'front' || cameraChoice === 'back'
+      ? `${cameraChoice.charAt(0).toUpperCase()}${cameraChoice.slice(1)} camera` : 'Saved camera']);
+  }
+  cameraSelect.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+  cameraSelect.value = cameraChoice ?? '';
+  cameraSelect.hidden = !facingChoice && cameras.length < 2 && !cameraChoice;
+}
+
+cameraSelect.addEventListener('change', () => {
+  cameraChoice = cameraSelect.value || null;
+  const url = new URL(window.location.href);
+  if (cameraChoice) url.searchParams.set('camera', cameraChoice);
+  else url.searchParams.delete('camera');
+  window.history.replaceState(null, '', url);
+  if (cameraChoice) params.set('camera', cameraChoice);
+  else params.delete('camera');
+});
+navigator.mediaDevices?.addEventListener?.('devicechange', () => { void refreshCameras(); });
+void refreshCameras();
 
 // MoQ state. Everything a broadcast touches — capture, encoders, connection,
 // media publisher, alias allocator, audio settings — is owned by the
@@ -859,6 +900,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   claimNamespace();
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
+  cameraSelect.disabled = true;
   stopBtn.disabled = false;
   setState('connecting', 'starting');
 
@@ -1048,12 +1090,15 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ctx.onCancel(() => { try { cap.stop(); } catch { /* not started */ } });
       ctx.onCancel(() => { if (reconnectTimer !== null) clearTimeout(reconnectTimer); });
       capture = cap;
+      cap.onCameraFallback = (camera, err) => {
+        log(`Camera ${camera} not available (${err.name}); using the default camera`);
+      };
       const stream = source === 'camera'
         ? await cap.startCamera({
           width: Math.round((captureHeight * 16) / 9), height: captureHeight,
           // ideal only: a min is mandatory and hides devices that cannot meet it.
           frameRate: { ideal: captureFps },
-        }, cameraAudio && voiceProcessing ? VOICE_AUDIO : cameraAudio)
+        }, cameraAudio && voiceProcessing ? VOICE_AUDIO : cameraAudio, cameraChoice)
         : await cap.startScreen({ video: { frameRate: { ideal: captureFps } }, audio: false });
       // The tracks only become real HERE — MediaCapture.stop() before this
       // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
@@ -1063,6 +1108,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       ctx.throwIfCancelled();
       preview.srcObject = stream;
       log(`Capture started: ${source}`);
+      if (source === 'camera') void refreshCameras();
 
       const settings = cap.videoSettings;
       width = settings?.width ?? 1280;
@@ -1462,5 +1508,6 @@ function resetBroadcastUi(): void {
   lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
   startCameraBtn.disabled = false;
   startScreenBtn.disabled = false;
+  cameraSelect.disabled = false;
   stopBtn.disabled = true;
 }
