@@ -1417,6 +1417,23 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
+   * Forget one track's committed group floor, keeping its timeline index: a
+   * new subscription may number groups from zero. Appends already queued or
+   * in flight for the track no longer raise the floor when they commit.
+   */
+  clearGroupFloor(mediaType: 'video' | 'audio', trackName: string): void {
+    this.committedGroupFloor.delete(`${mediaType}:${trackName}`);
+    for (const entry of mediaType === 'video' ? this.videoQueue : this.audioQueue) {
+      if (entry.trackName === trackName) delete entry.groupId;
+    }
+    if (mediaType === 'video') {
+      if (this.pendingVideoTrackName === trackName) this.pendingVideoGroupId = undefined;
+    } else if (this.pendingAudioTrackName === trackName) {
+      this.pendingAudioGroupId = undefined;
+    }
+  }
+
+  /**
    * Clear a specific track's timeline index and committed group floor.
    * Called on decode-time discontinuity so old ranges don't cause
    * overlap drops on segments from the new epoch. Scoped to the

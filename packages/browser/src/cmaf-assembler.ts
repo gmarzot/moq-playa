@@ -728,6 +728,24 @@ export class CmafAssembler {
   }
 
   /**
+   * A new subscription starts a fresh Group ID sequence for one media type:
+   * forget its group high-water mark and epoch group floor, so a restarted
+   * publisher's lower groups are not taken for late data. Raw decode-time
+   * history stays, so a backward bmd still re-anchors and a forward one does not.
+   */
+  resetGroupOrder(mediaType: 'video' | 'audio'): void {
+    this.clearPending(mediaType);
+    this.order[mediaType].lastGroup = null;
+    if (mediaType === 'video') {
+      this.highestVideoGroupId = null;
+      this.videoEpochGroupFloor = null;
+    } else {
+      this.highestAudioGroupId = null;
+      this.audioEpochGroupFloor = null;
+    }
+  }
+
+  /**
    * Delivery is resuming after a deliberate pause: drop pending half-pairs and
    * held segments, and emit the next of each without waiting on its gap.
    */
