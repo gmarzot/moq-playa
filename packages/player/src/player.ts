@@ -4216,6 +4216,8 @@ export class MoqtPlayer {
    */
   play(): void {
     this.log.info('play()');
+    // Already playing, e.g. autoplay on a reconnect's catalog.
+    if (this.stateMachine.state === PlayerState.PLAYING) return;
     // ONE transaction. The transition is validated first (an invalid one throws
     // having changed nothing), then state, playback intent, adapter intent and
     // ticking are all committed, and only then is the completed transition
@@ -5551,6 +5553,15 @@ export class MoqtPlayer {
   }
 
   /** Readiness: today's first-catalog block, run once with the converged state. */
+  /** Announce the catalog. A throwing listener is logged: it must not skip the media subscribe that follows. */
+  private emitCatalogReceived(catalog: CatalogState): void {
+    try {
+      this.emitter.emitIsolated('catalog_received', { type: 'catalog_received', catalog });
+    } catch (err) {
+      this.log.warn('catalog_received listener threw: %s', err instanceof Error ? err.message : String(err));
+    }
+  }
+
   private onCatalogBootstrapReady(catalogState: CatalogState): void {
     if (this._destroyed || this.isTerminalState() || this.catalogReceived) return;
     const conn = this.connection;
@@ -5560,7 +5571,7 @@ export class MoqtPlayer {
     this._stats.recordCatalogReceived();
     this.watchdog.fulfill('catalog_received');
     this.watchdog.expect('first_media_object', 20_000);
-    this.emitter.emit('catalog_received', { type: 'catalog_received', catalog: catalogState });
+    this.emitCatalogReceived(catalogState);
     if (this._destroyed || this.isTerminalState() || this.connection !== conn || this.bootstrapGeneration !== gen) return;
     this.log.info('Catalog received (bootstrap): %d tracks', catalogState.tracks.length);
     if (this.pipelinesCreated) {
@@ -8576,10 +8587,7 @@ export class MoqtPlayer {
           this.log.warn('Catalog: ignoring track(s) with unsupported packaging: %s',
             catalogState.ignoredTracks.map((t) => `"${t.name}" (${t.packaging})`).join(', '));
         }
-        this.emitter.emit('catalog_received', {
-          type: 'catalog_received',
-          catalog: catalogState,
-        });
+        this.emitCatalogReceived(catalogState);
         if (!live()) return;
 
         if (this.pipelinesCreated) {
@@ -10551,6 +10559,11 @@ export class MoqtPlayer {
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
+    if (isMsePackaging(packaging) && mediaType === 'video') {
+      // The new subscription may start mid-group: wait for a keyframe, as on init.
+      this.cmafVideoSynced = false;
+      this.cmafAssembler?.clearPending?.('video');
+    }
 
     // Reset pipeline + sync to prepare for fresh data.
     // Audio resubscribe MUST reset sync — the new subscription will

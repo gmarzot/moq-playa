@@ -847,7 +847,8 @@ export class Player {
         duration: this._duration,
       });
       this.emitter.emit('levelsloaded', { levels: this._levels });
-      if (this.options.autoplay ?? DEFAULTS.autoplay) this.play();
+      // A reconnect's catalog finds playback already running.
+      if ((this.options.autoplay ?? DEFAULTS.autoplay) && this._state !== 'playing') this.play();
     });
 
     this.engine.on('first_frame', () => {
