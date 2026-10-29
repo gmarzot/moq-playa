@@ -151,8 +151,10 @@ export interface PlayerStats {
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
   readonly sessionAgeMs: number;
-  /** Total stalled time. */
+  /** Total time of completed stalls. */
   readonly stallDurationMs: number;
+  /** Elapsed time of a stall still in progress; 0 when none. */
+  readonly ongoingStallMs: number;
   readonly gapCount: number;
   /** A/V skew EWMA (LOC path), null when unknown. */
   readonly avSkewMs: number | null;

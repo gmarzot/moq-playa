@@ -12001,6 +12001,32 @@ describe('MSE gap-jump escalation and wiring', () => {
     await player.destroy();
   });
 
+  it('a gap-jump ending a detected stall counts one episode once', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    mockMs.onStall(254);
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.ongoingStallMs).toBeGreaterThanOrEqual(254);
+
+    mockMs.onStall(9_368, 'media-gap');
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(9_368);
+    expect(player.stats.ongoingStallMs).toBe(0);
+    await player.destroy();
+  });
+
+  it('a committed seek ends the ongoing stall in the stats', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    (player as any).timelineState = {
+      entries: [{ mediaPts: 0, location: [0, 0] as const, wallclockTime: 0 }],
+    };
+    player.play();
+    mockMs.onStall(250);
+    expect(player.stats.ongoingStallMs).toBeGreaterThan(0);
+    await player.seek(1_000).catch(() => { /* downstream update is not under test */ });
+    expect(player.stats.ongoingStallMs).toBe(0);
+    await player.destroy();
+  });
+
   it('a committed seek cancels the episode, before the pipeline resets', async () => {
     // Cancellation belongs at the commit boundary: every guard has passed and
     // `seeking` has been published, so the seek really does supersede playback.

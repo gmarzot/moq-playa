@@ -187,3 +187,18 @@ describe('Player — congestion control', () => {
     expect(player.congestionControl).toBe('default');
   });
 });
+
+// ─── stats ───────────────────────────────────────────────────────────
+
+describe('Player — stats', () => {
+  it('carries a stall still in progress apart from completed stall time', () => {
+    const p = createPlayer();
+    const engineStats = (p as any).engine._stats;
+    engineStats.recordStall(250);
+    expect(p.stats.ongoingStallMs).toBeGreaterThanOrEqual(250);
+    expect(p.stats.stallDurationMs).toBe(0);
+    engineStats.recordStallRecovered(5_000);
+    expect(p.stats.ongoingStallMs).toBe(0);
+    expect(p.stats.stallDurationMs).toBe(5_000);
+  });
+});

@@ -312,6 +312,50 @@ describe('StatsAccumulator', () => {
       expect(snap.totalStallDurationMs).toBe(43_360);
     });
 
+    it('reports the elapsed time of a stall still in progress', () => {
+      const stats = new StatsAccumulator();
+      expect(stats.snapshot().ongoingStallMs).toBe(0);
+      stats.recordStall(250);
+      expect(stats.snapshot().ongoingStallMs).toBe(250);
+      vi.advanceTimersByTime(3 * 60 * 60_000);
+      const snap = stats.snapshot();
+      expect(snap.ongoingStallMs).toBe(3 * 60 * 60_000 + 250);
+      expect(snap.totalStallDurationMs).toBe(0);
+
+      stats.recordStallRecovered(3 * 60 * 60_000 + 250);
+      expect(stats.snapshot().ongoingStallMs).toBe(0);
+      expect(stats.snapshot().totalStallDurationMs).toBe(3 * 60 * 60_000 + 250);
+    });
+
+    it('a pause, seek or teardown ends the ongoing stall without completing it', () => {
+      const stats = new StatsAccumulator();
+      stats.recordStall(250);
+      stats.cancelStall();
+      expect(stats.snapshot().ongoingStallMs).toBe(0);
+      stats.recordPlayStart();
+      stats.recordStall(250);
+      stats.recordPlayStop();
+      expect(stats.snapshot().ongoingStallMs).toBe(0);
+      expect(stats.snapshot().totalStallDurationMs).toBe(0);
+      expect(stats.snapshot().stallCount).toBe(2);
+    });
+
+    it('a resolved stall ending a detected episode counts it once', () => {
+      const stats = new StatsAccumulator();
+      stats.recordStall(254);
+      vi.advanceTimersByTime(9_114);
+      stats.recordResolvedStall(9_368);
+      const snap = stats.snapshot();
+      expect(snap.stallCount).toBe(1);
+      expect(snap.totalStallDurationMs).toBe(9_368);
+      expect(snap.ongoingStallMs).toBe(0);
+
+      // A resolved stall with no episode open is a stall of its own.
+      stats.recordResolvedStall(2_100);
+      expect(stats.snapshot().stallCount).toBe(2);
+      expect(stats.snapshot().totalStallDurationMs).toBe(11_468);
+    });
+
     it('increments decodeErrorCount', () => {
       const stats = new StatsAccumulator();
       stats.recordDecodeError();
