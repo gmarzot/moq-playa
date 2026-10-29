@@ -270,7 +270,7 @@ function codecsCompatible(a: string, b: string): boolean {
 }
 
 /** Why a media track is re-subscribed. */
-type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration' | 'refused';
+type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration' | 'refused' | 'namespace_return';
 
 function defaultMediaSubscriptionFilter(isLive: boolean) {
   if (isLive) {
@@ -821,6 +821,8 @@ export class MoqtPlayer {
     onState: (state, detail) => this.emitter.emit('namespace_state', { type: 'namespace_state', state, detail }),
     canReestablish: (returnedAtUs) => this.mayReestablishOnNamespaceReturn(returnedAtUs),
     reestablish: () => this.reestablishOnNamespaceReturn(),
+    resumeInSession: (catalogLost) => this.resumeOnNamespaceReturn(catalogLost),
+    resumeHeld: () => this.holdWhileHidden(),
   });
   /** Last media object: media resuming after the namespace returns needs no re-establish. */
   private lastMediaArrivalUs = -Infinity;
@@ -8148,7 +8150,7 @@ export class MoqtPlayer {
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
         this._mediaSubsFailed++;
-        // DOES_NOT_EXIST while the namespace is not known published: its return re-establishes.
+        // DOES_NOT_EXIST: the namespace's return resumes the track, or ends a failed resume.
         if (this.config.followNamespace && BigInt(errorCode) === 0x10n) this.follower.noteTrackMissing();
         this.failSwitchForSubscription(BigInt(requestId), trackName,
           new Error(`track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`));
@@ -8194,7 +8196,7 @@ export class MoqtPlayer {
           ));
           return;
         }
-        // followNamespace: the namespace's publication re-establishes the session.
+        // followNamespace: the namespace's publication resumes the catalog.
         if (this.follower.awaitPublisher(conn)) {
           this.emitError(createPlayerError(
             'degraded', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
@@ -9996,6 +9998,51 @@ export class MoqtPlayer {
     const awaitingCatalog = state === PlayerState.LOADING && !this.catalogReceived;
     if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED && !awaitingCatalog) return false;
     return this.lastMediaArrivalUs <= returnedAtUs;
+  }
+
+  /**
+   * The followed namespace returned: resubscribe the refused catalog, or the
+   * ended media, on the current session. False when live media subscriptions
+   * remain (they may resume by themselves) or there is nothing to resubscribe.
+   */
+  private resumeOnNamespaceReturn(catalogLost: boolean): boolean {
+    if (this._destroyed || this.currentMigration || this.reconnect !== null) return false;
+    const conn = this.connection;
+    if (!conn) return false;
+    const state = this.stateMachine.state;
+    if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED
+        && !(state === PlayerState.LOADING && !this.catalogReceived)) return false;
+    if (!this.catalogReceived) {
+      if (!catalogLost) return false;
+      this.log.info('Namespace published again: re-subscribing the catalog on this session');
+      this.cancelCatalogBootstrap();
+      this.terminateCatalogRetrieval(conn, this.catalogRequestId, null);
+      this.subscribeCatalog(conn).catch((err: unknown) => {
+        this.log.warn('Catalog re-subscribe after the namespace returned failed: %s',
+          err instanceof Error ? err.message : String(err));
+      });
+      return true;
+    }
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.mediaType === 'video' || sub.mediaType === 'audio') return false;
+    }
+    const names = [
+      this.config.disableVideo ? undefined : this.qualityController?.currentVideoTrack?.name,
+      this.config.disableAudio ? undefined : this.qualityController?.currentAudioTrack?.name,
+    ].filter((n): n is string => n !== undefined);
+    if (names.length === 0) return false;
+    this.log.info('Namespace published again: re-subscribing %s on this session', names.join(', '));
+    for (const name of names) {
+      // Retry now rather than at the pending backoff.
+      const retry = this.publishDoneRetries.get(name);
+      if (retry && retry.timer !== null) {
+        clearTimeout(retry.timer);
+        retry.timer = null;
+        retry.attempts = 0;
+      }
+      this.scheduleResubscribe(name, 'namespace_return');
+    }
+    return true;
   }
 
   /** Rebuild the catalog and subscriptions on a fresh session, as a reconnect does. */
