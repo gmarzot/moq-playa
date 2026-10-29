@@ -422,10 +422,18 @@ export interface GapJumpEvent {
   readonly from: number;
   /** Landing position just inside the next buffered range (seconds). */
   readonly to: number;
+  /** Start of the skipped hole (seconds). */
+  readonly holeStart: number;
   /** Width of the skipped hole (seconds). */
   readonly holeSec: number;
   /** How long the hole persisted before the jump (ms). */
   readonly waitedMs: number;
+  /**
+   * `hole` after waiting for late media; `resubscribe` a hole the player's
+   * own resubscribe left; `timeline` a hole wide enough to be stale media
+   * followed by live. Only `hole` implies media lost in delivery.
+   */
+  readonly reason: 'hole' | 'resubscribe' | 'timeline';
 }
 
 /**

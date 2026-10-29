@@ -3774,6 +3774,60 @@ describe('buffered-hole gap-jump', () => {
         adapter.destroy();
         expect((adapter as any).onGapJump).toBeNull();
     });
+
+    it('a hole the player\'s resubscribe left is skipped as soon as media past it is buffered, with no stall', () => {
+        const { adapter, video, jumps, stalls, check } = gapSetup({ ranges: [[5, 19.27]], ct: 18.0 });
+        adapter.expectDiscontinuity();
+        video.buffered = makeTimeRanges([[5, 19.4], [21.0, 21.5]]);  // in-flight tail, then the new start
+        check(0);                                                      // playhead still coasting
+        expect(video.seekCount).toBe(1);
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0].reason).toBe('resubscribe');
+        expect(jumps[0].holeStart).toBeCloseTo(19.4, 5);
+        expect(stalls).toHaveLength(0);
+    });
+
+    it('a hole of 5 s or more is a timeline jump, skipped at once', () => {
+        const { video, jumps, stalls, check } = gapSetup({ ranges: [[5, 19.27], [30, 31]], ct: 18.0 });
+        check(0);
+        expect(video.seekCount).toBe(1);
+        expect(jumps[0].reason).toBe('timeline');
+        expect(jumps[0].holeSec).toBeCloseTo(10.73, 2);
+        expect(stalls).toHaveLength(0);
+    });
+
+    it('a final hole skipped after the playhead froze at it reports the stall', () => {
+        const { adapter, jumps, stalls, check } = gapSetup({ ranges: [[5, 19.27], [30, 31]] });
+        (adapter as any).stallStartTime = 400;
+        check(1_000);
+        expect(jumps[0].reason).toBe('timeline');
+        expect(stalls).toEqual([{ durationMs: 600, cause: 'media-gap' }]);
+    });
+
+    it('a short hole with no resubscribe still waits for late media', () => {
+        const { video, jumps, check } = gapSetup({ ranges: [[5, 19.27], [20.77, 25]] });
+        check(0);
+        check(1_000);
+        expect(video.seekCount).toBe(0);
+        check(3_100);
+        expect(video.seekCount).toBe(1);
+        expect(jumps[0].reason).toBe('hole');
+    });
+
+    it('a hole before the resubscribe point keeps the wait', () => {
+        const { adapter, video, check } = gapSetup();                // hole 19.27-19.78, buffered to 25
+        adapter.expectDiscontinuity();
+        check(0);
+        expect(video.seekCount).toBe(0);
+    });
+
+    it('a resubscribe mark expires when no hole follows it', () => {
+        const { adapter, video, check } = gapSetup({ ranges: [[5, 19.27]], ct: 18.0 });
+        adapter.expectDiscontinuity();
+        video.buffered = makeTimeRanges([[5, 19.27], [20.77, 25]]);
+        check(performance.now() + 11_000);
+        expect(video.seekCount).toBe(0);
+    });
 });
 
 describe('MseMediaSource DRM lifecycle', () => {

@@ -385,7 +385,15 @@ export interface MediaSourceLike {
   onGapJump?: ((info: {
     from: number; to: number; holeSec: number; waitedMs: number;
     bufferedRanges: string;
+    holeStart: number;
+    reason: 'hole' | 'resubscribe' | 'timeline';
   }) => void) | null;
+
+  /**
+   * OPTIONAL: the player resubscribed past what is buffered, so the next
+   * hole after the current buffered end cannot fill and needs no infill wait.
+   */
+  expectDiscontinuity?(): void;
 
   /**
    * OPTIONAL playback-intent contract.
