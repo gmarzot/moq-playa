@@ -12650,6 +12650,49 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
+  it('a CMAF resubscribe starts a fresh group epoch: a restarted publisher\'s group 2 reaches the assembler', async () => {
+    const adapter = createMockAdapter();
+    const floors = new Map<string, bigint>([['video:video_main', 15_150n], ['audio:audio', 15_150n]]);
+    const pushed: Array<[string, bigint]> = [];
+    const resetGroupOrder = vi.fn();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+        getCommittedGroupFloor: (mt: string, tn: string) => floors.get(`${mt}:${tn}`),
+        clearGroupFloor: (mt: string, tn: string) => { floors.delete(`${mt}:${tn}`); },
+      }),
+      createCmafAssembler: () => ({
+        push: (mt: string, _track: string, group: bigint) => { pushed.push([mt, group]); },
+        selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null,
+        reset: vi.fn(), destroy: vi.fn(), clearPending: vi.fn(), resetGroupOrder,
+      }),
+    } as Partial<MoqtPlayerConfig>);
+
+    (player as any).replaceSubscription('video_main', 'publish_done');
+    (player as any).replaceSubscription('audio', 'publish_done');
+
+    expect(resetGroupOrder).toHaveBeenCalledWith('video');
+    expect(resetGroupOrder).toHaveBeenCalledWith('audio');
+    expect(floors.size).toBe(0);
+    for (const [track, alias] of [['video_main', 200n], ['audio', 201n]] as const) {
+      const reqId = await requestIdOf(adapter, track);
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(alias),
+        parameters: new Map(), trackExtensions: new Map(),
+      } as any);
+      adapter._triggerObject(alias, {
+        kind: 'data', trackAlias: varint(alias), groupId: varint(2), subgroupId: varint(0),
+        objectId: varint(0), payload: new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]),
+        extensions: new Uint8Array(0),
+      } as MoqtObject);
+    }
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(pushed).toEqual([['video', 2n], ['audio', 2n]]);
+    await player.destroy();
+  });
+
   /** SUBSCRIBE_OK the latest subscription and deliver its first keyframe object. */
   async function landLatestSubscription(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {
     const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
