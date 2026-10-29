@@ -2185,6 +2185,21 @@ describe('MoqtPlayer', () => {
       expect(player.state).toBe(PlayerState.PLAYING);
     });
 
+    it('resumeSuspendedPlayback() restarts the media source while playing, not while paused', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadCatalogAndSubscribe(adapter);
+      const resumePlayback = vi.fn();
+      player.play();
+      (player as any).mediaSource = { resumePlayback };
+
+      player.resumeSuspendedPlayback();
+      expect(resumePlayback).toHaveBeenCalledTimes(1);
+
+      player.pause();
+      player.resumeSuspendedPlayback();
+      expect(resumePlayback).toHaveBeenCalledTimes(1);
+    });
+
     it('play() sends REQUEST_UPDATE for all subscriptions even if one fails (§9.11)', async () => {
       const adapter = createMockAdapter();
       const player = await loadCatalogAndSubscribe(adapter);

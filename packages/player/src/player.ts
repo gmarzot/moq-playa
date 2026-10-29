@@ -10039,6 +10039,12 @@ export class MoqtPlayer {
     }, delayMs);
   }
 
+  /** Restart playback the browser suspended while the page was frozen or hidden. No-op unless playing. */
+  resumeSuspendedPlayback(): void {
+    if (this._destroyed || this.stateMachine.state !== PlayerState.PLAYING) return;
+    this.mediaSource?.resumePlayback?.();
+  }
+
   /** Whether a closed session would be reconnected now. */
   private canReconnect(): boolean {
     if (this._destroyed || this.currentMigration) return false;
