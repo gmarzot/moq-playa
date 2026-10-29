@@ -1,7 +1,7 @@
 /**
- * followNamespace: SUBSCRIBE_NAMESPACE state reporting, and re-establishing the
- * session when the namespace is published again after going away, including
- * before the first catalog.
+ * followNamespace: SUBSCRIBE_NAMESPACE state reporting, and resuming or
+ * re-establishing the session when the namespace is published again after
+ * going away, including before the first catalog.
  *
  * @see draft-ietf-moq-transport-18 §10.18
  * @module
@@ -60,6 +60,7 @@ const VIDEO_ALIAS = 50n;
 const AUDIO_ALIAS = 51n;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const SETTLE_MS = NamespaceFollower.RETURN_SETTLE_MS;
+const RESUME_BOUND_MS = NamespaceFollower.RESUME_BOUND_MS;
 
 /**
  * Load and play with followNamespace on, recording namespace states from the
@@ -170,8 +171,14 @@ function feedVideo(adapter: ReturnType<typeof createMockAdapter>): void {
 }
 
 describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
-  beforeEach(() => { NamespaceFollower.RETURN_SETTLE_MS = 20; });
-  afterEach(() => { NamespaceFollower.RETURN_SETTLE_MS = SETTLE_MS; });
+  beforeEach(() => {
+    NamespaceFollower.RETURN_SETTLE_MS = 20;
+    NamespaceFollower.RESUME_BOUND_MS = 20;
+  });
+  afterEach(() => {
+    NamespaceFollower.RETURN_SETTLE_MS = SETTLE_MS;
+    NamespaceFollower.RESUME_BOUND_MS = RESUME_BOUND_MS;
+  });
 
   it('is off unless configured', async () => {
     const adapter = createMockAdapter();
@@ -259,7 +266,7 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
   });
 
   describe('the publisher restarting during catalog bootstrap', () => {
-    it('waits instead of failing and re-establishes after the namespace returned', async () => {
+    it('waits instead of failing and re-subscribes the catalog after the namespace returned', async () => {
       const adapter = createMockAdapter();
       const { player, errors, nsReqId } = await startLoading(adapter);
       requestOk(adapter, nsReqId!);
@@ -267,17 +274,22 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
       const migrate = vi.spyOn(player, 'migrate').mockResolvedValue();
       namespaceMsg(adapter, nsReqId!, 'NAMESPACE_DONE');
       namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      const subscribes = adapter.subscribe.mock.calls.length;
       catalogSubscriptionEnded(player);
 
       expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
       expect(errors.some((e) => e.severity === 'degraded' && /waiting for the publisher/.test(e.message)))
         .toBe(true);
+      await sleep(0);
+      expect(adapter.subscribe).toHaveBeenCalledTimes(subscribes + 1);
+      expect(migrate).not.toHaveBeenCalled();
+      // No catalog within RESUME_BOUND_MS: the session is re-established.
       await sleep(60);
       expect(player.state).toBe(PlayerState.LOADING);
       expect(migrate).toHaveBeenCalledTimes(1);
     });
 
-    it('ending while the namespace is withdrawn re-establishes on its return', async () => {
+    it('ending while the namespace is withdrawn re-subscribes the catalog on its return', async () => {
       const adapter = createMockAdapter();
       const { player, errors, nsReqId } = await startLoading(adapter);
       requestOk(adapter, nsReqId!);
@@ -288,7 +300,10 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
       await sleep(60);
       expect(migrate).not.toHaveBeenCalled();
 
+      const subscribes = adapter.subscribe.mock.calls.length;
       namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      await sleep(0);
+      expect(adapter.subscribe).toHaveBeenCalledTimes(subscribes + 1);
       await sleep(60);
       expect(migrate).toHaveBeenCalledTimes(1);
       expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
@@ -308,7 +323,15 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
       expect((player as unknown as { catalogSubscribeRetryTimer: unknown }).catalogSubscribeRetryTimer).toBeNull();
 
       namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
-      await sleep(60);
+      await sleep(0);
+      expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+      const retryReqId = await adapter.subscribe.mock.results[1]?.value;
+      // Refused again: the session is re-established at once.
+      adapter._triggerMessage({
+        type: 'REQUEST_ERROR', requestId: retryReqId, errorCode: varint(0x10n),
+        retryInterval: varint(2n), errorReason: 'no such track',
+      } as unknown as ControlMessage);
+      await sleep(5);
       expect(migrate).toHaveBeenCalledTimes(1);
       expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
     });

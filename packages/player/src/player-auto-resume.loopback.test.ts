@@ -150,22 +150,22 @@ describe('autoResume', () => {
   });
 
   describe('relay restart while the page is hidden', () => {
-    it('by default subscribes media on the re-established session while hidden', async () => {
+    it('by default subscribes media on the resumed session while hidden', async () => {
       const { r, player } = await restartWhileHidden(doc);
       expect(r.sessions.map((s) => s.subs)).toEqual([
-        ['catalog', 'video', 'audio'], ['catalog(DNE)'], ['catalog', 'video', 'audio'],
+        ['catalog', 'video', 'audio'], ['catalog(DNE)', 'catalog', 'video', 'audio'],
       ]);
       await player.destroy();
     }, 10_000);
 
     it('off: holds media while hidden, then subscribes on the same session once visible', async () => {
       const { r, player } = await restartWhileHidden(doc, false);
-      expect(r.sessions[2]!.subs).toEqual(['catalog']);
+      expect(r.sessions[1]!.subs).toEqual(['catalog(DNE)', 'catalog']);
 
       doc.setHidden(false);
       await sleep(100);
-      expect(r.sessions).toHaveLength(3);
-      expect(r.sessions[2]!.subs).toEqual(['catalog', 'video', 'audio']);
+      expect(r.sessions).toHaveLength(2);
+      expect(r.sessions[1]!.subs).toEqual(['catalog(DNE)', 'catalog', 'video', 'audio']);
       expect(player.state).toBe(PlayerState.PLAYING);
       await player.destroy();
     }, 10_000);
