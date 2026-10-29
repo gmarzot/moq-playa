@@ -1154,6 +1154,25 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
         .toEqual([0n, 3_000n, 6_000n, 9_000n]);
     });
 
+    it('re-anchors a restart that follows an old-group straggler', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+      const push = pusher(assembler, 'video', 'video0', 3_000);
+
+      push(15_149n, 7_000_000);
+      push(15_150n, 7_003_000);
+      assembler.resetGroupOrder('video');
+      push(15_149n, 7_000_000); // late data of the old subscription
+      push(0n, 0);
+      push(1n, 3_000);
+
+      expect(onDiscontinuity).toHaveBeenCalledOnce();
+      expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+        .toEqual([0n, 3_000n, 6_000n, 9_000n]);
+    });
+
     it('detects a second restart after a re-anchored one', () => {
       const onSegment = vi.fn();
       const onDiscontinuity = vi.fn();

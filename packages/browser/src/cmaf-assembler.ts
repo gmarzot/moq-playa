@@ -227,7 +227,7 @@ export class CmafAssembler {
   private videoEpochGroupFloor: bigint | null = null;
   private audioEpochGroupFloor: bigint | null = null;
 
-  /** Armed by resetGroupOrder: the next segment may start a restarted publisher's epoch. */
+  /** Armed by resetGroupOrder until a forward segment or a re-anchor: a restart check is pending. */
   private videoResubscribed = false;
   private audioResubscribed = false;
 
@@ -735,9 +735,9 @@ export class CmafAssembler {
 
   /**
    * A new subscription may start a restarted publisher's Group ID sequence for
-   * one media type. Forget its epoch group floor and arm a restart check for its
-   * next segment: a backward bmd there re-anchors when the group falls more than
-   * one below the high-water mark or decode time jumps back past
+   * one media type. Forget its epoch group floor and arm a restart check until
+   * the next forward segment: a backward bmd re-anchors when the group falls more
+   * than one below the high-water mark or decode time jumps back past
    * RESTART_JUMP_SEC. A re-delivered current or previous group stays late data.
    */
   resetGroupOrder(mediaType: 'video' | 'audio'): void {
@@ -984,8 +984,6 @@ export class CmafAssembler {
     const bmd = readBaseMediaDecodeTime(moof);
     if (bmd === null) return true;
     const resubscribed = mediaType === 'video' ? this.videoResubscribed : this.audioResubscribed;
-    if (mediaType === 'video') this.videoResubscribed = false;
-    else this.audioResubscribed = false;
 
     const currentTrackName = mediaType === 'video' ? this.videoTrackName : this.audioTrackName;
     const isTrackSwitch = currentTrackName !== null && currentTrackName !== trackName;
@@ -1006,6 +1004,11 @@ export class CmafAssembler {
     }
     const lastBmd = mediaType === 'video' ? this.lastVideoBmd : this.lastAudioBmd;
     const epoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
+    // A forward segment ends the restart check; late or overlapping data leaves it armed.
+    if (lastBmd === null || bmd >= lastBmd) {
+      if (mediaType === 'video') this.videoResubscribed = false;
+      else this.audioResubscribed = false;
+    }
 
     if (isTrackSwitch) {
       // Track switch (ABR splice): variants in a switching set are media-time
@@ -1082,12 +1085,14 @@ export class CmafAssembler {
           this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
           this.videoEpochGroupFloor = groupId;
           this.highestVideoGroupId = groupId;
+          this.videoResubscribed = false;
         } else {
           this.audioEpoch = anchored;
           this.lastAudioBmd = bmd;
           this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
           this.audioEpochGroupFloor = groupId;
           this.highestAudioGroupId = groupId;
+          this.audioResubscribed = false;
         }
         this.pendingDiscontinuities.push({ mediaType, trackName });
       }
