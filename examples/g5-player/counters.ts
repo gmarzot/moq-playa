@@ -24,6 +24,7 @@ export interface ObjSeq {
   reorders: number; lost: number;
   settles: Array<[number, number]>;     // [arrival, settle ms]
   rebase?: boolean;                     // the next newer id restarts the sequence
+  dropPending?: boolean;                // and the rebase gives up the holes still pending
 }
 
 /** What one arrival changed: ids newly given up as lost, or a jump past the cap. */
@@ -34,12 +35,19 @@ export interface SeqNote {
 }
 
 /**
- * Restart a track's sequence (every track's without `t`) at its next newer id.
- * For gaps that are not loss: a pause, a reconnect, a migration or a media
- * resubscribe. Holes still pending from before are dropped with them.
+ * Restart a track's sequence (every track's without `track`) at its next newer
+ * id, for gaps that are not loss. `dropPending` is for outages (reconnect,
+ * migration, resubscribe): the holes still pending will never fill. A pause
+ * keeps them, so a straggler still matches and a real loss still counts.
  */
-export function rebaseSeqs(seqs: Record<string, ObjSeq>, t?: string): void {
-  for (const [k, s] of Object.entries(seqs)) if (t === undefined || k === t) s.rebase = true;
+export function rebaseSeqs(
+  seqs: Record<string, ObjSeq>, opts: { dropPending: boolean; track?: string },
+): void {
+  for (const [k, s] of Object.entries(seqs)) {
+    if (opts.track !== undefined && k !== opts.track) continue;
+    s.rebase = true;
+    if (opts.dropPending) s.dropPending = true;
+  }
 }
 
 /** Account one arriving object id on track `t`. */
@@ -55,7 +63,8 @@ export function noteSeq(
   const newer = group > s.group || (group === s.group && object > s.object);
   if (s.rebase && newer) {
     s.rebase = false;
-    s.pending.clear();
+    if (s.dropPending) s.pending.clear();
+    s.dropPending = false;
     s.group = group;
     s.object = object;
     return note;

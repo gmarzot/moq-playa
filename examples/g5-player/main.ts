@@ -595,7 +595,7 @@ async function main(): Promise<void> {
       ? `Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`
       : `Reconnecting (attempt ${attempt})`);
     setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${attempt}` };
-    rebaseSeqs(objSeq);
+    rebaseSeqs(objSeq, { dropPending: true });
   });
   player.on('track_unsubscribed', ({ trackName, reason }) => {
     log(`Track "${trackName}" ended: ${reason || '(no reason)'}`);
@@ -613,7 +613,7 @@ async function main(): Promise<void> {
   });
   player.on('session_migrated', () => {
     log('Session re-established');
-    rebaseSeqs(objSeq);
+    rebaseSeqs(objSeq, { dropPending: true });
     setupBadgeState = { tone: 'ok', detail: 'Session re-established' };
     logCongestionControl();
     // The new session retrieves the catalog again: report its progress too.
@@ -1207,7 +1207,8 @@ async function main(): Promise<void> {
   });
   // A new subscription restarts the track's ids: groups published across the
   // outage or switch were never requested, so they are not loss.
-  (player as any).engine?.on('track_subscribed', (e: any) => rebaseSeqs(objSeq, e.mediaType));
+  (player as any).engine?.on('track_subscribed', (e: any) =>
+    rebaseSeqs(objSeq, { dropPending: true, track: e.mediaType }));
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
@@ -1810,7 +1811,7 @@ async function main(): Promise<void> {
     if (!pausedByUser) return;
     pausedByUser = false;
     // Delivery stops while paused: neither the skipped ids nor the buffered hole is loss.
-    rebaseSeqs(objSeq);
+    rebaseSeqs(objSeq, { dropPending: false });
     const ranges: Array<[number, number]> | undefined =
       (player as any).engine?.mediaSource?.bufferedRanges?.('video');
     if (ranges?.length) noteSkippedHole(ranges[ranges.length - 1]![1]);

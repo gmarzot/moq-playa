@@ -34,7 +34,7 @@ describe('object continuity', () => {
   it('groups skipped across a resubscribe are not lost', () => {
     const seqs: Record<string, ObjSeq> = {};
     feed(seqs, 'video', [710, 711, 712], 0);
-    rebaseSeqs(seqs, 'video');
+    rebaseSeqs(seqs, { dropPending: true, track: 'video' });
     feed(seqs, 'video', [717, 718], 10_000);
     feed(seqs, 'video', [719], 10_000 + REORDER_SETTLE_MS + 500);
     expect(seqs['video']!.lost).toBe(0);
@@ -43,16 +43,27 @@ describe('object continuity', () => {
   it('a hole still pending at the outage is dropped with it', () => {
     const seqs: Record<string, ObjSeq> = {};
     feed(seqs, 'video', [710, 712], 0);
-    rebaseSeqs(seqs);
+    rebaseSeqs(seqs, { dropPending: true });
     feed(seqs, 'video', [717], 10_000);
     feed(seqs, 'video', [718], 10_000 + REORDER_SETTLE_MS + 500);
     expect(seqs['video']!.lost).toBe(0);
   });
 
+  it('a pause rebase keeps pending ids: a straggler matches, a missing one is lost', () => {
+    const seqs: Record<string, ObjSeq> = {};
+    feed(seqs, 'video', [710, 712, 714], 0);   // 711 and 713 pending
+    rebaseSeqs(seqs, { dropPending: false });
+    feed(seqs, 'video', [720], 500);
+    feed(seqs, 'video', [711], 600);           // straggler from before the pause
+    feed(seqs, 'video', [721], REORDER_SETTLE_MS + 500);
+    expect(seqs['video']!.reorders).toBe(1);
+    expect(seqs['video']!.lost).toBe(1);       // 713 never arrived
+  });
+
   it('after the rebase, loss in the new session still counts', () => {
     const seqs: Record<string, ObjSeq> = {};
     feed(seqs, 'video', [710], 0);
-    rebaseSeqs(seqs);
+    rebaseSeqs(seqs, { dropPending: true });
     feed(seqs, 'video', [717, 719], 10_000);
     feed(seqs, 'video', [720], 10_000 + REORDER_SETTLE_MS + 500);
     expect(seqs['video']!.lost).toBe(1);
@@ -61,7 +72,7 @@ describe('object continuity', () => {
   it('a stale id from before the resubscribe does not consume the rebase', () => {
     const seqs: Record<string, ObjSeq> = {};
     feed(seqs, 'audio', [500, 501], 0);
-    rebaseSeqs(seqs, 'audio');
+    rebaseSeqs(seqs, { dropPending: true, track: 'audio' });
     feed(seqs, 'audio', [499, 520], 100);
     feed(seqs, 'audio', [521], 100 + REORDER_SETTLE_MS + 500);
     expect(seqs['audio']!.lost).toBe(0);
@@ -71,7 +82,7 @@ describe('object continuity', () => {
     const seqs: Record<string, ObjSeq> = {};
     feed(seqs, 'video', [1], 0);
     feed(seqs, 'audio', [1], 0);
-    rebaseSeqs(seqs, 'video');
+    rebaseSeqs(seqs, { dropPending: true, track: 'video' });
     feed(seqs, 'audio', [3], 100);
     feed(seqs, 'audio', [4], 100 + REORDER_SETTLE_MS + 500);
     expect(seqs['audio']!.lost).toBe(1);
