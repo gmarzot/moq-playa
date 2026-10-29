@@ -227,6 +227,10 @@ export class CmafAssembler {
   private videoEpochGroupFloor: bigint | null = null;
   private audioEpochGroupFloor: bigint | null = null;
 
+  /** Armed by resetGroupOrder until a forward segment or a re-anchor: a restart check is pending. */
+  private videoResubscribed = false;
+  private audioResubscribed = false;
+
   /** Discontinuities committed but not yet reported to the sink. */
   private pendingDiscontinuities: Array<{
     mediaType: 'video' | 'audio';
@@ -289,6 +293,8 @@ export class CmafAssembler {
   private static readonly STARTUP_DIAG_COUNT = 5;
   /** Buffered depth at which a hold gives up: Chrome reports `waiting` with ~100 ms still ahead. */
   private static readonly HOLD_RELEASE_MARGIN_MS = 150;
+  /** Backward decode-time jump after a resubscribe that is a publisher restart whatever its Group IDs. */
+  private static readonly RESTART_JUMP_SEC = 10n;
   private diagVideoCount = 0;
   private diagAudioCount = 0;
 
@@ -728,6 +734,25 @@ export class CmafAssembler {
   }
 
   /**
+   * A new subscription may start a restarted publisher's Group ID sequence for
+   * one media type. Forget its epoch group floor and arm a restart check until
+   * the next forward segment: a backward bmd re-anchors when the group falls more
+   * than one below the high-water mark or decode time jumps back past
+   * RESTART_JUMP_SEC. A re-delivered current or previous group stays late data.
+   */
+  resetGroupOrder(mediaType: 'video' | 'audio'): void {
+    this.clearPending(mediaType);
+    this.order[mediaType].lastGroup = null;
+    if (mediaType === 'video') {
+      this.videoEpochGroupFloor = null;
+      this.videoResubscribed = true;
+    } else {
+      this.audioEpochGroupFloor = null;
+      this.audioResubscribed = true;
+    }
+  }
+
+  /**
    * Delivery is resuming after a deliberate pause: drop pending half-pairs and
    * held segments, and emit the next of each without waiting on its gap.
    */
@@ -756,6 +781,8 @@ export class CmafAssembler {
     this.highestAudioGroupId = null;
     this.videoEpochGroupFloor = null;
     this.audioEpochGroupFloor = null;
+    this.videoResubscribed = false;
+    this.audioResubscribed = false;
     this.pendingDiscontinuities = [];
     this.videoTrackName = null;
     this.audioTrackName = null;
@@ -956,6 +983,7 @@ export class CmafAssembler {
   ): boolean {
     const bmd = readBaseMediaDecodeTime(moof);
     if (bmd === null) return true;
+    const resubscribed = mediaType === 'video' ? this.videoResubscribed : this.audioResubscribed;
 
     const currentTrackName = mediaType === 'video' ? this.videoTrackName : this.audioTrackName;
     const isTrackSwitch = currentTrackName !== null && currentTrackName !== trackName;
@@ -976,6 +1004,11 @@ export class CmafAssembler {
     }
     const lastBmd = mediaType === 'video' ? this.lastVideoBmd : this.lastAudioBmd;
     const epoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
+    // A forward segment ends the restart check; late or overlapping data leaves it armed.
+    if (lastBmd === null || bmd >= lastBmd) {
+      if (mediaType === 'video') this.videoResubscribed = false;
+      else this.audioResubscribed = false;
+    }
 
     if (isTrackSwitch) {
       // Track switch (ABR splice): variants in a switching set are media-time
@@ -1028,7 +1061,11 @@ export class CmafAssembler {
         ? this.highestVideoGroupId
         : this.highestAudioGroupId;
       const isOutOfOrderGroup = highestGroupId !== null && groupId <= highestGroupId;
-      if (!isSmallAudioReorder && !isOutOfOrderGroup) {
+      const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+      const isRestart = resubscribed && (
+        (highestGroupId !== null && groupId + 1n < highestGroupId)
+        || jumpBack > BigInt(timescale ?? (mediaType === 'video' ? 90000 : 48000)) * CmafAssembler.RESTART_JUMP_SEC);
+      if (isRestart || (!isSmallAudioReorder && !isOutOfOrderGroup)) {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
         // Both tracks re-base from what they emitted: held segments go out first.
@@ -1047,11 +1084,15 @@ export class CmafAssembler {
           this.lastVideoBmd = bmd;
           this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
           this.videoEpochGroupFloor = groupId;
+          this.highestVideoGroupId = groupId;
+          this.videoResubscribed = false;
         } else {
           this.audioEpoch = anchored;
           this.lastAudioBmd = bmd;
           this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
           this.audioEpochGroupFloor = groupId;
+          this.highestAudioGroupId = groupId;
+          this.audioResubscribed = false;
         }
         this.pendingDiscontinuities.push({ mediaType, trackName });
       }

@@ -10634,7 +10634,12 @@ export class MoqtPlayer {
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
-    if (isMsePackaging(packaging)) this.mediaSource?.expectDiscontinuity?.();
+    if (isMsePackaging(packaging)) {
+      this.mediaSource?.expectDiscontinuity?.();
+      // The new subscription's Group IDs may restart below the old ones.
+      this.cmafAssembler?.resetGroupOrder?.(mediaType);
+      this.mediaSource?.clearGroupFloor?.(mediaType, trackName);
+    }
     if (isMsePackaging(packaging) && mediaType === 'video') {
       // The new subscription may start mid-group: wait for a keyframe, as on init.
       this.cmafVideoSynced = false;

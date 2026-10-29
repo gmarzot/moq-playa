@@ -562,6 +562,57 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         warn.mockRestore();
     });
 
+    it('clearGroupFloor clears the group floor only, keeping the timeline', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1', 15_150n);
+        await flush();
+        expect(adapter.getCommittedGroupFloor('video', 'track1')).toBe(15_150n);
+        adapter.appendChunk('video', makeSegment({ bmd: 500, defaultDur: 100, sampleCount: 5 }), 'track1', 2n);
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1); // below the floor: dropped
+
+        adapter.clearGroupFloor('video', 'track1');
+        expect(adapter.getCommittedGroupFloor('video', 'track1')).toBeUndefined();
+        expect(warn.mock.calls.some((c) => String(c[0]).includes('timeline cleared'))).toBe(false);
+
+        adapter.appendChunk('video', makeSegment({ bmd: 500, defaultDur: 100, sampleCount: 5 }), 'track1', 2n);
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(adapter.getCommittedGroupFloor('video', 'track1')).toBe(2n);
+
+        // The timeline index survives: a contained replay is still dropped.
+        adapter.appendChunk('video', makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 2 }), 'track1', 3n);
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+
+        warn.mockRestore();
+    });
+
+    it('appends in flight or queued at clearGroupFloor do not raise the floor again', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        vsb.autoComplete = false;
+        adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1', 15_149n);
+        adapter.appendChunk('video', makeSegment({ bmd: 500, defaultDur: 100, sampleCount: 5 }), 'track1', 15_150n);
+        expect(vsb.updating).toBe(true);
+
+        adapter.clearGroupFloor('video', 'track1');
+        vsb.autoComplete = true;
+        vsb.updating = false;
+        vsb.fire('updateend');
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(adapter.getCommittedGroupFloor('video', 'track1')).toBeUndefined();
+
+        adapter.appendChunk('video', makeSegment({ bmd: 1000, defaultDur: 100, sampleCount: 5 }), 'track1', 2n);
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 3);
+        expect(adapter.getCommittedGroupFloor('video', 'track1')).toBe(2n);
+    });
+
     it('failed append clears pending — legitimate retransmit is not treated as overlap', async () => {
         const { adapter, vsb } = await makeReadyAdapter();
         const initCount = vsb.appendedPayloads.length;

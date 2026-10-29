@@ -24,6 +24,7 @@
     "packages/webtransport/src/adapter-d22-lifecycle.test.ts",
     "packages/webtransport/src/topology/inbound-request.test.ts",
     "packages/player/src/player-d22-bootstrap.loopback.test.ts",
+    "packages/player/src/player-cmaf-publisher-restart.loopback.test.ts",
     "packages/webtransport/src/adapter-goaway-notice.test.ts",
     "packages/webtransport/src/adapter-goaway-diagnostics.test.ts",
     "packages/player/src/player-goaway-request-owners.test.ts",

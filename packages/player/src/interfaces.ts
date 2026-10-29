@@ -396,6 +396,12 @@ export interface MediaSourceLike {
   expectDiscontinuity?(): void;
 
   /**
+   * OPTIONAL: forget one track's committed group floor; a new subscription
+   * may number groups from zero.
+   */
+  clearGroupFloor?(mediaType: 'video' | 'audio', trackName: string): void;
+
+  /**
    * OPTIONAL playback-intent contract.
    *
    * Arrival of media is not a request to play. Without this, an adapter that
@@ -479,6 +485,12 @@ export interface CmafAssemblerLike {
    * state may ignore the call.
    */
   clearPending?(mediaType: 'video' | 'audio'): void;
+  /**
+   * A new subscription starts a fresh Group ID sequence for one media type:
+   * forget its group order so a restarted publisher's lower groups are not
+   * taken for late data. Optional; assemblers without group state may ignore it.
+   */
+  resetGroupOrder?(mediaType: 'video' | 'audio'): void;
   /**
    * Delivery resumes after a pause: the paused interval is not missing media.
    * Optional; assemblers without ordering state may ignore it.

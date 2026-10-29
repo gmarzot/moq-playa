@@ -986,6 +986,212 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
       .toEqual([0n, 2_000n, 1_000n, 3_000n]);
   });
 
+  describe('resetGroupOrder', () => {
+    const pusher = (assembler: CmafAssembler, mediaType: 'video' | 'audio', track: string, duration: number) =>
+      (groupId: bigint, rawBmd: number) => assembler.push(
+        mediaType, track, groupId,
+        concat(buildMoof(rawBmd, Number(groupId % 1000n) + 1, duration), buildMdat(new Uint8Array([1]))),
+      );
+
+    it('takes a restarted publisher\'s lower video groups as a new epoch', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      const push = pusher(assembler, 'video', 'video0', 1_000);
+
+      push(15_149n, 7_000_000);
+      push(15_150n, 7_001_000);
+      assembler.resetGroupOrder('video');
+      push(0n, 0);
+      push(1n, 1_000);
+      push(2n, 2_000);
+
+      expect(onDiscontinuity).toHaveBeenCalledOnce();
+      expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video0');
+      expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+        .toEqual([0n, 1_000n, 2_000n, 3_000n, 4_000n]);
+      expect(assembler.videoOrderStats.late).toBe(0);
+    });
+
+    it('takes a restarted publisher\'s lower audio groups as a new epoch', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+      const push = pusher(assembler, 'audio', 'audio0', 1_024);
+
+      push(15_149n, 345_600_000);
+      push(15_150n, 345_601_024);
+      assembler.resetGroupOrder('audio');
+      push(0n, 0);
+      push(1n, 1_024);
+
+      expect(onDiscontinuity).toHaveBeenCalledOnce();
+      expect(onDiscontinuity).toHaveBeenCalledWith('audio', 'audio0');
+      expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+        .toEqual([0n, 1_024n, 2_048n, 3_072n]);
+      expect(assembler.audioOrderStats.late).toBe(0);
+    });
+
+    it('without it, a restarted publisher\'s lower groups are taken for late data', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+      const push = pusher(assembler, 'audio', 'audio0', 1_024);
+
+      push(15_150n, 345_600_000);
+      push(0n, 0);
+
+      expect(onDiscontinuity).not.toHaveBeenCalled();
+    });
+
+    it('re-anchors both tracks on one shared epoch after a restart', () => {
+      const onDiscontinuity = vi.fn();
+      const { assembler, onSegment } = assemblerWithInits(onDiscontinuity);
+      const video = pusher(assembler, 'video', 'video0', VIDEO_TS);
+      const audio = pusher(assembler, 'audio', 'audio0', AUDIO_TS);
+
+      audio(15_150n, 7_000 * AUDIO_TS);
+      video(15_150n, 7_000 * VIDEO_TS);
+      assembler.resetGroupOrder('video');
+      assembler.resetGroupOrder('audio');
+      video(0n, 0);
+      audio(0n, 0);
+      video(1n, VIDEO_TS);
+      audio(1n, AUDIO_TS);
+
+      expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video0');
+      expect(onDiscontinuity).toHaveBeenCalledWith('audio', 'audio0');
+      const out = onSegment.mock.calls.map((c, i) => [c[0], outBmd(onSegment, i)]);
+      expect(out).toEqual([
+        ['audio', 0n], ['video', 0n],
+        ['video', BigInt(VIDEO_TS)], ['audio', BigInt(AUDIO_TS)],
+        ['video', BigInt(2 * VIDEO_TS)], ['audio', BigInt(2 * AUDIO_TS)],
+      ]);
+    });
+
+    it('does not re-anchor a resubscribe to the same publisher', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+      const video = pusher(assembler, 'video', 'video0', 1_000);
+      const audio = pusher(assembler, 'audio', 'audio0', 1_024);
+
+      video(100n, 10_000);
+      audio(100n, 20_000);
+      assembler.resetGroupOrder('video');
+      assembler.resetGroupOrder('audio');
+      video(101n, 11_000);
+      audio(101n, 21_024);
+      audio(100n, 20_000); // a late frame of the prior subscription is not a restart
+
+      expect(onDiscontinuity).not.toHaveBeenCalled();
+      const out = onSegment.mock.calls.map((c, i) => [c[0], outBmd(onSegment, i)]);
+      expect(out).toEqual([
+        ['video', 0n], ['audio', 0n],
+        ['video', 1_000n], ['audio', 1_024n], ['audio', 0n],
+      ]);
+    });
+
+    const ascending = (xs: bigint[]) => xs.every((x, i) => i === 0 || x >= xs[i - 1]!);
+
+    it('does not re-anchor the current group re-delivered from its first object', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+      const push = pusher(assembler, 'video', 'video0', 1_000);
+
+      push(15_149n, 7_000_000);
+      push(15_150n, 7_001_000);
+      push(15_150n, 7_002_000);
+      assembler.resetGroupOrder('video');
+      push(15_150n, 7_001_000);
+      push(15_150n, 7_002_000);
+      push(15_151n, 7_003_000);
+
+      expect(onDiscontinuity).not.toHaveBeenCalled();
+      const out = onSegment.mock.calls.map((_, i) => outBmd(onSegment, i));
+      expect(out).toEqual([0n, 1_000n, 2_000n, 2_000n, 3_000n]);
+      expect(assembler.videoOrderStats.late).toBe(1);
+    });
+
+    it('does not re-anchor the previous group\'s tail arriving first after a resubscribe', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+      const push = pusher(assembler, 'audio', 'audio0', 1_024);
+
+      push(15_149n, 345_600_000);
+      push(15_150n, 345_601_024);
+      assembler.resetGroupOrder('audio');
+      push(15_149n, 345_600_000);
+      push(15_151n, 345_602_048);
+
+      expect(onDiscontinuity).not.toHaveBeenCalled();
+      expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+        .toEqual([0n, 1_024n, 0n, 2_048n]);
+    });
+
+    it('re-anchors a restart whose old Group IDs were still small, by its decode-time jump', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+      const push = pusher(assembler, 'video', 'video0', 3_000);
+
+      push(0n, 7_200 * VIDEO_TS);
+      push(1n, 7_200 * VIDEO_TS + 3_000);
+      assembler.resetGroupOrder('video');
+      push(0n, 0);
+      push(1n, 3_000);
+
+      expect(onDiscontinuity).toHaveBeenCalledOnce();
+      expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+        .toEqual([0n, 3_000n, 6_000n, 9_000n]);
+    });
+
+    it('re-anchors a restart that follows an old-group straggler', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+      const push = pusher(assembler, 'video', 'video0', 3_000);
+
+      push(15_149n, 7_000_000);
+      push(15_150n, 7_003_000);
+      assembler.resetGroupOrder('video');
+      push(15_149n, 7_000_000); // late data of the old subscription
+      push(0n, 0);
+      push(1n, 3_000);
+
+      expect(onDiscontinuity).toHaveBeenCalledOnce();
+      expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+        .toEqual([0n, 3_000n, 6_000n, 9_000n]);
+    });
+
+    it('detects a second restart after a re-anchored one', () => {
+      const onSegment = vi.fn();
+      const onDiscontinuity = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+      const push = pusher(assembler, 'video', 'video0', 1_000);
+
+      push(15_150n, 7_000_000);
+      assembler.resetGroupOrder('video');
+      push(0n, 0);
+      push(500n, 500_000);
+      assembler.resetGroupOrder('video');
+      push(0n, 0);
+
+      expect(onDiscontinuity).toHaveBeenCalledTimes(2);
+      const out = onSegment.mock.calls.map((_, i) => outBmd(onSegment, i));
+      expect(ascending(out)).toBe(true);
+    });
+  });
+
   it('patches every chunk in a multi-chunk CMSF object', () => {
     const onSegment = vi.fn();
     const onDiscontinuity = vi.fn();
