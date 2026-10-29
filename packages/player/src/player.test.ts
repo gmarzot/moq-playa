@@ -1561,8 +1561,10 @@ describe('MoqtPlayer', () => {
   // ─── PUBLISH_DONE (§9.12) ────────────────────────────────
 
   describe('PUBLISH_DONE handling (§9.12)', () => {
-    async function loadAndSubscribeMedia(adapter: ReturnType<typeof createMockAdapter>) {
-      const player = new MoqtPlayer(createConfig(adapter));
+    async function loadAndSubscribeMedia(
+      adapter: ReturnType<typeof createMockAdapter>, overrides: Partial<MoqtPlayerConfig> = {},
+    ) {
+      const player = new MoqtPlayer({ ...createConfig(adapter), ...overrides });
       const loadPromise = player.load();
       await resolveConnect(adapter);
       await loadPromise;
@@ -1953,14 +1955,14 @@ describe('MoqtPlayer', () => {
         }
       });
 
-      it('parks the retry while the document is hidden and resubscribes once visible', async () => {
+      it('autoResume off: parks the retry while the document is hidden and resubscribes once visible', async () => {
         vi.useFakeTimers();
         const doc = { visibilityState: 'visible', addEventListener: () => {}, removeEventListener: () => {} };
         (globalThis as any).document = doc;
         try {
           const adapter = createMockAdapter();
           adapter.draftVersion = 18;
-          const player = await loadAndSubscribeMedia(adapter);
+          const player = await loadAndSubscribeMedia(adapter, { autoResume: false });
           const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
           const before = videoSubscribes(adapter);
           doc.visibilityState = 'hidden';
@@ -2167,6 +2169,20 @@ describe('MoqtPlayer', () => {
 
       const err = errorFn.mock.calls[0][0];
       expect(err.type).toBe('error');
+    });
+
+    it('play() while playing is a no-op', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadCatalogAndSubscribe(adapter);
+      player.play();
+      const errors = vi.fn();
+      player.on('error', errors);
+      (adapter.requestUpdate as any).mockClear();
+
+      expect(() => player.play()).not.toThrow();
+      expect(errors).not.toHaveBeenCalled();
+      expect(adapter.requestUpdate).not.toHaveBeenCalled();
+      expect(player.state).toBe(PlayerState.PLAYING);
     });
 
     it('play() sends REQUEST_UPDATE for all subscriptions even if one fails (§9.11)', async () => {
@@ -12292,6 +12308,61 @@ describe('MoqtPlayer — reconnect after the session closes', () => {
     } as MoqtObject);
   }
 
+  for (const hidden of [false, true]) {
+    it(`resumes media after a reconnect when a catalog listener plays (autoplay, ${hidden ? 'hidden' : 'visible'})`, async () => {
+      if (hidden) {
+        vi.stubGlobal('document', {
+          visibilityState: 'hidden', addEventListener: () => {}, removeEventListener: () => {},
+        });
+      }
+      try {
+        const first = createMockAdapter();
+        const { player, next } = await playingWithMedia(first);
+        const second = createMockAdapter();
+        next.push(second);
+        player.on('catalog_received', () => player.play());
+
+        await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+        await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+        await player.destroy();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+  }
+
+  it('resumes media after a reconnect even when a catalog listener throws', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    player.on('catalog_received', () => { throw new Error('listener bug'); });
+    const later = vi.fn();
+    player.on('catalog_received', later);
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Connection lost.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    expect(later).toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('a frozen tab: the jump to live fails, the session closes, and the reconnect resumes media', async () => {
+    const first = createMockAdapter();
+    const { player, next } = await playingWithMedia(first);
+    const second = createMockAdapter();
+    next.push(second);
+    player.on('catalog_received', () => player.play());
+    vi.mocked(first.requestUpdate).mockRejectedValue(new Error('The stream was aborted by the remote server'));
+    player.jumpToLive('resumed after 6.0s frozen');
+
+    await reconnectOnto(player, second, () => first._triggerClose(0x2, 'Page entered back/forward cache.'));
+
+    await vi.waitFor(() => expect(subscribedNames(second).sort()).toEqual(['audio', 'catalog', 'video']));
+    await player.destroy();
+  });
+
   it('re-subscribes the media the lost session played on the new session, without UNSUBSCRIBE there', async () => {
     const first = createMockAdapter();
     const { player, next } = await playingWithMedia(first);
@@ -12541,6 +12612,28 @@ describe('MoqtPlayer — video views (altGroups)', () => {
 
   const subscribedNames = (adapter: ReturnType<typeof createMockAdapter>): string[] =>
     (adapter.subscribe as any).mock.calls.map((c: any) => new TextDecoder().decode(c[1]));
+
+  it('a CMAF video resubscribe (reconnect) waits for a keyframe again', async () => {
+    const adapter = createMockAdapter();
+    const clearPending = vi.fn();
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+      }),
+      createCmafAssembler: () => ({
+        push: vi.fn(), selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null,
+        reset: vi.fn(), destroy: vi.fn(), clearPending,
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    (player as any).cmafVideoSynced = true;
+
+    (player as any).replaceSubscription('video_main', 'migration');
+
+    expect((player as any).cmafVideoSynced).toBe(false);
+    expect(clearPending).toHaveBeenCalledWith('video');
+    await player.destroy();
+  });
 
   /** SUBSCRIBE_OK the latest subscription and deliver its first keyframe object. */
   async function landLatestSubscription(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {

@@ -270,7 +270,7 @@ function codecsCompatible(a: string, b: string): boolean {
 }
 
 /** Why a media track is re-subscribed. */
-type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration';
+type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration' | 'refused';
 
 function defaultMediaSubscriptionFilter(isLive: boolean) {
   if (isLive) {
@@ -577,6 +577,8 @@ export class MoqtPlayer {
 
   /** `visibilitychange` listener installed while the first-frame deadline is pending. */
   private visibilityListener: (() => void) | null = null;
+  /** One-shot `visibilitychange` listener holding a media resume (autoResume off). */
+  private mediaResumeListener: (() => void) | null = null;
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
@@ -2353,6 +2355,11 @@ export class MoqtPlayer {
    * played, or to the current selection where none played.
    */
   private resumeMigratedMedia(selected: SelectedTracks): void {
+    if (this.holdWhileHidden()) {
+      this.log.info('Media resume held until the page is visible (autoResume off)');
+      this.resumeWhenVisible(() => this.resumeMigratedMedia(selected));
+      return;
+    }
     const playing = this.migratedMedia;
     this.migratedMedia = null;
     const tracks = this._catalogState?.tracks;
@@ -4209,6 +4216,8 @@ export class MoqtPlayer {
    */
   play(): void {
     this.log.info('play()');
+    // Already playing, e.g. autoplay on a reconnect's catalog.
+    if (this.stateMachine.state === PlayerState.PLAYING) return;
     // ONE transaction. The transition is validated first (an invalid one throws
     // having changed nothing), then state, playback intent, adapter intent and
     // ticking are all committed, and only then is the completed transition
@@ -5544,6 +5553,15 @@ export class MoqtPlayer {
   }
 
   /** Readiness: today's first-catalog block, run once with the converged state. */
+  /** Announce the catalog. A throwing listener is logged: it must not skip the media subscribe that follows. */
+  private emitCatalogReceived(catalog: CatalogState): void {
+    try {
+      this.emitter.emitIsolated('catalog_received', { type: 'catalog_received', catalog });
+    } catch (err) {
+      this.log.warn('catalog_received listener threw: %s', err instanceof Error ? err.message : String(err));
+    }
+  }
+
   private onCatalogBootstrapReady(catalogState: CatalogState): void {
     if (this._destroyed || this.isTerminalState() || this.catalogReceived) return;
     const conn = this.connection;
@@ -5553,7 +5571,7 @@ export class MoqtPlayer {
     this._stats.recordCatalogReceived();
     this.watchdog.fulfill('catalog_received');
     this.watchdog.expect('first_media_object', 20_000);
-    this.emitter.emit('catalog_received', { type: 'catalog_received', catalog: catalogState });
+    this.emitCatalogReceived(catalogState);
     if (this._destroyed || this.isTerminalState() || this.connection !== conn || this.bootstrapGeneration !== gen) return;
     this.log.info('Catalog received (bootstrap): %d tracks', catalogState.tracks.length);
     if (this.pipelinesCreated) {
@@ -6846,6 +6864,7 @@ export class MoqtPlayer {
     this.cmafFirstFrameHiddenAt = undefined;
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
     this.removeVisibilityListener();
+    this.cancelResumeWhenVisible();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -8154,6 +8173,12 @@ export class MoqtPlayer {
             'All media track subscriptions refused — no playable content',
           ));
         }
+        // A listed track not published yet: retry with backoff while nothing else plays this media type.
+        if (BigInt(errorCode) === BigInt(RequestError.DOES_NOT_EXIST)
+            && this.activeTrackName(mediaType) === undefined
+            && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName)) {
+          this.scheduleResubscribe(trackName, 'refused');
+        }
       },
       onCatalogSubscribeOk: (largest) => {
         this.catalogBootstrapCoord?.onSubscribeOk(largest);
@@ -8562,10 +8587,7 @@ export class MoqtPlayer {
           this.log.warn('Catalog: ignoring track(s) with unsupported packaging: %s',
             catalogState.ignoredTracks.map((t) => `"${t.name}" (${t.packaging})`).join(', '));
         }
-        this.emitter.emit('catalog_received', {
-          type: 'catalog_received',
-          catalog: catalogState,
-        });
+        this.emitCatalogReceived(catalogState);
         if (!live()) return;
 
         if (this.pipelinesCreated) {
@@ -9115,6 +9137,34 @@ export class MoqtPlayer {
   private documentHidden(): boolean {
     const doc = (globalThis as { document?: { visibilityState?: string } }).document;
     return doc?.visibilityState === 'hidden';
+  }
+
+  /** Recovery waits for a visible page: autoResume is off and the document is hidden. */
+  private holdWhileHidden(): boolean {
+    return this.config.autoResume === false && this.documentHidden();
+  }
+
+  /** Run `resume` once the page is visible, on the session current now; one pending at a time. */
+  private resumeWhenVisible(resume: () => void): void {
+    this.cancelResumeWhenVisible();
+    const doc = (globalThis as { document?: EventTarget }).document;
+    if (!doc) return;
+    const conn = this.connection;
+    const listener = (): void => {
+      if (this.documentHidden()) return;
+      this.cancelResumeWhenVisible();
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      resume();
+    };
+    this.mediaResumeListener = listener;
+    doc.addEventListener('visibilitychange', listener);
+  }
+
+  private cancelResumeWhenVisible(): void {
+    if (!this.mediaResumeListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    doc?.removeEventListener('visibilitychange', this.mediaResumeListener);
+    this.mediaResumeListener = null;
   }
 
   /** Suspend a CMAF bootstrap deadline while the document is hidden. */
@@ -10290,19 +10340,19 @@ export class MoqtPlayer {
   }
 
   /**
-   * Hold a restart while the document is hidden, where it only spends request
-   * streams. Once visible: true if delivery resumed within one reset probe,
-   * else the ladder continues with a fresh budget.
+   * With autoResume off, hold a restart while the document is hidden. Once
+   * visible: true if delivery resumed within one reset probe, else the ladder
+   * continues with a fresh budget.
    */
   private async livenessHoldWhileHidden(
     track: LivenessTrack,
     restart: { attempts: number; cancelled: boolean },
   ): Promise<boolean> {
-    if (!this.documentHidden()) return false;
+    if (!this.holdWhileHidden()) return false;
     const heldAtMs = performance.now();
     this.log.info('Liveness: %s "%s" restart held while the page is hidden',
       track.mediaType, track.trackName);
-    while (this.documentHidden()) {
+    while (this.holdWhileHidden()) {
       if (!this.livenessLadderMayContinue(restart)) return false;
       await new Promise((r) => setTimeout(r, 250));
     }
@@ -10431,7 +10481,7 @@ export class MoqtPlayer {
 
   /**
    * Resubscribe a track at once, then with doubling backoff, one pending retry
-   * per track; parked while the document is hidden.
+   * per track; parked while hidden when autoResume is off.
    */
   private scheduleResubscribe(trackName: string, cause: ResubscribeCause): void {
     const nowMs = performance.now();
@@ -10455,7 +10505,7 @@ export class MoqtPlayer {
       // A migration re-subscribes the replaced session's tracks itself.
       if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
       // A reconnect in flight either replaces this session or has just made it.
-      if (this.reconnect !== null || this.documentHidden()) {
+      if (this.reconnect !== null || this.holdWhileHidden()) {
         state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
         return;
       }
@@ -10512,6 +10562,11 @@ export class MoqtPlayer {
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
     if (isMsePackaging(packaging)) this.mediaSource?.expectDiscontinuity?.();
+    if (isMsePackaging(packaging) && mediaType === 'video') {
+      // The new subscription may start mid-group: wait for a keyframe, as on init.
+      this.cmafVideoSynced = false;
+      this.cmafAssembler?.clearPending?.('video');
+    }
 
     // Reset pipeline + sync to prepare for fresh data.
     // Audio resubscribe MUST reset sync — the new subscription will

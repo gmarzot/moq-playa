@@ -81,6 +81,11 @@
        stacks, rather than the row overflowing under the catalog. */
     .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: nowrap; }
     .controls .spacer { flex: 1; min-width: 0; }
+    .controls select {
+      background: #333; color: #ddd; border: 1px solid #555; border-radius: 6px;
+      padding: 7px 8px; font-size: .85rem; max-width: 14rem; flex-shrink: 1; min-width: 0;
+    }
+    .controls select:disabled { opacity: 0.4; }
     .controls button.mini {
       font-size: .85rem; padding: 6px 12px;
       display: inline-flex; align-items: center; justify-content: center;
@@ -266,6 +271,7 @@
         </div>
 
         <div class="controls">
+          <select id="camera" title="Camera to open on Start. Phones: front or back; desktops: one of the cameras." hidden></select>
           <button id="start-camera">Camera</button>
           <button id="start-screen">Screen</button>
           <button id="stop" disabled>Stop</button>
