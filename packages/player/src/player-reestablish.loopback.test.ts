@@ -24,7 +24,7 @@ const td = new TextDecoder();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const DOES_NOT_EXIST = 0x10n;
 
-const CATALOG = {
+const CATALOG_V1 = {
   version: 'draft-01',
   tracks: [
     { name: 'video', packaging: 'loc', renderGroup: 1, isLive: true, role: 'video',
@@ -32,6 +32,12 @@ const CATALOG = {
     { name: 'audio', packaging: 'loc', renderGroup: 1, isLive: true, role: 'audio',
       codec: 'opus', samplerate: 48000, channelConfig: '2', bitrate: 32_000 },
   ],
+};
+
+/** The restarted publisher's catalog: the video track is renamed. */
+const CATALOG_V2 = {
+  ...CATALOG_V1,
+  tracks: CATALOG_V1.tracks.map((t) => (t.name === 'video' ? { ...t, name: 'video-hd' } : t)),
 };
 
 /** A media subscription the relay serves objects on. */
@@ -44,6 +50,7 @@ interface Session {
   subs: string[];
   nsRequestId: bigint | null;
   media: Map<bigint, MediaSub>;
+  catalogRequestId: bigint | null;
 }
 
 /** A relay whose catalog and media tracks can each be published or not. */
@@ -53,6 +60,7 @@ function relay(opts: { refusalDelayMs: number }) {
   const sessions: Session[] = [];
   let alias = 40n;
   let group = 100n;
+  let catalog: object = CATALOG_V1;
 
   /** One object per group every 20 ms while the subscription lives. */
   const serve = async (server: MoqtConnection, sub: MediaSub): Promise<void> => {
@@ -84,7 +92,7 @@ function relay(opts: { refusalDelayMs: number }) {
         await server.acceptSubscribe(requestId, a, name === 'catalog'
           ? { parameters: new Map([[0x09n, [{ group: 5n, object: 0n }]]]) as never }
           : undefined);
-        if (name === 'catalog') return;
+        if (name === 'catalog') { s.catalogRequestId = requestId; return; }
         const sub: MediaSub = { alias: a, live: true, sending: Promise.resolve() };
         s.media.set(requestId, sub);
         sub.sending = serve(server, sub);
@@ -96,7 +104,7 @@ function relay(opts: { refusalDelayMs: number }) {
         await server.acceptFetch(requestId, { endLocation: range.endLocation });
         const sid = await server.openFetchStream(requestId);
         await server.sendFetchObject(sid, {
-          groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: enc(CATALOG),
+          groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: enc(catalog),
         });
         await server.closeFetchStream(sid);
       })();
@@ -119,6 +127,7 @@ function relay(opts: { refusalDelayMs: number }) {
       const { a, b } = createLoopback({});
       const s: Session = {
         server: new MoqtConnection(18, { role: 'server' }), subs: [], nsRequestId: null, media: new Map(),
+        catalogRequestId: null,
       };
       wire(s);
       sessions.push(s);
@@ -145,6 +154,21 @@ function relay(opts: { refusalDelayMs: number }) {
         s.media.clear();
       }
       await this.withdraw();
+    },
+    /**
+     * The publisher restarts: PUBLISH_DONE on the catalog and the media,
+     * NAMESPACE_DONE, and its catalog changes when it returns.
+     */
+    async restartPublisher(): Promise<void> {
+      published.catalog = false;
+      for (const s of sessions) {
+        if (s.catalogRequestId === null) continue;
+        await s.server.publishDone(s.catalogRequestId, PublishDoneCode18.TRACK_ENDED, 'publisher left')
+          .catch(() => {});
+        s.catalogRequestId = null;
+      }
+      await this.endPublisher();
+      catalog = CATALOG_V2;
     },
     /** NAMESPACE_DONE on every session following the namespace. */
     async withdraw(): Promise<void> {
@@ -265,6 +289,29 @@ describe('resuming when the followed namespace returns (d18 loopback)', () => {
     await sleep(PROMPT_MS);
     expect(r.sessions).toHaveLength(1);
     expect(r.sessions[0]!.subs).toEqual(['catalog', 'video', 'audio', 'video', 'audio']);
+    expect(objectsSince(returnedAt)).toBeGreaterThan(0);
+    expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+    await player.destroy();
+  }, 10_000);
+
+  it('a publisher restart ending the catalog too renews it on a prompt fresh session', async () => {
+    const r = relay({ refusalDelayMs: 0 });
+    stop = () => r.stop();
+    const { player, errors, objectsSince } = await startPlaying(r);
+    const catalogs: string[][] = [];
+    player.on('catalog_received', (e) => catalogs.push(e.catalog.tracks.map((t) => t.name)));
+    await sleep(100);
+
+    await r.restartPublisher();
+    await sleep(100);
+    r.published.media = true;
+    const returnedAt = performance.now();
+    await r.republish();
+    await sleep(PROMPT_MS);
+    expect(r.sessions[0]!.subs).toEqual(['catalog', 'video', 'audio']);
+    expect(r.sessions).toHaveLength(2);
+    expect(r.sessions[1]!.subs).toEqual(['catalog', 'video-hd', 'audio']);
+    expect(catalogs).toEqual([['video-hd', 'audio']]);
     expect(objectsSince(returnedAt)).toBeGreaterThan(0);
     expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
     await player.destroy();

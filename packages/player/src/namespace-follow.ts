@@ -10,6 +10,12 @@ import type { ControlMessage } from '@openmoq/transport';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { NamespaceState } from './events.js';
 
+/**
+ * What the host did about a return: resumed on the current session, left live
+ * subscriptions to resume by themselves, or found the session needs replacing.
+ */
+export type ReturnAction = 'resumed' | 'settle' | 'reestablish';
+
 export interface NamespaceFollowHost {
   /** The current session; messages from any other are stale. */
   connection(): MoqtConnection | null;
@@ -24,10 +30,9 @@ export interface NamespaceFollowHost {
   reestablish(): void;
   /**
    * Resubscribe on the current session what cannot resume by itself: the
-   * catalog when `catalogLost`, else ended media. False when live
-   * subscriptions remain or nothing can be resumed here.
+   * catalog when `catalogLost`, else ended media.
    */
-  resumeInSession(catalogLost: boolean): boolean;
+  resumeInSession(catalogLost: boolean): ReturnAction;
   /** An in-session resume is parked until the page is visible. */
   resumeHeld(): boolean;
 }
@@ -157,9 +162,9 @@ export class NamespaceFollower {
   /**
    * The namespace is published again after it went away. Resume on the current
    * session when nothing on it can resume by itself, re-establishing if no
-   * media follows within RESUME_BOUND_MS; otherwise re-establish if media has
-   * not resumed within RETURN_SETTLE_MS. Re-establishes at most once per
-   * RETURN_MIN_SPACING_US.
+   * media follows within RESUME_BOUND_MS; re-establish at once when the host
+   * says so; otherwise re-establish if media has not resumed within
+   * RETURN_SETTLE_MS. Re-establishes at most once per RETURN_MIN_SPACING_US.
    */
   private returned(): void {
     this.lost = false;
@@ -170,15 +175,16 @@ export class NamespaceFollower {
     }
     const now = this.host.now();
     this.returnedAtUs = now;
-    if (now - this.resumeAtUs >= NamespaceFollower.RESUME_MIN_SPACING_US
-        && this.host.resumeInSession(this.catalogLost)) {
+    const action = now - this.resumeAtUs >= NamespaceFollower.RESUME_MIN_SPACING_US
+      ? this.host.resumeInSession(this.catalogLost) : 'settle';
+    if (action === 'resumed') {
       this.catalogLost = false;
       this.resumeAtUs = now;
       this.resuming = true;
       this.arm(NamespaceFollower.RESUME_BOUND_MS);
       return;
     }
-    this.arm(NamespaceFollower.RETURN_SETTLE_MS);
+    this.arm(action === 'reestablish' ? 0 : NamespaceFollower.RETURN_SETTLE_MS);
   }
 
   private arm(delayMs: number): void {

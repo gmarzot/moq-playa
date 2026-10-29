@@ -25,7 +25,7 @@ import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openm
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import type { BootstrapPhase } from './catalog-bootstrap.js';
-import { NamespaceFollower } from './namespace-follow.js';
+import { NamespaceFollower, type ReturnAction } from './namespace-follow.js';
 import { cmafChunkStartsWithSync } from './cmaf-sync.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
@@ -824,6 +824,8 @@ export class MoqtPlayer {
     resumeInSession: (catalogLost) => this.resumeOnNamespaceReturn(catalogLost),
     resumeHeld: () => this.holdWhileHidden(),
   });
+  /** The catalog subscription that received PUBLISH_DONE, on its session. */
+  private catalogEnded: { conn: MoqtConnection; requestId: bigint } | null = null;
   /** Last media object: media resuming after the namespace returns needs no re-establish. */
   private lastMediaArrivalUs = -Infinity;
   /** Delay before each reconnect attempt: the first is immediate; later attempts reuse the last. */
@@ -8302,6 +8304,7 @@ export class MoqtPlayer {
         return true;
       },
       onCatalogPublishDone: (statusCode) => {
+        if (this.catalogRequestId !== null) this.catalogEnded = { conn, requestId: this.catalogRequestId };
         const reason = this.normalizePublishDoneStatus(statusCode);
         if (reason === 'going-away') {
           // GOAWAY semantics: quarantine THIS connection's catalog delivery
@@ -10002,18 +10005,20 @@ export class MoqtPlayer {
 
   /**
    * The followed namespace returned: resubscribe the refused catalog, or the
-   * ended media, on the current session. False when live media subscriptions
-   * remain (they may resume by themselves) or there is nothing to resubscribe.
+   * ended media, on the current session. 'settle' when live media
+   * subscriptions remain (they may resume by themselves) or there is nothing to
+   * resubscribe; 'reestablish' when the catalog subscription ended, since a
+   * fresh session renews the catalog before its media.
    */
-  private resumeOnNamespaceReturn(catalogLost: boolean): boolean {
-    if (this._destroyed || this.currentMigration || this.reconnect !== null) return false;
+  private resumeOnNamespaceReturn(catalogLost: boolean): ReturnAction {
+    if (this._destroyed || this.currentMigration || this.reconnect !== null) return 'settle';
     const conn = this.connection;
-    if (!conn) return false;
+    if (!conn) return 'settle';
     const state = this.stateMachine.state;
     if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED
-        && !(state === PlayerState.LOADING && !this.catalogReceived)) return false;
+        && !(state === PlayerState.LOADING && !this.catalogReceived)) return 'settle';
     if (!this.catalogReceived) {
-      if (!catalogLost) return false;
+      if (!catalogLost) return 'settle';
       this.log.info('Namespace published again: re-subscribing the catalog on this session');
       this.cancelCatalogBootstrap();
       this.terminateCatalogRetrieval(conn, this.catalogRequestId, null);
@@ -10021,16 +10026,20 @@ export class MoqtPlayer {
         this.log.warn('Catalog re-subscribe after the namespace returned failed: %s',
           err instanceof Error ? err.message : String(err));
       });
-      return true;
+      return 'resumed';
     }
     for (const sub of this.activeSubscriptions.values()) {
-      if (sub.mediaType === 'video' || sub.mediaType === 'audio') return false;
+      if (sub.mediaType === 'video' || sub.mediaType === 'audio') return 'settle';
+    }
+    if (!this.catalogSubscriptionLive()) {
+      this.log.info('Namespace published again with the catalog subscription ended');
+      return 'reestablish';
     }
     const names = [
       this.config.disableVideo ? undefined : this.qualityController?.currentVideoTrack?.name,
       this.config.disableAudio ? undefined : this.qualityController?.currentAudioTrack?.name,
     ].filter((n): n is string => n !== undefined);
-    if (names.length === 0) return false;
+    if (names.length === 0) return 'settle';
     this.log.info('Namespace published again: re-subscribing %s on this session', names.join(', '));
     for (const name of names) {
       // Retry now rather than at the pending backoff.
@@ -10042,7 +10051,15 @@ export class MoqtPlayer {
       }
       this.scheduleResubscribe(name, 'namespace_return');
     }
-    return true;
+    return 'resumed';
+  }
+
+  /** Whether catalog updates can still arrive on the current session. */
+  private catalogSubscriptionLive(): boolean {
+    if (this.catalogRecovery !== null) return true;
+    const ended = this.catalogEnded;
+    if (ended && ended.conn === this.connection && ended.requestId === this.catalogRequestId) return false;
+    return this.catalogRequestId !== null && this.catalogTrackAlias !== null;
   }
 
   /** Rebuild the catalog and subscriptions on a fresh session, as a reconnect does. */
