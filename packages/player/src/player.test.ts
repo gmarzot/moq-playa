@@ -12693,6 +12693,54 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
+  it('an async objectTransform settling after a resubscribe delivers nothing from the retired subscription', async () => {
+    const adapter = createMockAdapter();
+    const settle: Array<() => void> = [];
+    const pushed: Array<[string, bigint]> = [];
+    const player = await loadWithCatalog(adapter, twoViewCatalog('cmaf'), {
+      objectTransform: (obj: MoqtObject) => new Promise<MoqtObject>((resolve) => settle.push(() => resolve(obj))),
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null, onFirstFrame: null, onError: null, onStall: null, clearGroupFloor: vi.fn(),
+      }),
+      createCmafAssembler: () => ({
+        push: (mt: string, _track: string, group: bigint) => { pushed.push([mt, group]); },
+        selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null,
+        reset: vi.fn(), destroy: vi.fn(), clearPending: vi.fn(), resetGroupOrder: vi.fn(),
+      }),
+    } as Partial<MoqtPlayerConfig>);
+    // Both subscriptions get the same alias: the identity of the registration decides.
+    const alias = 300n;
+    const land = async (group: number) => {
+      const reqId = await requestIdOf(adapter, 'video_main');
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(alias),
+        parameters: new Map(), trackExtensions: new Map(),
+      } as any);
+      adapter._triggerObject(alias, {
+        kind: 'data', trackAlias: varint(alias), groupId: varint(group), subgroupId: varint(0),
+        objectId: varint(0), payload: new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]),
+        extensions: new Uint8Array(0),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+      return reqId;
+    };
+
+    const oldReqId = await land(15_150);
+    expect(settle).toHaveLength(1);
+    adapter._triggerMessage({
+      type: 'PUBLISH_DONE', requestId: varint(oldReqId), statusCode: varint(0x0),
+      streamCount: varint(0), errorReason: 'publisher restart',
+    } as ControlMessage);
+    expect(await requestIdOf(adapter, 'video_main')).not.toBe(oldReqId);
+    await land(2);
+    for (const resolve of settle) resolve();
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(pushed).toEqual([['video', 2n]]);
+    await player.destroy();
+  });
+
   /** SUBSCRIBE_OK the latest subscription and deliver its first keyframe object. */
   async function landLatestSubscription(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {
     const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;

@@ -418,6 +418,8 @@ export class SubscriptionManager {
         const result = this.objectTransform(obj);
         transformed = result instanceof Promise ? await result : result;
         if (pendingTransform && !pendingTransform.valid) return;
+        // The subscription was retired or its alias re-registered during the await.
+        if (this.tracks.get(alias) !== info) return;
         if (!transformed) return; // Transform dropped the object
       }
 
