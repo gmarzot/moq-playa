@@ -17,6 +17,9 @@ import {
 import { parseCompat } from '../shared/compat.js';
 import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import {
+  FreezeWatch, noteSeq, rebaseSeqs, stallsCell, SETTLE_WINDOW_MS, type ObjSeq,
+} from './counters.js';
+import {
   readMdhdTimescale, readSegmentTimeRanges, readTrexDefaults, type TrexDefaults,
 } from '../../packages/browser/src/mp4-box.js';
 
@@ -561,12 +564,12 @@ async function main(): Promise<void> {
     const where = video
       ? ` start: ${stallStartSnap || '?'} · end: ${describeVideo(video)}` : '';
     log(`Stall detected after ${durationMs.toFixed(0)}ms${where}${describeBuffers()}`);
-    stallStartSnap = '';
     stallMarks.push(performance.now());
     clockDrift.disturb(performance.now());
   });
 
   player.on('stall_recovered', ({ durationMs }) => {
+    stallStartSnap = '';
     clockDrift.disturb(performance.now());
     log(`Stall recovered — outage ${(durationMs / 1000).toFixed(2)}s${describeBuffers()}`);
   });
@@ -592,6 +595,7 @@ async function main(): Promise<void> {
       ? `Reconnecting (attempt ${attempt} in ${(delayMs / 1000).toFixed(0)}s)`
       : `Reconnecting (attempt ${attempt})`);
     setupBadgeState = { tone: 'wait', detail: `Session closed; reconnect attempt ${attempt}` };
+    rebaseSeqs(objSeq);
   });
   player.on('track_unsubscribed', ({ trackName, reason }) => {
     log(`Track "${trackName}" ended: ${reason || '(no reason)'}`);
@@ -609,6 +613,7 @@ async function main(): Promise<void> {
   });
   player.on('session_migrated', () => {
     log('Session re-established');
+    rebaseSeqs(objSeq);
     setupBadgeState = { tone: 'ok', detail: 'Session re-established' };
     logCongestionControl();
     // The new session retrieves the catalog again: report its progress too.
@@ -652,12 +657,13 @@ async function main(): Promise<void> {
     const naTip = (label: string) => `${CELL_TIPS[label]} Not on this stream's path: it plays through MSE.`;
     const cushion = renderCushionMs();
     const locPath = cushion != null || s.avSkewMs != null;
-    // Interruptions: playback stalls, plus on MSE the video holes played through
-    // (picture frozen while audio continues; no stall is reported).
-    const stalls = s.stallCount ?? 0;
-    const freezes = locPath ? 0 : videoFreezes;
-    const stallSec = (s.stallDurationMs ?? 0) / 1000;
-    const interruptedSec = stallSec + (locPath ? 0 : videoFrozenSec);
+    // Interruptions: playback stalls, including one still going on, plus on MSE
+    // the video holes played through (picture frozen while audio continues; no
+    // stall is reported).
+    const stallsNow = stallsCell({
+      stallCount: s.stallCount ?? 0, stallDurationMs: s.stallDurationMs ?? 0,
+      ongoingStallMs: s.ongoingStallMs ?? 0, freezes: videoFreezes, frozenSec: videoFrozenSec, locPath,
+    });
     // TTFF runs from connection start; the connect share goes in its tooltip.
     const connectMs: number | null = (player as any).engine?.stats?.ttffBreakdown?.setupCompleteMs ?? null;
     noteAudioDatagrams();
@@ -720,9 +726,8 @@ async function main(): Promise<void> {
       cell('obj lost a/v',
         `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`, '',
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
-      cell('stalls', interruptedSec.toFixed(1), 's', FAULT(stalls + freezes), '',
-        `${CELL_TIPS['stalls']} Stalls: ${stalls} (${stallSec.toFixed(1)} s)`
-        + (locPath ? '' : ` · Freezes: ${freezes} (${videoFrozenSec.toFixed(1)} s)`)),
+      cell('stalls', stallsNow.sec.toFixed(1), 's', FAULT(stallsNow.faults), '',
+        `${CELL_TIPS['stalls']} ${stallsNow.detail}`),
     ].join('');
   });
 
@@ -954,26 +959,7 @@ async function main(): Promise<void> {
     return s === null ? 0 : s.assemblyMs + s.decodeMs;
   };
 
-  // Per-track object continuity. Arrival order is not delivery order: LOC audio
-  // is one group per frame on its own QUIC stream (~47/s), and independent
-  // streams carry no ordering guarantee between them, so adjacent ids routinely
-  // race. A high-water mark plus a pending set separates the two cases — an id
-  // that lands late and fills its own hole is a reorder, one still missing after
-  // the settle window is loss. Loss inside a buffered range is what a stall with
-  // data still ahead of the playhead looks like from here.
-  const REORDER_SETTLE_MS = 1_000;
-  // Past this a jump is a restart or a join, not a hole worth enumerating.
-  const SEQ_JUMP_CAP = 200n;
-  // Settle times age out: a lifetime maximum reports one bad moment forever and
-  // stops describing current conditions.
-  const SETTLE_WINDOW_MS = 45_000;
-  interface ObjSeq {
-    group: bigint; object: bigint;        // high-water mark, not last seen
-    pending: Map<string, number>;
-    reorders: number; lost: number;
-    settles: Array<[number, number]>;     // [arrival, settle ms]
-    rebase?: boolean;                     // resumed: the next newer id restarts the sequence
-  }
+  // Per-track object continuity (counters.ts).
   const objSeq: Record<string, ObjSeq> = {};
   const seqStat = (t: string, k: 'reorders' | 'lost'): number => objSeq[t]?.[k] ?? 0;
   const settleMaxMs = (): number => {
@@ -1010,61 +996,10 @@ async function main(): Promise<void> {
     // The facade names these groupId/objectId.
     const gid = e.groupId ?? e.group, oid = e.objectId ?? e.object;
     if (gid === undefined || oid === undefined) return;
-    const group = BigInt(gid), object = BigInt(oid);
-    const now = performance.now();
-    const s = objSeq[t];
-    if (!s) {
-      objSeq[t] = { group, object, pending: new Map(),
-                    reorders: 0, lost: 0, settles: [] };
-      return;
-    }
-    if (s.rebase && (group > s.group || (group === s.group && object > s.object))) {
-      // Nothing was sent while paused, so the ids skipped over the pause are not loss.
-      s.rebase = false;
-      s.group = group;
-      s.object = object;
-      return;
-    }
-    if (group > s.group || (group === s.group && object > s.object)) {
-      if (group - s.group > SEQ_JUMP_CAP) {
-        s.pending.clear();
-        log(`obj jump [${t}]: ${s.group}.${s.object} -> ${group}.${object}`);
-      } else if (group === s.group) {
-        for (let o = s.object + 1n; o < object; o++) s.pending.set(`${group}.${o}`, now);
-      } else {
-        // Only each skipped group's head is tracked: without END_OF_GROUP the
-        // previous group's object count is unknown, so its tail is not a hole.
-        for (let g = s.group + 1n; g < group; g++) s.pending.set(`${g}.0`, now);
-        for (let o = 0n; o < object && o < SEQ_JUMP_CAP; o++) {
-          s.pending.set(`${group}.${o}`, now);
-        }
-      }
-      s.group = group;
-      s.object = object;
-    } else {
-      const key = `${group}.${object}`;
-      const at = s.pending.get(key);
-      if (at !== undefined) {
-        s.pending.delete(key);
-        s.reorders++;
-        s.settles.push([now, now - at]);
-      }
-    }
-    // An id that never fills its hole is loss. The settle window is what keeps
-    // this from counting every in-flight reorder as a missing object.
-    while (s.settles.length && now - s.settles[0]![0] > SETTLE_WINDOW_MS) s.settles.shift();
-    let lost = 0, firstKey = '';
-    for (const [key, at] of s.pending) {
-      if (now - at <= REORDER_SETTLE_MS) continue;
-      s.pending.delete(key);
-      if (!lost) firstKey = key;
-      lost++;
-    }
+    const seq = noteSeq(objSeq, t, BigInt(gid), BigInt(oid), performance.now());
+    if (seq.jump) log(`obj jump [${t}]: ${seq.jump}`);
     // One line per sweep: a multi-group gap expires every id it opened at once.
-    if (lost) {
-      s.lost += lost;
-      log(`obj lost [${t}]: ${lost} from ${firstKey}`);
-    }
+    if (seq.lost) log(`obj lost [${t}]: ${seq.lost} from ${seq.firstLostKey}`);
   };
 
   // Arrival and CMAF video timeline trace, at most four lines a second: an
@@ -1235,6 +1170,26 @@ async function main(): Promise<void> {
       latP95Samples[i] = inWindow.length ? percentile(inWindow, 0.95) : NaN;
     }
   };
+  /** Start of the current picture freeze (performance.now()), or null while it moves. */
+  let frozenSinceMs: number | null = null;
+  const freezeWatch = new FreezeWatch();
+  /** Takes back the video latency samples and charted ticks since a freeze began. */
+  const withdrawLatencySince = (sinceMs: number): void => {
+    dropStaleLatency(([t]) => t >= sinceMs, true);
+    for (let i = playoutWindow.length - 1; i >= 0; i--) {
+      if (playoutWindow[i]![0] >= sinceMs) playoutWindow.splice(i, 1);
+    }
+    for (let i = sampleAtMs.length - 1; i >= 0 && sampleAtMs[i]! >= sinceMs; i--) {
+      latP50Samples[i] = NaN;
+      latP95Samples[i] = NaN;
+      latTickMaxSamples[i] = NaN;
+    }
+  };
+  /** Start of the video hole the playhead is in, or null. */
+  const holeAtPlayhead = (t: number): number | null => {
+    for (const [a, b] of videoHolesSeen.values()) if (t >= a && t < b && !holeSkipped(a)) return a;
+    return null;
+  };
   (player as any).engine?.on('timeline_jump', (e: any) => {
     log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
     dropStaleLatency(([, , g]) => g !== undefined && g < e.toGroupId, e.mediaType === 'video');
@@ -1250,6 +1205,9 @@ async function main(): Promise<void> {
     dropStaleLatency(([, , g]) => g !== undefined && g < jump.group, true);
     dropStaleLatency(([t]) => t < jump.atMs, false);
   });
+  // A new subscription restarts the track's ids: groups published across the
+  // outage or switch were never requested, so they are not loss.
+  (player as any).engine?.on('track_subscribed', (e: any) => rebaseSeqs(objSeq, e.mediaType));
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
@@ -1300,7 +1258,8 @@ async function main(): Promise<void> {
       // Kept whatever the sign: a publisher stamping ahead of its own clock,
       // or an unsynchronised pair of machines, is an offset the tick removes.
       // Only a stamp too far out to be a clock difference is dropped.
-      if (Math.abs(latencyMs) < 120_000) {
+      // Arrivals go on while the picture is frozen; they are not what is on screen.
+      if (Math.abs(latencyMs) < 120_000 && frozenSinceMs === null) {
         const now = performance.now();
         const sample: [number, number, bigint | undefined] = [now, latencyMs, latGroup];
         latWindow.push(sample);
@@ -1505,6 +1464,24 @@ async function main(): Promise<void> {
     // measure that throttle, so they skip it; latency and jitter come from arrivals.
     const hidden = document.hidden;
 
+    // The playhead is watched on MSE only, while it should be moving.
+    const engStats = eng?.stats;
+    const videoEl = byKind ? playerContainer.querySelector('video') : null;
+    const watchPlayhead = videoEl !== null && !hidden && player.state === 'playing'
+      && engStats?.timeToFirstFrameMs != null;
+    const freezeSince = freezeWatch.update({
+      nowMs: tickNowMs,
+      ongoingStallMs: engStats?.ongoingStallMs ?? 0,
+      playheadSec: watchPlayhead ? videoEl.currentTime : null,
+      playbackRate: videoEl?.playbackRate ?? 1,
+      holeStartSec: watchPlayhead ? holeAtPlayhead(videoEl.currentTime) : null,
+    });
+    if (freezeSince !== null && (frozenSinceMs === null || freezeSince < frozenSinceMs)) {
+      withdrawLatencySince(freezeSince);
+    }
+    frozenSinceMs = freezeSince;
+    const frozen = frozenSinceMs !== null;
+
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
     while (latHistory.length && tickNowMs - latHistory[0]![0] > CHART_SPAN_MS + LAT_WINDOW_MS) latHistory.shift();
@@ -1526,19 +1503,19 @@ async function main(): Promise<void> {
     // MSE plays behind its buffered end, so on screen is roughly arrival plus that buffer.
     // The buffered-ahead term is a sawtooth between appends: report its p50
     // over the chart's window, as the drawn-frame E2E is on LOC.
-    if (byKind && latVals.length) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
+    if (byKind && latVals.length && !frozen) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
     while (playoutWindow.length && tickNowMs - playoutWindow[0]![0] > LAT_WINDOW_MS) playoutWindow.shift();
     cmafPlayoutMs = playoutWindow.length ? percentile(playoutWindow.map(([, v]) => v), 0.5) : null;
     while (screenWindow.length && tickNowMs - screenWindow[0]![0] > LAT_WINDOW_MS) screenWindow.shift();
     const screenVals = screenWindow.map(([, v]) => v - driftCorrectionMs);
     // Every series takes a value on every tick, NaN where there is nothing to
     // report, so all of them index the same sample times.
-    const have = latVals.length > 0;
+    const have = latVals.length > 0 && !frozen;
     const queued = player.state !== 'idle' && !hidden;
     sampleAtMs.push(tickNowMs);
     latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
     latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
-    latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) ? tickWorstRawMs - driftCorrectionMs : NaN);
+    latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) && !frozen ? tickWorstRawMs - driftCorrectionMs : NaN);
     jitSamples.push(prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
     queuedASamples.push(queued ? (aMs ?? NaN) : NaN);
     queuedVSamples.push(queued ? (vMs ?? NaN) : NaN);
@@ -1619,14 +1596,16 @@ async function main(): Promise<void> {
       }
     }
 
-    latVal.textContent = latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
-    latP95.textContent = latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
+    // Nothing is on screen to be late: a figure here would describe arrivals only.
+    const STALLED = 'stalled';
+    latVal.textContent = frozen ? STALLED : latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
+    latP95.textContent = frozen ? STALLED : latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
     const clockOffset = referenceClock.offset;
     latKind.textContent = relativeDelay ? 'relative delay' : 'latency';
-    latScreen.textContent = relativeDelay ? '—'
+    latScreen.textContent = frozen ? STALLED : relativeDelay ? '—'
       : screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
       : cmafPlayoutMs != null ? `≈${cmafPlayoutMs.toFixed(0)}` : '—';
-    latMax.textContent = peakMs?.toFixed(0) ?? '—';
+    latMax.textContent = frozen ? STALLED : peakMs?.toFixed(0) ?? '—';
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
@@ -1831,7 +1810,7 @@ async function main(): Promise<void> {
     if (!pausedByUser) return;
     pausedByUser = false;
     // Delivery stops while paused: neither the skipped ids nor the buffered hole is loss.
-    for (const s of Object.values(objSeq)) s.rebase = true;
+    rebaseSeqs(objSeq);
     const ranges: Array<[number, number]> | undefined =
       (player as any).engine?.mediaSource?.bufferedRanges?.('video');
     if (ranges?.length) noteSkippedHole(ranges[ranges.length - 1]![1]);
