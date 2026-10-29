@@ -375,6 +375,7 @@ export class Player {
       audioCodec: s.currentAudioCodec ?? null,
       sessionAgeMs: s.sessionAgeMs,
       stallDurationMs: s.totalStallDurationMs,
+      ongoingStallMs: s.ongoingStallMs,
       gapCount: s.gapCount,
       avSkewMs: s.avSkewEwmaMs ?? null,
       cushionMs: this.cushionMs(),

@@ -4379,6 +4379,7 @@ export class MoqtPlayer {
     // cancelled inside CommandDispatcher.flush() below; CMAF needs its own
     // call, and it must land before the resets.
     this.mediaSource?.cancelStallEpisode?.();
+    this._stats.cancelStall();
 
     // Reset playback pipelines — flush jitter buffer, decoder state, sync reference.
     // §9.11.1: "it might still receive Objects outside the new range if the
@@ -6288,6 +6289,7 @@ export class MoqtPlayer {
     }
     attempt(() => this.mediaSource?.setPlaybackIntent?.(false));
     attempt(() => this.commandDispatcher?.flush());
+    attempt(() => this._stats.cancelStall());
 
     // Both publications are attempted, even if a listener throws. State comes
     // first so a re-entrant destroy cannot publish ENDED before this ERROR.
@@ -9099,6 +9101,7 @@ export class MoqtPlayer {
     this.cmafVideoSynced = false;
     for (const decoder of this.locmafDecoders.values()) decoder.reset();
     ms.rebuild();
+    this._stats.cancelStall();
     this.mseRebuildAwaitingFrame = true;
     this.maybeApplyCmafInit();
     this.emitError(createPlayerError(

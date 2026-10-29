@@ -131,6 +131,11 @@ export interface PlayerStats {
    * once.
    */
   readonly totalStallDurationMs: number;
+  /**
+   * Elapsed time of a detected stall still in progress (ms); 0 when none.
+   * Not included in `totalStallDurationMs` until the episode completes.
+   */
+  readonly ongoingStallMs: number;
   /** Number of decode errors. */
   readonly decodeErrorCount: number;
   /** Number of recovery actions taken. */
@@ -254,6 +259,8 @@ export class StatsAccumulator {
   private _gapJumpCount = 0;
   private _locmafObjectsRejected = 0;
   private _totalStallDurationMs = 0;
+  /** Onset (Date.now()) of the detected, not yet ended stall episode. */
+  private _stallOnsetMs: number | null = null;
   private _decodeErrorCount = 0;
   private _recoveryActionCount = 0;
 
@@ -401,10 +408,10 @@ export class StatsAccumulator {
     this._locmafObjectsRejected++;
   }
 
-  /** Record a playback stall. */
+  /** Record a playback stall detected `durationMs` after its onset. */
   recordStall(durationMs: number): void {
-    void durationMs; // elapsed at detection, not the outage length
     this._stallCount++;
+    this._stallOnsetMs ??= Date.now() - Math.max(0, durationMs);
   }
 
   /**
@@ -418,6 +425,12 @@ export class StatsAccumulator {
    */
   recordStallRecovered(durationMs: number): void {
     this._totalStallDurationMs += durationMs;
+    this._stallOnsetMs = null;
+  }
+
+  /** End a detected episode without completing it (pause, seek, rebuild, teardown). */
+  cancelStall(): void {
+    this._stallOnsetMs = null;
   }
 
   /**
@@ -426,14 +439,15 @@ export class StatsAccumulator {
    * The gap-jump path reports the span from stall onset to the seek attempt,
    * which has genuinely elapsed — unlike ordinary detection, whose value is a
    * fixed latency into an outage that is still running. It counts and
-   * contributes in one call, preserving the aggregate this path had before
-   * detection and completion were separated.
+   * contributes in one call. When it ends an episode already counted at
+   * detection, it only completes that episode: one outage counts once.
    *
    * It is NOT proof that the landing recovered; the gap-attempt lifecycle is
    * deliberately unmodelled here, so no completion event is published.
    */
   recordResolvedStall(durationMs: number): void {
-    this._stallCount++;
+    if (this._stallOnsetMs === null) this._stallCount++;
+    this._stallOnsetMs = null;
     this._totalStallDurationMs += durationMs;
   }
 
@@ -503,6 +517,7 @@ export class StatsAccumulator {
 
   /** Mark end of active playback segment. */
   recordPlayStop(): void {
+    this._stallOnsetMs = null;
     if (this._playing && this._playSegmentStartMs !== null) {
       this._accumulatedPlayMs += Date.now() - this._playSegmentStartMs;
       this._playSegmentStartMs = null;
@@ -589,6 +604,7 @@ export class StatsAccumulator {
       gapJumpCount: this._gapJumpCount,
       locmafObjectsRejected: this._locmafObjectsRejected,
       totalStallDurationMs: this._totalStallDurationMs,
+      ongoingStallMs: this._stallOnsetMs === null ? 0 : Math.max(0, now - this._stallOnsetMs),
       decodeErrorCount: this._decodeErrorCount,
       recoveryActionCount: this._recoveryActionCount,
 
