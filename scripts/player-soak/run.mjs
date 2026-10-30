@@ -245,7 +245,7 @@ async function runMtt(browser, webUrl, cases) {
   const worker = async () => {
     for (let g = queue.shift(); g; g = queue.shift()) {
       const plays = g.relayInfo.playDrafts.map((draft) => ({
-        name: `mtt-${g.id ?? g.packaging}-${g.relay}-d${draft}`, url: g.relayInfo.url, namespace: g.namespace, draft,
+        name: `mtt-${g.id ?? g.packaging}-${g.relay}-d${draft}`, url: g.relayInfo.url, draft,
         packaging: g.packaging, expected: g.expected ?? cases.mttExpected,
       }));
       let job;
@@ -253,9 +253,11 @@ async function runMtt(browser, webUrl, cases) {
         const ttl = Math.ceil(plays.length * (minutes + 2) * 60) + 300;
         job = await client.start({ namespace: g.namespace, relay: g.relay, draft: g.relayInfo.publishDraft, mode: 'publish', ttl_s: ttl },
           { log: (m) => log(g.relay, g.packaging, m) });
-        log(g.relay, g.packaging, `job ${job.id} ${job.joined ? 'joined' : 'started'}`);
+        // The service publishes under its own (shortest) form of the namespace.
+        const namespace = job.namespace ?? g.namespace;
+        log(g.relay, g.packaging, `job ${job.id} ${job.joined ? 'joined' : 'started'}: ${namespace}`);
         await client.waitRunning(job.id);
-        for (const p of plays) results.push(await playCase(browser, webUrl, p));
+        for (const p of plays) results.push(await playCase(browser, webUrl, { ...p, namespace }));
       } catch (error) {
         for (const p of plays) results.push({ name: p.name, verdict: 'error', error: String(error).slice(0, 500) });
       } finally {
