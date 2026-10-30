@@ -187,6 +187,8 @@ export interface MoqtObjectData {
   /** `performance.now()` when assembly began: the read that ended the previous object,
    *  or read-loop entry for the first. Set on subgroup streams only. */
   readonly socketFirstMs?: number;
+  /** `performance.now()` when the read carrying this object's first byte resolved. */
+  readonly socketStartMs?: number;
   /** `performance.now()` when the read that completed this object resolved. */
   readonly socketLastMs?: number;
   /** Time between those two readings spent in the read loop rather than awaiting a read. */

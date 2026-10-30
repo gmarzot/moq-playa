@@ -9601,11 +9601,10 @@ describe('MoqtPlayer', () => {
       // Enough healthy renders to clear videoRecoveryActive
       simulateRenderedFrames(5);
 
-      // Advance 10s (total 18s) — still within 15s of the stall at t=8
-      advanceClock(10_000_000);
+      // 3s after the stall at t=8 — inside the 5s live upshift wait
+      advanceClock(3_000_000);
       player.tick();
 
-      // No upshift: stall timestamp is too recent (8s + 10s = 18s, stall at 8s, delta = 10s < 15s)
       expect(hasSubscribeTo('video-0')).toBe(false);
       // No downshift either
       expect(hasSubscribeTo('video-2')).toBe(false);
@@ -9624,7 +9623,7 @@ describe('MoqtPlayer', () => {
       });
       simulateRenderedFrames(10);
 
-      advanceClock(10_000_000); // 10s after abandon — within 15s window
+      advanceClock(3_000_000); // inside the 5s live upshift wait
       player.tick();
 
       expect(hasSubscribeTo('video-0')).toBe(false);
@@ -9677,7 +9676,7 @@ describe('MoqtPlayer', () => {
       simulateRenderedFrames(10);
 
       const subsBefore = (adapter.subscribe as any).mock.calls.length;
-      advanceClock(10_000_000); // 10s after pressure — within 15s window
+      advanceClock(3_000_000); // inside the 5s live upshift wait
       player.tick();
 
       expect(hasSubscribeTo('video-0', subsBefore)).toBe(false);
@@ -10403,6 +10402,139 @@ describe('MoqtPlayer', () => {
       // Controller should still be at v0
       expect(qc.currentVideoTrack?.name).toBe('v0');
       expect(qc.currentIndex).toBe(0);
+    });
+    describe('live link rate', () => {
+      let clockUs = 0;
+      const clock = { now: () => clockUs };
+      const S = 1_000_000;
+
+      async function loadLive(bufferAheadUs: number) {
+        clockUs = 0;
+        const adapter = createMockAdapter();
+        const ms = createMockMediaSource(bufferAheadUs);
+        const player = new MoqtPlayer({
+          url: 'https://relay.example.com/moq',
+          namespace: 'live/broadcast',
+          createTransport: vi.fn(async () => ({}) as any),
+          createConnection: () => adapter as unknown as MoqtConnection,
+          catalogBootstrap: 'subscribe',
+          clock,
+          createMediaSource: () => ms as any,
+          createCmafAssembler: () => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
+          qualitySwitchCooldownMs: 1,
+        });
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+        ackCatalog(adapter);
+        adapter._triggerObject(0n, {
+          kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+          payload: new TextEncoder().encode(CMAF_ABR_CATALOG),
+        } as MoqtObject);
+        await new Promise(r => setTimeout(r, 0));
+        expect((player as any).qualityController.currentVideoTrack?.name).toBe('video-1');
+        const subsBefore = (adapter.subscribe as any).mock.calls.length;
+        const subscribedTo = (name: string): boolean => (adapter.subscribe as any).mock.calls.slice(subsBefore)
+          .some((c: any) => { try { return new TextDecoder().decode(c[1]) === name; } catch { return false; } });
+        return { player, subscribedTo };
+      }
+
+      /** Large objects that each took the time `kbps` implies from first to last byte. */
+      function timeObjects(player: MoqtPlayer, kbps: number, count = 3): void {
+        const bytes = 100_000;
+        for (let i = 0; i < count; i++) {
+          (player as any).recordDeliverySpans({
+            kind: 'data', payload: new Uint8Array(bytes),
+            socketFirstMs: 0, socketStartMs: 100, socketLastMs: 100 + (bytes * 8) / kbps, assemblyBusyMs: 0,
+          });
+        }
+      }
+
+      it('a thin buffer with link headroom holds instead of downshifting', async () => {
+        const { player, subscribedTo } = await loadLive(400_000);
+        clockUs = 1 * S;
+        timeObjects(player, 20_000);
+        for (let i = 0; i < 3; i++) player.tick();
+        expect(subscribedTo('video-2')).toBe(false);
+        expect(subscribedTo('video-0')).toBe(false);
+        await player.destroy();
+      });
+
+      it('a thin buffer holds until there is a rate, then downshifts on a slow link', async () => {
+        const { player, subscribedTo } = await loadLive(400_000);
+        clockUs = 1 * S;
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(false);
+        timeObjects(player, 1_000);
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(true);
+        await player.destroy();
+      });
+
+      it('an arrival rate near the current bitrate does not step down a live stream', async () => {
+        const { player, subscribedTo } = await loadLive(400_000);
+        const est = (player as any).bandwidthEstimator;
+        // 1.6 Mbps arrival on the 1.5 Mbps level: the publisher's pace, not the link's limit.
+        for (let i = 0; i < 8; i++) est.recordGroup(20_000, (i + 1) * 100_000);
+        clockUs = 1 * S;
+        player.tick();
+        expect(est.getEstimateKbps()).toBeGreaterThan(0);
+        expect(subscribedTo('video-2')).toBe(false);
+        await player.destroy();
+      });
+
+      it('upshifts at a sub-second buffer once the 5 s live wait has passed', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        clockUs = 4 * S;
+        timeObjects(player, 20_000);
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        clockUs = 6 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(true);
+        await player.destroy();
+      });
+
+      it('holds inside the hysteresis band: room to stay, not to climb', async () => {
+        // 5 Mbps: above 1.5x the 1.5 Mbps level, below 2.25x the 3 Mbps one.
+        const { player, subscribedTo } = await loadLive(400_000);
+        clockUs = 10 * S;
+        timeObjects(player, 5_000);
+        for (let i = 0; i < 3; i++) player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        expect(subscribedTo('video-2')).toBe(false);
+        await player.destroy();
+      });
+
+      it('no upshift without link-rate samples', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        clockUs = 10 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        await player.destroy();
+      });
+
+      it('a downshift soon after an upshift doubles the live wait, up to 2 min', async () => {
+        const { player } = await loadLive(500_000);
+        const p = player as any;
+        expect(p.abrUpshiftWaitUs(true, 10 * S)).toBe(5 * S);
+        expect(p.abrUpshiftWaitUs(false, 10 * S)).toBe(15 * S);
+        let t = 10 * S;
+        for (const waitS of [10, 20, 40, 80, 120, 120]) {
+          p.lastAbrUpshiftUs = t;
+          t += 20 * S;
+          p.noteAbrDownshift(t);
+          expect(p.abrUpshiftWaitUs(true, t)).toBe(waitS * S);
+        }
+        // Past the 30 s trial, a downshift is not the upshift's failure.
+        p.lastAbrUpshiftUs = t;
+        t += 31 * S;
+        p.noteAbrDownshift(t);
+        expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
+        // Two minutes without a downshift restore the base wait.
+        expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(5 * S);
+        await player.destroy();
+      });
     });
   });
 });

@@ -6586,8 +6586,11 @@ export class MoqtPlayer {
   }
 
   private recordDeliverySpans(obj: MoqtObjectData): void {
-    const { socketFirstMs, socketLastMs, assemblyBusyMs } = obj;
+    const { socketFirstMs, socketStartMs, socketLastMs, assemblyBusyMs } = obj;
     if (socketFirstMs === undefined || socketLastMs === undefined) return;
+    if (socketStartMs !== undefined) {
+      this.bandwidthEstimator?.recordBurst(obj.payload?.byteLength ?? 0, socketLastMs - socketStartMs, this.clock.now());
+    }
     const assemblyMs = assemblyBusyMs ?? 0;
     this.deliverySpans.unshift({
       // Socket span less read-loop work.
@@ -6633,8 +6636,18 @@ export class MoqtPlayer {
   /** Throttle for sync_skew diagnostic events (~1/s). */
   private lastSkewEmitMs = 0;
 
+  private static readonly ABR_LIVE_UPSHIFT_WAIT_US = 5_000_000;
+  private static readonly ABR_UPSHIFT_WAIT_MAX_US = 120_000_000;
+  /** A downshift this soon after an ABR upshift fails the upshift. */
+  private static readonly ABR_UPSHIFT_TRIAL_US = 30_000_000;
   /** Timestamp of last ABR downshift — gates upshift for stability. */
   private lastAbrDownshiftUs = 0;
+  /** Timestamp of the last ABR upshift still on trial; 0 when none. */
+  private lastAbrUpshiftUs = 0;
+  /** Live upshift wait; doubles on each failed upshift. */
+  private liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
+  /** Timestamp (µs) of last MSE stall — gates live CMAF upshift. */
+  private lastMseStallUs = 0;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
   private lastLocStallUs = 0;
   /** Timestamp (µs) of last video decode error — gates LOC upshift. */
@@ -6663,9 +6676,29 @@ export class MoqtPlayer {
   private static readonly STALL_PARK_MS = 1_500;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
 
-  private isLocDeliveryHealthy(): boolean {
+  /** Healthy time required before an upshift: fixed on VOD, backed off on live. */
+  private abrUpshiftWaitUs(live: boolean, now: number): number {
+    if (!live) return MoqtPlayer.ABR_UPSHIFT_STABILITY_US;
+    if (now - this.lastAbrDownshiftUs >= MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US) {
+      this.liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
+    }
+    return this.liveUpshiftWaitUs;
+  }
+
+  private noteAbrDownshift(now: number): void {
+    this.lastAbrDownshiftUs = now;
+    if (this.lastAbrUpshiftUs > 0 && now - this.lastAbrUpshiftUs < MoqtPlayer.ABR_UPSHIFT_TRIAL_US) {
+      this.liveUpshiftWaitUs = Math.min(this.liveUpshiftWaitUs * 2, MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US);
+    }
+    this.lastAbrUpshiftUs = 0;
+  }
+
+  private isMseDeliveryHealthy(now: number, windowUs: number): boolean {
+    return now - Math.max(this.lastMseStallUs, this.lastAbrDownshiftUs) >= windowUs;
+  }
+
+  private isLocDeliveryHealthy(window: number): boolean {
     const now = this.clock.now();
-    const window = MoqtPlayer.ABR_UPSHIFT_STABILITY_US;
     const lastBadEvent = Math.max(
       this.lastLocStallUs,
       this.lastLocDecodeErrorUs,
@@ -6685,6 +6718,13 @@ export class MoqtPlayer {
     // switch time to deliver data before deciding to switch again.
     if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) return;
 
+    const now = this.clock.now();
+    const live = this.qualityController.currentVideoTrack?.isLive === true;
+    const upshiftWaitUs = this.abrUpshiftWaitUs(live, now);
+    const arrivalKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+    const linkKbps = live ? (this.bandwidthEstimator?.getBurstKbps(now) ?? 0) : 0;
+    // On live the arrival rate is the publisher's pace; the link rate shows the headroom.
+    const bandwidthKbps = Math.max(arrivalKbps, linkKbps);
     let effectiveBufferUs: number;
 
     if (this.videoPipeline) {
@@ -6692,7 +6732,7 @@ export class MoqtPlayer {
       // cap to hold zone regardless of buffer depth — prevents upshift
       // after stalls, decode errors, or partial group abandonment.
       const bufferedGroups = this.videoPipeline.bufferedGroupCount;
-      const healthy = this.isLocDeliveryHealthy();
+      const healthy = this.isLocDeliveryHealthy(upshiftWaitUs);
       if (!healthy) {
         effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
       } else if (bufferedGroups === 0) {
@@ -6709,28 +6749,26 @@ export class MoqtPlayer {
       // bandwidth can't sustain the current track.
       const bufferUs = this.mediaSource.getBufferAheadUs();
       if (bufferUs === null) return; // no trustworthy signal yet — hold
+      const currentBitrateKbps = this.bufferAbrController.currentTrack?.bitrateKbps ?? 0;
       if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
-      } else if (bufferUs < this.bufferAbrController.lowThresholdUs) {
-        // Thin but not empty — check if bandwidth sustains.
-        // On fast networks MSE buffers are naturally thin; a thin
-        // buffer with high bandwidth is healthy, not starving.
-        const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
-        const currentTrack = this.bufferAbrController.currentTrack;
-        const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
-        effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? this.bufferAbrController.lowThresholdUs
-          : bufferUs;
-      } else {
+      } else if (bufferUs < this.bufferAbrController.lowThresholdUs
+        && !(bandwidthKbps > currentBitrateKbps * 1.5)) {
+        // Live with no link rate yet: arrival alone is the publisher's pace, not a slow link.
+        // An empty buffer or a stall still downshifts.
+        if (live && linkKbps === 0) return;
         effectiveBufferUs = bufferUs;
+      } else if (live && this.isMseDeliveryHealthy(now, upshiftWaitUs)) {
+        // Live holds a sub-second cushion: health and link rate gate the upshift, not depth.
+        effectiveBufferUs = this.bufferAbrController.highThresholdUs;
+      } else {
+        effectiveBufferUs = Math.max(bufferUs, this.bufferAbrController.lowThresholdUs);
       }
     } else {
       effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
     }
-
-    const bandwidthKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
 
     const decision = this.bufferAbrController.evaluate({
       bufferDepthUs: effectiveBufferUs,
@@ -6739,12 +6777,9 @@ export class MoqtPlayer {
 
     if (decision.action === 'hold') return;
 
-    // Block upshift for 15s after any downshift — prevents oscillation
+    // Block upshift after any downshift — prevents oscillation
     // where a lower-bitrate stream inflates the throughput estimate.
-    if (decision.action === 'upshift') {
-      const sinceDownshift = this.clock.now() - this.lastAbrDownshiftUs;
-      if (sinceDownshift < MoqtPlayer.ABR_UPSHIFT_STABILITY_US) return;
-    }
+    if (decision.action === 'upshift' && now - this.lastAbrDownshiftUs < upshiftWaitUs) return;
 
     const isDown = decision.action === 'downshift';
     const isEmergency = isDown && effectiveBufferUs < this.bufferAbrController.lowThresholdUs;
@@ -6754,10 +6789,11 @@ export class MoqtPlayer {
       : this.qualityController.peekHigherVideoQuality();
 
     if (newTrack) {
-      if (isDown) this.lastAbrDownshiftUs = this.clock.now();
+      if (isDown) this.noteAbrDownshift(now);
+      else this.lastAbrUpshiftUs = now;
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
-        effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      this.log.warn('Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s',
+        effectiveBufferUs / 1_000_000, bandwidthKbps, arrivalKbps, verb, newTrack.name);
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack(newTrack.name, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
@@ -8941,6 +8977,7 @@ export class MoqtPlayer {
         // A media-gap stall is missing SOURCE media the adapter already
         // skipped — not a bandwidth signal. Count it, never downshift on it.
         if (cause === 'media-gap') return;
+        this.lastMseStallUs = this.clock.now();
 
         // Don't cascade downshifts while a switch is already in flight.
         // Each switch needs time for the relay to deliver the new track's
@@ -8953,7 +8990,7 @@ export class MoqtPlayer {
         if (this.qualityController && this.bufferAbrController) {
           const newTrack = this.qualityController.peekLowerVideoQuality(true);
           if (newTrack) {
-            this.lastAbrDownshiftUs = this.clock.now();
+            this.noteAbrDownshift(this.clock.now());
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
             this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
               this.log.warn('Stall downshift to "%s" failed: %s', newTrack.name, err);
