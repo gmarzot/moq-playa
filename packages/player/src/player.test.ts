@@ -10471,6 +10471,18 @@ describe('MoqtPlayer', () => {
         await player.destroy();
       });
 
+      it('an arrival rate near the current bitrate does not step down a live stream', async () => {
+        const { player, subscribedTo } = await loadLive(400_000);
+        const est = (player as any).bandwidthEstimator;
+        // 1.6 Mbps arrival on the 1.5 Mbps level: the publisher's pace, not the link's limit.
+        for (let i = 0; i < 8; i++) est.recordGroup(20_000, (i + 1) * 100_000);
+        clockUs = 1 * S;
+        player.tick();
+        expect(est.getEstimateKbps()).toBeGreaterThan(0);
+        expect(subscribedTo('video-2')).toBe(false);
+        await player.destroy();
+      });
+
       it('upshifts at a sub-second buffer once the 5 s live wait has passed', async () => {
         const { player, subscribedTo } = await loadLive(500_000);
         clockUs = 4 * S;

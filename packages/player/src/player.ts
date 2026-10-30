@@ -6722,10 +6722,9 @@ export class MoqtPlayer {
     const live = this.qualityController.currentVideoTrack?.isLive === true;
     const upshiftWaitUs = this.abrUpshiftWaitUs(live, now);
     const arrivalKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+    const linkKbps = live ? (this.bandwidthEstimator?.getBurstKbps(now) ?? 0) : 0;
     // On live the arrival rate is the publisher's pace; the link rate shows the headroom.
-    const bandwidthKbps = live
-      ? Math.max(arrivalKbps, this.bandwidthEstimator?.getBurstKbps(now) ?? 0)
-      : arrivalKbps;
+    const bandwidthKbps = Math.max(arrivalKbps, linkKbps);
     let effectiveBufferUs: number;
 
     if (this.videoPipeline) {
@@ -6757,8 +6756,9 @@ export class MoqtPlayer {
         effectiveBufferUs = 0;
       } else if (bufferUs < this.bufferAbrController.lowThresholdUs
         && !(bandwidthKbps > currentBitrateKbps * 1.5)) {
-        // Live startup has no rate yet; an empty buffer or a stall still downshifts.
-        if (live && bandwidthKbps === 0) return;
+        // Live with no link rate yet: arrival alone is the publisher's pace, not a slow link.
+        // An empty buffer or a stall still downshifts.
+        if (live && linkKbps === 0) return;
         effectiveBufferUs = bufferUs;
       } else if (live && this.isMseDeliveryHealthy(now, upshiftWaitUs)) {
         // Live holds a sub-second cushion: health and link rate gate the upshift, not depth.
