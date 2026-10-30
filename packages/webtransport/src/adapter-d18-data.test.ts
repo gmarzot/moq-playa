@@ -271,6 +271,39 @@ describe('MoqtConnection(18) subgroup stream delivery', () => {
   });
 });
 
+describe('MoqtConnection(18) subgroup object timing', () => {
+  it('stamps each object\'s first-byte read apart from the wait before it', async () => {
+    const { conn, transport } = await connected();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objects.push(o);
+    let nowMs = 1000;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    try {
+      const second = subgroupObject(0n, [0x02, 0x03, 0x04, 0x05]);
+      const s = transport.openIncomingUni();
+      s.push(concat(subgroupHeader(7n, 42n), subgroupObject(0n, [0x01])));
+      await flush();
+      nowMs = 1100; // idle: the publisher has not sent the next object yet
+      await flush();
+      nowMs = 1200;
+      s.push(second.subarray(0, 3));
+      await flush();
+      nowMs = 1210;
+      s.push(second.subarray(3));
+      await flush();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(objects).toHaveLength(2);
+    const o = objects[1]!;
+    if (o.kind !== 'data') throw new Error('expected data');
+    expect(o.socketFirstMs).toBe(1000);
+    expect(o.socketStartMs).toBe(1200);
+    expect(o.socketLastMs).toBe(1210);
+  });
+});
+
 describe('MoqtConnection(18) datagram delivery', () => {
   it('delivers an object datagram to onDatagram', async () => {
     const { conn, transport } = await connected();

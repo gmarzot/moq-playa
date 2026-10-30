@@ -7777,6 +7777,8 @@ export class MoqtConnection {
     let socketLastMs = performance.now();
     let socketFirstMs = socketLastMs;
     let busyMs = 0;
+    // When the object's first byte arrived; unset while the buffer is empty.
+    let socketStartMs: number | undefined = buf.length > 0 ? socketLastMs : undefined;
 
     while (true) {
       // Gate: see `locallyDiscardedReaders`.
@@ -7836,6 +7838,7 @@ export class MoqtConnection {
                 properties: object.extensions,
                 payload: object.payload,
                 socketFirstMs,
+                socketStartMs: socketStartMs ?? socketLastMs,
                 socketLastMs,
                 assemblyBusyMs: busyMs,
               } satisfies MoqtObjectData;
@@ -7861,6 +7864,7 @@ export class MoqtConnection {
           previousObjectId = object.objectId;
           isFirstObject = false;
           socketFirstMs = socketLastMs; // the next object starts where this ended
+          socketStartMs = buf.length > 0 ? socketLastMs : undefined;
           busyMs = 0;
           continue; // Try to decode another object from remaining buffer
         } catch (e) {
@@ -7906,6 +7910,7 @@ export class MoqtConnection {
         this.onSubgroupFin?.(streamId, header);
         return 'peer-fin';
       }
+      if (socketStartMs === undefined && value.length > 0) socketStartMs = socketLastMs;
       buf = this.appendBuffer(buf, value);
     }
   }
