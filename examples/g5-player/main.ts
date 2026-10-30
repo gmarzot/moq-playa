@@ -1207,8 +1207,11 @@ async function main(): Promise<void> {
   });
   // A new subscription restarts the track's ids: groups published across the
   // outage or switch were never requested, so they are not loss.
-  (player as any).engine?.on('track_subscribed', (e: any) =>
-    rebaseSeqs(objSeq, { dropPending: true, track: e.mediaType }));
+  (player as any).engine?.on('track_subscribed', (e: any) => {
+    rebaseSeqs(objSeq, { dropPending: true, track: e.mediaType });
+    // 'ready' precedes track selection, so the pickers are empty until now.
+    fillTrackPickers();
+  });
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
