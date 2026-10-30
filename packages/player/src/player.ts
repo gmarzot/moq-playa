@@ -6757,6 +6757,8 @@ export class MoqtPlayer {
         effectiveBufferUs = 0;
       } else if (bufferUs < this.bufferAbrController.lowThresholdUs
         && !(bandwidthKbps > currentBitrateKbps * 1.5)) {
+        // Live startup has no rate yet; an empty buffer or a stall still downshifts.
+        if (live && bandwidthKbps === 0) return;
         effectiveBufferUs = bufferUs;
       } else if (live && this.isMseDeliveryHealthy(now, upshiftWaitUs)) {
         // Live holds a sub-second cushion: health and link rate gate the upshift, not depth.

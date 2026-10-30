@@ -10460,9 +10460,12 @@ describe('MoqtPlayer', () => {
         await player.destroy();
       });
 
-      it('a thin buffer without link-rate evidence still downshifts', async () => {
+      it('a thin buffer holds until there is a rate, then downshifts on a slow link', async () => {
         const { player, subscribedTo } = await loadLive(400_000);
         clockUs = 1 * S;
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(false);
+        timeObjects(player, 1_000);
         player.tick();
         expect(subscribedTo('video-2')).toBe(true);
         await player.destroy();
