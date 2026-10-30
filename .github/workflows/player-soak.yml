@@ -29,7 +29,7 @@ on:
   # A change to the soak itself gets a one-minute smoke run; PRs into dev only, so
   # dev's tracking PR does not rerun it (and restart test-track jobs) on every merge.
   pull_request:
-    branches: [gmarzot-playa-dev]
+    branches: [gmarzot-g5-dev]
     paths:
       - 'scripts/player-soak/**'
       - '.github/workflows/player-soak.yml'
