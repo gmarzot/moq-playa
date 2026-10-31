@@ -163,6 +163,28 @@
       background: #333; color: #eee; border: 1px solid #555;
       padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
     }
+    .controls #view { min-width: 0; max-width: 200px; flex: 0 1 auto; text-overflow: ellipsis; }
+
+    /* Gear menu: track choices and connection settings, above the bar at its right. */
+    .menu-wrap { position: relative; flex-shrink: 0; }
+    .controls #menu-btn { font-size: 1.15rem; padding: 4px 10px; }
+    .menu {
+      position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 20;
+      display: flex; flex-direction: column; gap: 8px; min-width: 240px;
+      background: #1a1a2e; border: 1px solid #3a3a52; border-radius: 8px;
+      padding: 10px 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, .5);
+    }
+    .menu[hidden], .menu-row[hidden] { display: none; }
+    .menu-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      font-size: .85rem; color: #aab;
+    }
+    .menu-row select { max-width: 170px; }
+    .menu .menu-item {
+      text-align: left; background: none; border: none; border-top: 1px solid #2a2a40;
+      border-radius: 0; padding: 8px 0 2px; color: #bbb; font-size: .85rem;
+    }
+    .menu .menu-item:hover { background: none; color: #fff; }
 
     /* Diagnostics strip — always visible beneath the playback window */
     .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
@@ -308,12 +330,12 @@
     .badge.bad { color: #e55; border-color: #5a2f2f; background: #271616; }
     .cat-track .badge { margin-left: auto; }
     .cat-badges { display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto; }
+    /* At most half the panel, so the JSON keeps room; long catalogs scroll. */
     .cat-tracks {
-      display: grid; gap: 6px; margin-top: 10px; flex-shrink: 0;
+      display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin-top: 10px;
+      flex-shrink: 0; max-height: 50%; overflow-y: auto;
       font-size: 1rem; font-variant-numeric: tabular-nums;
     }
-    /* Name and badge hold their line; the detail wraps under them rather than
-       scrolling the panel sideways. Nothing is clipped either way. */
     /* One line per track: the summary ellipsises rather than wrapping under
        the name, so every track row is the same height. */
     .cat-track {
@@ -326,7 +348,7 @@
       min-width: 0; white-space: nowrap;
       overflow: hidden; text-overflow: ellipsis;
     }
-    .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; }
+    .cat-track .nm { color: #eee; font-weight: 700; min-width: 44px; white-space: nowrap; flex-shrink: 0; }
     .cat-track.audio .dt { color: #6cf; }
     .cat-track.video .dt { color: #a98cf0; }
     .cat-json {
@@ -451,11 +473,17 @@
         <button id="mute-btn" disabled>Mute</button>
         <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100">
       </div>
-      <select id="program" title="Program" hidden></select>
       <select id="view" title="View" hidden></select>
-      <select id="lang" title="Audio language" hidden></select>
-      <select id="quality" disabled><option>Auto</option></select>
-      <button id="settings-btn" class="mini" type="button" title="Connection settings">⚙ settings</button>
+      <div class="menu-wrap">
+        <button id="menu-btn" class="mini" type="button" title="Quality, audio and settings"
+          aria-haspopup="true" aria-expanded="false">⚙</button>
+        <div id="menu" class="menu" hidden>
+          <label class="menu-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
+          <label class="menu-row" hidden>Language <select id="lang"></select></label>
+          <label class="menu-row" hidden>Program <select id="program"></select></label>
+          <button id="settings-btn" class="menu-item" type="button">Connection settings…</button>
+        </div>
+      </div>
       <button id="cat-restore" class="mini" hidden>catalog</button>
     </div>
     </div>
