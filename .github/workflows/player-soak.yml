@@ -25,8 +25,8 @@ on:
         description: Minutes per broadcast under an adverse profile
         default: '3'
   schedule:
-    # GitHub starts this 6-7 h late; 21:00 lands it around 03:30 UTC.
-    - cron: '0 21 * * *'
+    # On time or at GitHub's usual 6-7 h delay, 03:17 starts inside the guard's 01:00-11:00 window.
+    - cron: '17 3 * * *'
   # A change to the soak itself gets a one-minute smoke run; PRs into dev only, so
   # dev's tracking PR does not rerun it (and restart test-track jobs) on every merge.
   pull_request:
