@@ -216,9 +216,10 @@
     }
     h1 .conn > span { margin-right: 14px; }
     h1 .conn > span:last-of-type { margin-right: 0; }
+    /* Long URLs and namespaces break anywhere rather than run off a narrow screen. */
     h1 .conn b {
       color: var(--link); font-weight: 700;
-      text-transform: none; letter-spacing: 0;
+      text-transform: none; letter-spacing: 0; overflow-wrap: anywhere;
     }
     h1 .conn b.copyable { cursor: copy; position: relative; }
     h1 .conn b.copyable:hover { text-decoration: underline dotted; }
@@ -561,11 +562,15 @@
        keys set the volume, so its slider goes. */
     @media (max-width: 600px) {
       .wrapper { padding: 16px 12px; }
-      .controls { flex-wrap: wrap; gap: 10px 8px; }
+      /* The menu anchors to the whole bar, so it stays on screen wherever the gear wraps. */
+      .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
+      .menu-wrap { position: static; }
+      .menu { max-width: 100%; }
       .seek-bar { order: -1; flex: 1 0 100%; }
-      .controls #view { flex: 1 1 0; }
+      .controls #view { flex: 1 1 0; min-width: 7em; }
       .volume-bar { display: none; }
       .controls > button:not(.mini), .volume-group button { padding: 6px 14px; }
+      .controls button, .controls select { min-height: 40px; }
       .cat-head .chart-label { white-space: normal; }
     }
 
