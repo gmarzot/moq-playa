@@ -2841,6 +2841,8 @@ export class MoqtPlayer {
     reason: string = 'manual',
     abrAction?: 'downshift' | 'upshift',
   ): Promise<void> {
+    // A recovery step-down fails an upshift on trial, as an ABR downshift does.
+    if (reason === 'recovery') this.noteAbrDownshift(this.clock.now());
     // One video switch at a time: a second one (ABR, recovery, view, program,
     // manual) racing the first through its awaits would overwrite the pending
     // switch and orphan a subscription.
@@ -3286,6 +3288,8 @@ export class MoqtPlayer {
     // Commit QualityController to the new track index (and view / program).
     const fromProgram = this.qualityController?.currentProgram;
     this.qualityController?.commitVideoTrack(sw.newTrackName);
+    // An ABR upshift goes on trial when it commits; a refused one never does.
+    if (sw.abrAction === 'upshift') this.lastAbrUpshiftUs = this.clock.now();
     this.syncBufferAbrController();
     this.emitter.emit('quality_switched', {
       type: 'quality_switched',
@@ -6790,7 +6794,6 @@ export class MoqtPlayer {
 
     if (newTrack) {
       if (isDown) this.noteAbrDownshift(now);
-      else this.lastAbrUpshiftUs = now;
       const verb = isDown ? 'downshift' : 'upshift';
       this.log.warn('Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s',
         effectiveBufferUs / 1_000_000, bandwidthKbps, arrivalKbps, verb, newTrack.name);
