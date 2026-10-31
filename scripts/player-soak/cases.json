@@ -45,7 +45,7 @@
       "relay": "moqx-main",
       "id": "bbb_4k60",
       "packaging": "cmaf",
-      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/60/6750/2000/0/aac/2/128/1/0/clip/0",
+      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/clip/msf/cmaf/h264/1080/60/aac/2",
       "expected": {
         "videoWidth": 1920,
         "videoHeight": 1080,
@@ -56,7 +56,7 @@
       "relay": "moqx-main",
       "id": "akamai_cmaf",
       "packaging": "loc",
-      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/msf/loc/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clip/0",
+      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/clip/msf/loc/h264/720/30/aac/2",
       "expected": {
         "videoWidth": 1280,
         "videoHeight": 720,
@@ -67,7 +67,7 @@
       "relay": "aiomoqt-relay",
       "id": "bbb_4k60",
       "packaging": "cmaf",
-      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/60/6750/2000/0/aac/2/128/1/0/clip/0",
+      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/clip/msf/cmaf/h264/1080/60/aac/2",
       "expected": {
         "videoWidth": 1920,
         "videoHeight": 1080,
@@ -78,7 +78,7 @@
       "relay": "aiomoqt-relay",
       "id": "akamai_cmaf",
       "packaging": "loc",
-      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/msf/loc/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clip/0",
+      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/clip/msf/loc/h264/720/30/aac/2",
       "expected": {
         "videoWidth": 1280,
         "videoHeight": 720,
@@ -86,7 +86,7 @@
       }
     }
   ],
-  "mttNamespace": "openmoq/mtt/aiomoqt/moq_test_tracks_00/msf/{packaging}/catalog/h264/720/30/2500/2000/0/aac/2/128/1/0/clock/0",
+  "mttNamespace": "openmoq/mtt/aiomoqt/moq_test_tracks_00/clock/msf/{packaging}/h264/720/30/aac/2",
   "mttExpected": {
     "videoWidth": 1280,
     "videoHeight": 720,
