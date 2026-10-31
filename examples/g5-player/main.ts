@@ -69,6 +69,12 @@ const qualitySelect = document.getElementById('quality') as HTMLSelectElement;
 const programSelect = document.getElementById('program') as HTMLSelectElement;
 const viewSelect = document.getElementById('view') as HTMLSelectElement;
 const langSelect = document.getElementById('lang') as HTMLSelectElement;
+const menuBtn = document.getElementById('menu-btn') as HTMLButtonElement;
+const menu = document.getElementById('menu')!;
+function setMenuOpen(open: boolean): void {
+  menu.hidden = !open;
+  menuBtn.setAttribute('aria-expanded', String(open));
+}
 const stateBadge = document.getElementById('state')!;
 stateBadge.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
@@ -191,7 +197,11 @@ function log(msg: string): void {
     advSec.open = MANAGED.slice(3).some((k) => p.has(k));
   }
 
-  byId('settings-btn').addEventListener('click', () => { populate(); backdrop.classList.add('visible'); });
+  byId('settings-btn').addEventListener('click', () => {
+    setMenuOpen(false);
+    populate();
+    backdrop.classList.add('visible');
+  });
   byId('set-cancel').addEventListener('click', close);
   backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
   document.addEventListener('keydown', (e) => {
@@ -438,6 +448,7 @@ async function main(): Promise<void> {
       qualitySelect.appendChild(opt);
     }
     qualitySelect.value = player.autoQuality || player.currentLevel < 0 ? 'auto' : String(player.currentLevel);
+    qualitySelect.closest<HTMLElement>('.menu-row')!.hidden = levels.length < 2;
   }
   player.on('levelsloaded', ({ levels }) => fillQuality(levels));
 
@@ -450,7 +461,8 @@ async function main(): Promise<void> {
       return opt;
     }));
     if (current !== undefined) sel.value = current;
-    sel.hidden = options.length < 2;
+    // Menu pickers hide their row; the view picker on the bar hides itself.
+    (sel.closest<HTMLElement>('.menu-row') ?? sel).hidden = options.length < 2;
   }
   function fillTrackPickers(): void {
     const str = (v: number | undefined): string | undefined => (v === undefined ? undefined : String(v));
@@ -1828,6 +1840,14 @@ async function main(): Promise<void> {
   volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
   muteBtn.addEventListener('click', () => player.toggleMute());
   player.on('volumechange', ({ muted }) => { muteBtn.textContent = muted ? 'Unmute' : 'Mute'; });
+
+  // Gear menu: closes on a choice, a click outside or Escape.
+  menuBtn.addEventListener('click', () => setMenuOpen(menu.hidden));
+  menu.addEventListener('change', () => setMenuOpen(false));
+  document.addEventListener('click', (e) => {
+    if (!menu.hidden && !menu.parentElement!.contains(e.target as Node)) setMenuOpen(false);
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenuOpen(false); });
 
   qualitySelect.addEventListener('change', () => {
     const val = qualitySelect.value;
