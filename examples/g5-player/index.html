@@ -28,6 +28,7 @@
       --surface-3: #23233a;
       --chart-bg: #161622;
       --log-bg: #1a1a2e;
+      --card-border: transparent;
       --modal-bg: #1a1a1a;
       --code-bg: #222;
       --video-bg: #000;
@@ -114,8 +115,9 @@
       --surface: #fffaf2;
       --surface-2: #f8f2e8;
       --surface-3: #efe6d8;
-      --chart-bg: #f8f2e8;
-      --log-bg: #f8f2e8;
+      --chart-bg: #fffaf2;
+      --log-bg: #fffaf2;
+      --card-border: #e3d8c6;
       --modal-bg: #fffaf2;
       --code-bg: #efe6d8;
       --tooltip-bg: #2a2420;
@@ -162,7 +164,7 @@
       --json: #3f4f5c;
       --brand: #d9532b;
       --link: #1d7182;
-      --value: #1d7182;
+      --value: #27744a;
       --warn: #996100;
       --notice: #996100;
       --delta: #aa561b;
@@ -459,6 +461,7 @@
     .chart canvas {
       width: 100%; height: 69px; background: var(--chart-bg);
       border-radius: 6px; display: block; margin-top: 4px;
+      outline: 1px solid var(--card-border); outline-offset: -1px;
     }
 
     /* Catalog panel — the MSF/CMSF catalog in display order, redrawn on deltas.
@@ -471,6 +474,7 @@
       display: flex; flex-direction: column;
       background: var(--surface);
       border-radius: 8px; padding: 10px 14px;
+      outline: 1px solid var(--card-border); outline-offset: -1px;
     }
     /* The badges drop under the title when the panel is too narrow for both. */
     .cat-head {
@@ -606,6 +610,7 @@
 
     #log {
       background: var(--log-bg);
+      outline: 1px solid var(--card-border); outline-offset: -1px;
       padding: 12px 16px;
       border-radius: 8px;
       font-family: monospace;
