@@ -6644,7 +6644,7 @@ export class MoqtPlayer {
   private lastAbrDownshiftUs = 0;
   /** Timestamp of the last ABR upshift still on trial; 0 when none. */
   private lastAbrUpshiftUs = 0;
-  /** Live upshift wait; doubles on each failed upshift. */
+  /** Live upshift wait; doubles on each failed upshift, resets once an upshift holds 2 min. */
   private liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
   /** Timestamp (µs) of last MSE stall — gates live CMAF upshift. */
   private lastMseStallUs = 0;
@@ -6679,7 +6679,7 @@ export class MoqtPlayer {
   /** Healthy time required before an upshift: fixed on VOD, backed off on live. */
   private abrUpshiftWaitUs(live: boolean, now: number): number {
     if (!live) return MoqtPlayer.ABR_UPSHIFT_STABILITY_US;
-    if (now - this.lastAbrDownshiftUs >= MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US) {
+    if (this.lastAbrUpshiftUs > 0 && now - this.lastAbrUpshiftUs >= MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US) {
       this.liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
     }
     return this.liveUpshiftWaitUs;

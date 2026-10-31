@@ -10531,8 +10531,27 @@ describe('MoqtPlayer', () => {
         t += 31 * S;
         p.noteAbrDownshift(t);
         expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
-        // Two minutes without a downshift restore the base wait.
+        // Only an upshift that holds two minutes restores the base wait.
+        expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(120 * S);
+        t += 120 * S;
+        p.lastAbrUpshiftUs = t;
+        expect(p.abrUpshiftWaitUs(true, t + 119 * S)).toBe(120 * S);
         expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(5 * S);
+        await player.destroy();
+      });
+
+      it('an upshift at the 2 min cap that falls back keeps the 2 min wait', async () => {
+        const { player } = await loadLive(500_000);
+        const p = player as any;
+        p.liveUpshiftWaitUs = 120 * S;
+        p.noteAbrDownshift(10 * S);
+        let t = 130 * S;
+        expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
+        p.lastAbrUpshiftUs = t;
+        t += 10 * S;
+        p.noteAbrDownshift(t);
+        expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
+        expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(120 * S);
         await player.destroy();
       });
     });
