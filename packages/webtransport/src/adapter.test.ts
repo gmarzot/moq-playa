@@ -1643,7 +1643,7 @@ describe('MoqtConnection', () => {
       expect(nsSm!.state).toBe('terminated');
     });
 
-    it('routes NAMESPACE_DONE and terminates namespace subscription (§6.1)', async () => {
+    it('routes NAMESPACE_DONE as a per-suffix withdrawal; the subscription stays active (§10.17)', async () => {
       const mock = createMockTransport();
       const adapter = await connectAdapter(mock);
 
@@ -1674,7 +1674,8 @@ describe('MoqtConnection', () => {
       await deepFlush();
 
       const nsSm = adapter.session.getNamespaceSubscription(requestId);
-      expect(nsSm!.state).toBe('terminated');
+      expect(nsSm!.state).toBe('active');
+      expect(nsSm!.discoveredNamespaces.length).toBe(0);
     });
 
     it('closes session on unexpected message type on namespace stream', async () => {
@@ -4856,15 +4857,15 @@ describe('MoqtConnection draft-14', () => {
         await flush();
 
         const internals = adapter as unknown as {
-          abortPublisherStreamsForRequest(requestId: bigint): Promise<boolean>;
+          abortPublisherStreamsForRequest(requestId: bigint): Promise<true | string>;
           outgoingStreams: Map<bigint, unknown>;
           openSubgroupsByRequest: Map<bigint, Set<bigint>>;
         };
         const start = Date.now();
-        const allReset = await internals.abortPublisherStreamsForRequest(1n);
+        const outcome = await internals.abortPublisherStreamsForRequest(1n);
         expect(Date.now() - start).toBeLessThan(4000);
         // The reset could NOT be proven — the caller must not send PUBLISH_DONE.
-        expect(allReset).toBe(false);
+        expect(outcome).toMatch(/aborts still queued after \d+ms/);
         // Ownership transfer still happened synchronously.
         expect(internals.outgoingStreams.has(streamId)).toBe(false);
         expect(internals.openSubgroupsByRequest.has(1n)).toBe(false);

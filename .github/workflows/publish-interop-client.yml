@@ -29,6 +29,8 @@ env:
 
 jobs:
   build-and-push:
+    # Upstream only: a fork's main sync must not rebuild and publish the image.
+    if: github.repository == 'openmoq/moq-playa'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

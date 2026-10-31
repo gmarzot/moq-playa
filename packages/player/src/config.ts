@@ -69,6 +69,9 @@ export interface PlayerAuthorization extends Omit<ConnectionAuthorization, 'rela
 }
 
 /** Connection options. */
+/** Opt-in interop behaviour for a non-conformant relay ({@link ConnectionConfig.compat}). */
+export type PlayerCompat = 'request-credit' | 'empty-objects' | 'loc-bare';
+
 export interface ConnectionConfig {
   /** WebTransport URL to the relay (e.g., "https://relay.example.com/moq"). */
   readonly url: string;
@@ -163,6 +166,18 @@ export interface ConnectionConfig {
   readonly authorization?: PlayerAuthorization;
 
   /**
+   * Opt-in interop behaviours for relays that deviate from the spec; none by
+   * default. Each is logged once when it takes effect and counted.
+   * - `request-credit`: when SERVER_SETUP grants no MAX_REQUEST_ID, send
+   *   requests uncapped until the relay sends one (draft-14/16).
+   * - `empty-objects`: skip empty Normal objects on media tracks instead of
+   *   passing them to the decoder.
+   * - `loc-bare`: LOC payloads are the bare frame, without the leading
+   *   Private Properties block (publishers predating LOC-04 §2.2).
+   */
+  readonly compat?: readonly PlayerCompat[];
+
+  /**
    * MOQT implementation identifier included in CLIENT_SETUP.
    * Default: 'proto-moq'.
    * @see draft-ietf-moq-transport-16 §9.3.1.6
@@ -230,13 +245,35 @@ export interface ConnectionConfig {
    * - `'subscribe'` — the explicitly named COMPATIBILITY escape hatch:
    *   legacy wire behavior (`AbsoluteStart{0,0}` subscription, no fetch),
    *   accepting any catalog profile. Forever reachable.
+   * - `'fetch'` — for relays that serve the catalog only by FETCH: no catalog
+   *   subscription. TRACK_STATUS finds the latest group, fetched with a standalone
+   *   FETCH; failing that, one FETCH of every group newest first. The catalog is
+   *   then fixed for the session (no live updates).
    *
    * Ignored when {@link catalog} is injected (no catalog subscription exists).
    *
    * @see draft-ietf-moq-msf-01 §5
    * @see draft-ietf-moq-transport-16 §9.16.2, draft-ietf-moq-transport-18 §10.12.2
    */
-  readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe';
+  readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | 'fetch';
+
+  /**
+   * Follow {@link namespace} with SUBSCRIBE_NAMESPACE on every session and
+   * report its state (`namespace_state`). When it is published again after
+   * going away — NAMESPACE_DONE, or a track refused as not existing — the
+   * player re-establishes its session, catalog and subscriptions as a
+   * reconnect does. Draft-18 sessions only. Default false.
+   *
+   * @see draft-ietf-moq-transport-18 §10.18
+   */
+  readonly followNamespace?: boolean;
+
+  /**
+   * Recover media while the page is hidden (background tab): resubscribes,
+   * liveness restarts and the media resumed after a reconnect run as when
+   * visible. False holds them until the page is visible. Default true.
+   */
+  readonly autoResume?: boolean;
 }
 
 /** Playback tuning options. */
@@ -305,17 +342,33 @@ export interface PlaybackTuningConfig {
    * boundary. The FETCH and the live subscription are contiguous and
    * non-overlapping by construction (§9.16.2.1).
    *
-   * Scope: initial tune-in only (never ABR switches), live LOC tracks only —
-   * CMAF tracks keep their normal boundary start (MSE append ordering is not
-   * warm-start safe yet) and non-live tracks already start from group 0. A
-   * refused FETCH is non-fatal: playback continues live-only from the next
-   * group boundary.
+   * Live CMAF and LOCMAF video cannot take that backlog through MSE; its
+   * SUBSCRIBE carries NEW_GROUP_REQUEST 0 instead (draft-16/18 §10.2.13), so a
+   * publisher with dynamic groups starts a new group at once. A publisher
+   * without them ignores it, and playback starts at the next group.
+   *
+   * Scope: initial tune-in only (never ABR switches); non-live tracks already
+   * start from group 0. A refused FETCH is non-fatal: playback continues
+   * live-only from the next group boundary.
    *
    * Default: off. Incompatible with an explicit `subscriptionFilter` other
    * than `'LargestObject'` — draft-16 §9.16.2 closes the session when a
    * Joining Fetch references a subscription with any other filter.
    */
   readonly warmStartCurrentGroup?: boolean;
+
+  /**
+   * Static floor of the LOC render cushion in milliseconds: the minimum
+   * playout delay video and audio schedule ahead of arrival.
+   * Default: 200, or 50 when the WebTransport handshake RTT is under 5 ms.
+   */
+  readonly renderCushionFloorMs?: number;
+
+  /**
+   * Cap of the LOC render cushion in milliseconds; bounds how far arrival
+   * jitter can raise the playout delay. Default: 750. Never below the floor.
+   */
+  readonly renderCushionMaxMs?: number;
 }
 
 /** Latency and catch-up options. */
@@ -382,6 +435,24 @@ export interface QualityConfig {
   readonly startLevel?: number | 'lowest' | 'auto';
 
   /**
+   * renderGroup of the program to start on when the catalog carries several
+   * (sets of tracks meant to be rendered together, e.g. a commentator booth
+   * and the match). Default: the program of the first video track in catalog
+   * order. `videoAltGroup` wins when it names a view of another program.
+   * Switch later with `selectProgram()`.
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  readonly initialProgram?: number;
+
+  /**
+   * Preferred audio language, e.g. `'es'` or `'en-US'`. Matched against the
+   * catalog's `lang` on the primary subtag, ignoring case. When no track
+   * matches, audio selection proceeds as if unset. Switch later with
+   * `selectAudioTrack()`.
+   */
+  readonly preferredLanguage?: string;
+
+  /**
    * Cap video quality to a maximum resolution.
    * Tracks exceeding this resolution are excluded from selection.
    * Useful for mobile devices or bandwidth-constrained environments.
@@ -402,10 +473,12 @@ export interface QualityConfig {
   readonly videoConstraints?: TrackConstraints;
 
   /**
-   * Video alternate group to select at tune-in. Omitted: first video group.
-   * Quality selection and ABR stay within this group. Selecting another group
-   * requires a new player; groups need not share a media timeline or Group IDs.
-   * Cannot be combined with the catalog-free knownTracks fast path.
+   * Video alternate group (view) to select at tune-in, e.g. a landscape or a
+   * portrait canvas; it also selects the view's program. Omitted: the first
+   * view in catalog order. An unknown group fails rather than falling back to
+   * other content. Quality selection and ABR stay within the view; switch
+   * later with `selectView()`. Cannot be combined with the catalog-free
+   * knownTracks fast path.
    * @see draft-ietf-moq-msf-01 §4.2, §5.2.12
    */
   readonly videoAltGroup?: number;
@@ -501,7 +574,8 @@ export interface RecoveryConfig {
 
   /**
    * Maximum delivery-restart attempts per starvation incident before
-   * escalating to a fatal MEDIA_STARVED error. Default: 3.
+   * escalating to a fatal MEDIA_STARVED error; with followNamespace, to a
+   * degraded one and a slow resubscribe until media returns. Default: 3.
    */
   readonly livenessMaxRestarts?: number;
 
@@ -583,6 +657,10 @@ export interface FactoryConfig {
   readonly createCmafAssembler?: (options: {
     onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void;
     onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+    /** Audio buffered ahead of the playhead (ms), or null when unknown. */
+    audioAheadMs?: () => number | null;
+    /** Video buffered ahead of the playhead (ms), or null when unknown. */
+    videoAheadMs?: () => number | null;
   }) => CmafAssemblerLike;
 
   /**
@@ -738,6 +816,9 @@ export const DEFAULT_PLAYER_CONFIG = {
   cmafBootstrapTimeoutMs: 10_000,
   cmafFirstFrameMaxWaitMs: 60_000,
 
+  // Recovery while the page is hidden
+  autoResume: true,
+
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
   livenessResetProbeMs: 2_000,
@@ -811,12 +892,25 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     ['livenessResetProbeMs', config.livenessResetProbeMs],
     ['livenessRestartBackoffMs', config.livenessRestartBackoffMs],
     ['livenessHealthyResetMs', config.livenessHealthyResetMs],
+    ['renderCushionFloorMs', config.renderCushionFloorMs],
+    ['renderCushionMaxMs', config.renderCushionMaxMs],
   ];
 
   for (const [name, value] of msFields) {
     if (value !== undefined && value <= 0) {
       throw new RangeError(`${name} must be > 0, got ${value}`);
     }
+  }
+
+  if (config.renderCushionFloorMs !== undefined && config.renderCushionMaxMs !== undefined
+      && config.renderCushionMaxMs < config.renderCushionFloorMs) {
+    throw new RangeError(
+      `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
+    );
+  }
+
+  if (config.autoResume !== undefined && typeof config.autoResume !== 'boolean') {
+    throw new TypeError(`autoResume must be a boolean, got ${String(config.autoResume)}`);
   }
 
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
@@ -858,9 +952,9 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   }
 
   if (config.catalogBootstrap !== undefined
-      && !['auto', 'joining-fetch', 'strict', 'subscribe'].includes(config.catalogBootstrap)) {
+      && !['auto', 'joining-fetch', 'strict', 'subscribe', 'fetch'].includes(config.catalogBootstrap)) {
     throw new RangeError(
-      `catalogBootstrap must be 'auto' | 'joining-fetch' | 'strict' | 'subscribe', got ${String(config.catalogBootstrap)}`,
+      `catalogBootstrap must be 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | 'fetch', got ${String(config.catalogBootstrap)}`,
     );
   }
 
@@ -909,6 +1003,17 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // maxDecodeErrors: > 0
   if (config.maxDecodeErrors !== undefined && (config.maxDecodeErrors <= 0 || !Number.isInteger(config.maxDecodeErrors))) {
     throw new RangeError(`maxDecodeErrors must be a positive integer, got ${config.maxDecodeErrors}`);
+  }
+
+  // initialProgram: a renderGroup number (non-negative integer)
+  if (config.initialProgram !== undefined && (config.initialProgram < 0 || !Number.isInteger(config.initialProgram))) {
+    throw new RangeError(`initialProgram must be a non-negative integer renderGroup, got ${config.initialProgram}`);
+  }
+
+  // preferredLanguage: a non-empty language tag
+  if (config.preferredLanguage !== undefined
+    && (typeof config.preferredLanguage !== 'string' || config.preferredLanguage.trim() === '')) {
+    throw new RangeError('preferredLanguage must be a non-empty language tag');
   }
 
   // capLevelToResolution: both dimensions > 0

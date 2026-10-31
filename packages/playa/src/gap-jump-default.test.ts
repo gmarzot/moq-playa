@@ -78,7 +78,7 @@ describe('Playa default construction — gap-jump active with zero config', () =
     (ms as any).checkGapJump(2_100);
 
     expect(seeks).toBe(1);
-    expect((video as any)._ct).toBeCloseTo(19.79, 5);
+    expect((video as any)._ct).toBeCloseTo(23, 5);   // 25 - targetAheadSec(2): live-edge landing
     ms.destroy();
   });
 });

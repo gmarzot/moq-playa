@@ -24,7 +24,7 @@ import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
-import { RenderCushionSmoother } from './render-cushion.js';
+import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 import { usesMsePath } from './packaging.js';
@@ -73,6 +73,8 @@ export interface TrackInfo {
   } | undefined;
   /** Whether the stream is live. Gates bounded release + backlog shedding. */
   isLive?: boolean;
+  /** Catalog targetLatency of the selected tracks (ms); config overrides it. */
+  targetLatencyMs?: number;
 }
 
 /** Callbacks from pipeline to player. */
@@ -123,7 +125,8 @@ export interface PipelineEventContext {
   syncController: SyncController | null;
   syncResetThisTick: boolean;
   setSyncResetThisTick: (value: boolean) => void;
-  recoveryHook: (action: RecoveryAction) => RecoveryAction | null;
+  /** `localSkip`: the pipeline already moved to a buffered group. */
+  recoveryHook: (action: RecoveryAction, localSkip: boolean) => RecoveryAction | null;
   /**
    * Observability-only counter hook for LOC diagnostics (stats.loc).
    * `sync_reset` is recorded exactly when the reset is actually performed,
@@ -150,14 +153,21 @@ export interface RecoveryCallbacks {
  * `max(adaptive, static)`: the adaptive component is the video pipeline's
  * effective gap timeout (arrival-jitter EMA); the static floor is 200 ms,
  * or 50 ms when the WebTransport handshake RTT is under 5 ms (LAN/loopback).
+ *
+ * A declared target latency caps the result: the floor is a jitter estimate
+ * and must not exceed the latency the publisher asked for.
  */
 export function computePlaybackDelayUs(
   effectiveGapTimeoutUs: number | undefined,
   handshakeRttMs: number | undefined,
+  targetLatencyUs?: number,
 ): number {
   const staticDelayUs = handshakeRttMs !== undefined && handshakeRttMs < 5
     ? 50_000 : 200_000;
-  return Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+  const delayUs = Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+  return targetLatencyUs !== undefined && targetLatencyUs > 0
+    ? Math.min(delayUs, targetLatencyUs)
+    : delayUs;
 }
 
 // ─── createPipelines ─────────────────────────────────────────────────
@@ -245,9 +255,25 @@ export function createPipelines(
   // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
-  const cushionFloorUs = handshakeRttMs !== undefined && handshakeRttMs < 5
-    ? 50_000 : 200_000;
-  const renderCushion = hasLoc ? new RenderCushionSmoother({ floorUs: cushionFloorUs }, clock) : null;
+  // Resolved before the floor so it can cap it; an explicit floor still wins.
+  const targetLatencyMs = config.targetLatencyMs ?? trackInfo.targetLatencyMs;
+  const cushionFloorUs = config.renderCushionFloorMs !== undefined
+    ? config.renderCushionFloorMs * 1000
+    : computePlaybackDelayUs(undefined, handshakeRttMs,
+      targetLatencyMs !== undefined ? targetLatencyMs * 1000 : undefined);
+  // The cap follows the target latency when one is known (config, else
+  // catalog), so jitter cannot grow the cushion past the latency the
+  // publisher asked for; an explicit cap wins. A floor above the cap lifts it.
+  const defaultMaxUs = targetLatencyMs !== undefined
+    ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
+    : RENDER_CUSHION_MAX_US;
+  const cushionMaxUs = Math.max(
+    config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : defaultMaxUs,
+    cushionFloorUs,
+  );
+  const renderCushion = hasLoc
+    ? new RenderCushionSmoother({ floorUs: cushionFloorUs, maxUs: cushionMaxUs }, clock)
+    : null;
 
   if (videoDecoder || audioDecoder) {
     commandDispatcher = new CommandDispatcher(defined({
@@ -328,6 +354,8 @@ export function createPipelines(
       onCommand: (cmd) => callbacks.onCommand(cmd),
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
+      // The cushion the dispatcher adds to audio render times (peek only).
+      getPlaybackDelayUs: () => renderCushion?.currentUs ?? cushionFloorUs,
     });
   }
 
@@ -435,7 +463,8 @@ export function handlePipelineEvent(
     case 'skip_forward':
       ctx.recordDiagnostic?.('skip_forward');
       ctx.log.warn('Skip forward %s group=%s→%s', mediaType, evt.fromGroupId, evt.toGroupId);
-      if (!ctx.syncResetThisTick && ctx.syncController) {
+      // Skipping a lost audio frame leaves the timeline where it was.
+      if (mediaType === 'video' && !ctx.syncResetThisTick && ctx.syncController) {
         ctx.syncController.reset();
         ctx.setSyncResetThisTick(true);
         ctx.recordDiagnostic?.('sync_reset');
@@ -443,6 +472,20 @@ export function handlePipelineEvent(
       ctx.emitEvent({
         type: 'skip_forward', mediaType,
         fromGroupId: evt.fromGroupId, toGroupId: evt.toGroupId,
+      });
+      break;
+    case 'timeline_jump':
+      ctx.log.info('Timeline jump %s group=%s→%s (+%ss): playing the newer group now',
+        mediaType, evt.fromGroupId, evt.toGroupId, (evt.jumpUs / 1e6).toFixed(1));
+      // The abandoned group's timeline anchored the shared reference.
+      if (!ctx.syncResetThisTick && ctx.syncController) {
+        ctx.syncController.reset();
+        ctx.setSyncResetThisTick(true);
+        ctx.recordDiagnostic?.('sync_reset');
+      }
+      ctx.emitEvent({
+        type: 'timeline_jump', mediaType,
+        fromGroupId: evt.fromGroupId, toGroupId: evt.toGroupId, jumpMs: evt.jumpUs / 1000,
       });
       break;
     case 'keyframe_waiting':
@@ -461,13 +504,25 @@ export function handlePipelineEvent(
       });
       break;
     case 'recovery': {
-      const action = ctx.recoveryHook(evt.action);
+      const action = ctx.recoveryHook(evt.action, evt.localSkip === true);
       if (action) {
         ctx.recordDiagnostic?.('recovery_action');
         ctx.emitEvent({ type: 'recovery_action', action });
       }
       break;
     }
+    case 'audio_reanchored':
+      ctx.recordDiagnostic?.('sync_reset');
+      ctx.log.warn('Audio late by %dms for a sustained run — sync reference re-anchored',
+        Math.round(evt.lateByUs / 1000));
+      break;
+    case 'sync_reference_fallback':
+      // warn, not debug: the catalog advertised audio that never arrived, and
+      // without this the picture would have stayed black indefinitely.
+      ctx.log.warn('No audio frame in %dms — video anchored the sync reference itself; '
+        + 'the advertised audio track has delivered nothing',
+        Math.round(evt.waitedUs / 1000));
+      break;
     case 'catch_up_changed':
       ctx.log.debug('Catch-up %s rate=%.2f latency=%dms target=%dms',
         evt.state.active ? 'active' : 'inactive',
@@ -532,9 +587,22 @@ export function handleRecoveryAction(
   qualityController: QualityController | null,
   log: LoggerLike,
   callbacks: RecoveryCallbacks,
+  localSkip = false,
 ): void {
   switch (action.type) {
     case 'skip_forward':
+      // Each audio group stands alone and the live subscription already
+      // carries the next one: skipping needs no REQUEST_UPDATE.
+      if (mediaType === 'audio') {
+        log.debug('Recovery: skip forward audio — continue at the next group');
+        break;
+      }
+      // Re-requesting the next group would cut short the buffered group the
+      // pipeline moved to.
+      if (localSkip) {
+        log.debug('Recovery: skip forward %s — continuing at the buffered group', mediaType);
+        break;
+      }
       log.warn('Recovery: skip forward %s — flush pipeline and resubscribe from live edge', mediaType);
       callbacks.onResubscribe(mediaType);
       break;

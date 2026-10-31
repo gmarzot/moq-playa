@@ -271,6 +271,39 @@ describe('MoqtConnection(18) subgroup stream delivery', () => {
   });
 });
 
+describe('MoqtConnection(18) subgroup object timing', () => {
+  it('stamps each object\'s first-byte read apart from the wait before it', async () => {
+    const { conn, transport } = await connected();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objects.push(o);
+    let nowMs = 1000;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    try {
+      const second = subgroupObject(0n, [0x02, 0x03, 0x04, 0x05]);
+      const s = transport.openIncomingUni();
+      s.push(concat(subgroupHeader(7n, 42n), subgroupObject(0n, [0x01])));
+      await flush();
+      nowMs = 1100; // idle: the publisher has not sent the next object yet
+      await flush();
+      nowMs = 1200;
+      s.push(second.subarray(0, 3));
+      await flush();
+      nowMs = 1210;
+      s.push(second.subarray(3));
+      await flush();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(objects).toHaveLength(2);
+    const o = objects[1]!;
+    if (o.kind !== 'data') throw new Error('expected data');
+    expect(o.socketFirstMs).toBe(1000);
+    expect(o.socketStartMs).toBe(1200);
+    expect(o.socketLastMs).toBe(1210);
+  });
+});
+
 describe('MoqtConnection(18) datagram delivery', () => {
   it('delivers an object datagram to onDatagram', async () => {
     const { conn, transport } = await connected();
@@ -443,10 +476,11 @@ describe('MoqtConnection(18) FETCH data', () => {
     transport.pushIncomingUni(concat(
       fetchHeader(reqId),
       firstFetchObj(1n, 0n, 3, [0xaa]),
-      pack(0x8cn, 1n, 5n, 0n), // End of Non-Existent Range at {1,5}
+      pack(0x8cn, 1n, 5n), // End of Non-Existent Range at {1,5}
     ));
     await flush();
 
+    expect(objs).toHaveLength(2);
     expect(objs[0]!.kind).toBe('data');
     expect(objs[1]!.kind).toBe('gap');
     expect(objs[1]!.groupId).toBe(1n);
@@ -1369,6 +1403,48 @@ describe('MoqtConnection(18) publisher data send for accepted inbound SUBSCRIBE 
     expect(datagram.objectId).toBe(5n);
     expect(datagram.publisherPriority).toBe(3);
     expect(datagram.payload).toEqual(new Uint8Array([0x01, 0x02]));
+    // No Properties asked for, so the flag must be clear.
+    expect(datagram.extensions).toBeUndefined();
+  });
+
+  // Datagram media carries its LOC headers (a capture timestamp among them) in
+  // object Properties; without them a receiver has no sync reference at all.
+  it('sendDatagram carries object Properties and sets the PROPERTIES flag', async () => {
+    const { conn, transport } = await subscribed(7n);
+    const props = new Uint8Array([0x10, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+
+    await conn.sendDatagram(7n, 9n, 1n, new Uint8Array([0xaa]), {
+      publisherPriority: 4,
+      extensions: props,
+    });
+
+    expect(transport.sentDatagrams.length).toBe(1);
+    const raw = transport.sentDatagrams[0]!;
+    expect(raw[0]! & 0x01).toBe(0x01);   // DatagramFlags18.PROPERTIES
+    const { datagram } = decodeObjectDatagram18(raw, 0);
+    expect(datagram.trackAlias).toBe(7n);
+    expect(datagram.groupId).toBe(9n);
+    expect(datagram.objectId).toBe(1n);
+    expect(datagram.extensions).toEqual(props);
+    expect(datagram.payload).toEqual(new Uint8Array([0xaa]));
+  });
+
+  // A WritableStream admits ONE writer, so acquiring one per datagram throws
+  // "Cannot create writer when WritableStream is locked" the moment two sends
+  // overlap — which audio does routinely at 8 in flight.
+  it('concurrent sendDatagram calls share one writer', async () => {
+    const { conn, transport } = await subscribed(7n);
+
+    await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        conn.sendDatagram(7n, 1n, BigInt(i), new Uint8Array([i]))),
+    );
+
+    expect(transport.sentDatagrams.length).toBe(8);
+    const ids = transport.sentDatagrams
+      .map((b) => decodeObjectDatagram18(b, 0).datagram.objectId)
+      .sort((a, b) => Number(a - b));
+    expect(ids).toEqual([0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n]);
   });
 });
 

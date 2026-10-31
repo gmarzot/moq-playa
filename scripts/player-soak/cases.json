@@ -1,0 +1,185 @@
+{
+  "relays": {
+    "moqx-main": {
+      "url": "https://moqx-main.ci.openmoq.org:4433/moq-relay",
+      "publishDraft": 18,
+      "playDrafts": [
+        18
+      ]
+    },
+    "aiomoqt-relay": {
+      "url": "https://aiomoqt-relay.marzresearch.net:4443/",
+      "publishDraft": 22,
+      "playDrafts": [
+        22,
+        18
+      ]
+    }
+  },
+  "mtt": [
+    {
+      "relay": "moqx-main",
+      "packaging": "loc"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "locmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "loc"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "locmaf"
+    },
+    {
+      "relay": "moqx-main",
+      "id": "bbb_4k60",
+      "packaging": "cmaf",
+      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/clip/msf/cmaf/h264/1080/60/aac/2",
+      "expected": {
+        "videoWidth": 1920,
+        "videoHeight": 1080,
+        "videoFps": 60
+      }
+    },
+    {
+      "relay": "moqx-main",
+      "id": "akamai_cmaf",
+      "packaging": "loc",
+      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/clip/msf/loc/h264/720/30/aac/2",
+      "expected": {
+        "videoWidth": 1280,
+        "videoHeight": 720,
+        "videoFps": 30
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "id": "bbb_4k60",
+      "packaging": "cmaf",
+      "namespace": "openmoq/mtt/aiomoqt/bbb_4k60/moq_test_tracks_00/clip/msf/cmaf/h264/1080/60/aac/2",
+      "expected": {
+        "videoWidth": 1920,
+        "videoHeight": 1080,
+        "videoFps": 60
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "id": "akamai_cmaf",
+      "packaging": "loc",
+      "namespace": "openmoq/mtt/aiomoqt/akamai_cmaf/moq_test_tracks_00/clip/msf/loc/h264/720/30/aac/2",
+      "expected": {
+        "videoWidth": 1280,
+        "videoHeight": 720,
+        "videoFps": 30
+      }
+    }
+  ],
+  "mttNamespace": "openmoq/mtt/aiomoqt/moq_test_tracks_00/clock/msf/{packaging}/h264/720/30/aac/2",
+  "mttExpected": {
+    "videoWidth": 1280,
+    "videoHeight": 720,
+    "videoFps": 30
+  },
+  "broadcast": [
+    {
+      "relay": "moqx-main",
+      "packaging": "loc"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "moqx-main",
+      "packaging": "locmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "loc"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "cmaf"
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "packaging": "locmaf"
+    }
+  ],
+  "broadcastParams": {
+    "height": 720,
+    "fps": 30,
+    "bitrate": 2500,
+    "target": 200
+  },
+  "broadcastExpected": {
+    "videoWidth": 1280,
+    "videoHeight": 720,
+    "videoFps": 30
+  },
+  "adverse": {
+    "broadcasts": [
+      "moqx-main:cmaf",
+      "moqx-main:loc",
+      "aiomoqt-relay:cmaf",
+      "aiomoqt-relay:loc"
+    ]
+  },
+  "restartEveryS": 75,
+  "profiles": {
+    "lossy": {
+      "netem": "delay 40ms 10ms loss 2%",
+      "smoke": true
+    },
+    "jitter": {
+      "netem": "delay 60ms 20ms distribution normal"
+    },
+    "capped": {
+      "down": "delay 30ms rate 3mbit limit 200",
+      "up": "delay 30ms"
+    },
+    "wifi": {
+      "netem": "delay 10ms 5ms slot 20ms 60ms loss 0.5%"
+    },
+    "blackouts": {
+      "events": [
+        {
+          "atS": 30,
+          "blackoutS": 3
+        },
+        {
+          "atS": 75,
+          "blackoutS": 10
+        }
+      ],
+      "smoke": true
+    },
+    "hidden-tab": {
+      "events": [
+        {
+          "atS": 30,
+          "hiddenS": 5
+        },
+        {
+          "atS": 75,
+          "hiddenS": 20
+        }
+      ]
+    },
+    "republish": {
+      "variant": "restart"
+    }
+  }
+}

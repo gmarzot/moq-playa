@@ -397,6 +397,34 @@ describe('CatalogBootstrap — failure ladder', () => {
         expect(h.calls.ready).toEqual([['video']]);
     });
 
+    it('INVALID_RANGE after a SUBSCRIBE_OK that reported a Largest → rung 1, not EMPTY_WAIT', () => {
+        const h = makeHarness();
+        h.coord.start();
+        h.coord.onSubscribeOk({ group: 7n, object: 0n });  // the track has content
+        h.f.err('invalid-range');
+        expect(h.coord.phase).not.toBe('empty-wait');
+        expect(h.calls.standaloneFetches).toHaveLength(1);
+    });
+
+    it('INVALID_RANGE before SUBSCRIBE_OK waits for it: a Largest → join again, then rung 1; none → EMPTY_WAIT', () => {
+        const h = makeHarness();
+        h.coord.start();
+        h.f.err('invalid-range');
+        expect(h.calls.standaloneFetches).toHaveLength(0);
+        h.coord.onSubscribeOk({ group: 7n, object: 0n });
+        expect(h.calls.joiningFetch).toBe(2);
+        expect(h.calls.standaloneFetches).toHaveLength(0);
+        h.f.err('invalid-range');
+        expect(h.calls.standaloneFetches).toHaveLength(1);
+
+        const h2 = makeHarness();
+        h2.coord.start();
+        h2.f.err('invalid-range');
+        h2.coord.onSubscribeOk(null);
+        expect(h2.coord.phase).toBe('empty-wait');
+        expect(h2.calls.legacyResubscribes).toBe(0);
+    });
+
     it('#15: refusal with history → rung 1 standalone fetch from SUBSCRIBE_OK largest, sub retained', () => {
         const h = makeHarness();
         h.coord.start();
@@ -413,17 +441,34 @@ describe('CatalogBootstrap — failure ladder', () => {
         expect(h.calls.ready).toEqual([['video']]);
     });
 
-    it('refusal before SUBSCRIBE_OK waits for history before choosing a fallback', () => {
+    it('refusal before SUBSCRIBE_OK waits for history, joins once more, then falls back', () => {
         const h = makeHarness();
         h.coord.start();
         h.f.err('refused');       // SUBSCRIBE_OK not yet seen
         expect(h.calls.standaloneFetches).toHaveLength(0);
         expect(h.calls.legacyResubscribes).toBe(0);
         h.coord.onSubscribeOk({ group: 6n, object: 4n });
+        expect(h.calls.joiningFetch).toBe(2);
+        expect(h.calls.standaloneFetches).toHaveLength(0);
+        h.f.err('refused');       // refused again with the subscription known: a failed join
+        expect(h.calls.joiningFetch).toBe(2);
         expect(h.calls.standaloneFetches).toEqual([
             { startGroup: 6n, startObject: 0n, endGroupWholeOf: 6n },
         ]);
         expect(h.calls.legacyResubscribes).toBe(0);
+    });
+
+    it('an MSF-01 catalog whose first join raced its SUBSCRIBE arrives on the second join, not a fallback', () => {
+        const h = makeHarness({ draft: 18 });
+        h.coord.start();
+        h.f.err('refused');
+        h.coord.onSubscribeOk({ group: 6n, object: 0n });
+        h.f.obj({ location: { group: 6n, object: 0n }, kind: 'payload', payload: msf01Indep(['video']) });
+        h.f.ok({ group: 6n, object: 1n }, false);
+        h.f.closed(true);
+        expect(h.calls.fatals).toEqual([]);
+        expect(h.calls.ready).toEqual([['video']]);
+        expect(h.calls.standaloneFetches).toHaveLength(0);
     });
 
     it('a refused join on an empty subscription retains the first live catalog', () => {
@@ -448,7 +493,8 @@ describe('CatalogBootstrap — failure ladder', () => {
             expect(h.calls.ready).toEqual([]);
             h.coord.onSubscribeOk(largest);
             expect(h.calls.ready).toEqual(largest === null ? [['video']] : []);
-            expect(h.calls.standaloneFetches).toHaveLength(largest === null ? 0 : 1);
+            expect(h.calls.joiningFetch).toBe(largest === null ? 1 : 2);
+            expect(h.calls.standaloneFetches).toHaveLength(0);
             h.coord.abort();
         }
     });
@@ -497,6 +543,20 @@ describe('CatalogBootstrap — failure ladder', () => {
         expect(h.calls.fatals).toHaveLength(1);
         expect(h.calls.settled).toEqual([]);
         expect(h.coord.phase).toBe('aborted');
+    });
+
+    it('a refusal before a SUBSCRIBE_OK that never comes → rung 2 at the inactivity deadline', () => {
+        vi.useFakeTimers();
+        try {
+            const h = makeHarness();
+            h.coord.start();
+            h.f.err('refused');
+            expect(h.calls.legacyResubscribes).toBe(0);
+            vi.advanceTimersByTime(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
+            expect(h.calls.legacyResubscribes).toBe(1);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('#20: rung 1 failure → rung 2; legacy path ready on first acceptable base', () => {

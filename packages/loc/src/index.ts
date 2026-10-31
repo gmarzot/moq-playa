@@ -30,6 +30,7 @@ export { LocHeaderError, LocEncodeError } from './errors.js';
 // ─── Header parsing ─────────────────────────────────────────────────
 
 export { parseLocHeaders, encodeLocHeaders, toVideoChunkInit, toAudioChunkInit, locWireProfileForDraft } from './headers.js';
+export { LOC_PRIVATE_PROPERTIES_TYPE, withLocPrivateProperties, stripLocPrivateProperties } from './headers.js';
 export type { LocHeaderOptions } from './headers.js';
 
 // ─── Layer B — LOC semantic resolution (PropertyMap ⇄ LocHeaders) ────

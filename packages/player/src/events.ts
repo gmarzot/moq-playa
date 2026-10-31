@@ -19,6 +19,7 @@ import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
 import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
 import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
+import type { CaptureTimes } from './capture-time.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
 
@@ -90,6 +91,14 @@ export interface SessionClosedEvent {
   readonly type: 'session_closed';
   readonly error?: number;
   readonly reason?: string;
+}
+
+/** The current session closed during playback; a fresh session is attempted after `delayMs`. */
+export interface SessionReconnectingEvent {
+  readonly type: 'session_reconnecting';
+  /** 1 for the first attempt after the close. */
+  readonly attempt: number;
+  readonly delayMs: number;
 }
 
 /**
@@ -249,6 +258,20 @@ export interface TrackEndedEvent {
   readonly mediaType: 'video' | 'audio';
 }
 
+/**
+ * A buffered group started far ahead in media time of the group playing (a
+ * stale or partial group served before a pause or join): playback moved to it
+ * at once and the sync reference re-anchors.
+ */
+export interface TimelineJumpEvent {
+  readonly type: 'timeline_jump';
+  readonly mediaType: 'video' | 'audio';
+  readonly fromGroupId: bigint;
+  readonly toGroupId: bigint;
+  /** Capture-time distance from the newest frame of the abandoned group (ms). */
+  readonly jumpMs: number;
+}
+
 /** A partial video GOP was abandoned before END_OF_GROUP was received. */
 export interface PartialGroupAbandonedEvent {
   readonly type: 'partial_group_abandoned';
@@ -341,7 +364,13 @@ export interface MediaObjectEvent {
   readonly extensions?: Uint8Array;
   readonly status?: bigint;
   readonly captureTimestamp?: bigint;
+  /** False when captureTimestamp is media time under a declared timescale, not wall clock. */
+  readonly timestampIsWallClock?: boolean;
   readonly isKeyframe?: boolean;
+  /** Wall-clock capture times by source, for latency measurement only. */
+  readonly captureTimes?: CaptureTimes;
+  /** Why the track's timestamp properties are not used. */
+  readonly timingError?: string;
 }
 
 // ─── Rendering Events ────────────────────────────────────────────────
@@ -393,10 +422,18 @@ export interface GapJumpEvent {
   readonly from: number;
   /** Landing position just inside the next buffered range (seconds). */
   readonly to: number;
+  /** Start of the skipped hole (seconds). */
+  readonly holeStart: number;
   /** Width of the skipped hole (seconds). */
   readonly holeSec: number;
   /** How long the hole persisted before the jump (ms). */
   readonly waitedMs: number;
+  /**
+   * `hole` after waiting for late media; `resubscribe` a hole the player's
+   * own resubscribe left; `timeline` a hole wide enough to be stale media
+   * followed by live. Only `hole` implies media lost in delivery.
+   */
+  readonly reason: 'hole' | 'resubscribe' | 'timeline';
 }
 
 /**
@@ -448,6 +485,62 @@ export interface QualitySwitchFailedEvent {
 }
 
 /**
+ * Video view changed — a switch to a track of another altGroup (or another
+ * program's video) committed.
+ * Fires right after the `quality_switched` event of that switch.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+ */
+export interface ViewChangedEvent {
+  readonly type: 'view_changed';
+  /** altGroup of the previous view. */
+  readonly fromView: number | undefined;
+  /** altGroup of the new view; undefined when it has none (a program without altGroups). */
+  readonly toView: number | undefined;
+  /** Track of the new view that is now playing. */
+  readonly trackName: string;
+}
+
+/**
+ * Audio track changed — a switch to another audio track (typically another
+ * language) committed: the new track now feeds the decoder or SourceBuffer.
+ */
+export interface AudioTrackChangedEvent {
+  readonly type: 'audio_track_changed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  /** Catalog `lang` of the new track, when it has one. */
+  readonly lang: string | undefined;
+  readonly reason: string;
+}
+
+/**
+ * Audio track switch rolled back — the new track could not be committed
+ * (e.g. `mediaSource.changeType()` rejected). The old track keeps playing.
+ */
+export interface AudioTrackSwitchFailedEvent {
+  readonly type: 'audio_track_switch_failed';
+  readonly fromTrackName: string;
+  readonly toTrackName: string;
+  readonly reason: string;
+  readonly error: Error;
+}
+
+/**
+ * Program changed — the current renderGroup moved. After `selectProgram()`
+ * it fires once every track that had to change has committed (at once when
+ * the program shares all playing tracks); a manual `selectVideoTrack()` of
+ * another program's track fires it when that switch commits.
+ *
+ * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+ */
+export interface ProgramChangedEvent {
+  readonly type: 'program_changed';
+  readonly fromProgram: number | undefined;
+  readonly toProgram: number;
+}
+
+/**
  * Live catch-up state changed — activated, rate adjusted, or deactivated.
  *
  * Emitted when the player adjusts playback rate to catch up to the live
@@ -485,6 +578,21 @@ export interface NamespaceDoneEvent {
   readonly type: 'namespace_done';
   readonly requestId: bigint;
   readonly namespaceSuffix: Uint8Array[];
+}
+
+/** The followed namespace at the relay (config `followNamespace`). */
+export type NamespaceState = 'pending' | 'listening' | 'published' | 'withdrawn' | 'refused';
+
+/**
+ * The followed namespace changed state: SUBSCRIBE_NAMESPACE sent (`pending`),
+ * accepted (`listening`), NAMESPACE received (`published`), NAMESPACE_DONE
+ * (`withdrawn`), or REQUEST_ERROR / stream failure (`refused`).
+ * @see draft-ietf-moq-transport-18 §10.18
+ */
+export interface NamespaceStateEvent {
+  readonly type: 'namespace_state';
+  readonly state: NamespaceState;
+  readonly detail: string;
 }
 
 /**
@@ -666,6 +774,7 @@ export interface PlayerEventMap {
   request_goaway: RequestGoawayEvent;
   session_migrated: SessionMigratedEvent;
   session_closed: SessionClosedEvent;
+  session_reconnecting: SessionReconnectingEvent;
   session_error: SessionErrorEvent;
 
   // Errors (structured)
@@ -695,6 +804,7 @@ export interface PlayerEventMap {
   keyframe_waiting: KeyframeWaitingEvent;
   track_ended: TrackEndedEvent;
   partial_group_abandoned: PartialGroupAbandonedEvent;
+  timeline_jump: TimelineJumpEvent;
 
   // Recovery
   recovery_action: RecoveryActionEvent;
@@ -707,11 +817,16 @@ export interface PlayerEventMap {
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;
   quality_switch_failed: QualitySwitchFailedEvent;
+  view_changed: ViewChangedEvent;
+  audio_track_changed: AudioTrackChangedEvent;
+  audio_track_switch_failed: AudioTrackSwitchFailedEvent;
+  program_changed: ProgramChangedEvent;
   catch_up_changed: CatchUpChangedEvent;
 
   // Namespace discovery
   namespace_discovered: NamespaceDiscoveredEvent;
   namespace_done: NamespaceDoneEvent;
+  namespace_state: NamespaceStateEvent;
   namespace_announced: NamespaceAnnouncedEvent;
   namespace_announcement_done: NamespaceAnnouncementDoneEvent;
 
