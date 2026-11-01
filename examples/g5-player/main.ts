@@ -84,6 +84,8 @@ const prefersLight = matchMedia('(prefers-color-scheme: light)');
 
 /** Chart colours from the CSS tokens of the same names, re-read on a theme change. */
 const chartColors = { grid: '', loss: '', max: '', p50: '', p95: '', jitter: '', audio: '', video: '' };
+/** Series line width in CSS px, from `--chart-line`. */
+let chartLine = 1;
 
 /** Sets `data-theme` from the picker; auto follows the OS preference. */
 function applyTheme(): void {
@@ -94,6 +96,7 @@ function applyTheme(): void {
   for (const k of Object.keys(chartColors) as Array<keyof typeof chartColors>) {
     chartColors[k] = css.getPropertyValue(`--${k}`).trim();
   }
+  chartLine = parseFloat(css.getPropertyValue('--chart-line')) || 1;
 }
 
 {
@@ -1378,7 +1381,7 @@ async function main(): Promise<void> {
     ctx.beginPath();
     traceSeries(ctx, data, nowMs, w, yOf);
     ctx.strokeStyle = color;
-    ctx.lineWidth = devicePixelRatio;
+    ctx.lineWidth = chartLine * devicePixelRatio;
     ctx.stroke();
   }
 
@@ -1412,7 +1415,7 @@ async function main(): Promise<void> {
       ctx.beginPath();
       traceSeries(ctx, data, nowMs, w, yOf);
       ctx.strokeStyle = color;
-      ctx.lineWidth = devicePixelRatio;
+      ctx.lineWidth = chartLine * devicePixelRatio;
       ctx.stroke();
     }
     if (peak) {
