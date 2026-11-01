@@ -43,16 +43,13 @@ function setup(initial = '') {
 
 describe('KNOWN_RELAYS', () => {
   it('moqx-main is first and is the default', () => {
-    expect(KNOWN_RELAYS[0]!.url).toBe('https://moqx-main.ci.openmoq.org:4433/moq-relay');
-    expect(DEFAULT_RELAY).toBe(KNOWN_RELAYS[0]!.url);
+    expect(KNOWN_RELAYS[0]!).toBe('https://moqx-main.ci.openmoq.org:4433/moq-relay');
+    expect(DEFAULT_RELAY).toBe(KNOWN_RELAYS[0]!);
   });
 
-  it('every entry is an https (WebTransport) URL with a label, listed once', () => {
-    for (const r of KNOWN_RELAYS) {
-      expect(new URL(r.url).protocol).toBe('https:');
-      expect(r.label).not.toBe('');
-    }
-    expect(new Set(KNOWN_RELAYS.map((r) => r.url)).size).toBe(KNOWN_RELAYS.length);
+  it('every entry is an https (WebTransport) URL, listed once', () => {
+    for (const url of KNOWN_RELAYS) expect(new URL(url).protocol).toBe('https:');
+    expect(new Set(KNOWN_RELAYS).size).toBe(KNOWN_RELAYS.length);
   });
 });
 
@@ -60,7 +57,8 @@ describe('attachRelayPicker', () => {
   it('inserts a select offering every known relay, then "Other"', () => {
     const { select, inserted } = setup();
     expect(inserted).toEqual([select]);
-    expect(select.children.map((o) => o.value)).toEqual([...KNOWN_RELAYS.map((r) => r.url), '']);
+    expect(select.children.map((o) => o.value)).toEqual([...KNOWN_RELAYS, '']);
+    expect(select.children.slice(0, -1).map((o) => o.textContent)).toEqual([...KNOWN_RELAYS]);
   });
 
   it('selects the entry matching the input, or "Other" for a typed URL', () => {
@@ -69,18 +67,18 @@ describe('attachRelayPicker', () => {
     input.value = 'https://relay.example.com:4433/moq';
     input.fire('input');
     expect(select.value).toBe('');
-    input.value = KNOWN_RELAYS[1]!.url;
+    input.value = KNOWN_RELAYS[1]!;
     picker.sync();
-    expect(select.value).toBe(KNOWN_RELAYS[1]!.url);
+    expect(select.value).toBe(KNOWN_RELAYS[1]!);
   });
 
   it('choosing an entry fills the input; "Other" leaves it for typing', () => {
     const { input, select } = setup('https://relay.example.com:4433/moq');
-    select.value = KNOWN_RELAYS[1]!.url;
+    select.value = KNOWN_RELAYS[1]!;
     select.fire('change');
-    expect(input.value).toBe(KNOWN_RELAYS[1]!.url);
+    expect(input.value).toBe(KNOWN_RELAYS[1]!);
     select.value = '';
     select.fire('change');
-    expect(input.value).toBe(KNOWN_RELAYS[1]!.url);
+    expect(input.value).toBe(KNOWN_RELAYS[1]!);
   });
 });

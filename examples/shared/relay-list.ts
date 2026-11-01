@@ -1,18 +1,12 @@
 /**
- * Relays the G5 pages offer in their relay URL field. The first is the default.
+ * Relays the G5 pages offer in their relay URL field, listed by URL. The first is the default.
  */
-
-export interface KnownRelay {
-  readonly url: string;
-  readonly label: string;
-}
-
-export const KNOWN_RELAYS: readonly KnownRelay[] = [
-  { url: 'https://moqx-main.ci.openmoq.org:4433/moq-relay', label: 'moqx-main (default)' },
-  { url: 'https://aiomoqt-relay.marzresearch.net:4443/', label: 'aiomoqt ersatz relay' },
+export const KNOWN_RELAYS: readonly string[] = [
+  'https://moqx-main.ci.openmoq.org:4433/moq-relay',
+  'https://aiomoqt-relay.marzresearch.net:4443/',
 ];
 
-export const DEFAULT_RELAY: string = KNOWN_RELAYS[0]!.url;
+export const DEFAULT_RELAY: string = KNOWN_RELAYS[0]!;
 
 export interface RelayPicker {
   readonly select: HTMLSelectElement;
@@ -35,12 +29,12 @@ export function attachRelayPicker(input: HTMLInputElement, doc: Document = docum
     o.textContent = text;
     select.appendChild(o);
   };
-  for (const r of KNOWN_RELAYS) option(r.url, r.label);
+  for (const url of KNOWN_RELAYS) option(url, url);
   option('', 'Other (type a URL below)');
 
   const sync = (): void => {
     const url = input.value.trim();
-    select.value = KNOWN_RELAYS.some((r) => r.url === url) ? url : '';
+    select.value = KNOWN_RELAYS.includes(url) ? url : '';
   };
   select.addEventListener('change', () => {
     if (select.value) input.value = select.value;
