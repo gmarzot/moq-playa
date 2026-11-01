@@ -10531,8 +10531,55 @@ describe('MoqtPlayer', () => {
         t += 31 * S;
         p.noteAbrDownshift(t);
         expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
-        // Two minutes without a downshift restore the base wait.
+        // Only an upshift that holds two minutes restores the base wait.
+        expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(120 * S);
+        t += 120 * S;
+        p.lastAbrUpshiftUs = t;
+        expect(p.abrUpshiftWaitUs(true, t + 119 * S)).toBe(120 * S);
         expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(5 * S);
+        await player.destroy();
+      });
+
+      it('an ABR upshift goes on trial when it commits, not when it is requested', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        const p = player as any;
+        clockUs = 6 * S;
+        timeObjects(player, 20_000);
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(true);
+        expect(p.lastAbrUpshiftUs).toBe(0);
+        await new Promise(r => setTimeout(r, 0));
+        clockUs = 7 * S;
+        p.completePendingVideoSwitch();
+        expect(p.qualityController.currentVideoTrack?.name).toBe('video-0');
+        expect(p.lastAbrUpshiftUs).toBe(7 * S);
+        await player.destroy();
+      });
+
+      it('a recovery step-down fails an upshift on trial', async () => {
+        const { player } = await loadLive(500_000);
+        const p = player as any;
+        p.lastAbrUpshiftUs = 10 * S;
+        clockUs = 15 * S;
+        void player.selectVideoTrack('video-2', 'recovery', 'downshift').catch(() => {});
+        expect(p.lastAbrUpshiftUs).toBe(0);
+        expect(p.lastAbrDownshiftUs).toBe(15 * S);
+        expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
+        await player.destroy();
+      });
+
+      it('an upshift at the 2 min cap that falls back keeps the 2 min wait', async () => {
+        const { player } = await loadLive(500_000);
+        const p = player as any;
+        p.liveUpshiftWaitUs = 120 * S;
+        p.noteAbrDownshift(10 * S);
+        let t = 130 * S;
+        expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
+        p.lastAbrUpshiftUs = t;
+        t += 10 * S;
+        p.noteAbrDownshift(t);
+        expect(p.abrUpshiftWaitUs(true, t)).toBe(120 * S);
+        expect(p.abrUpshiftWaitUs(true, t + 120 * S)).toBe(120 * S);
         await player.destroy();
       });
     });
