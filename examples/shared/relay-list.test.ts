@@ -1,86 +1,128 @@
 import { describe, expect, it } from 'vitest';
 import { attachRelayPicker, DEFAULT_RELAY, KNOWN_RELAYS } from './relay-list.js';
 
+type Listener = (e: { target?: unknown; key?: string; stopPropagation(): void }) => void;
+
 /** The slice of the DOM attachRelayPicker touches. */
 interface FakeEl {
   value: string;
   textContent: string;
   title: string;
-  style: Record<string, string>;
+  className: string;
+  type: string;
+  hidden: boolean;
+  focused: boolean;
+  attrs: Record<string, string>;
   children: FakeEl[];
-  parentNode: null | { insertBefore: (a: unknown, b: unknown) => void };
+  parentNode: null | { insertBefore: (a: FakeEl, b: FakeEl) => void };
+  setAttribute(name: string, value: string): void;
   appendChild(c: FakeEl): void;
-  addEventListener(type: string, fn: () => void): void;
-  fire(type: string): void;
+  contains(n: unknown): boolean;
+  focus(): void;
+  addEventListener(type: string, fn: Listener): void;
+  fire(type: string, init?: { target?: unknown; key?: string }): void;
+}
+
+function fakeListeners() {
+  const listeners: Record<string, Listener[]> = {};
+  return {
+    addEventListener(type: string, fn: Listener) { (listeners[type] ??= []).push(fn); },
+    fire(type: string, init: { target?: unknown; key?: string } = {}) {
+      for (const fn of listeners[type] ?? []) fn({ ...init, stopPropagation() {} });
+    },
+  };
 }
 
 function fakeEl(): FakeEl {
-  const listeners: Record<string, Array<() => void>> = {};
   const el: FakeEl = {
-    value: '',
-    textContent: '',
-    title: '',
-    style: {},
+    value: '', textContent: '', title: '', className: '', type: '', hidden: false, focused: false,
+    attrs: {},
     children: [],
     parentNode: null,
+    setAttribute(name, value) { el.attrs[name] = value; },
     appendChild(c) { el.children.push(c); },
-    addEventListener(type, fn) { (listeners[type] ??= []).push(fn); },
-    fire(type) { for (const fn of listeners[type] ?? []) fn(); },
+    contains(n) { return n === el || el.children.some((c) => c.contains(n)); },
+    focus() { el.focused = true; },
+    ...fakeListeners(),
   };
   return el;
 }
 
 function setup(initial = '') {
-  const inserted: unknown[] = [];
+  const inserted: FakeEl[] = [];
   const input = fakeEl();
   input.value = initial;
-  input.parentNode = { insertBefore: (a: unknown) => { inserted.push(a); } };
-  const doc = { createElement: () => fakeEl() };
+  input.parentNode = { insertBefore: (a) => { inserted.push(a); } };
+  const doc = { createElement: () => fakeEl(), ...fakeListeners() };
   const picker = attachRelayPicker(input as unknown as HTMLInputElement, doc as unknown as Document);
-  const select = picker.select as unknown as FakeEl;
-  return { input, select, picker, inserted };
+  const wrap = inserted[0]!;
+  const [, button, menu] = wrap.children as [FakeEl, FakeEl, FakeEl];
+  return { input, wrap, button, menu, items: menu.children, picker, doc };
 }
 
 describe('KNOWN_RELAYS', () => {
   it('moqx-main is first and is the default', () => {
-    expect(KNOWN_RELAYS[0]!.url).toBe('https://moqx-main.ci.openmoq.org:4433/moq-relay');
-    expect(DEFAULT_RELAY).toBe(KNOWN_RELAYS[0]!.url);
+    expect(KNOWN_RELAYS[0]!).toBe('https://moqx-main.ci.openmoq.org:4433/moq-relay');
+    expect(DEFAULT_RELAY).toBe(KNOWN_RELAYS[0]!);
   });
 
-  it('every entry is an https (WebTransport) URL with a label, listed once', () => {
-    for (const r of KNOWN_RELAYS) {
-      expect(new URL(r.url).protocol).toBe('https:');
-      expect(r.label).not.toBe('');
-    }
-    expect(new Set(KNOWN_RELAYS.map((r) => r.url)).size).toBe(KNOWN_RELAYS.length);
+  it('every entry is an https (WebTransport) URL, listed once', () => {
+    for (const url of KNOWN_RELAYS) expect(new URL(url).protocol).toBe('https:');
+    expect(new Set(KNOWN_RELAYS).size).toBe(KNOWN_RELAYS.length);
   });
 });
 
 describe('attachRelayPicker', () => {
-  it('inserts a select offering every known relay, then "Other"', () => {
-    const { select, inserted } = setup();
-    expect(inserted).toEqual([select]);
-    expect(select.children.map((o) => o.value)).toEqual([...KNOWN_RELAYS.map((r) => r.url), '']);
+  it('wraps the input on one line with a closed menu listing every known relay by URL', () => {
+    const { input, wrap, button, menu, items } = setup();
+    expect(wrap.className).toBe('relay-combo');
+    expect(wrap.children[0]).toBe(input);
+    expect(button.attrs['aria-expanded']).toBe('false');
+    expect(menu.hidden).toBe(true);
+    expect(items.map((i) => i.textContent)).toEqual([...KNOWN_RELAYS]);
   });
 
-  it('selects the entry matching the input, or "Other" for a typed URL', () => {
-    const { input, select, picker } = setup(DEFAULT_RELAY);
-    expect(select.value).toBe(DEFAULT_RELAY);
+  it('the button toggles the menu', () => {
+    const { button, menu } = setup();
+    button.fire('click');
+    expect(menu.hidden).toBe(false);
+    expect(button.attrs['aria-expanded']).toBe('true');
+    button.fire('click');
+    expect(menu.hidden).toBe(true);
+  });
+
+  it('choosing an entry fills the input, closes the menu and focuses the input', () => {
+    const { input, button, menu, items } = setup('https://relay.example.com:4433/moq');
+    button.fire('click');
+    items[1]!.fire('click');
+    expect(input.value).toBe(KNOWN_RELAYS[1]!);
+    expect(menu.hidden).toBe(true);
+    expect(input.focused).toBe(true);
+    expect(items.map((i) => i.attrs['aria-selected'])).toEqual(['false', 'true']);
+  });
+
+  it('a typed URL stays as typed and selects no entry', () => {
+    const { input, items, picker } = setup(DEFAULT_RELAY);
+    expect(items[0]!.attrs['aria-selected']).toBe('true');
     input.value = 'https://relay.example.com:4433/moq';
     input.fire('input');
-    expect(select.value).toBe('');
-    input.value = KNOWN_RELAYS[1]!.url;
+    expect(input.value).toBe('https://relay.example.com:4433/moq');
+    expect(items.every((i) => i.attrs['aria-selected'] === 'false')).toBe(true);
+    input.value = KNOWN_RELAYS[1]!;
     picker.sync();
-    expect(select.value).toBe(KNOWN_RELAYS[1]!.url);
+    expect(items[1]!.attrs['aria-selected']).toBe('true');
   });
 
-  it('choosing an entry fills the input; "Other" leaves it for typing', () => {
-    const { input, select } = setup('https://relay.example.com:4433/moq');
-    select.value = KNOWN_RELAYS[1]!.url;
-    select.fire('change');
-    expect(input.value).toBe(KNOWN_RELAYS[1]!.url);
-    select.value = '';
-    select.fire('change');
-    expect(input.value).toBe(KNOWN_RELAYS[1]!.url);
+  it('a click outside or Escape closes the menu', () => {
+    const { wrap, button, menu, doc } = setup();
+    button.fire('click');
+    doc.fire('click', { target: button });
+    expect(menu.hidden).toBe(false);
+    doc.fire('click', { target: {} });
+    expect(menu.hidden).toBe(true);
+    button.fire('click');
+    wrap.fire('keydown', { key: 'Escape' });
+    expect(menu.hidden).toBe(true);
+    expect(button.focused).toBe(true);
   });
 });

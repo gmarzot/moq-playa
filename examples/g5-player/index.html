@@ -648,6 +648,22 @@
     }
     .modal input:focus, .modal select:focus { outline: none; border-color: var(--focus); }
     .modal .hint { font-size: .68rem; color: var(--text-dim); margin-top: 3px; }
+    /* Relay field: any URL, plus a menu of the known relays. */
+    .relay-combo { position: relative; display: flex; gap: 6px; }
+    .modal .relay-combo input[type=text] { flex: 1; min-width: 0; }
+    .relay-combo-btn { flex: none; padding: 0 12px; }
+    .relay-combo-menu {
+      position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 10; padding: 4px;
+      background: var(--modal-bg); border: 1px solid var(--input-border); border-radius: 6px;
+      box-shadow: 0 8px 24px var(--modal-shadow);
+    }
+    .relay-combo-item {
+      display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text);
+      padding: 7px 9px; border-radius: 4px; font-family: monospace; font-size: .85rem;
+      overflow-wrap: anywhere;
+    }
+    .relay-combo-item:hover, .relay-combo-item:focus-visible { background: var(--control-hover); outline: none; }
+    .relay-combo-item[aria-selected=true] { font-weight: 700; }
     .modal .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
     .modal .check input { width: auto; }
     .modal .check label { margin: 0; text-transform: none; letter-spacing: 0; font-size: .8rem; color: var(--text-soft); }

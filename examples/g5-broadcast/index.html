@@ -253,6 +253,22 @@
     }
     .modal input:focus, .modal select:focus { outline: none; border-color: #2a6; }
     .modal .hint { font-size: .68rem; color: #666; margin-top: 3px; }
+    /* Relay field: any URL, plus a menu of the known relays. */
+    .relay-combo { position: relative; display: flex; gap: 6px; }
+    .modal .relay-combo input[type=text] { flex: 1; min-width: 0; }
+    .relay-combo-btn { flex: none; padding: 0 12px; }
+    .relay-combo-menu {
+      position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 10; padding: 4px;
+      background: #1a1a1a; border: 1px solid #444; border-radius: 6px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    }
+    .relay-combo-item {
+      display: block; width: 100%; text-align: left; border: 0; background: none; color: #eee;
+      padding: 7px 9px; border-radius: 4px; font-family: monospace; font-size: .85rem;
+      overflow-wrap: anywhere;
+    }
+    .relay-combo-item:hover, .relay-combo-item:focus-visible { background: #333; outline: none; }
+    .relay-combo-item[aria-selected=true] { font-weight: 700; }
     .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
     .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
     .modal #settings-apply, .modal #share-open { background: #2a6; border-color: #2a6; color: #fff; }
@@ -355,40 +371,6 @@
       </div>
       <div class="hint">Blank or automatic: a new one each broadcast. A typed name is kept.</div>
 
-      <label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
-      <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
-        <option value="avc1.42001f">H.264 Baseline</option>
-        <option value="avc1.640028">H.264 High</option>
-        <option value="av01.0.04M.08">AV1 Main</option>
-        <option value="hvc1.1.6.L93.B0">HEVC Main</option>
-        <option value="vp09.00.31.08">VP9 Profile 0</option>
-      </select>
-
-      <label for="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">Camera resolution</label>
-      <select id="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">
-        <option value="1080">1080p</option>
-        <option value="720">720p (default)</option>
-        <option value="480">480p</option>
-      </select>
-
-      <label for="s-bitrate" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">Video bitrate (kbps)</label>
-      <input id="s-bitrate" type="number" min="1" placeholder="by resolution" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">
-
-      <label for="s-fps" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">Capture frame rate</label>
-      <input id="s-fps" type="number" min="1" placeholder="60" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">
-
-      <label for="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">Audio codec</label>
-      <select id="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
-        <option value="opus">Opus</option>
-        <option value="aac">AAC-LC</option>
-      </select>
-
-      <label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
-      <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200).">
-
-      <details class="adv" id="s-advanced" style="margin-top:14px">
-        <summary>Advanced</summary>
-
       <label for="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">Draft version</label>
       <select id="s-version" title="MoQT draft offered to the relay. 18 is current; 22 for relays that speak it; 14 and 16 for older relays.">
         <option value="22">Draft 22</option>
@@ -403,6 +385,47 @@
         <option value="cmaf">CMAF/CMSF</option>
         <option value="locmaf">LOCMAF/CMSF</option>
       </select>
+
+      <label for="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">Camera resolution</label>
+      <select id="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">
+        <option value="1080">1080p</option>
+        <option value="720">720p (default)</option>
+        <option value="480">480p</option>
+      </select>
+
+      <details class="adv" id="s-advanced" style="margin-top:14px">
+        <summary>Advanced</summary>
+
+      <label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
+      <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
+        <option value="avc1.42001f">H.264 Baseline</option>
+        <option value="avc1.640028">H.264 High</option>
+        <option value="av01.0.04M.08">AV1 Main</option>
+        <option value="hvc1.1.6.L93.B0">HEVC Main</option>
+        <option value="vp09.00.31.08">VP9 Profile 0</option>
+      </select>
+
+      <label for="s-bitrate" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">Video bitrate (kbps)</label>
+      <input id="s-bitrate" type="number" min="1" placeholder="by resolution" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">
+
+      <label for="s-fps" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">Capture frame rate</label>
+      <input id="s-fps" type="number" min="1" placeholder="60" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">
+
+      <label for="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">Audio codec</label>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <select id="s-audio-codec" style="flex:1 1 10em;width:auto" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
+          <option value="opus">Opus</option>
+          <option value="aac">AAC-LC</option>
+        </select>
+        <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin:0"
+             title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
+          <input id="s-audio-datagram" type="checkbox" style="width:auto">
+          <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">audio over datagrams</label>
+        </div>
+      </div>
+
+      <label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
+      <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200).">
 
       <label for="s-keyframe" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">Keyframe interval (s)</label>
       <input id="s-keyframe" type="number" min="0.1" step="0.1" placeholder="2" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">
@@ -438,12 +461,6 @@
            title="A joining viewer can ask for a new group (NEW_GROUP_REQUEST), so it starts at once instead of waiting for the next keyframe. Draft 18 only.">
         <input id="s-dynamic-groups" type="checkbox" style="width:auto">
         <label for="s-dynamic-groups" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">dynamic groups: a joining viewer may request a keyframe</label>
-      </div>
-
-      <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
-        <input id="s-audio-datagram" type="checkbox" style="width:auto">
-        <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">audio over datagrams</label>
       </div>
 
       <div class="check" id="s-self-describing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
