@@ -75,6 +75,44 @@ function setMenuOpen(open: boolean): void {
   menu.hidden = !open;
   menuBtn.setAttribute('aria-expanded', String(open));
 }
+
+// ─── Theme ───────────────────────────────────────────────────────────
+
+const THEME_KEY = 'g5-theme';
+const themeSelect = document.getElementById('theme') as HTMLSelectElement;
+const prefersLight = matchMedia('(prefers-color-scheme: light)');
+
+/** Chart colours from the CSS tokens of the same names, re-read on a theme change. */
+const chartColors = { grid: '', loss: '', max: '', p50: '', p95: '', jitter: '', audio: '', video: '' };
+/** Series line width in CSS px, from `--chart-line`. */
+let chartLine = 1;
+
+/** Sets `data-theme` from the picker; auto follows the OS preference. */
+function applyTheme(): void {
+  const choice = themeSelect.value;
+  document.documentElement.dataset.theme = choice === 'dark' || choice === 'light'
+    ? choice : (prefersLight.matches ? 'light' : 'dark');
+  const css = getComputedStyle(document.documentElement);
+  for (const k of Object.keys(chartColors) as Array<keyof typeof chartColors>) {
+    chartColors[k] = css.getPropertyValue(`--${k}`).trim();
+  }
+  chartLine = parseFloat(css.getPropertyValue('--chart-line')) || 1;
+}
+
+{
+  let stored: string | null = null;
+  try { stored = localStorage.getItem(THEME_KEY); } catch { /* storage unavailable */ }
+  themeSelect.value = stored === 'dark' || stored === 'light' ? stored : 'auto';
+  applyTheme();
+  themeSelect.addEventListener('change', () => {
+    try {
+      if (themeSelect.value === 'auto') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, themeSelect.value);
+    } catch { /* storage unavailable */ }
+    applyTheme();
+  });
+  prefersLight.addEventListener('change', () => { if (themeSelect.value === 'auto') applyTheme(); });
+}
 const stateBadge = document.getElementById('state')!;
 stateBadge.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
@@ -1331,19 +1369,19 @@ async function main(): Promise<void> {
       ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
       ctx.moveTo(0, yOf(refLine));
       ctx.lineTo(w, yOf(refLine));
-      ctx.strokeStyle = '#667';
+      ctx.strokeStyle = chartColors.grid;
       ctx.lineWidth = devicePixelRatio;
       ctx.stroke();
       ctx.setLineDash([]);
     }
     for (const m of marks ?? []) {
-      ctx.fillStyle = 'rgba(204, 68, 68, 0.55)';
+      ctx.fillStyle = chartColors.loss;
       ctx.fillRect(chartX(m, nowMs, w) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
     }
     ctx.beginPath();
     traceSeries(ctx, data, nowMs, w, yOf);
     ctx.strokeStyle = color;
-    ctx.lineWidth = devicePixelRatio;
+    ctx.lineWidth = chartLine * devicePixelRatio;
     ctx.stroke();
   }
 
@@ -1363,13 +1401,13 @@ async function main(): Promise<void> {
       ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
       ctx.moveTo(0, yOf(refLine));
       ctx.lineTo(w, yOf(refLine));
-      ctx.strokeStyle = '#667';
+      ctx.strokeStyle = chartColors.grid;
       ctx.lineWidth = devicePixelRatio;
       ctx.stroke();
       ctx.setLineDash([]);
     }
     for (const m of marks ?? []) {
-      ctx.fillStyle = 'rgba(204, 68, 68, 0.55)';
+      ctx.fillStyle = chartColors.loss;
       ctx.fillRect(chartX(m, nowMs, w) - devicePixelRatio, 0, 2 * devicePixelRatio, h);
     }
     for (const [data, color] of [[a, aColor], [b, bColor]] as Array<[number[], string]>) {
@@ -1377,7 +1415,7 @@ async function main(): Promise<void> {
       ctx.beginPath();
       traceSeries(ctx, data, nowMs, w, yOf);
       ctx.strokeStyle = color;
-      ctx.lineWidth = devicePixelRatio;
+      ctx.lineWidth = chartLine * devicePixelRatio;
       ctx.stroke();
     }
     if (peak) {
@@ -1385,7 +1423,7 @@ async function main(): Promise<void> {
       const r = 2.5 * devicePixelRatio;
       ctx.beginPath();
       ctx.arc(chartX(peak.atMs, nowMs, w), Math.max(r, yOf(peak.value)), r, 0, 2 * Math.PI);
-      ctx.fillStyle = '#e07a7a';
+      ctx.fillStyle = chartColors.max;
       ctx.fill();
     }
   }
@@ -1540,10 +1578,10 @@ async function main(): Promise<void> {
 
     const peakMs = maxFinite(latTickMaxSamples);
     const peakAt = peakMs === null ? -1 : latTickMaxSamples.indexOf(peakMs);
-    drawSpark2(latSpark, tickNowMs, latP50Samples, '#d9c25c', latP95Samples, '#d9922e', 0, undefined,
+    drawSpark2(latSpark, tickNowMs, latP50Samples, chartColors.p50, latP95Samples, chartColors.p95, 0, undefined,
       peakAt >= 0 ? { atMs: sampleAtMs[peakAt]!, value: peakMs! } : null);
-    drawSpark(jitSpark, tickNowMs, jitSamples, '#d9922e');
-    drawSpark2(cusSpark, tickNowMs, queuedASamples, '#6cf', queuedVSamples, '#a98cf0',
+    drawSpark(jitSpark, tickNowMs, jitSamples, chartColors.jitter);
+    drawSpark2(cusSpark, tickNowMs, queuedASamples, chartColors.audio, queuedVSamples, chartColors.video,
                targetLatencyMs, stallMarks);
     cusAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
