@@ -412,10 +412,17 @@
       <input id="s-fps" type="number" min="1" placeholder="60" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">
 
       <label for="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">Audio codec</label>
-      <select id="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
-        <option value="opus">Opus</option>
-        <option value="aac">AAC-LC</option>
-      </select>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <select id="s-audio-codec" style="flex:1 1 10em;width:auto" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
+          <option value="opus">Opus</option>
+          <option value="aac">AAC-LC</option>
+        </select>
+        <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin:0"
+             title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
+          <input id="s-audio-datagram" type="checkbox" style="width:auto">
+          <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">audio over datagrams</label>
+        </div>
+      </div>
 
       <label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
       <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200).">
@@ -454,12 +461,6 @@
            title="A joining viewer can ask for a new group (NEW_GROUP_REQUEST), so it starts at once instead of waiting for the next keyframe. Draft 18 only.">
         <input id="s-dynamic-groups" type="checkbox" style="width:auto">
         <label for="s-dynamic-groups" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">dynamic groups: a joining viewer may request a keyframe</label>
-      </div>
-
-      <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
-        <input id="s-audio-datagram" type="checkbox" style="width:auto">
-        <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">audio over datagrams</label>
       </div>
 
       <div class="check" id="s-self-describing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
