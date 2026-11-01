@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { SessionError, SessionState } from '@openmoq/transport';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
+import { withLocPrivateProperties } from '@openmoq/loc';
 import { MoqtPlayer } from './player.js';
 
 async function boot(packaging: 'loc' | 'cmaf') {
@@ -46,13 +47,14 @@ async function boot(packaging: 'loc' | 'cmaf') {
 }
 
 describe.each(['loc', 'cmaf'] as const)('%s alias routing over draft-18 streams', (packaging) => {
+  const frame = (marker: number) => packaging === 'loc' ? withLocPrivateProperties(Uint8Array.of(marker)) : Uint8Array.of(marker);
   it.each(['video-first', 'audio-first'])('accepts an alias equal to another request ID: %s', async (order) => {
     const h = await boot(packaging);
     try {
       const replies = order === 'video-first' ? [[2n, 4n], [4n, 5n]] : [[4n, 5n], [2n, 4n]];
       for (const [request, alias] of replies) await h.server.acceptSubscribe(request!, alias!);
-      await h.send(4n, Uint8Array.of(1));
-      await h.send(5n, Uint8Array.of(2));
+      await h.send(4n, frame(1));
+      await h.send(5n, frame(2));
       expect(h.received).toEqual([{ track: 'vide_1', marker: 1 }, { track: 'soun_2', marker: 2 }]);
       expect(h.errors).toEqual([]);
       expect(h.client.session.state).toBe(SessionState.ESTABLISHED);
@@ -68,12 +70,12 @@ describe.each(['loc', 'cmaf'] as const)('%s alias routing over draft-18 streams'
       const original = h.client.onObject!;
       h.client.onObject = (sid, object) => { earlyObjects++; original(sid, object); };
       await h.server.acceptSubscribe(2n, 4n);
-      await h.send(4n, Uint8Array.of(1));
+      await h.send(4n, frame(1));
       await vi.waitFor(() => expect(earlyObjects).toBe(1));
       expect(h.received).toEqual([]);
       response.releaseHeld();
       await h.server.acceptSubscribe(4n, 5n);
-      await h.send(5n, Uint8Array.of(2));
+      await h.send(5n, frame(2));
       expect(h.received).toEqual([{ track: 'vide_1', marker: 1 }, { track: 'soun_2', marker: 2 }]);
       expect(h.errors).toEqual([]);
     } finally { await h.destroy(); }

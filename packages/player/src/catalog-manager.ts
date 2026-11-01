@@ -301,6 +301,9 @@ export class CatalogManager {
                     ...(catalog.publishTracks !== undefined
                         ? { publishTracks: catalog.publishTracks }
                         : {}),
+                    ...(catalog.ignoredTracks !== undefined
+                        ? { ignoredTracks: catalog.ignoredTracks }
+                        : {}),
                 };
             }
         }

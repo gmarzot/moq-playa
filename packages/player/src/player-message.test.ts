@@ -192,6 +192,40 @@ describe('handleControlMessage', () => {
     expect(ctx.onMediaAliasBound).toHaveBeenCalledExactlyOnceWith(5n, 99n);
   });
 
+  it('SUBSCRIBE_OK: a draft-18 TIMESCALE track property registers the track\'s timestamp units', () => {
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
+    ctx.subscriptionManager = subMgr as any;
+    ctx.pendingMediaSubs.set(5n, { trackName: 'video', mediaType: 'video', packaging: 'loc' });
+    ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: null });
+
+    const msg = {
+      type: 'SUBSCRIBE_OK', requestId: 5n, trackAlias: 99n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+      trackProperties: new Map([[0x08n, [1000n]]]),
+    } as unknown as ControlMessage;
+    handleControlMessage(msg, ctx);
+
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(99n, 'video', 'video', 'loc', { timescale: 1000n });
+  });
+
+  it('SUBSCRIBE_OK: the catalog\'s LOC decoder configuration rides the track registration', () => {
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
+    ctx.subscriptionManager = subMgr as any;
+    const initConfig = new Uint8Array([1, 2, 3]);
+    ctx.pendingMediaSubs.set(5n, { trackName: 'video', mediaType: 'video', packaging: 'loc', initConfig });
+    ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: null });
+
+    const msg: ControlMessage = {
+      type: 'SUBSCRIBE_OK', requestId: 5n, trackAlias: 99n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+    };
+    handleControlMessage(msg, ctx);
+
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(99n, 'video', 'video', 'loc', { initConfig });
+  });
+
   it.each(['mediatimeline', 'eventtimeline'] as const)('SUBSCRIBE_OK: binds %s without unregistering its request ID', (packaging) => {
     const ctx = createContext();
     const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
@@ -337,7 +371,29 @@ describe('handleControlMessage', () => {
     expect(ctx.pendingMediaSubs.size).toBe(0);
     expect(ctx.activeSubscriptions.size).toBe(0);
     expect(unregisterTrack).not.toHaveBeenCalled();
-    expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n);
+    expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n, undefined);
+  });
+
+  it('forwards REQUEST_ERROR retry interval to the media subscribe error', () => {
+    const onMediaSubscribeError = vi.fn();
+    const ctx = createContext({
+      onMediaSubscribeError,
+      subscriptionManager: {
+        registerTrack: vi.fn(),
+        unregisterTrack: vi.fn(),
+        getMediaType: vi.fn(),
+      } as any,
+    });
+    ctx.pendingMediaSubs.set(7n, { trackName: 'video', mediaType: 'video' });
+
+    handleControlMessage({
+      type: 'REQUEST_ERROR', requestId: 7n,
+      errorCode: 0x10n, errorReason: 'no such namespace or track',
+      retryInterval: 3n,
+    } as ControlMessage, ctx);
+
+    expect(onMediaSubscribeError).toHaveBeenCalledWith(
+      7n, 'video', 'video', 'no such namespace or track', 0x10n, 3n);
   });
 
   it('ignores unhandled message types', () => {

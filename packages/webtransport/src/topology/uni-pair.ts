@@ -166,6 +166,10 @@ export class UniPairTopology {
    *  PROTOCOL_VIOLATION. */
   onRequestGoawayViolation?: (reason: string, message: DecodedControlMessage) => void;
 
+  /** Called when a PUBLISH_DONE ended a subscription with `count` REQUEST_UPDATEs
+   *  still unanswered (§10.9 owes each a response); those updates were rejected. */
+  onUnansweredUpdates?: (requestId: bigint, count: number) => void;
+
   /** Called when an open OUTBOUND request stream ends by PEER action — NOT a local
    *  cancel/finish (those are driven by the owner). `disposition` distinguishes:
    *   - `'fin'`: a clean peer FIN. The owner needs this to tell a valid
@@ -447,6 +451,7 @@ export class UniPairTopology {
     ctx.onGoaway = (err) => this.onRequestGoaway?.(err);
     // A session-fatal violation seen on this request stream closes the session.
     ctx.onFatalViolation = (reason, message) => this.onRequestGoawayViolation?.(reason, message);
+    ctx.onUnansweredUpdates = (count) => this.onUnansweredUpdates?.(requestId, count);
     // Surface a stream failure (unsolicited/wrong-typed response, early end)
     // immediately, even if no operation is awaiting a response at the time, and
     // ALWAYS reclaim the context when the stream ends so it can't leak. A clean FIN
@@ -852,6 +857,10 @@ class RequestStreamContext {
    *  offending message is passed so the owner can record it raw before closing. */
   onFatalViolation?: (reason: string, message: DecodedControlMessage) => void;
 
+  /** Invoked when PUBLISH_DONE ends the subscription with `count` update
+   *  responses still owed; those updates have been rejected. */
+  onUnansweredUpdates?: (count: number) => void;
+
   /** Whether this stream ended because a GOAWAY migrated its request. The close
    *  is CLEAN (the owner gets a migration signal, not a stream error), but it is
    *  a LOCAL cancellation, not a peer FIN — an accepted FETCH must be reclaimed
@@ -1039,8 +1048,8 @@ class RequestStreamContext {
           }
           // §10.11: PUBLISH_DONE is the publisher's TERMINAL message on a
           // subscription's request stream — accepted exactly once, only after
-          // a successful SUBSCRIBE_OK (never after REQUEST_ERROR), and only
-          // once all outstanding local update responses have settled. It is
+          // a successful SUBSCRIBE_OK (never after REQUEST_ERROR); update
+          // responses still owed are failed below. It is
           // not a response to any local operation — never FIFO-matched. On
           // receipt we FIN our own writable and keep READING until the peer's
           // clean FIN: `closed` resolves only on terminal completion, and any
@@ -1056,10 +1065,13 @@ class RequestStreamContext {
                 'PUBLISH_DONE without a preceding SUBSCRIBE_OK',
               );
             }
+            // §10.9 owes each update a response first. A publisher that ends the
+            // subscription without them made the updates moot: settle those as
+            // cancelled (the owner reports it once), not fail the session.
             if (this.queue.length > 0) {
-              throw new ProtocolViolationError(
-                'PUBLISH_DONE while update responses are still outstanding',
-              );
+              const unanswered = this.queue.splice(0);
+              for (const d of unanswered) d.reject(new RequestCancelledError(StreamResetCode18.CANCELLED));
+              this.onUnansweredUpdates?.(unanswered.length);
             }
             this.terminalSeen = true;
             await this.onPeerRequest?.(message);

@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig } from '@openmoq/player';
+import type { MoqtPlayerConfig, TTFFBreakdown } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -34,6 +34,13 @@ export interface PlayerOptions {
   readonly authTokens?: Uint8Array[];
   /** Issuer-supplied credentials for SETUP and subsequent requests. */
   readonly authorization?: MoqtPlayerConfig['authorization'];
+  /** WebTransport congestion-control hint, which the browser may ignore;
+   *  `Player.congestionControl` reports what it applied. */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
+  /** Draft-18: incoming streams allowed to await classification or SETUP at
+   *  once; at the bound, intake waits. Default: no bound beyond QUIC's
+   *  stream limit. */
+  readonly maxPendingStreams?: number;
 
   // ── Playback ──
 
@@ -138,8 +145,22 @@ export interface PlayerStats {
   readonly latencyMs: number;
   readonly stallCount: number;
   readonly timeToFirstFrameMs: number | null;
+  /** Startup milestones, ms after load(); null before load(). */
+  readonly ttffBreakdown: TTFFBreakdown | null;
   readonly resolution: { readonly width: number; readonly height: number } | null;
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
   readonly sessionAgeMs: number;
+  /** Total time of completed stalls. */
+  readonly stallDurationMs: number;
+  /** Elapsed time of a stall still in progress; 0 when none. */
+  readonly ongoingStallMs: number;
+  readonly gapCount: number;
+  /** A/V skew EWMA (LOC path), null when unknown. */
+  readonly avSkewMs: number | null;
+  /** Media playable ahead of the playhead: contiguous buffered range on
+   *  the MSE path, scheduled audio on the WebCodecs path. */
+  readonly cushionMs: number | null;
+  /** WebCodecs audio buffers that arrived after the chain ran dry. */
+  readonly audioUnderruns: number;
 }

@@ -62,7 +62,7 @@ async function boot(draft: 18 | 22) {
   const player = new MoqtPlayer({
     url: 'https://unused.example/moq', namespace: 'live/test', connection: client as unknown as MoqtConnection,
     createTransport: async () => ({}) as never, draftVersion: draft,
-    catalogBootstrap: 'subscribe',
+    catalogBootstrap: 'subscribe', compat: ['loc-bare'],
     createMediaSource: () => ({
       initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(),
       mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null,

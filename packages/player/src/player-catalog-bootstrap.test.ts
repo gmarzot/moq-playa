@@ -4155,3 +4155,51 @@ describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', (
         expect(kinds).toEqual(['fin']);
     });
 });
+
+describe('fetch-only catalog (catalogBootstrap: fetch)', () => {
+    it('TRACK_STATUS names the latest group and a standalone FETCH of it brings the catalog — no catalog SUBSCRIBE', async () => {
+        const adapter = createMockAdapter(16);
+        const { player, events, errors } = await loadPlayer(adapter, { catalogBootstrap: 'fetch' });
+        await flush();
+        expect(adapter.subscribe).not.toHaveBeenCalled();
+        expect(adapter.trackStatus).toHaveBeenCalledTimes(1);
+
+        // Draft-16 LARGEST_OBJECT: a raw Location (group 7, object 0).
+        adapter._triggerMessage({
+            type: 'REQUEST_OK', requestId: varint(99n), parameters: new Map([[0x09n, [new Uint8Array([7, 0])]]]),
+        } as unknown as ControlMessage);
+        await flush();
+        const opts = adapter.fetch.mock.calls[0]![2];
+        expect([opts.startGroup, opts.endGroup, opts.groupOrder]).toEqual([7n, 7n, undefined]);
+
+        await deliverFetchObject(adapter, 1n, 100n, 7n, 0n, enc(CATALOG));
+        await flush();
+        expect(events).toEqual(['catalog_received']);
+        expect(errors).toEqual([]);
+        expect(adapter.fetchCancel).not.toHaveBeenCalled();
+        expect(adapter.subscribe).toHaveBeenCalled();
+        await player.destroy();
+    });
+
+    it('without a TRACK_STATUS answer, one FETCH of every group newest first; the rest is cancelled', async () => {
+        const adapter = createMockAdapter(16);
+        const { player, events } = await loadPlayer(adapter, { catalogBootstrap: 'fetch' });
+        await flush();
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: varint(99n), errorCode: varint(4n), errorReason: 'Track not found',
+        } as unknown as ControlMessage);
+        await flush();
+        const opts = adapter.fetch.mock.calls[0]![2];
+        expect([opts.startGroup, opts.endGroup, opts.groupOrder]).toEqual([0n, (1n << 62n) - 1n, 2n]);
+
+        await deliverFetchObject(adapter, 1n, 100n, 9n, 0n, enc(CATALOG));
+        await flush();
+        expect(events).toEqual(['catalog_received']);
+        expect(adapter.fetchCancel).toHaveBeenCalledWith(1n);
+        await player.destroy();
+    });
+
+    it('is a valid catalogBootstrap value', () => {
+        expect(() => makePlayer(createMockAdapter(16), { catalogBootstrap: 'fetch' })).not.toThrow();
+    });
+});

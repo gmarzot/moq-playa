@@ -24,11 +24,15 @@ import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transpor
 import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
+import type { BootstrapPhase } from './catalog-bootstrap.js';
+import { NamespaceFollower, type ReturnAction } from './namespace-follow.js';
+import { cmafChunkStartsWithSync } from './cmaf-sync.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
+import type { MoqtObjectData } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, isKeyframePayload } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
@@ -42,7 +46,7 @@ import { HookChain } from './hooks.js';
 import { WatchdogController } from './watchdog.js';
 import { MediaLivenessMonitor, type LivenessTrack } from './media-liveness.js';
 import { PlayerStateMachine, PlayerState, type PlayerStateValue } from './state.js';
-import type { PlayerEventMap } from './events.js';
+import type { NamespaceState, PlayerEventMap } from './events.js';
 import {
   DEFAULT_PLAYER_CONFIG,
   validateConfig,
@@ -53,7 +57,7 @@ import { createLogger, LOG_LEVELS, type LoggerLike } from './logger.js';
 import { checkSupport as detectSupport } from './support.js';
 import type { SupportReport } from './support.js';
 import { CatalogManager } from './catalog-manager.js';
-import { QualityController } from './quality-controller.js';
+import { QualityController, type SelectedTracks } from './quality-controller.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
 import { isMsePackaging, mediaTrackPackaging, usesMsePath } from './packaging.js';
 
@@ -80,6 +84,7 @@ import { computePlaybackDelayUs,
   type TrackInfo,
 } from './player-pipeline.js';
 import {
+  extractLargestLocation,
   handleControlMessage as doControlMessage,
   removeSubscription,
   validateKnownTracks as doValidateKnownTracks,
@@ -107,6 +112,25 @@ const CATALOG_FILL = CURRENT_GROUP_FILL;
 
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
+/**
+ * How long a track switch waits for the new track's FIRST object before it is
+ * abandoned (old track kept). The staging timeout only runs once objects
+ * flow; this one covers a track the relay accepted but never delivers (its
+ * encoder down), which would otherwise block every later switch.
+ */
+const SWITCH_NO_DATA_TIMEOUT_MS = 10_000;
+
+/** Pipeline drain cadence (~60fps), for both the timer and the arrival pump. */
+const TICK_INTERVAL_MS = 16;
+const TICK_INTERVAL_US = TICK_INTERVAL_MS * 1_000;
+
+/** PUBLISH_DONE resubscribe backoff: the first retry is immediate, then doubles to the cap. */
+const PUBLISH_DONE_RETRY_BASE_MS = 1_000;
+const PUBLISH_DONE_RETRY_MAX_MS = 30_000;
+/** A subscription that lived this long before ending starts the backoff over. */
+const PUBLISH_DONE_RETRY_RESET_MS = 60_000;
+/** Poll cadence for a retry parked while the document is hidden. */
+const HIDDEN_RETRY_POLL_MS = 1_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -150,6 +174,90 @@ function namespaceDisplay(ns: string | readonly string[]): string {
   return typeof ns === 'string' ? ns : ns.join('/');
 }
 
+/** Wire bytes as hex, for reporting what a request actually sent. */
+function hexBytes(b: Uint8Array): string {
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/** A video track of the current view, as listed by `MoqtPlayer.availableVideoTracks`. */
+export interface VideoTrackInfo {
+  readonly name: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly bitrate?: number;
+  readonly codec?: string;
+  readonly label?: string;
+  readonly lang?: string;
+  readonly altGroup?: number;
+  readonly renderGroup?: number;
+}
+
+/** A video view (altGroup) of the current program, as listed by `MoqtPlayer.availableViews`. */
+export interface VideoViewInfo {
+  readonly altGroup: number;
+  /** Program of the view; absent when the view is shared by every program. */
+  readonly renderGroup?: number;
+  /** Catalog label of the view's first labelled track. */
+  readonly label?: string;
+  /** Dimensions of the view's highest-bitrate track. */
+  readonly width?: number;
+  readonly height?: number;
+  /** Track names of the view, highest bitrate first. */
+  readonly tracks: readonly string[];
+}
+
+/** An audio track of the current program, as listed by `MoqtPlayer.availableAudioTracks`. */
+export interface AudioTrackInfo {
+  readonly name: string;
+  readonly codec?: string;
+  readonly bitrate?: number;
+  readonly samplerate?: number;
+  readonly channelConfig?: string;
+  /** Catalog language tag (e.g. "en", "es"). */
+  readonly lang?: string;
+  /** Catalog label, only where the publisher set one. */
+  readonly label?: string;
+  readonly altGroup?: number;
+  readonly renderGroup?: number;
+}
+
+/** A program (renderGroup), as listed by `MoqtPlayer.availablePrograms`. */
+export interface ProgramInfo {
+  readonly renderGroup: number;
+  /** Names of the program's tracks, shared ones included, in catalog order. */
+  readonly tracks: readonly string[];
+}
+
+/** An in-flight program switch (see `selectProgram`). */
+interface PendingProgramSwitch {
+  readonly target: number;
+  readonly from: number | undefined;
+  /** Audio track playing before the switch, to go back to if the video fails. */
+  readonly prevAudio: string | undefined;
+  /** The tracks that change, and how each one ended. */
+  readonly legs: Map<'video' | 'audio', 'pending' | 'ok' | 'failed'>;
+}
+
+/** An in-flight audio track switch (see `selectAudioTrack`). */
+interface PendingAudioSwitch {
+  readonly oldRequestId: bigint | null;
+  readonly oldTrackName: string;
+  readonly newTrackName: string;
+  newRequestId: bigint | null;
+  readonly reason: string;
+  /** CMAF (MSE) path: the SourceBuffer is re-typed with `initData`. */
+  readonly mse: boolean;
+  readonly initData?: Uint8Array;
+  /** MSE path: the commit has started (changeType in flight). */
+  committing: boolean;
+  /** MSE path: new-track objects held until the commit finishes. */
+  readonly staged: Array<{ trackName: string; groupId: bigint; payload: Uint8Array }>;
+  /** This switch is the audio leg of the pending program switch. */
+  programLeg?: boolean;
+  /** No-data guard (see SWITCH_NO_DATA_TIMEOUT_MS). */
+  noDataTimer?: ReturnType<typeof setTimeout>;
+}
+
 /**
  * Check if two CMAF codec strings are compatible without changeType().
  * Returns true only if the exact codec string matches — different
@@ -160,6 +268,9 @@ function namespaceDisplay(ns: string | readonly string[]): string {
 function codecsCompatible(a: string, b: string): boolean {
   return a === b;
 }
+
+/** Why a media track is re-subscribed. */
+type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration' | 'refused' | 'namespace_return';
 
 function defaultMediaSubscriptionFilter(isLive: boolean) {
   if (isLive) {
@@ -193,6 +304,19 @@ function defined(obj: Record<string, unknown>): any {
     if (v !== undefined) result[k] = v;
   }
   return result;
+}
+
+/** One SUBSCRIBE the player holds, for status displays. */
+export interface SubscriptionStatus {
+  readonly trackName: string;
+  readonly kind: 'catalog' | 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
+  readonly requestId: bigint;
+  /** Null until SUBSCRIBE_OK assigns it. */
+  readonly alias: bigint | null;
+  /** SUBSCRIBE_OK has arrived. */
+  readonly established: boolean;
+  /** The Forward State the player last asked for (pause sends 0). */
+  readonly forward: boolean;
 }
 
 // ─── Hook intent types ───────────────────────────────────────────────
@@ -390,6 +514,8 @@ export class MoqtPlayer {
    * catalog arrived cannot get an adapter that starts anyway.
    */
   private playbackIntent: boolean | null = null;
+  /** Catalog targetLatency of the selected video track (ms); config wins. */
+  private catalogTargetLatencyMs: number | null = null;
   /** Pending `state_changed` announcements; see announceState(). */
   private readonly stateAnnouncements: { from: PlayerStateValue; to: PlayerStateValue }[] = [];
   private announcingState = false;
@@ -421,6 +547,13 @@ export class MoqtPlayer {
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
 
+  /** The MediaSource was rebuilt after a pipeline failure (once per pipeline set). */
+  private mseRebuilt = false;
+  /** A rebuilt MediaSource has not rendered a frame yet. */
+  private mseRebuildAwaitingFrame = false;
+  /** Why MSE audio was dropped, or null while it plays. */
+  private mseAudioDropped: string | null = null;
+
   /**
    * Wall-clock time `cmaf_init` fulfilled, i.e. when the `cmaf_first_frame`
    * watchdog expectation was first armed. Used to bound how long video
@@ -444,6 +577,8 @@ export class MoqtPlayer {
 
   /** `visibilitychange` listener installed while the first-frame deadline is pending. */
   private visibilityListener: (() => void) | null = null;
+  /** One-shot `visibilitychange` listener holding a media resume (autoResume off). */
+  private mediaResumeListener: (() => void) | null = null;
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
@@ -547,6 +682,17 @@ export class MoqtPlayer {
   /** Tick interval handle for pipeline processing. */
   private tickInterval: ReturnType<typeof setInterval> | null = null;
 
+  /** Clock reading of the last tick, shared by the timer and the arrival pump. */
+  private lastTickUs = 0;
+
+  /** Socket-to-engine spans per object, newest first, capped at DELIVERY_SPAN_SAMPLES. */
+  private readonly deliverySpans: Array<
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> = [];
+  private static readonly DELIVERY_SPAN_SAMPLES = 512;
+
+  /** tick() stages objects, which re-enters the arrival path. */
+  private tickInProgress = false;
+
   /**
    * Guard against double sync reset within a single tick cycle.
    * When both audio and video pipelines skip_forward in the same tick,
@@ -644,11 +790,56 @@ export class MoqtPlayer {
     replaying: boolean;
   } | null = null;
   /** Fail-closed recovery-parking bounds (objects / bytes / lifecycle). */
+  /** Cooldown after a failed recovery REQUEST_UPDATE: request IDs are bounded
+   *  by the peer's MAX_REQUEST_ID, and retrying per object exhausts them. */
+  private static readonly RECOVERY_UPDATE_COOLDOWN_US = 5_000_000;
+  /** Catalog objects dropped for an empty payload, and parse failures. */
+  private emptyCatalogObjects = 0;
+  private catalogParseFailures = 0;
+  /** Empty Normal media objects skipped under compat `empty-objects`. */
+  private _emptyMediaObjects = 0;
+  private _staleVideoDrops: { count: number; group: bigint | null; floor: bigint | null } = { count: 0, group: null, floor: null };
+  private readonly _datagramObjects = { audio: 0, video: 0 };
+  /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
+  private recoveryUpdateBlockedUntilUs = 0;
+  /** Clock time of the last recovery REQUEST_UPDATE, per media type. */
+  private readonly lastRecoveryUpdateUs = { video: Number.NEGATIVE_INFINITY, audio: Number.NEGATIVE_INFINITY };
+  /** Minimum spacing of recovery REQUEST_UPDATEs on one media type. */
+  private static readonly RECOVERY_UPDATE_MIN_INTERVAL_US = 2_000_000;
+  private recoveryUpdateFailures = 0;
+  /** Reconnect after the current session closed during playback; null when none is pending. */
+  private reconnect: {
+    attempt: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    readonly closeReason: string;
+  } | null = null;
+  /** SUBSCRIBE_NAMESPACE following config.namespace on the current session. */
+  private readonly follower = new NamespaceFollower({
+    connection: () => this.connection,
+    namespace: () => encodeNamespace(this.config.namespace, this.enc),
+    now: () => this.clock.now(),
+    onState: (state, detail) => this.emitter.emit('namespace_state', { type: 'namespace_state', state, detail }),
+    canReestablish: (returnedAtUs) => this.mayReestablishOnNamespaceReturn(returnedAtUs),
+    reestablish: () => this.reestablishOnNamespaceReturn(),
+    resumeInSession: (catalogLost) => this.resumeOnNamespaceReturn(catalogLost),
+    resumeHeld: () => this.holdWhileHidden(),
+  });
+  /** The catalog subscription that received PUBLISH_DONE, on its session. */
+  private catalogEnded: { conn: MoqtConnection; requestId: bigint } | null = null;
+  /** Last media object: media resuming after the namespace returns needs no re-establish. */
+  private lastMediaArrivalUs = -Infinity;
+  /** Delay before each reconnect attempt: the first is immediate; later attempts reuse the last. */
+  private static readonly RECONNECT_DELAYS_MS = [0, 1_000, 2_000, 4_000, 8_000, 15_000];
+  /** Attempts before giving up: about two minutes with the delays above. */
+  private static readonly RECONNECT_MAX_ATTEMPTS = 12;
+
   private static readonly MAX_RECOVERY_PARKED_OBJECTS = 256;
   private static readonly MAX_RECOVERY_PARKED_BYTES = 4 * 1024 * 1024;
   private static readonly MAX_RECOVERY_PARKED_EVENTS = 64;
   private static readonly MAX_RECOVERY_PARKED_ALIASES = 64;
   private recoveryAttempted = false;
+  /** Tracks the session played when a migration committed; consumed by resumeMigratedMedia. */
+  private migratedMedia: { video: string | undefined; audio: string | undefined } | null = null;
 
   /**
    * FAIL-CLOSED pre-alias stream lifecycle record: close events for streams
@@ -717,7 +908,25 @@ export class MoqtPlayer {
     reason: string;
     /** ABR direction — set by ABR/recovery paths for deferred commit. */
     abrAction?: 'downshift' | 'upshift';
+    /** Set when the new track is in another view (altGroup) or program (renderGroup). */
+    viewChange?: { readonly from: number | undefined; readonly to: number | undefined };
+    /** This switch is the video leg of the pending program switch. */
+    programLeg?: boolean;
   } | null = null;
+
+  /**
+   * True while `selectVideoTrack` awaits (init prefetch, SUBSCRIBE) before its
+   * pending switch is recorded — a second switch must not start meanwhile.
+   */
+  private videoSwitchStarting = false;
+  /** Target of the switch `videoSwitchStarting` guards (a repeat request for it is a no-op). */
+  private videoSwitchStartingTarget: string | null = null;
+
+  /** In-flight audio track switch (`selectAudioTrack`), until its new track commits. */
+  private pendingAudioSwitch: PendingAudioSwitch | null = null;
+
+  /** In-flight program switch (`selectProgram`), until every track settles. */
+  private pendingProgramSwitch: PendingProgramSwitch | null = null;
 
   /**
    * Staging buffer for new-track objects during make-before-break switch.
@@ -725,7 +934,7 @@ export class MoqtPlayer {
    * then all are fed to the pipeline in order on switch completion.
    * LOC pipeline path.
    */
-  private switchStagingBuffer: Array<{ obj: MoqtObject; headers: LocHeaders | undefined }> = [];
+  private switchStagingBuffer: Array<{ obj: MoqtObject; headers: LocHeaders | undefined; keyframe: boolean }> = [];
 
   /**
    * Staging buffer for new-track CMAF objects during make-before-break.
@@ -742,6 +951,8 @@ export class MoqtPlayer {
 
   /** Timeout for keyframe arrival during make-before-break switch. */
   private switchStagingTimeout: ReturnType<typeof setTimeout> | null = null;
+  /** No-data guard of the pending video switch (see SWITCH_NO_DATA_TIMEOUT_MS). */
+  private switchNoDataTimeout: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * True from the moment `completePendingVideoSwitch` starts until its
@@ -807,6 +1018,13 @@ export class MoqtPlayer {
     cancelled: boolean;
   }>();
 
+  /** PUBLISH_DONE resubscribe backoff per track name; at most one pending retry each. */
+  private readonly publishDoneRetries = new Map<string, {
+    attempts: number;
+    lastDoneAtMs: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>();
+
   /**
    * Media subscriptions pending SUBSCRIBE_OK: requestId → track info.
    * Registration in SubscriptionManager is deferred until SUBSCRIBE_OK
@@ -815,11 +1033,29 @@ export class MoqtPlayer {
    */
   private readonly pendingMediaSubs = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; packaging?: TrackPackaging }
+    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; packaging?: TrackPackaging;
+      initConfig?: Uint8Array }
   >();
   private _mediaSubsExpected = 0;
   private _mediaSubsOk = 0;
   private _mediaSubsFailed = 0;
+
+  /**
+   * What each media SUBSCRIBE put on the wire, by requestId, so a refusal
+   * can report the exact namespace and track bytes sent. Bounded FIFO.
+   */
+  private readonly mediaSubWire = new Map<bigint, string>();
+  private static readonly MEDIA_SUB_WIRE_MAX = 32;
+
+  /** Remember one SUBSCRIBE's wire detail, evicting the oldest past the cap. */
+  private recordMediaSubWire(requestId: bigint, detail: string): void {
+    this.mediaSubWire.set(requestId, detail);
+    while (this.mediaSubWire.size > MoqtPlayer.MEDIA_SUB_WIRE_MAX) {
+      const oldest = this.mediaSubWire.keys().next();
+      if (oldest.done) break;
+      this.mediaSubWire.delete(oldest.value);
+    }
+  }
 
   /**
    * Active fetches: requestId → track info for routing fetch objects.
@@ -854,6 +1090,8 @@ export class MoqtPlayer {
       resolve: (state: CatalogState) => void;
       reject: (error: Error) => void;
       timeout: ReturnType<typeof setTimeout>;
+      /** An open-ended range: cancel what is left once the first object settles it. */
+      cancelOnSettle?: boolean;
     }
   >();
 
@@ -1147,6 +1385,7 @@ export class MoqtPlayer {
     const locGauges = gapUs !== undefined ? {
       videoEffectiveGapTimeoutMs: gapUs / 1000, // raw adaptive fuse
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
+      audioLateDrops: this.audioPipeline?.lateAudioDrops ?? null,
     } : undefined;
     return Object.freeze(this._stats.snapshot(locGauges));
   }
@@ -1173,6 +1412,45 @@ export class MoqtPlayer {
     return this.timelineState !== null && this.timelineState.entries.length > 0;
   }
 
+  /** The catalog retrieval step (SUBSCRIBE + Joining FETCH ladder); null in subscribe-only mode. */
+  get catalogBootstrapPhase(): BootstrapPhase | null {
+    return this.catalogBootstrapCoord?.phase ?? null;
+  }
+
+  /** The followed namespace's state, or null when not following (config `followNamespace`). */
+  get namespaceState(): NamespaceState | null {
+    return this.follower.state;
+  }
+
+  /** The SUBSCRIBEs this player holds: the catalog's and each media track's. */
+  get subscriptions(): readonly SubscriptionStatus[] {
+    const forward = this.stateMachine.state !== PlayerState.PAUSED;
+    const out: SubscriptionStatus[] = [];
+    if (this.catalogRequestId !== null) {
+      out.push({
+        trackName: catalogTrackName(),
+        kind: 'catalog',
+        requestId: this.catalogRequestId,
+        alias: this.catalogTrackAlias,
+        established: this.catalogTrackAlias !== null,
+        // Pause updates media subscriptions only.
+        forward: true,
+      });
+    }
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      const established = !this.pendingMediaSubs.has(requestId);
+      out.push({
+        trackName: sub.trackName,
+        kind: sub.mediaType,
+        requestId,
+        alias: established ? sub.trackAlias : null,
+        established,
+        forward,
+      });
+    }
+    return out;
+  }
+
   // ─── Track switching (§5.1.19 altGroup, §4.2 group boundaries) ───
 
   /** Catalog video views for selecting videoAltGroup on a new player. */
@@ -1184,13 +1462,14 @@ export class MoqtPlayer {
   }
 
   /**
-   * Available video tracks from the altGroup.
+   * Available video tracks: the quality alternatives of the current view
+   * (altGroup), or every video track when the catalog has no altGroups.
    * Sorted by bitrate descending (highest first).
    * Empty before catalog is received.
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
-  get availableVideoTracks(): Array<{ name: string; width?: number; height?: number; bitrate?: number; codec?: string }> {
-    if (!this.qualityController) return [];
+  get availableVideoTracks(): VideoTrackInfo[] {
+    if (!this.qualityController || this.config.disableVideo) return [];
     const alts = this.qualityController.allAlternatives;
     return [...alts].map(t => defined({
       name: t.name,
@@ -1198,7 +1477,16 @@ export class MoqtPlayer {
       height: t.height,
       bitrate: t.bitrate,
       codec: t.codec,
+      label: t.label,
+      lang: t.lang,
+      altGroup: t.altGroup,
+      renderGroup: t.renderGroup,
     }));
+  }
+
+  /** Whether automatic quality switching (ABR) is on — off after a manual `selectVideoTrack()`. */
+  get autoQuality(): boolean {
+    return this.qualityController?.isAutoQuality ?? this.config.autoQuality !== false;
   }
 
   /**
@@ -1212,6 +1500,529 @@ export class MoqtPlayer {
       this.qualityController.unlockAuto();
     } else {
       this.qualityController.lockManual();
+    }
+  }
+
+  /**
+   * Video views of the current program — one per altGroup, in catalog order.
+   * Distinct altGroups carry different content (e.g. camera angles, or
+   * landscape and portrait canvases); each view's tracks are its quality
+   * alternatives. Empty when the catalog has no altGroups (a single implicit
+   * view). `label` is the catalog label of the view's first track.
+   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+   */
+  get availableViews(): VideoViewInfo[] {
+    if (!this.qualityController || this.config.disableVideo) return [];
+    return this.qualityController.views.map(v => defined({
+      altGroup: v.altGroup,
+      renderGroup: v.renderGroup,
+      label: v.tracks.find(t => t.label !== undefined)?.label,
+      width: v.tracks[0]?.width,
+      height: v.tracks[0]?.height,
+      tracks: v.tracks.map(t => t.name),
+    }));
+  }
+
+  /** altGroup of the view being played, or undefined without altGroups or video. */
+  get currentView(): number | undefined {
+    return this.config.disableVideo ? undefined : this.qualityController?.currentView;
+  }
+
+  /**
+   * Switch to another video view (altGroup). Audio is untouched. ABR keeps
+   * running inside the new view, starting at the level closest to the current
+   * one. The switch is make-before-break: the old view keeps playing until
+   * the new view's next group starts, then `view_changed` fires.
+   *
+   * @throws If the view is unknown or has no playable track
+   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
+   */
+  async selectView(altGroup: number): Promise<void> {
+    if (!this.qualityController) throw new Error('Cannot switch view: player not loaded');
+    if (this.config.disableVideo || this.activeTrackName('video') === undefined) {
+      throw new Error('Cannot switch view: video is not playing');
+    }
+    const pending = this.pendingVideoSwitch;
+    if (pending || this.switchInProgress || this.videoSwitchStarting) {
+      const target = pending?.newTrackName ?? this.videoSwitchStartingTarget;
+      if (target !== null && target !== undefined && this.qualityController.viewOf(target) === altGroup) return;
+      throw new Error('Cannot switch view: a video track switch is already in progress');
+    }
+    if (altGroup === this.qualityController.currentView) return;
+    const track = this.qualityController.peekViewTrack(altGroup);
+    if (!track) throw new Error(`Unknown or unplayable video view: altGroup ${altGroup}`);
+    await this.selectVideoTrack(track.name, 'view');
+  }
+
+  // ─── Audio tracks and programs (lang, §5.1.18 renderGroup) ───
+
+  /**
+   * Audio tracks of the current program, in catalog order. Several entries
+   * sharing an altGroup are usually languages, told apart by `lang`; `label`
+   * is present only where the publisher set one (a UI can fall back to
+   * `Intl.DisplayNames` on `lang`, then to the name).
+   */
+  get availableAudioTracks(): AudioTrackInfo[] {
+    if (!this.qualityController || this.config.disableAudio) return [];
+    return this.qualityController.audioTracks.map(t => defined({
+      name: t.name,
+      codec: t.codec,
+      bitrate: t.bitrate,
+      samplerate: t.samplerate,
+      channelConfig: t.channelConfig,
+      lang: t.lang,
+      label: t.label,
+      altGroup: t.altGroup,
+      renderGroup: t.renderGroup,
+    }));
+  }
+
+  /** Name of the video track being played (committed), or undefined before selection / without video. */
+  get currentVideoTrack(): string | undefined {
+    return this.config.disableVideo ? undefined : this.qualityController?.currentVideoTrack?.name;
+  }
+
+  /** Name of the audio track being played, or undefined before selection / without audio. */
+  get currentAudioTrack(): string | undefined {
+    return this.config.disableAudio ? undefined : this.qualityController?.currentAudioTrack?.name;
+  }
+
+  /**
+   * Programs of the catalog — one per renderGroup, in catalog order: sets of
+   * tracks meant to be rendered together (tracks without a renderGroup are
+   * part of every program). Empty when the catalog has no renderGroups.
+   * The catalog carries no program name, so naming them is up to the UI.
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  get availablePrograms(): ProgramInfo[] {
+    if (!this.qualityController) return [];
+    return this.qualityController.programs.map(p => ({
+      renderGroup: p.renderGroup,
+      tracks: p.tracks.map(t => t.name),
+    }));
+  }
+
+  /** renderGroup of the program being played, or undefined without renderGroups. */
+  get currentProgram(): number | undefined {
+    return this.qualityController?.currentProgram;
+  }
+
+  /**
+   * Switch to another program (renderGroup): video and audio together. The
+   * video goes to the program's first view at the current ABR level; audio
+   * keeps the current language when the program has it. `program_changed`
+   * fires once every track that changes has committed — at once when the
+   * program shares all playing tracks with the current one.
+   *
+   * @throws If the program is unknown or a video switch is already in progress
+   * @see draft-ietf-moq-msf-00 §5.1.18 (renderGroup)
+   */
+  async selectProgram(renderGroup: number): Promise<void> {
+    const qc = this.qualityController;
+    if (!qc) throw new Error('Cannot switch program: player not loaded');
+    const next = qc.peekProgramTracks(renderGroup);
+    if (!next) throw new Error(`Unknown program: renderGroup ${renderGroup}`);
+    const pendingProgram = this.pendingProgramSwitch;
+    if (pendingProgram) {
+      if (pendingProgram.target === renderGroup) return;
+      throw new Error('Cannot switch program: a program switch is already in progress');
+    }
+    if (renderGroup === qc.currentProgram) return;
+    if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) {
+      throw new Error('Cannot switch program: a video track switch is already in progress');
+    }
+    if (this.pendingAudioSwitch) {
+      throw new Error('Cannot switch program: an audio track switch is already in progress');
+    }
+    // A leg replaces a playing track; without one there is nothing to switch.
+    const video = next.video && !this.config.disableVideo && this.activeTrackName('video') !== undefined
+      && next.video.name !== this.activeTrackName('video') ? next.video : undefined;
+    const audio = next.audio && !this.config.disableAudio && this.hasAudioOutput()
+      && next.audio.name !== (this.activeTrackName('audio') ?? qc.currentAudioTrack?.name) ? next.audio : undefined;
+    // Refuse up front what the audio leg would refuse, so a program is never
+    // left half-switched (new video, old audio) by a predictable error.
+    if (audio?.packaging === 'locmaf') {
+      throw new Error(`Cannot switch program: audio track switching is not supported for LOCMAF yet`);
+    }
+    const ps: PendingProgramSwitch = {
+      target: renderGroup,
+      from: qc.currentProgram,
+      prevAudio: this.activeTrackName('audio'),
+      legs: new Map(),
+    };
+    if (video) ps.legs.set('video', 'pending');
+    if (audio) ps.legs.set('audio', 'pending');
+    this.pendingProgramSwitch = ps;
+    if (ps.legs.size === 0) {
+      // The program shares every playing track with the current one.
+      this.settleProgramLeg(null, true);
+      return;
+    }
+    // Video first: if it cannot start (e.g. no init for the new codec), the
+    // audio stays put rather than leaving a half-switched program.
+    if (video) {
+      try {
+        await this.selectVideoTrack(video.name, 'program');
+      } catch (err) {
+        if (this.pendingProgramSwitch === ps) this.pendingProgramSwitch = null;
+        throw err;
+      }
+      this.adoptProgramLeg(ps, 'video', video.name);
+    }
+    if (audio) {
+      // The video leg may already have failed (e.g. refused); then the audio stays.
+      if (this.pendingProgramSwitch !== ps || ps.legs.get('video') === 'failed') {
+        this.settleProgramLeg('audio', false);
+        return;
+      }
+      try {
+        await this.selectAudioTrack(audio.name, 'program');
+      } catch (err) {
+        if (this.pendingProgramSwitch === ps) this.settleProgramLeg('audio', false);
+        throw err;
+      }
+      this.adoptProgramLeg(ps, 'audio', audio.name);
+    }
+  }
+
+  /**
+   * After a program leg's select call: tie the pending switch to the program
+   * (it may be a switch to the same track that was already in flight), or —
+   * when no switch is pending because the track already plays — settle it.
+   */
+  private adoptProgramLeg(ps: PendingProgramSwitch, leg: 'video' | 'audio', trackName: string): void {
+    if (this.pendingProgramSwitch !== ps || ps.legs.get(leg) !== 'pending') return;
+    const pending = leg === 'video' ? this.pendingVideoSwitch : this.pendingAudioSwitch;
+    if (pending?.newTrackName === trackName) {
+      pending.programLeg = true;
+      return;
+    }
+    this.settleProgramLeg(leg, this.activeTrackName(leg) === trackName);
+  }
+
+  /**
+   * One track of a program switch settled — committed (`ok`) or failed; `null`:
+   * no track had to change. Once all have settled: if the video moved (or had
+   * no need to), the controller moves to the target program and
+   * `program_changed` reports the switch (a failed audio leg was reported by
+   * its own event and leaves the old language playing). If the video failed,
+   * the program stays, and an audio track already moved goes back.
+   */
+  private settleProgramLeg(leg: 'video' | 'audio' | null, ok: boolean): void {
+    const ps = this.pendingProgramSwitch;
+    const qc = this.qualityController;
+    if (!ps || !qc) return;
+    if (leg) ps.legs.set(leg, ok ? 'ok' : 'failed');
+    if ([...ps.legs.values()].includes('pending')) return;
+    this.pendingProgramSwitch = null;
+    if (ps.legs.get('video') === 'failed') {
+      if (ps.legs.get('audio') === 'ok' && ps.prevAudio) {
+        this.selectAudioTrack(ps.prevAudio, 'program-rollback').catch((err: unknown) => {
+          this.log.warn('Program switch rollback to audio "%s" failed: %s', ps.prevAudio, err);
+        });
+      }
+      return;
+    }
+    // Every track that had to change failed: the program did not move.
+    const outcomes = [...ps.legs.values()];
+    if (outcomes.length > 0 && !outcomes.includes('ok')) return;
+    const fromProgram = qc.currentProgram;
+    qc.commitProgram(ps.target);
+    if (ps.from !== ps.target || fromProgram !== ps.target) {
+      this.emitter.emit('program_changed', { type: 'program_changed', fromProgram: ps.from, toProgram: ps.target });
+    }
+  }
+
+  /**
+   * A switch's new subscription was refused, ended or found malformed before
+   * the switch committed: abort it so the player does not wait forever, keep
+   * the old track, and report the failure.
+   */
+  private failSwitchForSubscription(requestId: bigint, trackName: string, cause: Error): void {
+    const video = this.pendingVideoSwitch;
+    if (video && !this.switchInProgress
+        && (video.newRequestId === requestId || video.newTrackName === trackName)) {
+      this.abortPendingVideoSwitch(video, cause);
+    }
+    const audio = this.pendingAudioSwitch;
+    if (audio && !audio.committing
+        && (audio.newRequestId === requestId || audio.newTrackName === trackName)) {
+      this.abortPendingAudioSwitch(audio, cause);
+    }
+  }
+
+  /** Name of the live media subscription of `mediaType` (the first one found). */
+  private activeTrackName(mediaType: 'video' | 'audio'): string | undefined {
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.mediaType === mediaType) return sub.trackName;
+    }
+    return undefined;
+  }
+
+  /**
+   * Switch to another audio track — typically another language. Video is
+   * untouched. A live switch joins the new track at its next group (audio
+   * groups are about 1 s); the old track keeps playing until then.
+   *
+   * LOC: commits on the first object of the new track — the old track is
+   * dropped, the decoder reconfigured and scheduled audio flushed, so the
+   * language cuts over cleanly. CMAF: the new track's init re-types the audio
+   * SourceBuffer (keeping the timeline) and the old track is dropped only
+   * once that succeeds; on failure it keeps playing.
+   *
+   * @throws If the track is unknown, unsupported, or another audio switch is in progress
+   */
+  async selectAudioTrack(trackName: string, reason: string = 'manual'): Promise<void> {
+    if (!this._catalogState || !this.connection || !this.subscriptionManager) {
+      throw new Error('Cannot switch audio track: player not loaded');
+    }
+    const target = this._catalogState.tracks.find((t: CatalogTrack) => t.name === trackName && t.role === 'audio');
+    if (!target) throw new Error(`Unknown audio track: "${trackName}"`);
+    if (!isTrackPackagingSupported(target)) {
+      throw new Error(`Cannot switch to "${trackName}": unsupported locmafVersion "${target.locmafVersion ?? ''}" (LOCMAF §5)`);
+    }
+    if (target.packaging === 'locmaf') {
+      throw new Error(`Cannot switch to "${trackName}": audio track switching is not supported for LOCMAF yet`);
+    }
+    const pending = this.pendingAudioSwitch;
+    if (pending) {
+      if (pending.newTrackName === trackName) return;
+      throw new Error('Cannot switch audio track: an audio track switch is already in progress');
+    }
+    // A switch replaces the playing track: without one there is no decoder
+    // or SourceBuffer to feed.
+    let oldRequestId: bigint | null = null;
+    let oldTrackName = '';
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      if (sub.mediaType === 'audio') { oldRequestId = requestId; oldTrackName = sub.trackName; break; }
+    }
+    // Without a live audio subscription (e.g. the language's publisher went
+    // away) a switch can still replace it, as long as audio output exists.
+    if (this.config.disableAudio || (oldRequestId === null && !this.hasAudioOutput())) {
+      throw new Error('Cannot switch audio track: audio is not playing');
+    }
+    if (oldTrackName === trackName) return;
+
+    // MSE re-types the audio SourceBuffer with the new track's init, so it
+    // must be in hand before the switch starts.
+    const mse = this.usesMse(target.packaging);
+    let initData: Uint8Array | undefined;
+    if (mse) {
+      initData = this.decodeResolvedInlineInitData(target)
+        ?? (target.initTrack ? await this.ensureInitTrack(target.initTrack) : undefined);
+      if (!initData) {
+        throw new Error(`Cannot switch to "${trackName}": catalog provides no inline init (initData/initRef) or initTrack`);
+      }
+      if (this.pendingAudioSwitch) throw new Error('Cannot switch audio track: an audio track switch is already in progress');
+    }
+
+    if (!oldTrackName) oldTrackName = this.qualityController?.currentAudioTrack?.name ?? '';
+    const sw: PendingAudioSwitch = {
+      oldRequestId, oldTrackName, newTrackName: trackName, newRequestId: null,
+      reason, mse, ...(initData ? { initData } : {}), committing: false, staged: [],
+      ...(reason === 'program' ? { programLeg: true } : {}),
+    };
+    this.pendingAudioSwitch = sw;
+    sw.noDataTimer = setTimeout(() => {
+      if (this.pendingAudioSwitch !== sw || sw.committing) return;
+      this.log.warn('[AUDIO-SWITCH] "%s" delivered nothing in %dms — abandoning the switch', trackName, SWITCH_NO_DATA_TIMEOUT_MS);
+      this.abortPendingAudioSwitch(sw, new Error(`no media from "${trackName}" within ${SWITCH_NO_DATA_TIMEOUT_MS} ms`));
+    }, SWITCH_NO_DATA_TIMEOUT_MS);
+    const subscribeOptions = buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(target.isLive === true);
+    this.log.info('[AUDIO-SWITCH] start: "%s" → "%s" (%s)', oldTrackName, trackName, reason);
+    try {
+      sw.newRequestId = await this.subscribeReplacementTrack(
+        trackName, 'audio', mediaTrackPackaging(target.packaging), subscribeOptions,
+        (id) => { sw.newRequestId = id; });
+    } catch (err) {
+      if (this.pendingAudioSwitch === sw) this.pendingAudioSwitch = null;
+      throw err;
+    }
+  }
+
+  /**
+   * LOC audio switch commit, on the first object of the new track: drop the
+   * old subscription, reset the audio pipeline to the new track's groups and
+   * reconfigure the decoder for its codec and config.
+   */
+  private commitLocAudioSwitch(sw: PendingAudioSwitch, firstGroupId: bigint): void {
+    this.pendingAudioSwitch = null;
+    clearTimeout(sw.noDataTimer);
+    this.retireOldAudioTrack(sw);
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'audio');
+    if (track && this.audioPipeline) {
+      const channels = track.channelConfig ? Number(track.channelConfig) : undefined;
+      this.audioPipeline.resetForTrackSwitch(firstGroupId);
+      this.commandDispatcher?.updateAudioCodec(track.codec ?? '', track.samplerate, channels);
+      configurePipelines(
+        {
+          videoPipeline: null,
+          audioPipeline: this.audioPipeline,
+          syncController: this.syncController!,
+          recoveryController: this.recoveryController!,
+          commandDispatcher: this.commandDispatcher!,
+          mediaSource: null,
+        },
+        {
+          video: undefined,
+          audio: defined({
+            codec: track.codec ?? '',
+            initData: this.pipelineInitData(track),
+            samplerate: track.samplerate,
+            channels,
+          }),
+        },
+      );
+    }
+    this.finishAudioSwitch(sw);
+  }
+
+  /**
+   * CMAF audio switch commit, on the first object of the new track: pin the
+   * assembler to it (late old-track objects are dropped from here on), re-type
+   * the SourceBuffer with its init keeping the timeline, then replay what was
+   * staged meanwhile. The old subscription goes only after that succeeds.
+   */
+  private commitMseAudioSwitch(sw: PendingAudioSwitch): void {
+    sw.committing = true;
+    clearTimeout(sw.noDataTimer);
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'audio');
+    this.cmafAssembler?.selectTrack?.('audio', sw.newTrackName);
+    const finish = (): void => {
+      if (this.pendingAudioSwitch !== sw) return; // destroyed meanwhile
+      this.pendingAudioSwitch = null;
+      if (sw.initData) this.cmafAssembler?.setInitSegment?.('audio', sw.initData);
+      this.retireOldAudioTrack(sw);
+      for (const { trackName, groupId, payload } of sw.staged) {
+        this.cmafAssembler?.push('audio', trackName, groupId, payload);
+      }
+      this.finishAudioSwitch(sw);
+    };
+    if (!this.mediaSource?.changeType || !sw.initData) {
+      finish();
+      return;
+    }
+    this.mediaSource.changeType('audio', track?.codec ?? '', sw.initData)
+      .then(finish)
+      .catch((err: unknown) => {
+        if (this.pendingAudioSwitch !== sw) return;
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.log.warn('[AUDIO-SWITCH] changeType failed: %s — old track stays active', error.message);
+        this.cmafAssembler?.selectTrack?.('audio', sw.oldTrackName);
+        this.abortPendingAudioSwitch(sw, error);
+      });
+  }
+
+  /**
+   * Roll an audio switch back before it committed: drop the new subscription,
+   * keep the old track, report the failure.
+   */
+  private abortPendingAudioSwitch(sw: PendingAudioSwitch, error: Error): void {
+    if (this.pendingAudioSwitch !== sw) return;
+    this.pendingAudioSwitch = null;
+    clearTimeout(sw.noDataTimer);
+    // A liveness / TOO_FAR_BEHIND renewal of the old track was held back for
+    // the switch; with the switch gone, bring the old track back if it lapsed.
+    const oldAlive = [...this.activeSubscriptions.values()]
+      .some(sub => sub.mediaType === 'audio' && sub.trackName === sw.oldTrackName);
+    if (!oldAlive && sw.oldTrackName) this.replaceSubscription(sw.oldTrackName, 'liveness');
+    if (sw.newRequestId !== null && this.connection) {
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
+    }
+    this.emitter.emit('audio_track_switch_failed', {
+      type: 'audio_track_switch_failed',
+      fromTrackName: sw.oldTrackName,
+      toTrackName: sw.newTrackName,
+      reason: sw.reason,
+      error,
+    });
+    this.emitError(createPlayerError(
+      'degraded', 'subscription', PlayerErrorCode.AUDIO_DECODE_ERROR,
+      `Audio track switch to "${sw.newTrackName}" failed: ${error.message}`,
+      { cause: error, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
+    ));
+    if (sw.programLeg) this.settleProgramLeg('audio', false);
+  }
+
+  /** Whether audio output exists (a LOC pipeline, or a CMAF audio SourceBuffer). */
+  private hasAudioOutput(): boolean {
+    return this.audioPipeline !== null
+      || (this.cmafInitialized && this.qualityController?.currentAudioTrack !== undefined);
+  }
+
+  /**
+   * Unsubscribe the old track of an audio switch — every subscription of it,
+   * in case a liveness or TOO_FAR_BEHIND replacement renewed it meanwhile.
+   */
+  private retireOldAudioTrack(sw: PendingAudioSwitch): void {
+    if (!this.connection || !this.subscriptionManager) return;
+    for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
+      if (sub.mediaType !== 'audio' || sub.trackName !== sw.oldTrackName || sub.trackName === sw.newTrackName) continue;
+      this.retireMediaSubscription(requestId, this.connection);
+      void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
+    }
+  }
+
+  /** Commit an audio switch to the controller and report it. */
+  private finishAudioSwitch(sw: PendingAudioSwitch): void {
+    this.qualityController?.commitAudioTrack(sw.newTrackName);
+    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'audio');
+    // A language the viewer picked follows them across program switches.
+    if (sw.reason === 'manual' && track?.lang) this.qualityController?.rememberLanguage(track.lang);
+    this.log.info('[AUDIO-SWITCH] complete: "%s" → "%s"', sw.oldTrackName, sw.newTrackName);
+    this.emitter.emit('audio_track_changed', {
+      type: 'audio_track_changed',
+      fromTrackName: sw.oldTrackName,
+      toTrackName: sw.newTrackName,
+      lang: track?.lang,
+      reason: sw.reason,
+    });
+    if (sw.programLeg) this.settleProgramLeg('audio', true);
+  }
+
+  /** Emit `program_changed` when the controller's program moved away from `fromProgram`. */
+  private emitProgramChange(fromProgram: number | undefined): void {
+    const toProgram = this.qualityController?.currentProgram;
+    if (toProgram === undefined || toProgram === fromProgram) return;
+    this.emitter.emit('program_changed', { type: 'program_changed', fromProgram, toProgram });
+  }
+
+  /**
+   * Subscribe a replacement media track during a switch. Pre-send ownership
+   * (§9.10): the pending entry (alias remap) and the activeSubscriptions
+   * record are installed inside onRequestId so a same-tick SUBSCRIBE_OK
+   * cannot miss them. Only SUBSCRIBE_OK binds routing; objects arriving
+   * before it remain parked by their wire alias.
+   */
+  private async subscribeReplacementTrack(
+    trackName: string,
+    mediaType: 'video' | 'audio',
+    packaging: TrackPackaging,
+    subscribeOptions: object,
+    onRegistered?: (requestId: bigint) => void,
+  ): Promise<bigint> {
+    const conn = this.connection!;
+    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nameBytes = this.enc.encode(trackName);
+    let registeredId: bigint | null = null;
+    const register = (id: bigint): void => {
+      if (registeredId !== null) return;
+      registeredId = id;
+      if (!this.subscriptionManager || this.connection !== conn) return;
+      this.pendingAliasBinds.add(id);
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
+      this.pendingMediaSubs.set(id, { trackName, mediaType, packaging, ...this.catalogInitConfig(trackName) });
+      onRegistered?.(id);
+    };
+    try {
+      const reqId = await conn.subscribe(nsBytes, nameBytes,
+        { ...subscribeOptions, onRequestId: (id: bigint) => register(BigInt(id)) } as never);
+      register(BigInt(reqId));
+      return BigInt(reqId);
+    } catch (err) {
+      if (registeredId !== null) this.retireMediaSubscription(registeredId, conn);
+      throw err;
     }
   }
 
@@ -1239,6 +2050,24 @@ export class MoqtPlayer {
     return undefined;
   }
 
+  /**
+   * A LOC track's decoder configuration from the catalog's initialization data
+   * (MSF-00 initData, or MSF-01 initRef into initDataList): the codec's
+   * description, as LOC's VIDEO_CONFIG / AUDIO_CONFIG carry it.
+   */
+  private catalogInitConfig(trackName: string): { initConfig?: Uint8Array } {
+    const track = this._catalogState?.tracks.find((t) => t.name === trackName);
+    if (!track || mediaTrackPackaging(track.packaging) !== 'loc') return {};
+    const b64 = this.resolveInlineInitData(track);
+    if (!b64) return {};
+    try {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      return bytes.byteLength > 0 ? { initConfig: bytes } : {};
+    } catch {
+      return {};
+    }
+  }
+
   /** Consecutive groups with no reconstructable chunk before a LOCMAF track is malformed (§2.4.2). */
   private static readonly LOCMAF_MAX_FAILED_GROUPS = 3;
   /** Recent groups kept in a LOCMAF track's malformed-track bookkeeping. */
@@ -1256,7 +2085,12 @@ export class MoqtPlayer {
    * sample flags), never on object ids.
    * @see draft-einarsson-moq-locmaf-01 §3, §9, §15, §16
    */
-  private onLocmafMediaObject(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, obj: MoqtObject): void {
+  private onLocmafMediaObject(
+    mediaType: 'video' | 'audio' | 'eventtimeline',
+    trackName: string,
+    obj: MoqtObject,
+    headers: LocHeaders = {},
+  ): void {
     if (mediaType === 'eventtimeline') {
       this.onLocmafEventObject(trackName, obj);
       return;
@@ -1268,6 +2102,7 @@ export class MoqtPlayer {
     if (obj.kind === 'data') {
       const bytes = obj.payload ? obj.payload.byteLength : 0;
       this._stats.recordMediaObject(bytes);
+      this.recordDeliverySpans(obj);
       if (mediaType === 'video' && bytes > 0) {
         this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
       }
@@ -1282,7 +2117,11 @@ export class MoqtPlayer {
       objectId: BigInt(obj.objectId),
       kind: obj.kind,
       ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
+      ...(obj.kind === 'data' && obj.extensions ? { extensions: obj.extensions } : {}),
       ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+      ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
+      ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
+      ...this.subscriptionManager?.captureTimeFields(obj, headers),
     });
 
     if (this.stateMachine.state === PlayerState.PAUSED) return;
@@ -1343,7 +2182,9 @@ export class MoqtPlayer {
         && trackName === this.pendingVideoSwitch.newTrackName) {
       this.cmafSwitchStagingBuffer.push({ trackName, mediaType, groupId, payload: decoded.bytes });
       if (this.switchStagingTimeout === null) {
+        const stagingFor = this.pendingVideoSwitch;
         this.switchStagingTimeout = setTimeout(() => {
+          if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
           this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
           this.completePendingVideoSwitch();
         }, SWITCH_STAGING_TIMEOUT_MS);
@@ -1357,14 +2198,10 @@ export class MoqtPlayer {
       return;
     }
 
-    // Early stale-group drop, as for CMAF.
-    if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-      const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
-        .getCommittedGroupFloor(mediaType, trackName);
-      if (floor !== undefined && groupId < floor) return;
-    }
+    if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
-    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes);
+    this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes,
+      obj.subgroupId === undefined ? undefined : BigInt(obj.subgroupId));
   }
 
   /** Count reconstruction and pre-init rawBoxes validation through the same group-health policy. */
@@ -1475,6 +2312,116 @@ export class MoqtPlayer {
   }
 
   /** Whether a track of this packaging plays through MSE in this player (LOCMAF may take the frame path). */
+  /**
+   * Adopt an updated catalog (delta, re-sent catalog or recovery adoption):
+   * cache it, let the controller follow its programs, views and tracks
+   * (keeping the current ones by name), and report it.
+   */
+  private applyCatalogUpdate(state: CatalogState): void {
+    this._catalogState = state;
+    if (this.qualityController?.updateCatalog(state)) this.syncBufferAbrController();
+    this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+  }
+
+  /**
+   * When the controller is (re)built after media is already flowing — the
+   * knownTracks path, or a catalog re-received after a session migration —
+   * its own selection may differ from what plays: commit it to the playing
+   * tracks (else the configured known tracks) so its program, view, ABR
+   * ladder and getters tell the truth and the user's choices survive.
+   */
+  private alignControllerWithPlayingTracks(previous?: QualityController | null): void {
+    const qc = this.qualityController;
+    if (!qc) return;
+    if (previous) qc.adoptViewerChoices(previous);
+    const video = this.activeTrackName('video') ?? this.config.knownTracks?.video?.name;
+    const audio = this.activeTrackName('audio') ?? this.config.knownTracks?.audio?.name;
+    if (video) qc.commitVideoTrack(video);
+    if (audio) qc.commitAudioTrack(audio);
+    // Re-ladder buffer ABR where it runs; the knownTracks path never had it.
+    if (this.bufferAbrController) this.syncBufferAbrController();
+  }
+
+  /** Release the current session's media subscriptions; returns the tracks they played. */
+  private retireSessionMedia(): { video: string | undefined; audio: string | undefined } {
+    const playing = { video: this.activeTrackName('video'), audio: this.activeTrackName('audio') };
+    const conn = this.connection;
+    if (conn) {
+      for (const [requestId, sub] of [...this.activeSubscriptions]) {
+        if (sub.mediaType === 'video' || sub.mediaType === 'audio') this.retireMediaSubscription(requestId, conn);
+      }
+    }
+    return playing;
+  }
+
+  /**
+   * After a migration, subscribe the new session to the tracks the old one
+   * played, or to the current selection where none played.
+   */
+  private resumeMigratedMedia(selected: SelectedTracks): void {
+    if (this.holdWhileHidden()) {
+      this.log.info('Media resume held until the page is visible (autoResume off)');
+      this.resumeWhenVisible(() => this.resumeMigratedMedia(selected));
+      return;
+    }
+    const playing = this.migratedMedia;
+    this.migratedMedia = null;
+    const tracks = this._catalogState?.tracks;
+    if (!playing || !tracks) return;
+    for (const mediaType of ['video', 'audio'] as const) {
+      if (this.activeTrackName(mediaType) !== undefined) continue;
+      const kept = playing[mediaType];
+      const name = kept !== undefined && tracks.some((t: CatalogTrack) => t.name === kept)
+        ? kept : selected[mediaType]?.name;
+      if (name === undefined) continue;
+      if (mediaType === 'video') this.qualityController?.commitVideoTrack(name);
+      else this.qualityController?.commitAudioTrack(name);
+      this.replaceSubscription(name, 'migration', () => this.scheduleResubscribe(name, 'migration'));
+    }
+    this.syncBufferAbrController();
+  }
+
+  /**
+   * Warm start (§5.1.3) for a re-subscription, as far as the SUBSCRIBE alone
+   * carries it: a new group for live MSE video, the current group as a
+   * draft-22 fill for live LOC. LOC on older drafts needs a Joining FETCH for
+   * that, so it starts at the next group.
+   */
+  private warmResubscribeOptions(
+    track: CatalogTrack, packaging: string, mediaType: 'video' | 'audio', conn: MoqtConnection,
+  ): { options: object; fill: boolean } | null {
+    if (this.config.warmStartCurrentGroup !== true || track.isLive !== true) return null;
+    if (isMsePackaging(packaging)) {
+      return mediaType === 'video' && conn.draftVersion !== 14
+        ? { options: { ...defaultMediaSubscriptionFilter(true), newGroupRequest: 0n }, fill: false }
+        : null;
+    }
+    return isDraft22(conn.draftVersion)
+      ? { options: { subscriptionFilter: { type: 'LargestObject' as const }, fill: CURRENT_GROUP_FILL }, fill: true }
+      : null;
+  }
+
+  /**
+   * Whether a staged LOC object of a switch's new track can start decoding.
+   * Trusts the LOC frame marking, else the bitstream itself; object 0 is the
+   * last resort — a relay joining the subscription mid-group can number a
+   * delta frame 0.
+   * @see draft-ietf-moq-loc-04 §2.3.2.2 (Video Frame Marking)
+   */
+  private isLocSwitchKeyframe(trackName: string, obj: MoqtObject, headers: LocHeaders | undefined): boolean {
+    const marked = headers?.videoFrameMarking?.independent;
+    if (marked !== undefined) return marked;
+    const codec = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === trackName && t.role === 'video')?.codec;
+    if (codec && obj.kind === 'data' && obj.payload) {
+      const keyframe = isKeyframePayload(codec, obj.payload);
+      if (keyframe === true) return true;
+      // AV1 key frames need not repeat the sequence header the detector looks
+      // for, so a "no" is only trusted for H.264 / H.265 (IDR / IRAP NALs).
+      if (keyframe === false && !codec.startsWith('av01')) return false;
+    }
+    return BigInt(obj.objectId) === 0n;
+  }
+
   private usesMse(packaging: string | undefined): boolean {
     return usesMsePath(packaging, this.config.locmafDecoding);
   }
@@ -1649,9 +2596,11 @@ export class MoqtPlayer {
   private routeLocmafFrame(mediaType: 'video' | 'audio', trackName: string, frame: MoqtObject, headers: LocHeaders): void {
     if (this.pendingVideoSwitch && mediaType === 'video'
         && trackName === this.pendingVideoSwitch.newTrackName) {
-      this.switchStagingBuffer.push({ obj: frame, headers });
+      this.switchStagingBuffer.push({ obj: frame, headers, keyframe: headers.videoFrameMarking?.independent === true });
       if (this.switchStagingBuffer.length === 1) {
+        const stagingFor = this.pendingVideoSwitch;
         this.switchStagingTimeout = setTimeout(() => {
+          if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
           this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
           this.completePendingVideoSwitch();
         }, SWITCH_STAGING_TIMEOUT_MS);
@@ -1892,6 +2841,31 @@ export class MoqtPlayer {
     reason: string = 'manual',
     abrAction?: 'downshift' | 'upshift',
   ): Promise<void> {
+    // A recovery step-down fails an upshift on trial, as an ABR downshift does.
+    if (reason === 'recovery') this.noteAbrDownshift(this.clock.now());
+    // One video switch at a time: a second one (ABR, recovery, view, program,
+    // manual) racing the first through its awaits would overwrite the pending
+    // switch and orphan a subscription.
+    if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) {
+      if (this.pendingVideoSwitch?.newTrackName === trackName || this.videoSwitchStartingTarget === trackName) return;
+      throw new Error('Cannot switch video track: a video track switch is already in progress');
+    }
+    this.videoSwitchStarting = true;
+    this.videoSwitchStartingTarget = trackName;
+    try {
+      await this.startVideoSwitch(trackName, reason, abrAction);
+    } finally {
+      this.videoSwitchStarting = false;
+      this.videoSwitchStartingTarget = null;
+    }
+  }
+
+  /** Body of `selectVideoTrack`, serialized by it. */
+  private async startVideoSwitch(
+    trackName: string,
+    reason: string,
+    abrAction?: 'downshift' | 'upshift',
+  ): Promise<void> {
     if (!this._catalogState || !this.connection || !this.subscriptionManager) {
       throw new Error('Cannot switch track: player not loaded');
     }
@@ -1923,15 +2897,20 @@ export class MoqtPlayer {
 
     const currentTrack = this._catalogState.tracks.find(t => t.role === 'video' && t.name === currentVideoTrackName);
     if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
-    if (currentTrack.altGroup !== targetTrack.altGroup) {
-      throw new Error(`Cannot switch to "${trackName}": different video altGroup; select that view at tune-in with videoAltGroup`);
-    }
 
     // A rejected selection must not change the active group's ABR policy.
     if (reason === 'manual') this.qualityController?.lockManual();
 
     // No-op if already on the target track
     if (currentVideoTrackName === trackName) return;
+
+    // A track of another view (altGroup) is different content, not a quality
+    // alternative: §4.2 group alignment does not hold across views, and its
+    // init segment (resolution, aspect, SPS/PPS) always differs.
+    // A track of another program (renderGroup) is different content too.
+    const viewChange = (currentTrack.altGroup !== targetTrack.altGroup || currentTrack.renderGroup !== targetTrack.renderGroup)
+      ? { from: currentTrack.altGroup, to: targetTrack.altGroup }
+      : undefined;
 
     // For CMAF: if the switch crosses codec families, the SourceBuffer
     // needs to be retyped via changeType() with the new init segment.
@@ -1953,7 +2932,8 @@ export class MoqtPlayer {
     const needsCodecChange = this.usesMse(targetTrack.packaging)
         && targetTrack.codec !== undefined
         && (this.currentVideoCodec === null
-            || !codecsCompatible(targetTrack.codec, this.currentVideoCodec));
+            || !codecsCompatible(targetTrack.codec, this.currentVideoCodec)
+            || viewChange !== undefined);
     if (needsCodecChange) {
       // Resolve the inline init once (track.initData or an initRef → root inline
       // initDataList entry); fall back to an initTrack subscription otherwise.
@@ -2006,11 +2986,11 @@ export class MoqtPlayer {
     // Using AbsoluteStart at currentGroup+1 avoids replaying the current
     // group (which was already rendered in the old resolution), preventing
     // visual backtrack and A/V desync from past-timestamp bursts.
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(trackName);
+    // Across views the group IDs are numbered independently, so a live view
+    // switch joins at the new track's next group boundary instead.
     const currentGroup = this.videoPipeline?.currentGroupId ?? -1n;
-    const nextGroup = currentGroup >= 0n ? currentGroup + 1n : undefined;
     const isLive = targetTrack?.isLive === true;
+    const nextGroup = currentGroup >= 0n && !(viewChange && isLive) ? currentGroup + 1n : undefined;
     const subscribeOptions = nextGroup !== undefined
       ? {
           subscriptionFilter: {
@@ -2023,34 +3003,15 @@ export class MoqtPlayer {
     this.log.info('[SWITCH] subscribing at group=%s (current=%s)', nextGroup ?? 'latest', currentGroup);
     // Determine packaging from catalog
     const packaging: TrackPackaging = mediaTrackPackaging(targetTrack.packaging);
-    // Pre-send ownership (§9.10): the pending entry (alias remap) and the
-    // activeSubscriptions record are installed inside onRequestId so a
-    // same-tick SUBSCRIBE_OK cannot miss them. Only SUBSCRIBE_OK binds
-    // routing; objects arriving before it remain parked by their wire alias.
     const switchConn = this.connection;
-    let switchRegisteredId: bigint | null = null;
-    const registerSwitchSub = (id: bigint): void => {
-      if (switchRegisteredId !== null) return;
-      switchRegisteredId = id;
-      if (!this.subscriptionManager || this.connection !== switchConn) return;
-      this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null });
-      this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging });
-    };
-    let reqIdBigInt: bigint;
-    try {
-      const reqId = await this.connection.subscribe(nsBytes, nameBytes,
-        { ...subscribeOptions, onRequestId: (id: bigint) => registerSwitchSub(BigInt(id)) } as never);
-      reqIdBigInt = BigInt(reqId);
-      registerSwitchSub(reqIdBigInt);
-    } catch (err) {
-      if (switchRegisteredId !== null) {
-        this.retireMediaSubscription(switchRegisteredId, switchConn);
-      }
-      throw err;
-    }
+    const reqIdBigInt = await this.subscribeReplacementTrack(trackName, 'video', packaging, subscribeOptions);
 
     if (!this.subscriptionManager) return; // destroyed during await
+    // Refused (REQUEST_ERROR) or superseded by a session migration while the
+    // SUBSCRIBE was being sent: there is nothing to switch to.
+    if (this.connection !== switchConn || !this.activeSubscriptions.has(reqIdBigInt)) {
+      throw new Error(`Cannot switch to "${trackName}": its subscription ended before the switch started`);
+    }
 
     this.log.info('[SWITCH] start: "%s" → "%s" (newReqId=%s, oldReqId=%s)',
       currentVideoTrackName, trackName, reqIdBigInt, currentVideoRequestId);
@@ -2068,7 +3029,18 @@ export class MoqtPlayer {
         newTrackPackaging: packaging,
         reason,
         ...(abrAction ? { abrAction } : {}),
+        ...(viewChange ? { viewChange } : {}),
+        ...(reason === 'program' ? { programLeg: true } : {}),
       };
+      const sw = this.pendingVideoSwitch;
+      if (this.switchNoDataTimeout !== null) clearTimeout(this.switchNoDataTimeout);
+      this.switchNoDataTimeout = setTimeout(() => {
+        this.switchNoDataTimeout = null;
+        if (this.pendingVideoSwitch !== sw || this.switchInProgress
+            || this.switchStagingBuffer.length > 0 || this.cmafSwitchStagingBuffer.length > 0) return;
+        this.log.warn('[SWITCH] "%s" delivered nothing in %dms — abandoning the switch', trackName, SWITCH_NO_DATA_TIMEOUT_MS);
+        this.abortPendingVideoSwitch(sw, new Error(`no media from "${trackName}" within ${SWITCH_NO_DATA_TIMEOUT_MS} ms`));
+      }, SWITCH_NO_DATA_TIMEOUT_MS);
     }
 
     // Emit "intent" event up-front so the UI can render a transitional
@@ -2103,11 +3075,8 @@ export class MoqtPlayer {
     if (!sw) return;
     this.switchInProgress = true;
 
-    // Clear safety timeout
-    if (this.switchStagingTimeout !== null) {
-      clearTimeout(this.switchStagingTimeout);
-      this.switchStagingTimeout = null;
-    }
+    // Clear the safety timeouts
+    this.clearVideoSwitchTimers();
 
     if (!this.connection || !this.subscriptionManager) {
       this.pendingVideoSwitch = null;
@@ -2132,7 +3101,8 @@ export class MoqtPlayer {
     const needsChangeType = newTrack !== undefined && this.usesMse(newTrack.packaging)
       && newTrack.codec !== undefined
       && (this.currentVideoCodec === null
-          || !codecsCompatible(newTrack.codec, this.currentVideoCodec));
+          || !codecsCompatible(newTrack.codec, this.currentVideoCodec)
+          || sw.viewChange !== undefined);
 
     if (needsChangeType && newTrack && this.mediaSource?.changeType) {
       // Inline init (`initData` or an `initRef` → root inline entry) is Base64
@@ -2161,20 +3131,32 @@ export class MoqtPlayer {
       }
       this.log.info('[SWITCH] codec change → calling MSE changeType: "%s" → "%s"',
         this.currentVideoCodec ?? '(unknown)', newTrack.codec);
-      this.mediaSource.changeType('video', newTrack.codec ?? '', initData)
+      // Pin the assembler to the new track first: old-track fragments that
+      // arrive while the SourceBuffer is re-typed must not be appended after
+      // the new init (an old keyframe would decode with the new parameter
+      // sets). New-track objects keep staging until the flush below.
+      const pinnedInit = initData;
+      this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
+      this.mediaSource.changeType('video', newTrack.codec ?? '', pinnedInit)
         .then(() => {
+          if (this.pendingVideoSwitch !== sw) return; // aborted or destroyed meanwhile
+          // The new track's timescale and trex defaults drive the rebase.
+          this.cmafAssembler?.setInitSegment?.('video', pinnedInit);
           // Pivot succeeded. NOW it's safe to tear down the old track
           // and flush the staged new-track segments into the retyped
           // SourceBuffer.
           this.unsubscribeOldVideoTrack(sw);
           this.currentVideoCodec = newTrack.codec ?? null;
           this.flushCmafStagedBuffer(sw);
-        })
-        .catch((err) => {
+        }, (err: unknown) => {
+          // Only the re-type itself fails the switch — never a throw from the
+          // commit above (e.g. an app's event listener), which already happened.
+          if (this.pendingVideoSwitch !== sw) return;
           // Pivot failed. The old SourceBuffer is still good for the
           // old codec — keep that subscription running, drop new.
           this.log.warn('[SWITCH] changeType failed: %s — aborting switch, old track stays active',
             err instanceof Error ? err.message : String(err));
+          this.cmafAssembler?.selectTrack?.('video', sw.oldTrackName);
           this.abortPendingVideoSwitch(sw,
             err instanceof Error ? err : new Error(String(err)));
         });
@@ -2185,11 +3167,9 @@ export class MoqtPlayer {
     this.unsubscribeOldVideoTrack(sw);
 
     // Find the keyframe group ID for resetForTrackSwitch — use the
-    // group that contains objectId=0, not the first staged object
+    // group that holds the staged keyframe, not the first staged object
     // (which might be a partial group from a mid-stream subscription).
-    const keyframeEntry = this.switchStagingBuffer.find(
-      s => BigInt(s.obj.objectId) === 0n,
-    );
+    const keyframeEntry = this.switchStagingBuffer.find(s => s.keyframe);
     const firstGroupId = keyframeEntry
       ? BigInt(keyframeEntry.obj.groupId)
       : (this.switchStagingBuffer.length > 0
@@ -2235,7 +3215,7 @@ export class MoqtPlayer {
     // would cause decode errors.
     const staged = this.switchStagingBuffer;
     this.switchStagingBuffer = [];
-    const keyframeIdx = staged.findIndex(s => BigInt(s.obj.objectId) === 0n);
+    const keyframeIdx = staged.findIndex(s => s.keyframe);
     const toFlush = keyframeIdx >= 0 ? staged.slice(keyframeIdx) : staged;
     for (const { obj: stagedObj, headers: stagedHeaders } of toFlush) {
       this.videoPipeline?.pushObject(stagedObj, stagedHeaders);
@@ -2261,7 +3241,7 @@ export class MoqtPlayer {
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     if (!this.connection || !this.subscriptionManager) return;
     this.retireMediaSubscription(sw.oldRequestId, this.connection);
-    this.connection.unsubscribe(varint(sw.oldRequestId));
+    void this.connection.unsubscribe(varint(sw.oldRequestId)).catch(() => { /* already gone */ });
   }
 
   /**
@@ -2305,8 +3285,11 @@ export class MoqtPlayer {
         height: newTrack.height,
       }));
     }
-    // Commit QualityController to the new track index.
+    // Commit QualityController to the new track index (and view / program).
+    const fromProgram = this.qualityController?.currentProgram;
     this.qualityController?.commitVideoTrack(sw.newTrackName);
+    // An ABR upshift goes on trial when it commits; a refused one never does.
+    if (sw.abrAction === 'upshift') this.lastAbrUpshiftUs = this.clock.now();
     this.syncBufferAbrController();
     this.emitter.emit('quality_switched', {
       type: 'quality_switched',
@@ -2314,6 +3297,18 @@ export class MoqtPlayer {
       toTrackName: sw.newTrackName,
       reason: sw.reason,
     });
+    if (sw.viewChange && (sw.viewChange.from !== undefined || sw.viewChange.to !== undefined)) {
+      this.log.info('[SWITCH] view %s → %s ("%s")',
+        sw.viewChange.from ?? '(none)', sw.viewChange.to ?? '(none)', sw.newTrackName);
+      this.emitter.emit('view_changed', {
+        type: 'view_changed',
+        fromView: sw.viewChange.from,
+        toView: sw.viewChange.to,
+        trackName: sw.newTrackName,
+      });
+    }
+    if (sw.programLeg) this.settleProgramLeg('video', true);
+    else this.emitProgramChange(fromProgram);
   }
 
   /**
@@ -2327,9 +3322,12 @@ export class MoqtPlayer {
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
     cause: Error,
   ): void {
+    if (this.pendingVideoSwitch === sw) this.clearVideoSwitchTimers();
     if (this.connection && this.subscriptionManager) {
       this.retireMediaSubscription(sw.newRequestId, this.connection);
-      try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
+      // Async: a sync try/catch would let the rejection escape (the relay may
+      // already have dropped a refused or ended subscription).
+      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
     }
     this.cmafSwitchStagingBuffer = [];
     this.switchStagingBuffer = [];
@@ -2352,6 +3350,15 @@ export class MoqtPlayer {
       `Track switch to "${sw.newTrackName}" failed: ${cause.message}`,
       { cause, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
     ));
+    if (sw.programLeg) this.settleProgramLeg('video', false);
+  }
+
+  /** Clear the staging and no-data timeouts of the pending video switch. */
+  private clearVideoSwitchTimers(): void {
+    if (this.switchStagingTimeout !== null) clearTimeout(this.switchStagingTimeout);
+    this.switchStagingTimeout = null;
+    if (this.switchNoDataTimeout !== null) clearTimeout(this.switchNoDataTimeout);
+    this.switchNoDataTimeout = null;
   }
 
   // ─── Event API ──────────────────────────────────────────
@@ -2422,6 +3429,8 @@ export class MoqtPlayer {
       autoQuality: this.config.autoQuality!,
       startLevel: this.config.startLevel!,
       ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+      ...(this.config.initialProgram !== undefined ? { initialProgram: this.config.initialProgram } : {}),
+      ...(this.config.preferredLanguage !== undefined ? { preferredLanguage: this.config.preferredLanguage } : {}),
       qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
       clock: this.clock,
     });
@@ -2444,30 +3453,45 @@ export class MoqtPlayer {
     if (this.config.extensionParser) {
       this.subscriptionManager.extensionParser = this.config.extensionParser;
     }
+    if (this.config.compat?.includes('loc-bare')) {
+      this.subscriptionManager.locBare = true;
+      this.log.warn('LOC payloads read as bare frames, without the Private Properties block (compat loc-bare)');
+    }
 
     // Wire object delivery → media_object events + pipeline routing
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers) => {
       // Liveness: ANY object on this track (data, gap, or staged-for-switch)
       // proves the delivery path is alive — stamp before every early return.
       this.stampMediaArrival(BigInt(obj.trackAlias));
+      if (this.skipEmptyMediaObject(mediaType, obj)) return;
+
+      // Audio switch: every audio frame is a sync point, so the first object
+      // of the new track commits it; routing then continues as normal.
+      const audioSwitch = this.pendingAudioSwitch;
+      if (audioSwitch && !audioSwitch.mse && mediaType === 'audio' && trackName === audioSwitch.newTrackName) {
+        this.commitLocAudioSwitch(audioSwitch, BigInt(obj.groupId));
+      }
 
       // Make-before-break track switch: stage new-track objects until a
       // keyframe arrives, keeping the old track playing the entire time.
       // @see draft-ietf-moq-msf-00 §4.2 (seamless switch at group boundaries)
       if (this.pendingVideoSwitch && mediaType === 'video'
           && trackName === this.pendingVideoSwitch.newTrackName) {
-        this.switchStagingBuffer.push({ obj, headers });
+        const keyframe = this.isLocSwitchKeyframe(trackName, obj, headers);
+        this.switchStagingBuffer.push({ obj, headers, keyframe });
 
         // Start safety timeout on first staged object
         if (this.switchStagingBuffer.length === 1) {
+          const stagingFor = this.pendingVideoSwitch;
           this.switchStagingTimeout = setTimeout(() => {
+            if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
             this.log.warn('[SWITCH] keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
             this.completePendingVideoSwitch();
           }, SWITCH_STAGING_TIMEOUT_MS);
         }
 
-        // Complete when keyframe arrives (LOC: objectId 0 = keyframe)
-        if (obj.objectId === 0n) {
+        // Complete when a keyframe arrives
+        if (keyframe) {
           this.completePendingVideoSwitch();
         } else if (this.switchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
           this.log.warn('[SWITCH] staging overflow (%d objects) — force-completing', SWITCH_STAGING_MAX_OBJECTS);
@@ -2477,9 +3501,8 @@ export class MoqtPlayer {
         return; // don't route to old pipeline — staged for later
       }
 
-      // Verbose during development — shows every video object routed
       if (mediaType === 'video') {
-        this.log.info('[OBJ] %s "%s" group=%s obj=%s alias=%s %dB',
+        this.log.debug('[OBJ] %s "%s" group=%s obj=%s alias=%s %dB',
           mediaType, trackName, obj.groupId, obj.objectId, obj.trackAlias,
           obj.kind === 'data' && obj.payload ? obj.payload.byteLength : 0);
       } else {
@@ -2493,6 +3516,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
+        this.recordDeliverySpans(obj);
         if (mediaType === 'video' && bytes > 0) {
           const gid = BigInt(obj.groupId);
           if (gid !== this.bwEstimatorGroupId) {
@@ -2511,6 +3535,7 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
+      this.lastMediaArrivalUs = this.clock.now();
       // Emit raw event (recording, analytics, custom processing)
       this.emitter.emit('media_object', {
         type: 'media_object',
@@ -2523,7 +3548,9 @@ export class MoqtPlayer {
         ...(obj.kind === 'data' && obj.extensions ? { extensions: obj.extensions } : {}),
         ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
         ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
+        ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
         ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
+        ...this.subscriptionManager?.captureTimeFields(obj, headers),
       });
 
       // After switch commit starts (switchInProgress), drop old-track
@@ -2544,19 +3571,21 @@ export class MoqtPlayer {
       if (this.stateMachine.state === PlayerState.PAUSED) return;
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
       pipeline?.pushObject(obj, headers);
+      this.pumpDrain();
     };
 
     // Wire LOCMAF object delivery → reconstruction into CMAF chunks → assembler.
     // @see draft-einarsson-moq-locmaf-01 §15, §16
-    this.subscriptionManager.onLocmafObject = (mediaType, trackName, obj) => {
-      this.onLocmafMediaObject(mediaType, trackName, obj);
+    this.subscriptionManager.onLocmafObject = (mediaType, trackName, obj, headers) => {
+      this.onLocmafMediaObject(mediaType, trackName, obj, headers);
     };
 
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
-    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj) => {
+    this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, headers) => {
       // Liveness: stamp before every early return (gates, staging, drops).
       this.stampMediaArrival(BigInt(obj.trackAlias));
+      if (this.skipEmptyMediaObject(mediaType, obj)) return;
 
       // CMAF switch completion handled at raw onObject level (above)
 
@@ -2565,6 +3594,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
+        this.recordDeliverySpans(obj);
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
           this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
@@ -2573,8 +3603,10 @@ export class MoqtPlayer {
         this._stats.recordGapObject();
       }
 
-      // Emit media_object for CMAF too — sparkline jitter chart needs
-      // inter-arrival timing from all video objects regardless of packaging.
+      this.lastMediaArrivalUs = this.clock.now();
+      // Emit media_object for CMAF too — arrival timing and capture
+      // timestamps are packaging-independent, so latency and jitter are
+      // measured the same way on both paths.
       this.emitter.emit('media_object', {
         type: 'media_object',
         mediaType,
@@ -2584,6 +3616,10 @@ export class MoqtPlayer {
         kind: obj.kind,
         ...(obj.kind === 'data' && obj.payload ? { payload: obj.payload } : {}),
         ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
+        ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
+        ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
+        ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
+        ...this.subscriptionManager?.captureTimeFields(obj, headers),
       });
 
       if (obj.kind !== 'data' || !obj.payload) return;
@@ -2610,6 +3646,15 @@ export class MoqtPlayer {
           this.cmafHoldingForAttach = true;
           this.log.info('[CMAF] MediaSource not attached yet (sourceopen pending — hidden tab?); holding media until attached');
         }
+        return;
+      }
+
+      // Audio switch: the new track's first object commits it; its objects
+      // are staged until the SourceBuffer carries the new init.
+      const audioSwitch = this.pendingAudioSwitch;
+      if (audioSwitch?.mse && mediaType === 'audio' && trackName === audioSwitch.newTrackName) {
+        audioSwitch.staged.push({ trackName, groupId: BigInt(obj.groupId), payload: obj.payload });
+        if (!audioSwitch.committing) this.commitMseAudioSwitch(audioSwitch);
         return;
       }
 
@@ -2642,15 +3687,24 @@ export class MoqtPlayer {
         });
 
         if (this.switchStagingTimeout === null) {
+          const stagingFor = this.pendingVideoSwitch;
           this.switchStagingTimeout = setTimeout(() => {
+            if (this.pendingVideoSwitch !== stagingFor) return; // that switch already ended
             this.log.warn('[SWITCH] CMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
             this.completePendingVideoSwitch();
           }, SWITCH_STAGING_TIMEOUT_MS);
         }
 
-        // CMAF: groupId boundary = keyframe. objectId 0 of a new group
-        // is the moof of a fresh GOP, suitable as a splice point.
-        if (BigInt(obj.objectId) === 0n) {
+        // CMAF: splice in at a sync sample. Object 0 of a group is the
+        // moof of a fresh GOP, but a relay joining this subscription
+        // mid-group can number a delta frame 0 — so trust the chunk's own
+        // sample flags when it carries them, and drop the delta frames
+        // staged before it (MSE cannot start a new init on them).
+        const sync = cmafChunkStartsWithSync(obj.payload) ?? BigInt(obj.objectId) === 0n;
+        if (sync) {
+          // Before the commit only — once it runs (changeType in flight) the
+          // staged keyframe group is already the splice and must be kept.
+          if (!this.switchInProgress) this.cmafSwitchStagingBuffer = this.cmafSwitchStagingBuffer.slice(-1);
           this.completePendingVideoSwitch();
         } else if (this.cmafSwitchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
           this.log.warn('[SWITCH] CMAF staging overflow (%d objects) — force-completing',
@@ -2660,18 +3714,12 @@ export class MoqtPlayer {
         return;
       }
 
-      // Early stale-group drop: skip objects from groups older than what
-      // MSE has already committed. Prevents late-arriving old groups from
-      // poisoning the assembler's patchEpoch (false backward-bmd detection).
       const groupId = BigInt(obj.groupId);
-      if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-        const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
-          .getCommittedGroupFloor(mediaType, trackName);
-        if (floor !== undefined && groupId < floor) return;
-      }
+      if (this.isStaleVideoGroup(mediaType, trackName, groupId)) return;
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload);
+      this.cmafAssembler?.push(mediaType, trackName, groupId, obj.payload,
+        obj.subgroupId === undefined ? undefined : BigInt(obj.subgroupId));
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
@@ -2840,6 +3888,7 @@ export class MoqtPlayer {
 
       const peerMaxReqId = conn.session?.peerMaxRequestId ?? 'unknown';
       this.log.info('Session established (peer MAX_REQUEST_ID=%s)', peerMaxReqId);
+      this.noteUncappedRequestCredit(conn);
     } else {
       // External adapter: already connected, skip handshake
       this.log.info('Using externally owned adapter (already connected)');
@@ -2862,6 +3911,7 @@ export class MoqtPlayer {
       type: 'session_established',
       selectedVersion: 0n,
     });
+    void this.followNamespace(conn);
 
     // Watchdog: expect catalog within 10s (unless externally injected)
     if (!this.config.catalog && !this.config.knownTracks) {
@@ -2972,7 +4022,7 @@ export class MoqtPlayer {
             this.activeSubscriptions.set(reqIdBigInt, {
               trackName: track.name, mediaType, trackAlias: null,
             });
-            this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType });
+            this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType, ...this.catalogInitConfig(track.name) });
             // Authorization may delay this registration until after the catalog
             // arrives. Adopt the registered view before ABR can use its ladder.
             if (mediaType === 'video' && this.catalogReceived && this._catalogState) {
@@ -3027,6 +4077,11 @@ export class MoqtPlayer {
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
       && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
+    // Fetch-only retrieval reports its own outcome; load() does not wait on it.
+    if (this.config.catalogBootstrap === 'fetch') {
+      void this.fetchOnlyCatalog(conn);
+      return;
+    }
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
@@ -3066,6 +4121,49 @@ export class MoqtPlayer {
       if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
     }
     coord?.start();
+  }
+
+  /** Bounds TRACK_STATUS before fetch-only retrieval falls back to the open-ended FETCH. */
+  private static readonly FETCH_ONLY_STATUS_TIMEOUT_MS = 2_000;
+  /** End group of the open-ended catalog FETCH: the largest QUIC varint. */
+  private static readonly LAST_GROUP = (1n << 62n) - 1n;
+
+  /**
+   * `catalogBootstrap: 'fetch'`: the catalog without a subscription. TRACK_STATUS
+   * names the latest group for a standalone FETCH; without an answer, one FETCH of
+   * every group, newest first, takes the first object.
+   */
+  private async fetchOnlyCatalog(conn: MoqtConnection): Promise<void> {
+    const gen = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && this.connection === conn && gen === this.bootstrapGeneration;
+    let group: bigint | undefined;
+    try {
+      const status = await this.queryTrackStatus(catalogTrackName(), MoqtPlayer.FETCH_ONLY_STATUS_TIMEOUT_MS);
+      group = extractLargestLocation(status.parameters)?.group;
+    } catch (err) {
+      this.log.info('[catalog-fetch] no catalog location from TRACK_STATUS (%s)',
+        err instanceof Error ? err.message : String(err));
+    }
+    if (!live()) return;
+    try {
+      const state = group !== undefined
+        ? await this.fetchCatalog({ group })
+        : await this.fetchCatalog({ group: 0n, endGroup: MoqtPlayer.LAST_GROUP, descending: true });
+      if (!live()) return;
+      this.log.info('[catalog-fetch] catalog fetched %s',
+        group !== undefined ? `from group ${group}` : 'newest first');
+      this.onCatalogBootstrapReady(state);
+    } catch (err) {
+      if (!live()) return;
+      const reason = err instanceof Error ? err.message : String(err);
+      if (this.follower.awaitPublisher(conn)) {
+        this.emitError(createPlayerError('degraded', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+          `catalog fetch: ${reason}; waiting for the publisher`));
+        return;
+      }
+      this.emitError(createPlayerError('fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+        `catalog fetch failed: ${reason}`));
+    }
   }
 
   /**
@@ -3126,6 +4224,8 @@ export class MoqtPlayer {
    */
   play(): void {
     this.log.info('play()');
+    // Already playing, e.g. autoplay on a reconnect's catalog.
+    if (this.stateMachine.state === PlayerState.PLAYING) return;
     // ONE transaction. The transition is validated first (an invalid one throws
     // having changed nothing), then state, playback intent, adapter intent and
     // ticking are all committed, and only then is the completed transition
@@ -3148,6 +4248,7 @@ export class MoqtPlayer {
       this.audioPipeline?.reset();
       this.syncController?.reset();
       this.recoveryController?.reset?.();
+      this.cmafAssembler?.resumeAfterPause?.();
     }
 
     // Liveness: drop stale arrival stamps — a pause (no delivery, no ticks)
@@ -3185,6 +4286,7 @@ export class MoqtPlayer {
     this.mediaSource?.setPlaybackIntent?.(false);
     this._stats.recordPlayStop();
     this.stopTicking();
+    this.clearStallPark();
 
     // Flush pre-scheduled audio and queued video frames immediately
     this.commandDispatcher?.flush();
@@ -3199,7 +4301,15 @@ export class MoqtPlayer {
   }
 
   /**
-   * Send REQUEST_UPDATE with FORWARD parameter to all active subscriptions.
+   * Whether SUBSCRIBE_OK arrived. A REQUEST_UPDATE before it races the
+   * request's first response (§9.7 makes SUBSCRIBE_OK the first one).
+   */
+  private isSubscriptionEstablished(requestId: bigint): boolean {
+    return !this.pendingMediaSubs.has(requestId);
+  }
+
+  /**
+   * Send REQUEST_UPDATE with FORWARD parameter to all established subscriptions.
    *
    * Each call is independent — a failure on one subscription must not
    * prevent the update from being sent to others. Errors are surfaced
@@ -3213,6 +4323,7 @@ export class MoqtPlayer {
   private sendForwardUpdate(forward: 0 | 1): void {
     if (!this.connection) return;
     for (const [requestId] of this.activeSubscriptions) {
+      if (!this.isSubscriptionEstablished(requestId)) continue;
       this.connection.requestUpdate(varint(requestId), { forward }).catch((err: unknown) => {
         const cause = err instanceof Error ? err : new Error(String(err));
         this.log.warn('REQUEST_UPDATE forward:%d failed for reqId=%s: %s', forward, requestId, cause.message);
@@ -3276,6 +4387,7 @@ export class MoqtPlayer {
     // cancelled inside CommandDispatcher.flush() below; CMAF needs its own
     // call, and it must land before the resets.
     this.mediaSource?.cancelStallEpisode?.();
+    this._stats.cancelStall();
 
     // Reset playback pipelines — flush jitter buffer, decoder state, sync reference.
     // §9.11.1: "it might still receive Objects outside the new range if the
@@ -3293,6 +4405,7 @@ export class MoqtPlayer {
       for (const [requestId] of this.activeSubscriptions) {
         // Skip the timeline subscription — it should continue receiving updates
         if (requestId === this.timelineRequestId) continue;
+        if (!this.isSubscriptionEstablished(requestId)) continue;
 
         this.connection.requestUpdate(varint(requestId), {
           subscriptionFilter: {
@@ -3380,6 +4493,7 @@ export class MoqtPlayer {
       this.assertMigrationLive(txn); // destroyed/aborted during transport creation?
       await newConnection.connect(transport, setupOptions);
       this.assertMigrationLive(txn);
+      this.noteUncappedRequestCredit(newConnection);
       const nsBytes = encodeNamespace(this.config.namespace, this.enc);
       const nameBytes = this.enc.encode(catalogTrackName());
       // Candidate ownership is TRANSACTION-LOCAL: the active session's
@@ -3404,6 +4518,7 @@ export class MoqtPlayer {
       const candidateOptions = candidateMode === 'joining-fetch'
         ? {
             subscriptionFilter: { type: 'LargestObject' as const },
+            ...(this.usesCatalogFill(newConnection) ? { fill: CATALOG_FILL } : {}),
             onRequestId: (id: bigint) => { candidateReqId = id; },
             terminalDelivery: 'drain' as const,
             onDrained: candidateDrained,
@@ -3602,8 +4717,20 @@ export class MoqtPlayer {
     // still be awaiting SUBSCRIBE_OK (its staged response replays after this).
     this.pendingAliasBinds.clear();
     this.pendingAliasBinds.add(catalogReqId);
+    // Switches in flight belong to the old session too.
+    this.clearVideoSwitchTimers();
+    this.pendingVideoSwitch = null;
+    this.switchInProgress = false;
+    this.switchStagingBuffer = [];
+    this.cmafSwitchStagingBuffer = [];
+    this.pendingAudioSwitch = null;
+    this.pendingProgramSwitch = null;
+    // Media subscriptions die with the old session; resumeMigratedMedia re-makes
+    // them once the new session's catalog arrives.
+    this.migratedMedia = this.retireSessionMedia();
     this.connection = newConnection;
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
+    void this.followNamespace(newConnection);
 
     // Reset catalog state for the new session
     this.catalogReceived = false;
@@ -3930,11 +5057,16 @@ export class MoqtPlayer {
   async fetchCatalog(opts?: {
     group?: bigint;
     object?: bigint;
+    /** End group of a wider range; the first object returned settles the call. */
+    endGroup?: bigint;
+    /** Newest group first (GROUP_ORDER Descending). */
+    descending?: boolean;
     timeoutMs?: number;
   }): Promise<CatalogState> {
     if (!this.connection) throw new Error('Player not loaded');
     const group = opts?.group ?? 0n;
     const object = opts?.object ?? 0n;
+    const endGroup = opts?.endGroup ?? group;
     const timeoutMs = opts?.timeoutMs ?? 5_000;
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
@@ -3942,8 +5074,9 @@ export class MoqtPlayer {
     const fetchOptions = {
       startGroup: varint(group),
       startObject: varint(object),
-      endGroup: varint(group),
+      endGroup: varint(endGroup),
       endObject: varint(object),
+      ...(opts?.descending ? { groupOrder: varint(0x2n) } : {}),
     };
 
     // Pre-send ownership: register the pending fetch inside `onRequestId`
@@ -3964,7 +5097,7 @@ export class MoqtPlayer {
           this.connection?.fetchCancel(varint(id)).catch(() => { /* ignore */ });
           pending.reject(new Error(`fetchCatalog timed out after ${timeoutMs}ms`));
         }, timeoutMs);
-        this.pendingCatalogFetches.set(id, { resolve, reject, timeout });
+        this.pendingCatalogFetches.set(id, { resolve, reject, timeout, ...(endGroup > group ? { cancelOnSettle: true } : {}) });
       };
       void (async () => {
         try {
@@ -4259,8 +5392,7 @@ export class MoqtPlayer {
       },
       onUpdated: (state) => {
         if (!live()) return;
-        this._catalogState = state;
-        this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+        this.applyCatalogUpdate(state);
       },
       requestLegacyResubscribe: () => {
         void (async () => {
@@ -4325,8 +5457,15 @@ export class MoqtPlayer {
           }
         })();
       },
-      onFatal: (reason) => {
+      onFatal: (reason, subscriptionEnded) => {
         if (!live()) return;
+        if (subscriptionEnded && this.follower.awaitPublisher(conn)) {
+          this.emitError(createPlayerError(
+            'degraded', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+            `catalog bootstrap: ${reason}; waiting for the publisher`,
+          ));
+          return;
+        }
         this.failCatalogPlayback(createPlayerError(
           'fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
           `catalog bootstrap failed: ${reason}`,
@@ -4423,6 +5562,15 @@ export class MoqtPlayer {
   }
 
   /** Readiness: today's first-catalog block, run once with the converged state. */
+  /** Announce the catalog. A throwing listener is logged: it must not skip the media subscribe that follows. */
+  private emitCatalogReceived(catalog: CatalogState): void {
+    try {
+      this.emitter.emitIsolated('catalog_received', { type: 'catalog_received', catalog });
+    } catch (err) {
+      this.log.warn('catalog_received listener threw: %s', err instanceof Error ? err.message : String(err));
+    }
+  }
+
   private onCatalogBootstrapReady(catalogState: CatalogState): void {
     if (this._destroyed || this.isTerminalState() || this.catalogReceived) return;
     const conn = this.connection;
@@ -4432,20 +5580,26 @@ export class MoqtPlayer {
     this._stats.recordCatalogReceived();
     this.watchdog.fulfill('catalog_received');
     this.watchdog.expect('first_media_object', 20_000);
-    this.emitter.emit('catalog_received', { type: 'catalog_received', catalog: catalogState });
+    this.emitCatalogReceived(catalogState);
     if (this._destroyed || this.isTerminalState() || this.connection !== conn || this.bootstrapGeneration !== gen) return;
     this.log.info('Catalog received (bootstrap): %d tracks', catalogState.tracks.length);
     if (this.pipelinesCreated) {
-      // knownTracks path — pipelines already exist, media already subscribed.
+      // Pipelines already exist: media was subscribed from knownTracks, or
+      // is re-subscribed here after a migration.
+      const previousController = this.qualityController;
       this.qualityController = new QualityController({
         autoQuality: this.config.autoQuality!,
         startLevel: this.config.startLevel!,
         ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+        ...(this.config.initialProgram !== undefined ? { initialProgram: this.config.initialProgram } : {}),
+        ...(this.config.preferredLanguage !== undefined ? { preferredLanguage: this.config.preferredLanguage } : {}),
         qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
         clock: this.clock,
       });
-      this.selectCatalogTracks(catalogState);
+      const selected = this.selectCatalogTracks(catalogState);
       this.validateKnownTracks(catalogState);
+      this.alignControllerWithPlayingTracks(previousController);
+      this.resumeMigratedMedia(selected);
     } else {
       this.subscribeToMediaTracks(catalogState).catch((err: unknown) => {
         if (this.connection !== conn || this.bootstrapGeneration !== gen) return;
@@ -4731,8 +5885,7 @@ export class MoqtPlayer {
           return;
         }
         if (!ownedAsMain()) return;
-        this._catalogState = state;
-        this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+        this.applyCatalogUpdate(state);
       },
       requestLegacyResubscribe: () => {
         if (ownedAsCandidate()) failCandidate('fallback ladder exhausted');
@@ -5144,6 +6297,7 @@ export class MoqtPlayer {
     }
     attempt(() => this.mediaSource?.setPlaybackIntent?.(false));
     attempt(() => this.commandDispatcher?.flush());
+    attempt(() => this._stats.cancelStall());
 
     // Both publications are attempted, even if a listener throws. State comes
     // first so a re-entrant destroy cannot publish ENDED before this ERROR.
@@ -5177,8 +6331,7 @@ export class MoqtPlayer {
     // Adoption is an ordinary catalog update: no second catalog_received, no
     // media churn (documented limitation: a removed currently-active track
     // keeps its old media subscription running until a later selection).
-    this._catalogState = state;
-    this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+    this.applyCatalogUpdate(state);
   }
 
   /**
@@ -5228,6 +6381,7 @@ export class MoqtPlayer {
     const pending = this.pendingCatalogFetches.get(reqId);
     if (!pending) return;
     this.cleanupCatalogFetch(reqId);
+    if (pending.cancelOnSettle) this.connection?.fetchCancel(varint(reqId)).catch(() => { /* already done */ });
     if (result.ok) pending.resolve(result.state);
     else pending.reject(result.error);
   }
@@ -5285,7 +6439,7 @@ export class MoqtPlayer {
    *
    * @see draft-ietf-moq-transport-16 §9.19 (TRACK_STATUS)
    */
-  async queryTrackStatus(trackName: string): Promise<TrackStatusResult> {
+  async queryTrackStatus(trackName: string, timeoutMs?: number): Promise<TrackStatusResult> {
     if (!this.connection) throw new Error('Player not loaded');
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
@@ -5300,9 +6454,10 @@ export class MoqtPlayer {
     // yet, which escapes as an unhandled rejection.
     let settleResolve!: (result: TrackStatusResult) => void;
     let settleReject!: (error: Error) => void;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const promise = new Promise<TrackStatusResult>((resolve, reject) => {
-      settleResolve = resolve;
-      settleReject = reject;
+      settleResolve = (result) => { if (timer) clearTimeout(timer); resolve(result); };
+      settleReject = (err) => { if (timer) clearTimeout(timer); reject(err); };
     });
     const waiter = { resolve: settleResolve, reject: settleReject };
     // Remove only OUR entry. Request IDs are per-session, so a replacement
@@ -5314,6 +6469,14 @@ export class MoqtPlayer {
       }
     };
     const abandoned = (): Error => new Error('TRACK_STATUS abandoned: its session was replaced');
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        for (const [id, w] of this.pendingTrackStatuses) {
+          if (w === waiter) this.pendingTrackStatuses.delete(id);
+        }
+        settleReject(new Error(`TRACK_STATUS for "${trackName}" unanswered after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
 
     void (async () => {
       let registered: bigint | null = null;
@@ -5350,12 +6513,110 @@ export class MoqtPlayer {
   /**
    * Tick playback pipelines — drain buffers, evaluate gaps, emit commands.
    *
-   * Called automatically by play() on a 16ms interval.
+   * Driven by the 16ms interval and, via pumpDrain(), by object arrivals.
+   * A re-entrant call returns without work.
    * Exposed publicly for testing and manual control.
    *
    * @see draft-ietf-moq-loc-01 §4.2 (decode order)
    */
   tick(): void {
+    if (this.tickInProgress) return;
+    this.tickInProgress = true;
+    this.lastTickUs = this.clock.now();
+    try {
+      this.runTick();
+    } finally {
+      this.tickInProgress = false;
+    }
+  }
+
+  /** Per-object socket-to-engine spans, newest first. Empty on a transport
+   *  that does not stamp. */
+  get deliveryBreakdown(): ReadonlyArray<
+    { transferMs: number; assemblyMs: number; decodeMs: number; bytes: number }> {
+    return this.deliverySpans;
+  }
+
+  /** Empty Normal media objects skipped under compat `empty-objects`. */
+  get emptyMediaObjectsSkipped(): number {
+    return this._emptyMediaObjects;
+  }
+
+  /** Video objects dropped as stale before MSE, with the latest drop's group and floor. */
+  get staleVideoDrops(): { readonly count: number; readonly group: bigint | null; readonly floor: bigint | null } {
+    return this._staleVideoDrops;
+  }
+
+  /** Media objects that arrived as datagrams, per media type. */
+  get datagramObjects(): { readonly audio: number; readonly video: number } {
+    return { ...this._datagramObjects };
+  }
+
+  /**
+   * Early stale-group drop on the MSE paths (video only): groups older than the
+   * one before what MSE has committed are replay. The immediately previous
+   * group's tail legitimately races the next group's head across concurrent
+   * subgroup streams; the assembler's reorder window places it. Audio is one
+   * group per object; no group floor applies.
+   */
+  private isStaleVideoGroup(mediaType: string, trackName: string, groupId: bigint): boolean {
+    if (mediaType !== 'video' || !this.mediaSource || !('getCommittedGroupFloor' in this.mediaSource)) return false;
+    const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
+      .getCommittedGroupFloor(mediaType, trackName);
+    if (floor === undefined || groupId + 1n >= floor) return false;
+    this._staleVideoDrops = { count: this._staleVideoDrops.count + 1, group: groupId, floor };
+    return true;
+  }
+
+  /** compat `empty-objects`: an empty Normal object on a media track never
+   *  reaches a decoder; the first is logged, all are counted. */
+  private skipEmptyMediaObject(mediaType: 'video' | 'audio', obj: MoqtObject): boolean {
+    if (obj.kind !== 'data' || obj.payload.byteLength > 0) return false;
+    if (!this.config.compat?.includes('empty-objects')) return false;
+    this._emptyMediaObjects++;
+    if (this._emptyMediaObjects === 1) {
+      this.log.warn('Empty Normal %s object (group=%s object=%s) skipped; further ones counted only '
+        + '(compat empty-objects)', mediaType, String(obj.groupId), String(obj.objectId));
+    }
+    return true;
+  }
+
+  /** compat `request-credit`: say once per session that the relay granted no
+   *  request credit and requests are going out uncapped. */
+  private noteUncappedRequestCredit(conn: MoqtConnection): void {
+    if (!conn.session?.uncappedRequestCredit?.active) return;
+    this.log.warn('Relay granted no request credit (SERVER_SETUP without MAX_REQUEST_ID); '
+      + 'requests go uncapped until it sends one (compat request-credit)');
+  }
+
+  private recordDeliverySpans(obj: MoqtObjectData): void {
+    const { socketFirstMs, socketStartMs, socketLastMs, assemblyBusyMs } = obj;
+    if (socketFirstMs === undefined || socketLastMs === undefined) return;
+    if (socketStartMs !== undefined) {
+      this.bandwidthEstimator?.recordBurst(obj.payload?.byteLength ?? 0, socketLastMs - socketStartMs, this.clock.now());
+    }
+    const assemblyMs = assemblyBusyMs ?? 0;
+    this.deliverySpans.unshift({
+      // Socket span less read-loop work.
+      transferMs: Math.max(0, socketLastMs - socketFirstMs - assemblyMs),
+      assemblyMs,
+      decodeMs: Math.max(0, performance.now() - socketLastMs),
+      bytes: obj.payload?.byteLength ?? 0,
+    });
+    if (this.deliverySpans.length > MoqtPlayer.DELIVERY_SPAN_SAMPLES) {
+      this.deliverySpans.length = MoqtPlayer.DELIVERY_SPAN_SAMPLES;
+    }
+  }
+
+  /** Run a tick from the arrival path when one is due. Chrome clamps timers to
+   *  1 Hz in a hidden, inaudible tab; arrivals are not throttled. */
+  private pumpDrain(): void {
+    if (this.tickInProgress) return;
+    if (this.clock.now() - this.lastTickUs < TICK_INTERVAL_US) return;
+    this.tick();
+  }
+
+  private runTick(): void {
     // Clear the per-tick sync reset guard. If both pipelines skip_forward
     // in the same tick, only the first (audio) resets the sync controller.
     this.syncResetThisTick = false;
@@ -5379,8 +6640,18 @@ export class MoqtPlayer {
   /** Throttle for sync_skew diagnostic events (~1/s). */
   private lastSkewEmitMs = 0;
 
+  private static readonly ABR_LIVE_UPSHIFT_WAIT_US = 5_000_000;
+  private static readonly ABR_UPSHIFT_WAIT_MAX_US = 120_000_000;
+  /** A downshift this soon after an ABR upshift fails the upshift. */
+  private static readonly ABR_UPSHIFT_TRIAL_US = 30_000_000;
   /** Timestamp of last ABR downshift — gates upshift for stability. */
   private lastAbrDownshiftUs = 0;
+  /** Timestamp of the last ABR upshift still on trial; 0 when none. */
+  private lastAbrUpshiftUs = 0;
+  /** Live upshift wait; doubles on each failed upshift, resets once an upshift holds 2 min. */
+  private liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
+  /** Timestamp (µs) of last MSE stall — gates live CMAF upshift. */
+  private lastMseStallUs = 0;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
   private lastLocStallUs = 0;
   /** Timestamp (µs) of last video decode error — gates LOC upshift. */
@@ -5402,11 +6673,36 @@ export class MoqtPlayer {
   private videoRecoveryActive = false;
   private videoRecoveryHealthyRenders = 0;
   private static readonly RECOVERY_HEALTHY_THRESHOLD = 3;
+  /** Pending skip-forward for a detected stall; cleared when a frame renders. */
+  private stallParkTimer: ReturnType<typeof setTimeout> | null = null;
+  /** How long a detected stall waits for delivery to resume before skipping
+   *  to the next keyframe. */
+  private static readonly STALL_PARK_MS = 1_500;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
 
-  private isLocDeliveryHealthy(): boolean {
+  /** Healthy time required before an upshift: fixed on VOD, backed off on live. */
+  private abrUpshiftWaitUs(live: boolean, now: number): number {
+    if (!live) return MoqtPlayer.ABR_UPSHIFT_STABILITY_US;
+    if (this.lastAbrUpshiftUs > 0 && now - this.lastAbrUpshiftUs >= MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US) {
+      this.liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
+    }
+    return this.liveUpshiftWaitUs;
+  }
+
+  private noteAbrDownshift(now: number): void {
+    this.lastAbrDownshiftUs = now;
+    if (this.lastAbrUpshiftUs > 0 && now - this.lastAbrUpshiftUs < MoqtPlayer.ABR_UPSHIFT_TRIAL_US) {
+      this.liveUpshiftWaitUs = Math.min(this.liveUpshiftWaitUs * 2, MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US);
+    }
+    this.lastAbrUpshiftUs = 0;
+  }
+
+  private isMseDeliveryHealthy(now: number, windowUs: number): boolean {
+    return now - Math.max(this.lastMseStallUs, this.lastAbrDownshiftUs) >= windowUs;
+  }
+
+  private isLocDeliveryHealthy(window: number): boolean {
     const now = this.clock.now();
-    const window = MoqtPlayer.ABR_UPSHIFT_STABILITY_US;
     const lastBadEvent = Math.max(
       this.lastLocStallUs,
       this.lastLocDecodeErrorUs,
@@ -5424,8 +6720,15 @@ export class MoqtPlayer {
     if (!this.bufferAbrController || !this.qualityController) return;
     // Don't trigger ABR while a switch is in flight — give the current
     // switch time to deliver data before deciding to switch again.
-    if (this.pendingVideoSwitch || this.switchInProgress) return;
+    if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) return;
 
+    const now = this.clock.now();
+    const live = this.qualityController.currentVideoTrack?.isLive === true;
+    const upshiftWaitUs = this.abrUpshiftWaitUs(live, now);
+    const arrivalKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+    const linkKbps = live ? (this.bandwidthEstimator?.getBurstKbps(now) ?? 0) : 0;
+    // On live the arrival rate is the publisher's pace; the link rate shows the headroom.
+    const bandwidthKbps = Math.max(arrivalKbps, linkKbps);
     let effectiveBufferUs: number;
 
     if (this.videoPipeline) {
@@ -5433,7 +6736,7 @@ export class MoqtPlayer {
       // cap to hold zone regardless of buffer depth — prevents upshift
       // after stalls, decode errors, or partial group abandonment.
       const bufferedGroups = this.videoPipeline.bufferedGroupCount;
-      const healthy = this.isLocDeliveryHealthy();
+      const healthy = this.isLocDeliveryHealthy(upshiftWaitUs);
       if (!healthy) {
         effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
       } else if (bufferedGroups === 0) {
@@ -5450,28 +6753,26 @@ export class MoqtPlayer {
       // bandwidth can't sustain the current track.
       const bufferUs = this.mediaSource.getBufferAheadUs();
       if (bufferUs === null) return; // no trustworthy signal yet — hold
+      const currentBitrateKbps = this.bufferAbrController.currentTrack?.bitrateKbps ?? 0;
       if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
-      } else if (bufferUs < this.bufferAbrController.lowThresholdUs) {
-        // Thin but not empty — check if bandwidth sustains.
-        // On fast networks MSE buffers are naturally thin; a thin
-        // buffer with high bandwidth is healthy, not starving.
-        const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
-        const currentTrack = this.bufferAbrController.currentTrack;
-        const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
-        effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? this.bufferAbrController.lowThresholdUs
-          : bufferUs;
-      } else {
+      } else if (bufferUs < this.bufferAbrController.lowThresholdUs
+        && !(bandwidthKbps > currentBitrateKbps * 1.5)) {
+        // Live with no link rate yet: arrival alone is the publisher's pace, not a slow link.
+        // An empty buffer or a stall still downshifts.
+        if (live && linkKbps === 0) return;
         effectiveBufferUs = bufferUs;
+      } else if (live && this.isMseDeliveryHealthy(now, upshiftWaitUs)) {
+        // Live holds a sub-second cushion: health and link rate gate the upshift, not depth.
+        effectiveBufferUs = this.bufferAbrController.highThresholdUs;
+      } else {
+        effectiveBufferUs = Math.max(bufferUs, this.bufferAbrController.lowThresholdUs);
       }
     } else {
       effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
     }
-
-    const bandwidthKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
 
     const decision = this.bufferAbrController.evaluate({
       bufferDepthUs: effectiveBufferUs,
@@ -5480,12 +6781,9 @@ export class MoqtPlayer {
 
     if (decision.action === 'hold') return;
 
-    // Block upshift for 15s after any downshift — prevents oscillation
+    // Block upshift after any downshift — prevents oscillation
     // where a lower-bitrate stream inflates the throughput estimate.
-    if (decision.action === 'upshift') {
-      const sinceDownshift = this.clock.now() - this.lastAbrDownshiftUs;
-      if (sinceDownshift < MoqtPlayer.ABR_UPSHIFT_STABILITY_US) return;
-    }
+    if (decision.action === 'upshift' && now - this.lastAbrDownshiftUs < upshiftWaitUs) return;
 
     const isDown = decision.action === 'downshift';
     const isEmergency = isDown && effectiveBufferUs < this.bufferAbrController.lowThresholdUs;
@@ -5495,10 +6793,10 @@ export class MoqtPlayer {
       : this.qualityController.peekHigherVideoQuality();
 
     if (newTrack) {
-      if (isDown) this.lastAbrDownshiftUs = this.clock.now();
+      if (isDown) this.noteAbrDownshift(now);
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
-        effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      this.log.warn('Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s',
+        effectiveBufferUs / 1_000_000, bandwidthKbps, arrivalKbps, verb, newTrack.name);
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack(newTrack.name, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
@@ -5525,6 +6823,10 @@ export class MoqtPlayer {
     // in-flight transaction sees _destroyed at its next validation and rolls back;
     // detaching + closing the candidate here stops its callbacks and unblocks it.
     this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
+    if (this.reconnect?.timer) clearTimeout(this.reconnect.timer);
+    this.reconnect = null;
+    this.follower.destroy();
+    this.clearStallPark();
     if (this.currentMigration) {
       const txn = this.currentMigration;
       this.currentMigration = null;
@@ -5539,6 +6841,10 @@ export class MoqtPlayer {
     // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
     // never emit MEDIA_STARVED for an intentional teardown) and disarm.
     for (const restart of this.livenessRestarts.values()) restart.cancelled = true;
+    for (const retry of this.publishDoneRetries.values()) {
+      if (retry.timer !== null) clearTimeout(retry.timer);
+    }
+    this.publishDoneRetries.clear();
     this.livenessMonitor?.clear();
     this.subgroupStreams.clear();
     this.pendingMediaSubs.clear();
@@ -5555,7 +6861,12 @@ export class MoqtPlayer {
     this.pendingResetOrdinal = 0;
     this.pendingStreamEvents.clear();
     // Clear make-before-break switch state
+    this.clearVideoSwitchTimers();
+    if (this.pendingAudioSwitch) clearTimeout(this.pendingAudioSwitch.noDataTimer);
     this.pendingVideoSwitch = null;
+    this.pendingAudioSwitch = null;
+    this.pendingProgramSwitch = null;
+    this.videoSwitchStarting = false;
     this.switchInProgress = false;
     this.switchStagingBuffer = [];
     this.cmafSwitchStagingBuffer = [];
@@ -5591,10 +6902,14 @@ export class MoqtPlayer {
     this.locmafWarned.clear();
     this.locmafBadInit.clear();
     this.cmafInitDeadlineArmed = false;
+    this.mseRebuilt = false;
+    this.mseRebuildAwaitingFrame = false;
+    this.mseAudioDropped = null;
     this.cmafFirstFrameDeadlineStartedAt = undefined;
     this.cmafFirstFrameHiddenAt = undefined;
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
     this.removeVisibilityListener();
+    this.cancelResumeWhenVisible();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -5984,6 +7299,8 @@ export class MoqtPlayer {
           error,
           reason,
         }));
+        this.scheduleReconnect(reason
+          ?? (error !== undefined ? `code 0x${error.toString(16)}` : 'clean close'));
       },
 
       onError: (error) => {
@@ -6025,10 +7342,14 @@ export class MoqtPlayer {
           return;
         }
         if (classified.severity === 'fatal') this.cancelCatalogBootstrap();
+        // A session the player reconnects is degraded, not lost; scheduleReconnect
+        // reports fatal if the reconnect gives up.
+        const reconnecting = classified.severity === 'fatal' && this.canReconnect();
         this.emitError(createPlayerError(
-          classified.severity, 'connection', classified.code, error.message,
+          reconnecting ? 'degraded' : classified.severity, 'connection', classified.code, error.message,
           defined({ cause: error, context: classified.context }),
         ));
+        if (reconnecting) this.scheduleReconnect(error.message);
       },
 
       onObject: stageable((streamId, obj) => {
@@ -6513,6 +7834,7 @@ export class MoqtPlayer {
               requestId,
               namespaceSuffix: msg.trackNamespaceSuffix,
             });
+            this.follower.onNamespaceMessage(conn, requestId, 'NAMESPACE', msg.trackNamespaceSuffix);
             break;
           case 'NAMESPACE_DONE':
             this.emitter.emit('namespace_done', {
@@ -6520,6 +7842,7 @@ export class MoqtPlayer {
               requestId,
               namespaceSuffix: msg.trackNamespaceSuffix,
             });
+            this.follower.onNamespaceMessage(conn, requestId, 'NAMESPACE_DONE', msg.trackNamespaceSuffix);
             break;
           case 'PUBLISH_NAMESPACE': {
             const ns = msg.trackNamespace;
@@ -6546,7 +7869,9 @@ export class MoqtPlayer {
       // §10.3: Datagram objects — convert to MoqtObject for routing
       onDatagram: stageable((datagram) => {
         const alias = BigInt(datagram.trackAlias);
-        if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
+        const datagramMedia = this.subscriptionManager?.getMediaType(alias);
+        if (datagramMedia === undefined || !this.subscriptionManager) return;
+        if (datagramMedia === 'audio' || datagramMedia === 'video') this._datagramObjects[datagramMedia]++;
         this.log.debug('Datagram alias=%s group=%s obj=%s', alias, datagram.groupId, datagram.objectId);
 
         const obj: MoqtObject = datagram.status !== undefined
@@ -6799,6 +8124,7 @@ export class MoqtPlayer {
       this.log.info('Ignoring control message from a superseded session: %s', msg.type);
       return;
     }
+    if (this.follower.onResponse(msg)) return;
     if ((msg.type === 'SUBSCRIBE_OK' || msg.type === 'REQUEST_ERROR') && 'requestId' in msg) {
       const answeredReqId = BigInt((msg as { requestId: bigint | number }).requestId);
       const boundAlias = msg.type === 'SUBSCRIBE_OK' && 'trackAlias' in msg
@@ -6829,38 +8155,74 @@ export class MoqtPlayer {
         // uses 0x5 (§15.10.3), draft-14/16 use 0x6 (§13.4.3). On draft-18, 0x6 is
         // EXPIRED, so comparing against the wrong table would both miss real
         // TOO_FAR_BEHIND and mis-fire recovery on EXPIRED.
-        const tooFarBehind = isRequestStreamDraft(this.connection?.draftVersion)
-          ? PublishDoneCode18.TOO_FAR_BEHIND
-          : PublishDoneCode.TOO_FAR_BEHIND;
-        if (statusCode === BigInt(tooFarBehind)) {
-          this.log.warn('PUBLISH_DONE(TOO_FAR_BEHIND) "%s": resubscribing from live edge', trackName);
-          this.replaceSubscription(trackName, 'too_far_behind');
+        const d18Codes = isRequestStreamDraft(this.connection?.draftVersion);
+        const tooFarBehind = BigInt(d18Codes ? PublishDoneCode18.TOO_FAR_BEHIND : PublishDoneCode.TOO_FAR_BEHIND);
+        // INTERNAL_ERROR and EXCESSIVE_LOAD end a live subscription on a send-side
+        // condition (e.g. no stream credit toward us), not the end of the track.
+        const retriable = statusCode === tooFarBehind
+          || statusCode === BigInt(PublishDoneCode.INTERNAL_ERROR)
+          || (d18Codes && statusCode === BigInt(PublishDoneCode18.EXCESSIVE_LOAD));
+        if (retriable) {
+          this.log.warn('PUBLISH_DONE(0x%s) "%s": %s — resubscribing from live edge',
+            statusCode.toString(16), trackName, errorReason || '(no reason)');
+          this.scheduleResubscribe(
+            trackName, statusCode === tooFarBehind ? 'too_far_behind' : 'publish_done');
           return;
         }
+        // A switch target that ends before its first object can never commit.
+        this.failSwitchForSubscription(BigInt(_requestId), trackName,
+          new Error(`track "${trackName}" ended (PUBLISH_DONE ${statusCode}${errorReason ? `: ${errorReason}` : ''})`));
 
         this.emitter.emit('track_unsubscribed', {
           type: 'track_unsubscribed',
           trackName,
           reason: errorReason,
         });
+        // A live publisher that ended all its media may come back on the same
+        // namespace. Without a namespace to follow, retry as a reconnect does.
+        const liveTrack = this._catalogState?.tracks.some((t) => t.name === trackName && t.isLive === true);
+        const mediaLeft = [...this.activeSubscriptions.values()]
+          .some((s) => s.mediaType === 'video' || s.mediaType === 'audio');
+        if (!this.config.followNamespace && liveTrack && !mediaLeft) {
+          this.scheduleReconnect(`the publisher ended its tracks (${errorReason || 'PUBLISH_DONE'})`);
+        }
       },
-      onMediaSubscribeOk: (_requestId, _trackName, _mediaType) => {
+      onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
         this._mediaSubsOk++;
+        this.mediaSubWire.delete(requestId);
       },
-      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode) => {
+      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
         this._mediaSubsFailed++;
+        // DOES_NOT_EXIST: the namespace's return resumes the track, or ends a failed resume.
+        if (this.config.followNamespace && BigInt(errorCode) === 0x10n) this.follower.noteTrackMissing();
+        this.failSwitchForSubscription(BigInt(requestId), trackName,
+          new Error(`track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`));
         this.emitter.emit('track_subscribe_failed', {
           type: 'track_subscribe_failed', trackName, mediaType, requestId, errorCode, reason,
         });
+        // The wire detail travels in the message: this error reaches the
+        // application log without debug logging, and a refusal of a track
+        // another subscriber is receiving needs the exact bytes sent.
+        const wire = this.mediaSubWire.get(requestId);
+        this.mediaSubWire.delete(requestId);
         this.emitError(createPlayerError(
           'degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`,
+          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`
+          + ` reqId=${requestId.toString()}`
+          + (retryInterval !== undefined ? ` retryIn=${retryInterval.toString()}` : '')
+          + (wire !== undefined ? ` ${wire}` : ''),
         ));
         if (this._mediaSubsFailed === this._mediaSubsExpected && this._mediaSubsOk === 0 && this._mediaSubsExpected > 0) {
           this.emitError(createPlayerError(
             'fatal', 'subscription', PlayerErrorCode.ALL_TRACKS_REFUSED,
             'All media track subscriptions refused — no playable content',
           ));
+        }
+        // A listed track not published yet: retry with backoff while nothing else plays this media type.
+        if (BigInt(errorCode) === BigInt(RequestError.DOES_NOT_EXIST)
+            && this.activeTrackName(mediaType) === undefined
+            && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName)) {
+          this.scheduleResubscribe(trackName, 'refused');
         }
       },
       onCatalogSubscribeOk: (largest) => {
@@ -6870,10 +8232,25 @@ export class MoqtPlayer {
         if (conn !== this.connection) return;
         this.cancelCatalogBootstrap();
         // Only "not published yet" is retriable; other codes are real refusals.
-        if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST) || retryInterval === 0n) {
+        if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) {
           this.failCatalogPlayback(createPlayerError(
             'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-            `Catalog subscription refused: ${reason} (code=0x${errorCode.toString(16)})`,
+            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)})`,
+          ));
+          return;
+        }
+        // followNamespace: the namespace's publication resumes the catalog.
+        if (this.follower.awaitPublisher(conn)) {
+          this.emitError(createPlayerError(
+            'degraded', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)}); waiting for the publisher`,
+          ));
+          return;
+        }
+        if (retryInterval === 0n) {
+          this.failCatalogPlayback(createPlayerError(
+            'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)})`,
           ));
           return;
         }
@@ -6968,6 +8345,7 @@ export class MoqtPlayer {
         return true;
       },
       onCatalogPublishDone: (statusCode) => {
+        if (this.catalogRequestId !== null) this.catalogEnded = { conn, requestId: this.catalogRequestId };
         const reason = this.normalizePublishDoneStatus(statusCode);
         if (reason === 'going-away') {
           // GOAWAY semantics: quarantine THIS connection's catalog delivery
@@ -7215,6 +8593,20 @@ export class MoqtPlayer {
     // be re-sent as a new independent object on the next group.
     if (obj.kind === 'gap') return;
 
+    // A zero-length payload carries no catalog; parsing it throws and drives
+    // recovery.
+    if (obj.payload.byteLength === 0) {
+      this.emptyCatalogObjects++;
+      if (this.emptyCatalogObjects === 1) {
+        this.log.warn(
+          'Catalog object with empty payload (group=%s object=%s) — dropped; '
+          + 'further occurrences counted only',
+          String(obj.groupId), String(obj.objectId),
+        );
+      }
+      return;
+    }
+
     // Emit raw payload before parsing — for debugging catalog format issues
     if (obj.payload && obj.payload.byteLength > 0) {
       let text: string | null = null;
@@ -7237,24 +8629,31 @@ export class MoqtPlayer {
         this.watchdog.fulfill('catalog_received');
         this.watchdog.expect('first_media_object', 20_000);
         this.log.info('Catalog received: %d tracks', catalogState.tracks.length);
-        this.emitter.emit('catalog_received', {
-          type: 'catalog_received',
-          catalog: catalogState,
-        });
+        if (catalogState.ignoredTracks?.length) {
+          this.log.warn('Catalog: ignoring track(s) with unsupported packaging: %s',
+            catalogState.ignoredTracks.map((t) => `"${t.name}" (${t.packaging})`).join(', '));
+        }
+        this.emitCatalogReceived(catalogState);
         if (!live()) return;
 
         if (this.pipelinesCreated) {
-          // knownTracks path — pipelines already exist, media already subscribed.
+          // Pipelines already exist: media was subscribed from knownTracks, or
+          // is re-subscribed here after a migration.
           // Initialize QualityController for future ABR switches and validate.
+          const previousController = this.qualityController;
           this.qualityController = new QualityController({
             autoQuality: this.config.autoQuality!,
             startLevel: this.config.startLevel!,
             ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+            ...(this.config.initialProgram !== undefined ? { initialProgram: this.config.initialProgram } : {}),
+            ...(this.config.preferredLanguage !== undefined ? { preferredLanguage: this.config.preferredLanguage } : {}),
             qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
             clock: this.clock,
           });
-          this.selectCatalogTracks(catalogState);
+          const selected = this.selectCatalogTracks(catalogState);
           this.validateKnownTracks(catalogState);
+          this.alignControllerWithPlayingTracks(previousController);
+          this.resumeMigratedMedia(selected);
         } else {
           // Standard path — catalog-first: create pipelines and subscribe
           this.subscribeToMediaTracks(catalogState).catch((err) => {
@@ -7271,12 +8670,8 @@ export class MoqtPlayer {
         // A delta (or a re-sent independent catalog) changed the catalog —
         // refresh the cached state so track selection and initRef resolution see
         // delta-added tracks and the preserved root initDataList / protections.
-        this._catalogState = catalogState;
         this.log.info('Catalog updated');
-        this.emitter.emit('catalog_updated', {
-          type: 'catalog_updated',
-          catalog: catalogState,
-        });
+        this.applyCatalogUpdate(catalogState);
       }
     } catch (err) {
       // First catalog failure = fatal (can't proceed without catalog).
@@ -7286,9 +8681,21 @@ export class MoqtPlayer {
         ? PlayerErrorCode.CATALOG_DELTA_ERROR
         : PlayerErrorCode.CATALOG_PARSE_ERROR;
       const cause = err instanceof Error ? err : new Error(String(err));
-      const error = createPlayerError(severity, 'catalog', code, cause.message, { cause });
-      if (severity === 'fatal') this.failCatalogPlayback(error);
-      else this.emitError(error);
+      // Once only: a malformed producer repeats per object, and every emit
+      // drives recovery. Size and head separate truncation from a format
+      // mismatch.
+      this.catalogParseFailures++;
+      if (this.catalogParseFailures === 1) {
+        this.log.warn(
+          'Catalog parse failed (%d bytes, head=%s): %s',
+          obj.payload.byteLength,
+          JSON.stringify(new TextDecoder().decode(obj.payload.subarray(0, 64))),
+          cause.message,
+        );
+        const error = createPlayerError(severity, 'catalog', code, cause.message, { cause });
+        if (severity === 'fatal') this.failCatalogPlayback(error);
+        else this.emitError(error);
+      }
     }
   }
 
@@ -7317,6 +8724,12 @@ export class MoqtPlayer {
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
       onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
+        if (this.mseRebuildAwaitingFrame) {
+          this.mseRebuildAwaitingFrame = false;
+          this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
+          this.log.info('First frame rendered on the rebuilt MediaSource');
+          return;
+        }
         this._stats.recordFirstFrameRendered();
         this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
         this.log.info('First frame rendered');
@@ -7335,14 +8748,7 @@ export class MoqtPlayer {
         this.consecutiveStallCount++;
         this.videoRecoveryActive = true;
         this.videoRecoveryHealthyRenders = 0;
-
-        // Flush stale backlog AND reject in-flight objects from the old
-        // subscription. Pass currentGroupId+1 as targetGroupId so the
-        // pipeline's minAcceptGroupId gates out stale groups that arrive
-        // after the REQUEST_UPDATE but before the relay switches.
-        const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
-        this.videoPipeline?.reset(minFreshGroup);
-        this.syncController?.reset();
+        this.clearStallPark();
 
         // Jump to live: when stalls persist (3+ consecutive without a
         // rendered frame), the player has fallen behind the live edge.
@@ -7350,6 +8756,7 @@ export class MoqtPlayer {
         // from NOW, and resume from the next keyframe.
         if (this.consecutiveStallCount >= 3) {
           this.consecutiveStallCount = 0;
+          this.flushVideoForRecovery();
           this.log.warn('Jump to live: %d consecutive stalls — flushing and resubscribing', 3);
 
           // Tell relay to restart from live edge
@@ -7365,28 +8772,28 @@ export class MoqtPlayer {
         // Relay signals overload via PUBLISH_DONE/TOO_FAR_BEHIND;
         // network bottlenecks produce no server signal, so the player
         // must self-detect via stall rate.
-        if (this.recoveryController) {
-          const action = this.recoveryController.evaluate({ type: 'stall' as any, durationMs } as any);
-          this.emitter.emit('recovery_action', {
-            type: 'recovery_action',
-            action,
-          });
-          doRecoveryAction(action, 'video', this.qualityController, this.log, {
-            onQualityReduced: (newTrack) => {
-              // No stats here — deferred to completePendingVideoSwitch.
-              this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
-                this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
-              });
-            },
-            onResubscribe: (mt, sg) => this.requestFreshSubscriptionStart(mt, sg),
-            onTerminate: (_reason) => {
-              if (this.stateMachine.state !== PlayerState.ERROR) {
-                this.transitionState(PlayerState.ERROR);
-              }
-              this.stopTicking();
-            },
-          });
+        const action = this.recoveryController?.evaluate({ type: 'stall' as any, durationMs } as any);
+        if (action?.type === 'skip_forward') {
+          // A delivery gap usually resumes with the group intact; skipping now
+          // would discard it and wait for the next keyframe. Skip only if no
+          // frame renders within the bound.
+          this.stallParkTimer = setTimeout(() => {
+            this.stallParkTimer = null;
+            if (this._destroyed || this.isTerminalState()) return;
+            // A buffered group start plays now: nothing is flushed or re-requested.
+            const buffered = this.videoPipeline?.skipToBufferedGroup() ?? null;
+            if (buffered !== null) {
+              this.syncController?.reset();
+              this.log.warn('Stall: moving to buffered group %s', buffered);
+              return;
+            }
+            this.flushVideoForRecovery();
+            this.applyStallRecovery(action);
+          }, MoqtPlayer.STALL_PARK_MS);
+          return;
         }
+        this.flushVideoForRecovery();
+        if (action) this.applyStallRecovery(action);
       },
       onDecodeError: (mediaType, error) => {
         if (this.stateMachine.state === PlayerState.ERROR) return;
@@ -7450,6 +8857,17 @@ export class MoqtPlayer {
           return;
         }
 
+        if (error.name === 'MediaPipelineFailedError') {
+          if (this.rebuildMediaSource(error)) return;
+          this.emitError(createPlayerError(
+            'fatal', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED, error.message,
+            { cause: error, context: { mediaType } },
+          ));
+          if (!this.isTerminalState()) this.transitionState(PlayerState.ERROR);
+          this.stopTicking();
+          return;
+        }
+
         if (error.name === 'PlayheadWedgeError') {
           this.emitError(createPlayerError(
             'fatal', 'decoder', PlayerErrorCode.MEDIA_ELEMENT_WEDGED, error.message,
@@ -7489,6 +8907,7 @@ export class MoqtPlayer {
       },
       onFrameRendered: (_captureTimestampUs, _actualRenderUs) => {
         this._stats.recordFrameRendered();
+        this.clearStallPark();
         if (this.videoRecoveryActive) {
           // Pipeline reset(minFreshGroup) rejects stale in-flight objects,
           // so any frame reaching here is genuinely fresh relay data.
@@ -7532,13 +8951,14 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     this.mediaSource = pipelines.mediaSource;
-    // Re-state playback intent on the newly created adapter. play()/pause() can
-    // both happen before the catalog exists, so the adapter that is created
-    // afterwards must inherit the player's CURRENT intent rather than its own
-    // default. `null` means the embedder has never declared one — leave the
-    // adapter's default alone.
-    if (this.playbackIntent !== null) {
-      this.mediaSource?.setPlaybackIntent?.(this.playbackIntent);
+    // Declare playback intent on the newly created adapter. play()/pause() can
+    // both happen before the catalog exists, so the adapter created afterwards
+    // inherits the player's CURRENT intent. Undeclared means not playing: the
+    // player owns startup, the adapter must never start on its own.
+    this.mediaSource?.setPlaybackIntent?.(this.playbackIntent ?? false);
+    const targetLatencyMs = this.config.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    if (targetLatencyMs != null) {
+      this.mediaSource?.setTargetAheadSec?.(targetLatencyMs / 1000);
     }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
 
@@ -7560,19 +8980,20 @@ export class MoqtPlayer {
         // A media-gap stall is missing SOURCE media the adapter already
         // skipped — not a bandwidth signal. Count it, never downshift on it.
         if (cause === 'media-gap') return;
+        this.lastMseStallUs = this.clock.now();
 
         // Don't cascade downshifts while a switch is already in flight.
         // Each switch needs time for the relay to deliver the new track's
         // first keyframe. Rapid cascading (4 switches in <2s) means no
         // track ever gets a chance to deliver — changeType() keeps wiping
         // the decoder before data arrives.
-        if (this.pendingVideoSwitch || this.switchInProgress) return;
+        if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) return;
 
         // Emergency downshift: non-mutating peek, deferred commit.
         if (this.qualityController && this.bufferAbrController) {
           const newTrack = this.qualityController.peekLowerVideoQuality(true);
           if (newTrack) {
-            this.lastAbrDownshiftUs = this.clock.now();
+            this.noteAbrDownshift(this.clock.now());
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
             this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
               this.log.warn('Stall downshift to "%s" failed: %s', newTrack.name, err);
@@ -7587,12 +9008,13 @@ export class MoqtPlayer {
       this.mediaSource.onGapJump = (info) => {
         this._stats.recordGapJump();
         this.log.warn(
-          'MSE gap-jump: skipped %ss hole %ss -> %ss (waited %sms)',
-          info.holeSec.toFixed(2), info.from.toFixed(2), info.to.toFixed(2), info.waitedMs.toFixed(0),
+          'MSE gap-jump (%s): skipped %ss hole %ss -> %ss (waited %sms)',
+          info.reason, info.holeSec.toFixed(2), info.from.toFixed(2), info.to.toFixed(2), info.waitedMs.toFixed(0),
         );
         this.emitter.emit('gap_jump', {
           type: 'gap_jump',
-          from: info.from, to: info.to, holeSec: info.holeSec, waitedMs: info.waitedMs,
+          from: info.from, to: info.to, holeStart: info.holeStart,
+          holeSec: info.holeSec, waitedMs: info.waitedMs, reason: info.reason,
         });
       };
     }
@@ -7703,6 +9125,39 @@ export class MoqtPlayer {
   }
 
   /**
+   * Recover a failed MSE pipeline in-session: rebuild the MediaSource once and
+   * re-initialize from the retained init segments, without audio when audio
+   * failed and video can play alone. False when no rebuild applies.
+   */
+  private rebuildMediaSource(error: Error & { mediaType?: 'video' | 'audio' }): boolean {
+    const ms = this.mediaSource;
+    const pending = this.cmafPendingInit;
+    if (this.mseRebuilt || !ms?.rebuild || !pending || !this.cmafInitialized) return false;
+    this.mseRebuilt = true;
+    const dropAudio = error.mediaType === 'audio' && pending.audio !== undefined && pending.video !== undefined;
+    if (dropAudio) {
+      this.mseAudioDropped = error.message;
+      delete pending.audio;
+    }
+    this.log.warn('%s; rebuilding the MediaSource%s', error.message, dropAudio ? ' without audio' : '');
+    this.cmafAssembler?.destroy();
+    this.cmafAssembler = null;
+    this.cmafInitialized = false;
+    this.cmafVideoSynced = false;
+    for (const decoder of this.locmafDecoders.values()) decoder.reset();
+    ms.rebuild();
+    this._stats.cancelStall();
+    this.mseRebuildAwaitingFrame = true;
+    this.maybeApplyCmafInit();
+    this.emitError(createPlayerError(
+      'degraded', 'decoder', PlayerErrorCode.MEDIA_PIPELINE_FAILED,
+      dropAudio ? `Audio disabled, playing video only: ${error.message}` : `MediaSource rebuilt: ${error.message}`,
+      { cause: error, context: { mediaType: error.mediaType, recovery: dropAudio ? 'video-only' : 'rebuilt' } },
+    ));
+    return true;
+  }
+
+  /**
    * The CMAF MediaSource just attached (MSE `sourceopen` → SourceBuffers).
    * If media was held while unattached, everything the assembler had seen
    * was dropped before MSE: start its timeline over on what will actually be
@@ -7730,6 +9185,34 @@ export class MoqtPlayer {
   private documentHidden(): boolean {
     const doc = (globalThis as { document?: { visibilityState?: string } }).document;
     return doc?.visibilityState === 'hidden';
+  }
+
+  /** Recovery waits for a visible page: autoResume is off and the document is hidden. */
+  private holdWhileHidden(): boolean {
+    return this.config.autoResume === false && this.documentHidden();
+  }
+
+  /** Run `resume` once the page is visible, on the session current now; one pending at a time. */
+  private resumeWhenVisible(resume: () => void): void {
+    this.cancelResumeWhenVisible();
+    const doc = (globalThis as { document?: EventTarget }).document;
+    if (!doc) return;
+    const conn = this.connection;
+    const listener = (): void => {
+      if (this.documentHidden()) return;
+      this.cancelResumeWhenVisible();
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      resume();
+    };
+    this.mediaResumeListener = listener;
+    doc.addEventListener('visibilitychange', listener);
+  }
+
+  private cancelResumeWhenVisible(): void {
+    if (!this.mediaResumeListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    doc?.removeEventListener('visibilitychange', this.mediaResumeListener);
+    this.mediaResumeListener = null;
   }
 
   /** Suspend a CMAF bootstrap deadline while the document is hidden. */
@@ -7822,6 +9305,7 @@ export class MoqtPlayer {
     }
     this.cmafAssembler = this.config.createCmafAssembler({
       onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
+        if (mediaType === 'audio' && this.mseAudioDropped !== null) return;
         if (!timestampOffsetSet[mediaType]) {
           timestampOffsetSet[mediaType] = true;
           if ('setTimestampOffset' in ms) {
@@ -7836,6 +9320,13 @@ export class MoqtPlayer {
           (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
         }
       },
+      // Bound how long out-of-order media may wait for a missing frame.
+      audioAheadMs: () => ('getBufferAheadMsByKind' in ms
+        ? (ms as { getBufferAheadMsByKind: () => { audio: number | null } }).getBufferAheadMsByKind().audio
+        : null),
+      videoAheadMs: () => ('getBufferAheadMsByKind' in ms
+        ? (ms as { getBufferAheadMsByKind: () => { video: number | null } }).getBufferAheadMsByKind().video
+        : null),
     });
   }
 
@@ -7939,12 +9430,10 @@ export class MoqtPlayer {
     const activeSubscription = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === 'video');
     const activeVideo = activeSubscription && catalog.tracks.find(t => t.role === 'video' && t.name === activeSubscription.trackName);
     // Pre-known subscriptions are already active: catalog arrival must describe
-    // their switching set, not choose another view behind their back.
-    const selectionCatalog = activeVideo ? {
-      ...catalog, tracks: catalog.tracks.filter(t => t.role !== 'video' || t.altGroup === activeVideo.altGroup),
-    } : catalog;
-    const selected = this.qualityController!.selectInitialTracks(selectionCatalog, defined({
-      videoAltGroup: this.config.videoAltGroup,
+    // their view and program, not choose another one behind their back. The
+    // other views stay listed for a later selectView.
+    const selected = this.qualityController!.selectInitialTracks(catalog, defined({
+      videoAltGroup: activeVideo ? undefined : this.config.videoAltGroup,
       videoConstraints: this.config.videoConstraints,
       audioConstraints: this.config.audioConstraints,
       ...(this.config.disableVideo ? { disableVideo: true } : {}),
@@ -8029,6 +9518,7 @@ export class MoqtPlayer {
     );
     if (selected.video?.targetLatency !== undefined) {
       this._stats.setTargetLatency(selected.video.targetLatency);
+      this.catalogTargetLatencyMs = selected.video.targetLatency;
     }
 
     // §9.2.2: Build subscription options from config
@@ -8059,6 +9549,7 @@ export class MoqtPlayer {
         packaging: audioPackaging,
       }) : undefined,
       isLive: selected.video?.isLive === true || selected.audio?.isLive === true,
+      ...(this.catalogTargetLatencyMs != null ? { targetLatencyMs: this.catalogTargetLatencyMs } : {}),
     });
 
     // ── Subscribe to selected tracks (parallel) ──────────────────
@@ -8085,31 +9576,40 @@ export class MoqtPlayer {
 
       // Warm start (§5.1.3): a live LOC track subscribes with the Largest
       // Object filter so a relative Joining FETCH can prepend the current
-      // group's head (issued below). CMAF is excluded — its MSE append path
-      // is not warm-start safe (see cmafBootstrap notes) — and non-live
-      // tracks already start from group 0. Config validation guarantees any
-      // explicit subscriptionFilter is LargestObject when warm start is on.
-      const warmStart = this.config.warmStartCurrentGroup === true
-        && track?.isLive === true
-        && !isMsePackaging(packaging);
-      if (this.config.warmStartCurrentGroup === true && isMsePackaging(packaging)) {
-        this.log.warn('[warm-start] CMAF track "%s" skipped — LOC only in this slice', name);
-      }
+      // group's head (issued below). MSE packagings cannot take that backlog
+      // (see cmafBootstrap notes): their live video asks for a new group
+      // instead (NEW_GROUP_REQUEST 0, §10.2.13), which a publisher with
+      // dynamic groups honours and any other ignores. Non-live tracks already
+      // start from group 0. Config validation guarantees any explicit
+      // subscriptionFilter is LargestObject when warm start is on.
+      const warmStartAsked = this.config.warmStartCurrentGroup === true && track?.isLive === true;
+      const warmStart = warmStartAsked && !isMsePackaging(packaging);
+      const newGroupRequest = warmStartAsked && isMsePackaging(packaging)
+        && mediaType === 'video' && conn.draftVersion !== 14;
+      if (newGroupRequest) this.log.info('[warm-start] %s track "%s" asks for a new group', packaging, name);
       // Warm start overrides ONLY the filter — configured subscribe options
       // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
       // draft 22: the SUBSCRIBE itself asks for the current group as a fill.
       const warmFill = warmStart && isDraft22(conn.draftVersion);
-      const mediaOptions = warmStart
-        ? {
-          ...(subscribeOptions ?? {}),
-          subscriptionFilter: { type: 'LargestObject' as const },
-          ...(warmFill ? { fill: CURRENT_GROUP_FILL } : {}),
-        }
-        : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
+      const mediaOptions = {
+        ...(warmStart
+          ? {
+            ...(subscribeOptions ?? {}),
+            subscriptionFilter: { type: 'LargestObject' as const },
+            ...(warmFill ? { fill: CURRENT_GROUP_FILL } : {}),
+          }
+          : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true))),
+        ...(newGroupRequest ? { newGroupRequest: 0n } : {}),
+      };
       // Pre-send ownership (§9.10): register inside onRequestId — a
       // zero-latency SUBSCRIBE_OK must find the pending entry already in place. Adapters
       // that don't invoke the callback fall back to post-await registration.
       const connAtSubscribe = conn;
+      const wireDetail = `ns=${namespaceDisplay(this.config.namespace)}`
+        + ` nsFields=${nsBytes.length} nsHex=${nsBytes.map(hexBytes).join('/')}`
+        + ` track="${name}" trackHex=${hexBytes(nameBytes)}`
+        + ` filter=${(mediaOptions as { subscriptionFilter?: { type?: string } }).subscriptionFilter?.type ?? 'default'}`
+        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}${newGroupRequest ? ' newGroupRequest=0' : ''}`;
       let subRegistered = false;
       const registerMediaSub = (reqIdBigInt: bigint): void => {
         if (subRegistered) return;
@@ -8117,7 +9617,9 @@ export class MoqtPlayer {
         if (!live()) throw new Error('Media subscription retired before emission');
         this.pendingAliasBinds.add(reqIdBigInt);
         this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null });
-        this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
+        this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging, ...this.catalogInitConfig(name) });
+        this.recordMediaSubWire(reqIdBigInt, wireDetail);
+        this.log.info('SUBSCRIBE media reqId=%s %s', reqIdBigInt.toString(), wireDetail);
       };
       let registeredId: bigint | null = null;
       let reqIdBigInt: bigint;
@@ -8441,7 +9943,7 @@ export class MoqtPlayer {
       syncResetThisTick: this.syncResetThisTick,
       setSyncResetThisTick: (v) => { this.syncResetThisTick = v; },
       recordDiagnostic: (kind) => this._stats.recordLocDiagnostic(kind),
-      recoveryHook: (action) => {
+      recoveryHook: (action, localSkip) => {
         const result = this.hooks.onRecovery.run(action);
         if (result) {
           doRecoveryAction(result, mediaType, this.qualityController, this.log, {
@@ -8451,7 +9953,7 @@ export class MoqtPlayer {
               });
             },
             onResubscribe: (recoveryMediaType, startGroup) => {
-              this.requestFreshSubscriptionStart(recoveryMediaType, startGroup);
+              this.recoveryResubscribe(recoveryMediaType, startGroup);
             },
             onTerminate: (_reason) => {
               if (this.stateMachine.state !== PlayerState.ERROR) {
@@ -8459,11 +9961,238 @@ export class MoqtPlayer {
               }
               this.stopTicking();
             },
-          });
+          }, localSkip);
         }
         return result;
       },
     });
+  }
+
+  /** Re-join at the live edge, abandoning whatever is buffered. For callers that
+   *  know playback was suspended (frozen tab, sleep) and the buffer is stale. */
+  jumpToLive(reason: string): void {
+    if (!this.connection) return;
+    this.log.info('Jump to live: %s', reason);
+    this.clearStallPark();
+    // As the stall path does: drop the backlog, refuse stale groups still in
+    // flight, and re-anchor on what arrives next.
+    for (const pipeline of [this.videoPipeline, this.audioPipeline]) {
+      pipeline?.reset(pipeline.currentGroupId + 1n);
+    }
+    this.syncController?.reset();
+    this.requestFreshSubscriptionStart('video');
+    this.requestFreshSubscriptionStart('audio');
+    this.emitter.emit('recovery_action', {
+      type: 'recovery_action',
+      action: { type: 'jump_to_live' },
+    });
+  }
+
+  private clearStallPark(): void {
+    if (this.stallParkTimer === null) return;
+    clearTimeout(this.stallParkTimer);
+    this.stallParkTimer = null;
+  }
+
+  /**
+   * Drop the video backlog and refuse stale groups still in flight (the
+   * pipeline's minAcceptGroupId), so playback resumes at the next keyframe.
+   */
+  private flushVideoForRecovery(): void {
+    const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
+    this.videoPipeline?.reset(minFreshGroup);
+    this.syncController?.reset();
+  }
+
+  /** Publish and carry out the recovery controller's answer to a video stall. */
+  private applyStallRecovery(action: RecoveryAction): void {
+    this.emitter.emit('recovery_action', { type: 'recovery_action', action });
+    doRecoveryAction(action, 'video', this.qualityController, this.log, {
+      onQualityReduced: (newTrack) => {
+        // No stats here — deferred to completePendingVideoSwitch.
+        this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
+          this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
+        });
+      },
+      onResubscribe: (mt, sg) => this.recoveryResubscribe(mt, sg),
+      onTerminate: (_reason) => {
+        if (this.stateMachine.state !== PlayerState.ERROR) {
+          this.transitionState(PlayerState.ERROR);
+        }
+        this.stopTicking();
+      },
+    });
+  }
+
+  /**
+   * SUBSCRIBE_NAMESPACE for config.namespace on `conn` (d18 §10.18, d22 §9.15). Draft-18
+   * and later: on draft-16 the same request can solicit PUBLISH, which this player does not serve.
+   */
+  private async followNamespace(conn: MoqtConnection): Promise<void> {
+    if (!this.config.followNamespace || !isRequestStreamDraft(conn.draftVersion)) return;
+    await this.follower.follow(conn);
+  }
+
+  /**
+   * The followed namespace returned and media has not arrived since: the session
+   * may be rebuilt during playback, or while still loading without a catalog.
+   */
+  private mayReestablishOnNamespaceReturn(returnedAtUs: number): boolean {
+    if (this._destroyed || this.currentMigration || this.reconnect !== null) return false;
+    if (!this.config.createConnection || !this.config.createTransport) return false;
+    const state = this.stateMachine.state;
+    const awaitingCatalog = state === PlayerState.LOADING && !this.catalogReceived;
+    if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED && !awaitingCatalog) return false;
+    return this.lastMediaArrivalUs <= returnedAtUs;
+  }
+
+  /**
+   * The followed namespace returned: resubscribe the refused catalog, or the
+   * ended media, on the current session. 'settle' when live media
+   * subscriptions remain (they may resume by themselves) or there is nothing to
+   * resubscribe; 'reestablish' when the catalog subscription ended, since a
+   * fresh session renews the catalog before its media.
+   */
+  private resumeOnNamespaceReturn(catalogLost: boolean): ReturnAction {
+    if (this._destroyed || this.currentMigration || this.reconnect !== null) return 'settle';
+    const conn = this.connection;
+    if (!conn) return 'settle';
+    const state = this.stateMachine.state;
+    if (state !== PlayerState.PLAYING && state !== PlayerState.PAUSED
+        && !(state === PlayerState.LOADING && !this.catalogReceived)) return 'settle';
+    if (!this.catalogReceived) {
+      if (!catalogLost) return 'settle';
+      this.log.info('Namespace published again: re-subscribing the catalog on this session');
+      this.cancelCatalogBootstrap();
+      this.terminateCatalogRetrieval(conn, this.catalogRequestId, null);
+      this.subscribeCatalog(conn).catch((err: unknown) => {
+        this.log.warn('Catalog re-subscribe after the namespace returned failed: %s',
+          err instanceof Error ? err.message : String(err));
+      });
+      return 'resumed';
+    }
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.mediaType === 'video' || sub.mediaType === 'audio') return 'settle';
+    }
+    if (!this.catalogSubscriptionLive()) {
+      this.log.info('Namespace published again with the catalog subscription ended');
+      return 'reestablish';
+    }
+    const names = [
+      this.config.disableVideo ? undefined : this.qualityController?.currentVideoTrack?.name,
+      this.config.disableAudio ? undefined : this.qualityController?.currentAudioTrack?.name,
+    ].filter((n): n is string => n !== undefined);
+    if (names.length === 0) return 'settle';
+    this.log.info('Namespace published again: re-subscribing %s on this session', names.join(', '));
+    for (const name of names) {
+      // Retry now rather than at the pending backoff.
+      const retry = this.publishDoneRetries.get(name);
+      if (retry && retry.timer !== null) {
+        clearTimeout(retry.timer);
+        retry.timer = null;
+        retry.attempts = 0;
+      }
+      this.scheduleResubscribe(name, 'namespace_return');
+    }
+    return 'resumed';
+  }
+
+  /** Whether catalog updates can still arrive on the current session. */
+  private catalogSubscriptionLive(): boolean {
+    if (this.catalogRecovery !== null) return true;
+    const ended = this.catalogEnded;
+    if (ended && ended.conn === this.connection && ended.requestId === this.catalogRequestId) return false;
+    return this.catalogRequestId !== null && this.catalogTrackAlias !== null;
+  }
+
+  /** Rebuild the catalog and subscriptions on a fresh session, as a reconnect does. */
+  private reestablishOnNamespaceReturn(): void {
+    this.log.info('Namespace published again: re-establishing the session');
+    this.migrate(this.config.createConnection!()).catch((err: unknown) => {
+      this.log.warn('Re-establishing after the namespace returned failed: %s',
+        err instanceof Error ? err.message : String(err));
+      this.scheduleReconnect('namespace returned; re-establish failed');
+    });
+  }
+
+  /**
+   * Reconnect after the current session closed during playback: a migration to
+   * the configured URL on a fresh connection, retried with backoff, fatal after
+   * RECONNECT_MAX_ATTEMPTS. Each failed attempt rolls back cleanly.
+   */
+  private scheduleReconnect(closeReason: string): void {
+    if (!this.canReconnect()) return;
+    const r = this.reconnect ??= { attempt: 0, timer: null, closeReason };
+    if (r.timer !== null) return;
+    if (r.attempt >= MoqtPlayer.RECONNECT_MAX_ATTEMPTS) {
+      this.reconnect = null;
+      this.emitError(createPlayerError(
+        'fatal', 'connection', PlayerErrorCode.CONNECTION_LOST,
+        `Session closed (${r.closeReason}); reconnect gave up after ${r.attempt} attempts`,
+      ));
+      if (this.stateMachine.state !== PlayerState.ERROR) {
+        this.transitionState(PlayerState.ERROR);
+      }
+      this.stopTicking();
+      return;
+    }
+    r.attempt++;
+    const delays = MoqtPlayer.RECONNECT_DELAYS_MS;
+    const delayMs = delays[Math.min(r.attempt, delays.length) - 1]!;
+    this.emitter.emit('session_reconnecting', { type: 'session_reconnecting', attempt: r.attempt, delayMs });
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      this.attemptReconnect(r);
+    }, delayMs);
+  }
+
+  /** Restart playback the browser suspended while the page was frozen or hidden. No-op unless playing. */
+  resumeSuspendedPlayback(): void {
+    if (this._destroyed || this.stateMachine.state !== PlayerState.PLAYING) return;
+    this.mediaSource?.resumePlayback?.();
+  }
+
+  /** Whether a closed session would be reconnected now. */
+  private canReconnect(): boolean {
+    if (this._destroyed || this.currentMigration) return false;
+    if (!this.config.createConnection || !this.config.createTransport) return false;
+    const state = this.stateMachine.state;
+    return state === PlayerState.PLAYING || state === PlayerState.PAUSED;
+  }
+
+  private attemptReconnect(r: NonNullable<MoqtPlayer['reconnect']>): void {
+    if (this._destroyed || this.reconnect !== r) return;
+    this.migrate(this.config.createConnection!()).then(
+      () => { if (this.reconnect === r) this.reconnect = null; },
+      (err: unknown) => {
+        this.log.warn('Reconnect attempt %d failed: %s',
+          r.attempt, err instanceof Error ? err.message : String(err));
+        if (this.reconnect === r) this.scheduleReconnect(r.closeReason);
+      },
+    );
+  }
+
+  /**
+   * Run a reconnect waiting out its backoff now, with the backoff restarted,
+   * e.g. when the page becomes visible again: failures while it was hidden say
+   * nothing about the network now. No-op without a pending attempt.
+   */
+  reconnectNow(): void {
+    const r = this.reconnect;
+    if (!r || r.timer === null || this._destroyed) return;
+    clearTimeout(r.timer);
+    r.timer = null;
+    r.attempt = 0;
+    this.log.info('Reconnecting now (session closed: %s)', r.closeReason);
+    this.attemptReconnect(r);
+  }
+
+  /** Recovery's resubscribe: at most one REQUEST_UPDATE per media type per interval. */
+  private recoveryResubscribe(mediaType: 'video' | 'audio', startGroup?: bigint): void {
+    const now = this.clock.now();
+    if (now - this.lastRecoveryUpdateUs[mediaType] < MoqtPlayer.RECOVERY_UPDATE_MIN_INTERVAL_US) return;
+    this.lastRecoveryUpdateUs[mediaType] = now;
+    this.requestFreshSubscriptionStart(mediaType, startGroup);
   }
 
   private requestFreshSubscriptionStart(
@@ -8471,9 +10200,15 @@ export class MoqtPlayer {
     startGroup?: bigint,
   ): void {
     if (!this.connection) return;
+    // The session is gone; the reconnect re-subscribes.
+    if (this.reconnect !== null) return;
+    // Re-issuing on every failure exhausts the request-ID space.
+    if (this.clock.now() < this.recoveryUpdateBlockedUntilUs) return;
 
     const matching = [...this.activeSubscriptions.entries()]
-      .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId);
+      .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId
+        && this.isSubscriptionEstablished(requestId));
+    if (matching.length > 0) this.mediaSource?.expectDiscontinuity?.();
 
     for (const [requestId, sub] of matching) {
       this.connection.requestUpdate(varint(requestId), {
@@ -8485,6 +10220,7 @@ export class MoqtPlayer {
           }
           : { type: 'NextGroupStart' },
       }).then(() => {
+        this.recoveryUpdateFailures = 0;
         this.log.info(
           'Recovery REQUEST_UPDATE %s "%s" reqId=%s filter=%s',
           mediaType,
@@ -8494,8 +10230,13 @@ export class MoqtPlayer {
         );
       }).catch((err: unknown) => {
         const cause = err instanceof Error ? err : new Error(String(err));
+        this.recoveryUpdateBlockedUntilUs =
+          this.clock.now() + MoqtPlayer.RECOVERY_UPDATE_COOLDOWN_US;
+        this.recoveryUpdateFailures++;
+        if (this.recoveryUpdateFailures > 1) return;
         this.log.warn(
-          'Recovery REQUEST_UPDATE failed for %s reqId=%s: %s',
+          'Recovery REQUEST_UPDATE failed for %s reqId=%s: %s — backing off; '
+          + 'further failures counted only',
           mediaType,
           requestId,
           cause.message,
@@ -8523,6 +10264,8 @@ export class MoqtPlayer {
     const monitor = this.livenessMonitor;
     if (!monitor) return;
     if (this.stateMachine.state !== PlayerState.PLAYING) return;
+    // Restarts cannot succeed on a closed session; the reconnect owns recovery.
+    if (this.reconnect !== null) return;
     monitor.reconcile(this.collectLivenessTracks());
     monitor.check(performance.now());
   }
@@ -8571,7 +10314,8 @@ export class MoqtPlayer {
    * full resubscribe within the same attempt. Attempts ≥2: full
    * resubscribe directly. Bounded by livenessMaxRestarts with exponential
    * backoff; the budget resets after livenessHealthyResetMs of health.
-   * Exhausted → fatal MEDIA_STARVED (the application layer reconnects).
+   * Exhausted → fatal MEDIA_STARVED (the application layer reconnects), or
+   * with followNamespace a degraded MEDIA_STARVED and a wait for the publisher.
    */
   private async handleTrackStarvation(
     track: LivenessTrack,
@@ -8605,6 +10349,8 @@ export class MoqtPlayer {
     try {
       const maxAttempts = this.config.livenessMaxRestarts!;
       while (restart.attempts < maxAttempts && this.livenessLadderMayContinue(restart)) {
+        if (await this.livenessHoldWhileHidden(track, restart)) return;
+        if (!this.livenessLadderMayContinue(restart)) return;
         const attempt = restart.attempts + 1;
         // Backoff before retries (not before the first attempt — the
         // starvation timeout already waited).
@@ -8643,7 +10389,9 @@ export class MoqtPlayer {
         }
       }
 
-      if (this.livenessLadderMayContinue(restart)) {
+      if (this.livenessLadderMayContinue(restart) && this.config.followNamespace) {
+        await this.waitForStarvedTrack(track, restart);
+      } else if (this.livenessLadderMayContinue(restart)) {
         this.emitError(createPlayerError(
           'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
           `Media delivery starved: ${track.mediaType} "${track.trackName}" — ` +
@@ -8658,6 +10406,76 @@ export class MoqtPlayer {
     } finally {
       restart.active = false;
     }
+  }
+
+  /**
+   * followNamespace: an exhausted ladder waits for the publisher instead of
+   * failing. The track is resubscribed every 2 × livenessTimeoutMs (a wait,
+   * then a probe) until media returns; a namespace withdrawn and published
+   * again re-establishes the session meanwhile.
+   */
+  private async waitForStarvedTrack(
+    track: LivenessTrack,
+    restart: { attempts: number; cancelled: boolean },
+  ): Promise<void> {
+    const timeoutMs = this.config.livenessTimeoutMs!;
+    this.emitError(createPlayerError(
+      'degraded', 'connection', PlayerErrorCode.MEDIA_STARVED,
+      `Media delivery starved: ${track.mediaType} "${track.trackName}" — `
+      + `${this.config.livenessMaxRestarts} restart attempts failed; waiting for the publisher, `
+      + `resubscribing every ${Math.round((2 * timeoutMs) / 1000)}s`,
+      { context: { mediaType: track.mediaType, trackName: track.trackName } },
+    ));
+    while (this.livenessLadderMayContinue(restart)) {
+      await this.livenessSleep(timeoutMs, restart);
+      if (!this.livenessLadderMayContinue(restart)) return;
+      if (await this.livenessHoldWhileHidden(track, restart)) return;
+      if (!this.livenessLadderMayContinue(restart)) return;
+      const attemptStartMs = performance.now();
+      restart.attempts++;
+      this.emitter.emit('recovery_action', {
+        type: 'recovery_action',
+        action: {
+          type: 'track_restart',
+          mediaType: track.mediaType,
+          trackName: track.trackName,
+          attempt: restart.attempts,
+        },
+      });
+      this.flushForLivenessRestart(track);
+      this.fullResubscribeForLiveness(track);
+      if (await this.waitForTrackArrival(track, attemptStartMs, timeoutMs, restart)) {
+        this.log.info('Liveness: %s "%s" recovered while waiting (attempt %d)',
+          track.mediaType, track.trackName, restart.attempts);
+        return;
+      }
+    }
+  }
+
+  /**
+   * With autoResume off, hold a restart while the document is hidden. Once
+   * visible: true if delivery resumed within one reset probe, else the ladder
+   * continues with a fresh budget.
+   */
+  private async livenessHoldWhileHidden(
+    track: LivenessTrack,
+    restart: { attempts: number; cancelled: boolean },
+  ): Promise<boolean> {
+    if (!this.holdWhileHidden()) return false;
+    const heldAtMs = performance.now();
+    this.log.info('Liveness: %s "%s" restart held while the page is hidden',
+      track.mediaType, track.trackName);
+    while (this.holdWhileHidden()) {
+      if (!this.livenessLadderMayContinue(restart)) return false;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (await this.waitForTrackArrival(track, heldAtMs, this.config.livenessResetProbeMs!, restart)) {
+      this.log.info('Liveness: %s "%s" resumed once the page was visible',
+        track.mediaType, track.trackName);
+      return true;
+    }
+    restart.attempts = 0;
+    return false;
   }
 
   /** The ladder stops on cancel (stop/destroy), destroy, or leaving PLAYING. */
@@ -8770,7 +10588,48 @@ export class MoqtPlayer {
       // the request stream may have died with the delivery path.
       void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
     }
-    this.replaceSubscription(track.trackName, 'liveness');
+    this.replaceSubscription(track.trackName, 'liveness',
+      () => this.scheduleResubscribe(track.trackName, 'liveness'));
+  }
+
+  /**
+   * Resubscribe a track at once, then with doubling backoff, one pending retry
+   * per track; parked while hidden when autoResume is off.
+   */
+  private scheduleResubscribe(trackName: string, cause: ResubscribeCause): void {
+    const nowMs = performance.now();
+    let retry = this.publishDoneRetries.get(trackName);
+    if (!retry) {
+      retry = { attempts: 0, lastDoneAtMs: nowMs, timer: null };
+      this.publishDoneRetries.set(trackName, retry);
+    } else if (nowMs - retry.lastDoneAtMs >= PUBLISH_DONE_RETRY_RESET_MS) {
+      retry.attempts = 0;
+    }
+    retry.lastDoneAtMs = nowMs;
+    if (retry.timer !== null) return;
+    const delayMs = retry.attempts === 0
+      ? 0
+      : Math.min(PUBLISH_DONE_RETRY_BASE_MS * 2 ** (retry.attempts - 1), PUBLISH_DONE_RETRY_MAX_MS);
+    retry.attempts++;
+    const state = retry;
+    const conn = this.connection;
+    const fire = (): void => {
+      state.timer = null;
+      // A migration re-subscribes the replaced session's tracks itself.
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      // A reconnect in flight either replaces this session or has just made it.
+      if (this.reconnect !== null || this.holdWhileHidden()) {
+        state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
+        return;
+      }
+      for (const sub of this.activeSubscriptions.values()) {
+        if (sub.trackName === trackName) return;
+      }
+      this.replaceSubscription(trackName, cause,
+        () => this.scheduleResubscribe(trackName, cause));
+    };
+    if (delayMs === 0) fire();
+    else state.timer = setTimeout(fire, delayMs);
   }
 
   /**
@@ -8787,7 +10646,8 @@ export class MoqtPlayer {
    */
   private replaceSubscription(
     trackName: string,
-    cause: 'too_far_behind' | 'liveness',
+    cause: ResubscribeCause,
+    onFailed?: () => void,
   ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
 
@@ -8797,6 +10657,11 @@ export class MoqtPlayer {
     if (this.pendingVideoSwitch?.oldTrackName === trackName) {
       this.log.info('Ignoring %s replacement for "%s" — pending switch to "%s"',
         cause, trackName, this.pendingVideoSwitch.newTrackName);
+      return;
+    }
+    if (this.pendingAudioSwitch?.oldTrackName === trackName) {
+      this.log.info('Ignoring %s replacement for "%s" — pending audio switch to "%s"',
+        cause, trackName, this.pendingAudioSwitch.newTrackName);
       return;
     }
 
@@ -8809,6 +10674,17 @@ export class MoqtPlayer {
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
+    if (isMsePackaging(packaging)) {
+      this.mediaSource?.expectDiscontinuity?.();
+      // The new subscription's Group IDs may restart below the old ones.
+      this.cmafAssembler?.resetGroupOrder?.(mediaType);
+      this.mediaSource?.clearGroupFloor?.(mediaType, trackName);
+    }
+    if (isMsePackaging(packaging) && mediaType === 'video') {
+      // The new subscription may start mid-group: wait for a keyframe, as on init.
+      this.cmafVideoSynced = false;
+      this.cmafAssembler?.clearPending?.('video');
+    }
 
     // Reset pipeline + sync to prepare for fresh data.
     // Audio resubscribe MUST reset sync — the new subscription will
@@ -8824,6 +10700,7 @@ export class MoqtPlayer {
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(trackName);
     const filter = defaultMediaSubscriptionFilter(isLive);
+    const warm = cause === 'migration' ? this.warmResubscribeOptions(track, packaging, mediaType, this.connection) : null;
 
     // Pre-send ownership (§9.10): a same-tick SUBSCRIBE_OK must find the
     // pending entry; the EVENT still waits for the send to succeed.
@@ -8835,18 +10712,24 @@ export class MoqtPlayer {
       if (!this.subscriptionManager || this.connection !== resubConn) return;
       this.pendingAliasBinds.add(id);
       this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
-      this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
+      this.pendingMediaSubs.set(id, { trackName, mediaType, packaging, ...this.catalogInitConfig(trackName) });
     };
     // Start through the CAPTURED connection and attach both observers before
     // publishing: a recovery listener may synchronously destroy or migrate the
     // player, and `this.connection` is mutable. Announcing afterwards also
     // makes the event's contract true — the replacement has really started.
     const pending = resubConn.subscribe(nsBytes, nameBytes,
-      { ...(filter ?? {}), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
+      { ...(warm?.options ?? filter), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
       if (!this.subscriptionManager) return;
       registerResub(reqIdBigInt);
+      // The fill stream carries the SUBSCRIBE's Request ID, as at load.
+      if (warm?.fill && this.connection === resubConn) {
+        this.registerMediaFetch(reqIdBigInt, {
+          trackName, mediaType, subscriptionRequestId: reqIdBigInt, trackAlias: null, warmStart: true,
+        });
+      }
 
       this.log.info('Resubscribed %s "%s" requestId=%s after %s',
         mediaType, trackName, reqIdBigInt, cause);
@@ -8872,6 +10755,7 @@ export class MoqtPlayer {
         trackName,
         reason: `${cause} resubscribe failed: ${failure.message}`,
       });
+      if (!this._destroyed) onFailed?.();
     });
 
     // Now that the replacement exists and its outcome is observed, announce it.
@@ -8887,7 +10771,7 @@ export class MoqtPlayer {
   /** Start pipeline tick interval (~60fps). */
   private startTicking(): void {
     if (this.tickInterval) return;
-    this.tickInterval = setInterval(() => this.tick(), 16);
+    this.tickInterval = setInterval(() => this.tick(), TICK_INTERVAL_MS);
   }
 
   /** Stop pipeline tick interval. */
@@ -8925,8 +10809,12 @@ export class MoqtPlayer {
     // staging timeout later "completes" the switch and unsubscribes the old,
     // working track, or the switch stays pending forever.
     const pendingSwitch = this.pendingVideoSwitch;
-    if (pendingSwitch && pendingSwitch.newTrackName === trackName) {
+    if (pendingSwitch && !this.switchInProgress && pendingSwitch.newTrackName === trackName) {
       this.abortPendingVideoSwitch(pendingSwitch, error);
+    }
+    const pendingAudio = this.pendingAudioSwitch;
+    if (pendingAudio && !pendingAudio.committing && pendingAudio.newTrackName === trackName) {
+      this.abortPendingAudioSwitch(pendingAudio, error);
     }
 
     // Find the requestId for this track alias in activeSubscriptions

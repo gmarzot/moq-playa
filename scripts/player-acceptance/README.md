@@ -42,7 +42,7 @@ Twenty-seven scenarios are mandatory:
 | LOCMAF-01 MSE and frame mode, each with moving video and AAC | Healthy video/audio across a loop, with full and delta header evidence |
 | Each LOCMAF mode with a frozen picture or muted output | Only `picture-frozen` or `audio-missing` fails, respectively |
 | Default view and portrait alternatives in CMAF and LOC | Selected view identity, dimensions and healthy output |
-| CMAF and LOC view selection through the demo controls | Correct output after selection and clean stop/retry |
+| CMAF and LOC live view switching through the demo's video menu | Correct output after each switch on one open session, and a clean stop during a switch |
 | CMAF video with LOC audio, and LOC video with CMAF audio | Moving output, nonzero PCM, quarter-volume attenuation, mute and unmute |
 
 The fault controls passing means the harness correctly rejected their output, not

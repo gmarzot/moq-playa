@@ -237,13 +237,13 @@ portrait.play();
 `levels` and automatic quality selection only contain alternatives from that
 view. `videoGroups` (`availableVideoGroups` on `MoqtPlayer`) lists the catalog's
 supported video groups. Multiple players can select different groups independently.
-To change views, destroy the old player and create another with the desired
-group. `setQuality`/`selectVideoTrack` are quality switches within a view, not
-cross-view timeline mappings: different groups need not share timestamps or
-Group IDs. The player example's View selector stops and creates a fresh player
-for the requested group; `?altGroup=0` selects its initial view. Stop also cancels
-an in-progress retune. `videoAltGroup` cannot be combined with the catalog-free
-`knownTracks` fast path when video is enabled.
+`MoqtPlayer` switches views live with `selectView()` (see
+[Views, programs and languages](#views-programs-and-languages)); with `Player`,
+destroy the old player and create another with the desired group. Different
+groups need not share timestamps or Group IDs. The player example's menu
+switches views, programs and languages live; `?altGroup=0` selects its initial
+view. `videoAltGroup` cannot be combined with the catalog-free `knownTracks`
+fast path when video is enabled.
 
 ---
 
@@ -278,6 +278,44 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => console.log(activ
 with `.remove(theSameFunction)`. `MoqtPlayer` errors carry a structured `error`
 object; the higher-level `Player` instead emits `severity`, `code` and `message`.
 
+### Views, programs and languages
+
+A catalog can carry several things a viewer chooses between. The player reads
+them the way the FFmpeg and OBS MoQ publishers write them:
+
+- **Program** = a `renderGroup`: tracks meant to be rendered together (e.g. a
+  commentator booth and the match). Tracks without a `renderGroup` belong to
+  every program.
+- **View** = a video `altGroup` of the current program (camera angles, or
+  landscape and portrait canvases). ABR runs only inside the current view.
+- **Language** = audio tracks sharing an `altGroup`, told apart by `lang`.
+
+```ts
+player.availablePrograms;   // [{ renderGroup, tracks }]  (the catalog has no program names)
+player.availableViews;      // [{ altGroup, renderGroup?, label?, width?, height?, tracks }]
+player.availableAudioTracks;// [{ name, lang?, label?, codec?, ... }]  (current program)
+player.availableVideoTracks;// quality ladder of the current view
+player.currentProgram; player.currentView; player.currentVideoTrack; player.currentAudioTrack;
+
+await player.selectProgram(2);          // video + audio together; keeps the language if available
+await player.selectView(1);             // another view of this program; audio untouched
+await player.selectAudioTrack('audio_es'); // another language; video untouched
+player.autoQuality;                     // false after a manual selectVideoTrack(); setAutoQuality(true) restores ABR
+
+player.on('program_changed',  ({ fromProgram, toProgram }) => { ... });
+player.on('view_changed',     ({ fromView, toView, trackName }) => { ... });
+player.on('audio_track_changed', ({ fromTrackName, toTrackName, lang }) => { ... });
+player.on('audio_track_switch_failed', ({ toTrackName, error }) => { ... });
+```
+
+Switches are make-before-break: the old track plays until the new one reaches
+a sync point (video: its next group's keyframe; audio: its next group, about
+1 s), then the matching event fires. Views and programs are not assumed to be
+time-aligned (moq-wg/msf#142). One video switch and one audio switch run at a
+time; a second request for the same target is a no-op, a different one throws.
+A switch whose new track the relay refuses or ends is rolled back and reported.
+A language the viewer picks is preferred again on later program switches.
+
 ### Key config options
 
 | Option | Type | Default | Description |
@@ -286,6 +324,9 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 | `maxRequestId` | number | 10,000 | Initial MOQT MAX_REQUEST_ID on legacy drafts (auto-replenished) |
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
+| `initialProgram` | number | first video's | `renderGroup` to start on |
+| `videoAltGroup` | number | first view | Video `altGroup` to start on (selects its program); unknown fails |
+| `preferredLanguage` | string | — | Audio language, e.g. `'es'`; primary subtag match, `spa`/`es` equivalent; never leaves you without audio |
 | `targetLatencyMs` | number | — | Live catch-up target |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
@@ -306,7 +347,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 - **draft-ietf-moq-transport-18** — uni control-stream pair + per-request bidi streams (`draftVersion: 18` / `moqt-18`)
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
-- **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
+- **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), views, programs (`renderGroup`), languages (`lang`), timeline
 - **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on draft 22
 - **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); `locVersion: 4` to emit
 - **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, default on encode
@@ -441,6 +482,7 @@ Example pages:
 |------|-------------|
 | `/player/` | Player with stats, video-view and quality selectors, and settings |
 | `/simple/` | Minimal player — connect, play, done |
+| `/g5-player/` | G5 Player — playback with health counters, charts and catalog |
 | `/connect/` | Protocol explorer — raw message log |
 | `/catalog/` | Catalog browser |
 | `/broadcast/` | Camera/screen publisher example with opt-in CAT4MOQ |

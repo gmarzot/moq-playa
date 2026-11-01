@@ -6,6 +6,7 @@ const { loadFixtureFromDisk } = await tsImport('../../examples/node-publisher/sr
 const { publishObjects, establishTrack, buildFixtureCatalog } = await tsImport('../../examples/node-publisher/src/publisher.ts', import.meta.url);
 const { prepareLocTrack, locFrameProperties } = await tsImport('../../examples/node-publisher/src/loc-fixture.ts', import.meta.url);
 const { TrackObjectSource } = await tsImport('../../examples/node-publisher/src/track-packager.ts', import.meta.url);
+const { withLocPrivateProperties } = await tsImport('../../packages/loc/src/index.ts', import.meta.url);
 const { analyzeCmafTimeline } = await tsImport('../../examples/node-publisher/src/cmaf-loop-rebase.ts', import.meta.url);
 
 const [url, cmafDirectory, locDirectory, cmafRole] = process.argv.slice(2);
@@ -70,7 +71,7 @@ try {
           const stream = await client.conn.openSubgroup(12n, BigInt(loop * elementary.groups.length + g), BigInt(object), {
             hasExtensions: true, firstObject: true, endOfGroup: object === frames.length - 1,
           });
-          await client.conn.sendObject(stream, BigInt(object), frame.payload, locFrameProperties(elementary, frame, loop, 4, 'media', epochUs));
+          await client.conn.sendObject(stream, BigInt(object), withLocPrivateProperties(frame.payload), locFrameProperties(elementary, frame, loop, 4, 'media', epochUs));
           await client.conn.closeSubgroup(stream);
         }
       }

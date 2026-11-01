@@ -80,6 +80,9 @@ export function buildSetupOptions(config: MoqtPlayerConfig, urlOverride?: string
     options.authTokens = config.authTokens;
   }
 
+  if (config.compat?.includes('request-credit')) {
+    options.requestsUncappedUntilMaxRequestId = true;
+  }
   if (config.authorization) {
     if (config.authTokens !== undefined) throw new AuthorizationError('Specify authorization or authTokens, not both');
     const relayUrl = buildConnectUrl(config, urlOverride);

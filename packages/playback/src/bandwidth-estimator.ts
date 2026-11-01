@@ -24,6 +24,16 @@ export class BandwidthEstimator {
     private lastTimestampUs: number | null = null;
     private lastGroupBytes: number | null = null;
     private sampleCount = 0;
+    /** Link-rate samples, oldest first. */
+    private readonly bursts: Array<{ kbps: number; atUs: number }> = [];
+
+    /** Smallest object that spans enough packets to time the link. */
+    static readonly BURST_MIN_BYTES = 16_384;
+    /** Shorter transfers are below timer resolution. */
+    static readonly BURST_MIN_MS = 1;
+    static readonly BURST_WINDOW_US = 20_000_000;
+    static readonly BURST_MAX_SAMPLES = 16;
+    static readonly BURST_MIN_SAMPLES = 3;
 
     /**
      * @param alpha EWMA smoothing factor (0-1). Higher = more responsive
@@ -69,11 +79,32 @@ export class BandwidthEstimator {
         return this.estimateBps / 1000;
     }
 
+    /**
+     * Record one object's first-to-last-byte transfer. On live the arrival rate
+     * is the publisher's pace; a large object's transfer time measures the link.
+     */
+    recordBurst(bytes: number, transferMs: number, timestampUs: number): void {
+        if (bytes < BandwidthEstimator.BURST_MIN_BYTES || transferMs < BandwidthEstimator.BURST_MIN_MS) return;
+        this.bursts.push({ kbps: (bytes * 8) / transferMs, atUs: timestampUs });
+        if (this.bursts.length > BandwidthEstimator.BURST_MAX_SAMPLES) this.bursts.shift();
+    }
+
+    /** Lower median link rate over recent large objects in kbps; 0 without enough samples. */
+    getBurstKbps(nowUs: number): number {
+        while (this.bursts.length > 0 && nowUs - this.bursts[0]!.atUs > BandwidthEstimator.BURST_WINDOW_US) {
+            this.bursts.shift();
+        }
+        if (this.bursts.length < BandwidthEstimator.BURST_MIN_SAMPLES) return 0;
+        const sorted = this.bursts.map(b => b.kbps).sort((a, b) => a - b);
+        return sorted[Math.floor((sorted.length - 1) / 2)]!;
+    }
+
     /** Reset all state. */
     reset(): void {
         this.estimateBps = null;
         this.lastTimestampUs = null;
         this.lastGroupBytes = null;
         this.sampleCount = 0;
+        this.bursts.length = 0;
     }
 }

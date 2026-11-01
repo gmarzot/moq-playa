@@ -84,6 +84,8 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
   private lastWidth: number | undefined;
   private lastHeight: number | undefined;
   private lastDescription: Uint8Array | undefined;
+  /** lastDescription came from a keyframe's in-band parameter sets. */
+  private descriptionDerived = false;
 
   /** Codec-specific strategy — selected at configure() time. */
   private strategy: CodecStrategy = createCodecStrategy('');
@@ -120,6 +122,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
   private lastSubmittedKeyChunkHex = 'none';
   private lastSubmittedKeyChunkBytes: Uint8Array | null = null;
   private lastSubmittedChunkBytes: Uint8Array | null = null;
+  private lastObservedTimestamp: number | null = null;
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
@@ -153,6 +156,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     this.lastWidth = width;
     this.lastHeight = height;
     this.lastDescription = config.byteLength > 0 ? config : undefined;
+    this.descriptionDerived = false;
 
     // Select codec-specific strategy (only when codec changes)
     if (codecChanged) {
@@ -172,6 +176,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     this.lastSubmittedKeyChunkHex = 'none';
     this.lastSubmittedKeyChunkBytes = null;
     this.lastSubmittedChunkBytes = null;
+    this.lastObservedTimestamp = null;
     this.recentObservedChunkSummaries.length = 0;
     this.recentSubmittedChunkSummaries.length = 0;
 
@@ -223,16 +228,32 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       return;
     }
 
+    // Without a configured description, a keyframe may carry its parameter
+    // sets in the payload (LOC-04 §2.1.1): configure from those.
+    if (chunk.type === 'key' && this.strategy.descriptionFromKeyframe
+        && (this.lastDescription === undefined || this.descriptionDerived)) {
+      const derived = this.strategy.descriptionFromKeyframe(chunk.data);
+      if (derived && !sameBytes(derived, this.lastDescription)) {
+        this.lastDescription = derived;
+        this.descriptionDerived = true;
+        this.applyConfig();
+      }
+    }
+
     // Codec-specific chunk preparation (format conversion, sanitization)
     const prepared = this.strategy.prepareChunkData(chunk.data, this.lastDescription);
     if (!prepared) return;
     const { data, droppedReason } = prepared;
 
-    // Track observed chunk
+    // Track observed chunk. `dt` is the capture-timestamp step from the
+    // previous chunk: a missing frame reads as a double-length step.
     this.observedChunkCount++;
-    this.lastObservedChunkSummary = this.strategy.describeChunk
+    const dt = this.lastObservedTimestamp === null
+      ? '' : `|dt=${Math.round((chunk.timestamp - this.lastObservedTimestamp) / 1000)}ms`;
+    this.lastObservedTimestamp = chunk.timestamp;
+    this.lastObservedChunkSummary = (this.strategy.describeChunk
       ? this.strategy.describeChunk(data, chunk.type, this.lastDescription)
-      : `#${this.observedChunkCount}|type=${chunk.type}|bytes=${data.byteLength}`;
+      : `#${this.observedChunkCount}|type=${chunk.type}|bytes=${data.byteLength}`) + dt;
     this.recentObservedChunkSummaries.push(this.lastObservedChunkSummary);
     if (this.recentObservedChunkSummaries.length > MAX_CHUNK_HISTORY) {
       this.recentObservedChunkSummaries.shift();
@@ -595,4 +616,8 @@ function toBase64(data: Uint8Array | null | undefined): string {
   let binary = '';
   for (const byte of data) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array | undefined): boolean {
+  return b !== undefined && a.byteLength === b.byteLength && a.every((v, i) => v === b[i]);
 }
