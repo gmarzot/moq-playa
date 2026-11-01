@@ -9,38 +9,71 @@ export const KNOWN_RELAYS: readonly string[] = [
 export const DEFAULT_RELAY: string = KNOWN_RELAYS[0]!;
 
 export interface RelayPicker {
-  readonly select: HTMLSelectElement;
-  /** Re-select the entry matching the input's current value (or "Other"). */
+  /** Mark the menu entry matching the input's current value. */
   sync(): void;
 }
 
 /**
- * Put a picker of KNOWN_RELAYS before `input`. Choosing an entry fills the
- * input; typing any other URL selects "Other". Call `sync()` after setting the
- * input's value from code.
+ * Make `input` a one-line relay field: it takes any typed or pasted URL, and a
+ * ▾ button beside it opens a menu of KNOWN_RELAYS; choosing one fills the
+ * field. Call `sync()` after setting the input's value from code.
  */
 export function attachRelayPicker(input: HTMLInputElement, doc: Document = document): RelayPicker {
-  const select = doc.createElement('select');
-  select.title = 'Known relays; choosing one fills the URL below';
-  select.style.marginBottom = '6px';
-  const option = (value: string, text: string): void => {
-    const o = doc.createElement('option');
-    o.value = value;
-    o.textContent = text;
-    select.appendChild(o);
-  };
-  for (const url of KNOWN_RELAYS) option(url, url);
-  option('', 'Other (type a URL below)');
+  const wrap = doc.createElement('div');
+  wrap.className = 'relay-combo';
+  const button = doc.createElement('button');
+  button.type = 'button';
+  button.className = 'relay-combo-btn';
+  button.textContent = '▾';
+  button.title = 'Known relays';
+  button.setAttribute('aria-haspopup', 'listbox');
+  button.setAttribute('aria-expanded', 'false');
+  const menu = doc.createElement('div');
+  menu.className = 'relay-combo-menu';
+  menu.setAttribute('role', 'listbox');
+  menu.hidden = true;
 
+  const setOpen = (open: boolean): void => {
+    menu.hidden = !open;
+    button.setAttribute('aria-expanded', String(open));
+  };
+  const items = KNOWN_RELAYS.map((url) => {
+    const item = doc.createElement('button');
+    item.type = 'button';
+    item.className = 'relay-combo-item';
+    item.setAttribute('role', 'option');
+    item.textContent = url;
+    item.addEventListener('click', () => {
+      input.value = url;
+      sync();
+      setOpen(false);
+      input.focus();
+    });
+    menu.appendChild(item);
+    return item;
+  });
   const sync = (): void => {
     const url = input.value.trim();
-    select.value = KNOWN_RELAYS.includes(url) ? url : '';
+    KNOWN_RELAYS.forEach((known, i) => items[i]!.setAttribute('aria-selected', String(known === url)));
   };
-  select.addEventListener('change', () => {
-    if (select.value) input.value = select.value;
-  });
+
+  button.addEventListener('click', () => setOpen(menu.hidden));
   input.addEventListener('input', sync);
-  input.parentNode?.insertBefore(select, input);
+  doc.addEventListener('click', (e) => {
+    if (!menu.hidden && !wrap.contains(e.target as Node)) setOpen(false);
+  });
+  wrap.addEventListener('keydown', (e) => {
+    if ((e as KeyboardEvent).key === 'Escape' && !menu.hidden) {
+      e.stopPropagation();
+      setOpen(false);
+      button.focus();
+    }
+  });
+
+  input.parentNode?.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  wrap.appendChild(button);
+  wrap.appendChild(menu);
   sync();
-  return { select, sync };
+  return { sync };
 }
