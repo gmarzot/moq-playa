@@ -9,6 +9,8 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
     /* The UA's [hidden] rule loses to any class selector that sets display. */
     [hidden] { display: none !important; }
+    /* Native scrollbars and dropdowns in the page's dark palette. */
+    :root { color-scheme: dark; }
     body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
 
     .wrapper { max-width: 1440px; margin: 0 auto; padding: 24px; }
@@ -38,9 +40,10 @@
     }
     h1 .conn > span { margin-right: 14px; }
     h1 .conn > span:last-of-type { margin-right: 0; }
+    /* Long URLs and namespaces break anywhere rather than run off a narrow screen. */
     h1 .conn b {
       color: #6cf; font-weight: 700;
-      text-transform: none; letter-spacing: 0;
+      text-transform: none; letter-spacing: 0; overflow-wrap: anywhere;
     }
     h1 .conn b.copyable { cursor: copy; position: relative; }
     h1 .conn b.copyable:hover { text-decoration: underline dotted; }
@@ -163,7 +166,7 @@
       background: #333; color: #eee; border: 1px solid #555;
       padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
     }
-    .controls #view { min-width: 0; max-width: 200px; flex: 0 1 auto; text-overflow: ellipsis; }
+    .controls #view { min-width: 0; max-width: 16em; flex: 0 1 auto; text-overflow: ellipsis; }
 
     /* Gear menu: track choices and connection settings, above the bar at its right. */
     .menu-wrap { position: relative; flex-shrink: 0; }
@@ -174,7 +177,6 @@
       background: #1a1a2e; border: 1px solid #3a3a52; border-radius: 8px;
       padding: 10px 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, .5);
     }
-    .menu[hidden], .menu-row[hidden] { display: none; }
     .menu-row {
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
       font-size: .85rem; color: #aab;
@@ -291,9 +293,10 @@
       background: #1a1a2e;
       border-radius: 8px; padding: 10px 14px;
     }
+    /* The badges drop under the title when the panel is too narrow for both. */
     .cat-head {
-      display: flex; align-items: baseline;
-      justify-content: space-between; gap: 12px;
+      display: flex; flex-wrap: wrap; align-items: baseline;
+      justify-content: space-between; gap: 6px 12px;
     }
     .cat-head .chart-label { font-size: .95rem; color: #fff; font-weight: 700; white-space: nowrap; }
     .cat-head .chart-label b { font-size: 1rem; color: #4d4; font-weight: 600; }
@@ -375,6 +378,22 @@
     }
     .catalog-panel.collapsed .cat-tracks,
     .catalog-panel.collapsed .cat-json { display: none; }
+
+    /* Phones: the seek bar takes its own row above the buttons; the hardware
+       keys set the volume, so its slider goes. */
+    @media (max-width: 600px) {
+      .wrapper { padding: 16px 12px; }
+      /* The menu anchors to the whole bar, so it stays on screen wherever the gear wraps. */
+      .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
+      .menu-wrap { position: static; }
+      .menu { max-width: 100%; }
+      .seek-bar { order: -1; flex: 1 0 100%; }
+      .controls #view { flex: 1 1 0; min-width: 7em; }
+      .volume-bar { display: none; }
+      .controls > button:not(.mini), .volume-group button { padding: 6px 14px; }
+      .controls button, .controls select { min-height: 40px; }
+      .cat-head .chart-label { white-space: normal; }
+    }
 
     /* State overlay, as on the broadcaster: playing is green; red is reserved for faults. */
     .video-wrap { position: relative; }
