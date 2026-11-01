@@ -379,8 +379,9 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sTimescale.checked = locTimescale;
     sVoiceProcessing.checked = voiceProcessing;
     // Advanced opens when anything in it is set, so no change is hidden.
-    sAdvanced.open = broadcastDraft !== DEFAULT_DRAFT || packaging !== 'loc' || keyframeSec !== null
-      || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
+    sAdvanced.open = videoCodec !== 'avc1.42001f' || audioCodecParam !== 'opus'
+      || (Number.isFinite(bitrateParam) && bitrateParam > 0) || captureFps !== 60 || targetLatencyMs !== 200
+      || keyframeSec !== null || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
       || catalogIntervalMs !== null || catalogDelivery !== 'both' || params.get('hash') !== null || dynamicGroups || audioDatagrams
       || selfDescribing || locTimescale || annexbParam || debug || !showStatus || voiceProcessing;
     showApplicableFields();

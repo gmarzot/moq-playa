@@ -371,13 +371,19 @@
       </div>
       <div class="hint">Blank or automatic: a new one each broadcast. A typed name is kept.</div>
 
-      <label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
-      <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
-        <option value="avc1.42001f">H.264 Baseline</option>
-        <option value="avc1.640028">H.264 High</option>
-        <option value="av01.0.04M.08">AV1 Main</option>
-        <option value="hvc1.1.6.L93.B0">HEVC Main</option>
-        <option value="vp09.00.31.08">VP9 Profile 0</option>
+      <label for="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">Draft version</label>
+      <select id="s-version" title="MoQT draft offered to the relay. 18 is current; 22 for relays that speak it; 14 and 16 for older relays.">
+        <option value="22">Draft 22</option>
+        <option value="18">Draft 18 (default)</option>
+        <option value="16">Draft 16</option>
+        <option value="14">Draft 14</option>
+      </select>
+
+      <label for="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">Packaging</label>
+      <select id="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">
+        <option value="loc">LOC/MSF (default)</option>
+        <option value="cmaf">CMAF/CMSF</option>
+        <option value="locmaf">LOCMAF/CMSF</option>
       </select>
 
       <label for="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">Camera resolution</label>
@@ -385,6 +391,18 @@
         <option value="1080">1080p</option>
         <option value="720">720p (default)</option>
         <option value="480">480p</option>
+      </select>
+
+      <details class="adv" id="s-advanced" style="margin-top:14px">
+        <summary>Advanced</summary>
+
+      <label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
+      <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
+        <option value="avc1.42001f">H.264 Baseline</option>
+        <option value="avc1.640028">H.264 High</option>
+        <option value="av01.0.04M.08">AV1 Main</option>
+        <option value="hvc1.1.6.L93.B0">HEVC Main</option>
+        <option value="vp09.00.31.08">VP9 Profile 0</option>
       </select>
 
       <label for="s-bitrate" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">Video bitrate (kbps)</label>
@@ -401,24 +419,6 @@
 
       <label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
       <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200).">
-
-      <details class="adv" id="s-advanced" style="margin-top:14px">
-        <summary>Advanced</summary>
-
-      <label for="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">Draft version</label>
-      <select id="s-version" title="MoQT draft offered to the relay. 18 is current; 22 for relays that speak it; 14 and 16 for older relays.">
-        <option value="22">Draft 22</option>
-        <option value="18">Draft 18 (default)</option>
-        <option value="16">Draft 16</option>
-        <option value="14">Draft 14</option>
-      </select>
-
-      <label for="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">Packaging</label>
-      <select id="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">
-        <option value="loc">LOC/MSF (default)</option>
-        <option value="cmaf">CMAF/CMSF</option>
-        <option value="locmaf">LOCMAF/CMSF</option>
-      </select>
 
       <label for="s-keyframe" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">Keyframe interval (s)</label>
       <input id="s-keyframe" type="number" min="0.1" step="0.1" placeholder="2" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">
