@@ -28,7 +28,7 @@ class MockAudioContext {
     for (const l of [...this.listeners]) l();
   }
   readonly destination = { kind: 'destination' };
-  readonly started: Array<{ when: number; duration: number; rate: number }> = [];
+  readonly started: Array<{ when: number; offset: number; duration: number; rate: number }> = [];
   readonly sources: any[] = [];
 
   createBuffer(channels: number, frames: number, sampleRate: number) {
@@ -48,8 +48,8 @@ class MockAudioContext {
       connect: vi.fn(),
       disconnect: vi.fn(),
       stop: vi.fn(),
-      start(when: number) {
-        ctx.started.push({ when, duration: source.buffer.duration, rate: source.playbackRate.value });
+      start(when: number, offset = 0) {
+        ctx.started.push({ when, offset, duration: source.buffer.duration, rate: source.playbackRate.value });
       },
     };
     this.sources.push(source);
@@ -185,8 +185,8 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
     // Identical to pre-slice behavior: first anchored at renderTime+delay
     // (clock pinned to ctx → toAudioCtxTime(1s)=1.0, +0.2), second chained.
     expect(ctx.started).toEqual([
-      { when: 1.2, duration: 0.02, rate: 1 },
-      { when: 1.22, duration: 0.02, rate: 1 },
+      { when: 1.2, offset: 0, duration: 0.02, rate: 1 },
+      { when: 1.22, offset: 0, duration: 0.02, rate: 1 },
     ]);
   });
 });
@@ -404,6 +404,80 @@ describe('live-edge lead clamp', () => {
     out.schedule(audioData(600 * MS) as unknown as AudioData, 1_200 * MS); // lead 0.4 > 0.3
     expect(out.liveEdgeSnapCount).toBe(1);
     expect(ctx.started.at(-1)!.when).toBeCloseTo(1.25, 6);
+  });
+});
+
+describe('underrun resync', () => {
+  const MS = 1_000; // µs per ms
+  /** One on-time 20ms buffer at ctx 1.0: the chain ends at 1.02. */
+  const startChain = () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_000 * MS);
+    return { ctx, out };
+  };
+
+  it('a partly late buffer after an underrun starts part-way in, on its aligned slot', () => {
+    const { ctx, out } = startChain();
+    ctx.currentTime = 1.5;
+    out.schedule(audioData(490 * MS) as unknown as AudioData, 1_490 * MS); // 10ms late
+    expect(ctx.started[1]).toMatchObject({ when: 1.5 });
+    expect(ctx.started[1]!.offset).toBeCloseTo(0.01, 9);
+    expect(out.underrunCount).toBe(1);
+
+    out.schedule(audioData(510 * MS) as unknown as AudioData, 1_510 * MS);
+    expect(ctx.started[2]!.when).toBeCloseTo(1.51, 9);
+    expect(out.captureLeadSec).toBeCloseTo(0, 9);
+    ctx.currentTime = 1.505;
+    expect(out.playheadCaptureUs()).toBeCloseTo(505 * MS, 0);
+  });
+
+  it('wholly late buffers in the burst are skipped and the underrun counted once', () => {
+    const { ctx, out } = startChain();
+    ctx.currentTime = 1.5;
+    // 80, 60, 40 and 20ms late (each 20ms long), then one on time.
+    for (const t of [420, 440, 460, 480, 500]) {
+      out.schedule(audioData(t * MS) as unknown as AudioData, (1_000 + t) * MS);
+    }
+    expect(ctx.started).toHaveLength(2);
+    expect(ctx.started[1]).toMatchObject({ when: 1.5, offset: 0 });
+    expect(out.underrunCount).toBe(1);
+    expect(out.underrunGapSec).toBeCloseTo(0.48, 9);
+    ctx.currentTime = 1.51;
+    expect(out.playheadCaptureUs()).toBeCloseTo(510 * MS, 0);
+  });
+
+  it('lateness that outlasts the burst plays late, as before', () => {
+    const { ctx, out } = startChain();
+    // Every buffer arrives 50ms late, at the pace it plays.
+    for (let i = 0; i < 4; i++) {
+      ctx.currentTime = 1.5 + i * 0.02;
+      out.schedule(audioData((450 + i * 20) * MS) as unknown as AudioData, (1_450 + i * 20) * MS);
+    }
+    expect(ctx.started).toHaveLength(2);
+    expect(ctx.started[1]!.when).toBeCloseTo(1.56, 9);
+    expect(ctx.started[1]!.offset).toBe(0);
+    expect(out.underrunCount).toBe(2);
+    expect(out.underrunGapSec).toBeCloseTo(0.54, 9); // 1.02 → 1.56, counted once
+
+    ctx.currentTime = 1.58;
+    out.schedule(audioData(530 * MS) as unknown as AudioData, 1_530 * MS);
+    expect(out.captureLeadSec).toBeCloseTo(0.05, 9);
+  });
+
+  it('resyncs again only after audio has arrived on time', () => {
+    const { ctx, out } = startChain();
+    ctx.currentTime = 1.5;
+    out.schedule(audioData(490 * MS) as unknown as AudioData, 1_490 * MS); // resync, ends 1.51
+    ctx.currentTime = 1.53;
+    out.schedule(audioData(500 * MS) as unknown as AudioData, 1_500 * MS); // still late: plays late
+    expect(ctx.started[2]).toMatchObject({ when: 1.53, offset: 0 });
+
+    out.schedule(audioData(540 * MS) as unknown as AudioData, 1_540 * MS); // on time: re-arms
+    ctx.currentTime = 2.0;
+    out.schedule(audioData(990 * MS) as unknown as AudioData, 1_990 * MS); // 10ms late
+    expect(ctx.started[4]!.when).toBe(2.0);
+    expect(ctx.started[4]!.offset).toBeCloseTo(0.01, 9);
   });
 });
 
