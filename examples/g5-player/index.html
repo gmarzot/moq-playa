@@ -5,15 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>G5 Player</title>
   <link rel="icon" type="image/svg+xml" href="./favicon.svg">
-  <!-- Applied before first paint; main.ts keeps it in sync. -->
-  <script>
-    (function () {
-      var t = null;
-      try { t = localStorage.getItem('g5-theme'); } catch (e) { /* storage unavailable */ }
-      if (t !== 'dark' && t !== 'light') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-      document.documentElement.dataset.theme = t;
-    })();
-  </script>
+  <!-- A file, not inline: the relay site's CSP allows only same-origin scripts. -->
+  <script src="/g5-player/theme-init.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     /* The UA's [hidden] rule loses to any class selector that sets display. */
@@ -211,7 +204,19 @@
        reclaims its width. A restore button rides the controls bar. */
     .layout.cat-hidden { grid-template-columns: minmax(0, 1fr); }
     .layout.cat-hidden .cat-col { display: none; }
-    h1 { font-size: 1.4rem; margin-bottom: 8px; font-weight: 700; color: var(--text-strong); }
+    /* Title and session identity on the left, theme toggle pinned top right. */
+    .top { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 8px; }
+    .top h1 { flex: 1; min-width: 0; }
+    h1 { font-size: 1.4rem; font-weight: 700; color: var(--text-strong); }
+    .theme-btn {
+      flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px; padding: 0; margin-top: -2px;
+      background: none; border: none; border-radius: 50%; color: var(--text-muted);
+    }
+    .theme-btn:hover { background: var(--control); color: var(--text-strong); }
+    .theme-btn svg { width: 20px; height: 20px; }
+    /* Shows the theme a tap switches to. */
+    :root[data-theme="dark"] .theme-btn .i-moon, :root[data-theme="light"] .theme-btn .i-sun { display: none; }
     h1 .five { color: var(--brand); }
     /* Session identity after the title. */
     h1 .conn {
@@ -287,6 +292,14 @@
     button:hover { background: var(--control-hover); }
     button:disabled { opacity: 0.4; cursor: default; }
     button.active { background: var(--active); border-color: var(--active); color: var(--active-fg); }
+    /* Icon buttons hold one glyph per state; a fixed box keeps the row still. */
+    button.icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 40px; height: 34px; padding: 0; flex-shrink: 0;
+    }
+    button.icon svg { width: 20px; height: 20px; fill: currentColor; }
+    #play-btn:not(.playing) .i-pause, #play-btn.playing .i-play,
+    #mute-btn:not(.muted) .i-muted, #mute-btn.muted .i-sound { display: none; }
 
     /* Seek bar */
     .seek-bar {
@@ -500,6 +513,7 @@
       /* The seek bar takes all slack; these must not be squeezed into wrapping. */
       white-space: nowrap; flex-shrink: 0;
     }
+    .controls button.mini svg { width: 16px; height: 16px; }
     /* A quiet link after the catalog size. */
     .cat-head .cat-hide {
       background: none; border: none; padding: 0; cursor: pointer; font: inherit;
@@ -573,9 +587,8 @@
       .menu-wrap { position: static; }
       .menu { max-width: 100%; }
       .seek-bar { order: -1; flex: 1 0 100%; }
-      .controls #view { flex: 1 1 0; min-width: 7em; }
+      .controls #view { flex: 1 1 0; min-width: 5em; }
       .volume-bar { display: none; }
-      .controls > button:not(.mini), .volume-group button { padding: 6px 14px; }
       .controls button, .controls select { min-height: 40px; }
       .cat-head .chart-label { white-space: normal; }
     }
@@ -677,7 +690,16 @@
 </head>
 <body>
   <div class="wrapper">
-    <h1>G<span class="five">5</span> Player<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span><a id="build-update" class="build-update" href="#" hidden></a></h1>
+    <header class="top">
+      <h1>G<span class="five">5</span> Player<span class="conn" id="conn">(<span>relay: <b id="conn-relay">—</b></span><span>ns: <b id="conn-ns">—</b></span><span>draft: <b id="conn-draft">—</b></span>)</span><a id="build-update" class="build-update" href="#" hidden></a></h1>
+      <button id="theme-btn" class="theme-btn" type="button">
+        <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4" stroke="none"/><path
+          d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></svg>
+        <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path
+          d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+    </header>
 
     <div class="layout" id="layout">
     <div class="main-col">
@@ -687,11 +709,21 @@
     </div>
 
     <div class="controls">
-      <button id="play-btn" disabled>Play</button>
+      <button id="play-btn" class="icon" type="button" disabled>
+        <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+        <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 5h4v14h-4zM13.5 5h4v14h-4z"/></svg>
+      </button>
       <input type="range" class="seek-bar" id="seek" min="0" max="1000" value="0" disabled>
       <span class="time" id="time">0:00</span>
       <div class="volume-group">
-        <button id="mute-btn" disabled>Mute</button>
+        <button id="mute-btn" class="icon" type="button" disabled>
+          <svg class="i-sound" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9h4l5-4v14l-5-4H3z"/><path
+            d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round"/></svg>
+          <svg class="i-muted" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9h4l5-4v14l-5-4H3z"/><path
+            d="M15.5 9.5l5 5M20.5 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round"/></svg>
+        </button>
         <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100">
       </div>
       <select id="view" title="View" hidden></select>
@@ -702,13 +734,13 @@
           <label class="menu-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
           <label class="menu-row" hidden>Language <select id="lang"></select></label>
           <label class="menu-row" hidden>Program <select id="program"></select></label>
-          <label class="menu-row">Theme <select id="theme">
-            <option value="auto">Auto</option><option value="dark">Dark</option><option value="light">Light</option>
-          </select></label>
           <button id="settings-btn" class="menu-item" type="button">Connection settings…</button>
         </div>
       </div>
-      <button id="cat-restore" class="mini" hidden>catalog</button>
+      <button id="cat-restore" class="mini" type="button" title="Show the catalog" aria-label="Show the catalog" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><rect
+          x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14"/></svg>
+      </button>
     </div>
     </div>
 

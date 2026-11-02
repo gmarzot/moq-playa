@@ -79,19 +79,24 @@ function setMenuOpen(open: boolean): void {
 // ─── Theme ───────────────────────────────────────────────────────────
 
 const THEME_KEY = 'g5-theme';
-const themeSelect = document.getElementById('theme') as HTMLSelectElement;
+const themeBtn = document.getElementById('theme-btn') as HTMLButtonElement;
 const prefersLight = matchMedia('(prefers-color-scheme: light)');
+/** The tapped theme; null follows the OS preference. */
+let themeChoice: 'dark' | 'light' | null = null;
 
 /** Chart colours from the CSS tokens of the same names, re-read on a theme change. */
 const chartColors = { grid: '', loss: '', max: '', p50: '', p95: '', jitter: '', audio: '', video: '' };
 /** Series line width in CSS px, from `--chart-line`. */
 let chartLine = 1;
 
-/** Sets `data-theme` from the picker; auto follows the OS preference. */
+const osTheme = (): 'dark' | 'light' => (prefersLight.matches ? 'light' : 'dark');
+
+/** Sets `data-theme` and the toggle's label from the choice, else the OS preference. */
 function applyTheme(): void {
-  const choice = themeSelect.value;
-  document.documentElement.dataset.theme = choice === 'dark' || choice === 'light'
-    ? choice : (prefersLight.matches ? 'light' : 'dark');
+  const theme = themeChoice ?? osTheme();
+  document.documentElement.dataset.theme = theme;
+  themeBtn.title = `Switch to the ${theme === 'dark' ? 'light' : 'dark'} theme`;
+  themeBtn.setAttribute('aria-label', themeBtn.title);
   const css = getComputedStyle(document.documentElement);
   for (const k of Object.keys(chartColors) as Array<keyof typeof chartColors>) {
     chartColors[k] = css.getPropertyValue(`--${k}`).trim();
@@ -102,16 +107,19 @@ function applyTheme(): void {
 {
   let stored: string | null = null;
   try { stored = localStorage.getItem(THEME_KEY); } catch { /* storage unavailable */ }
-  themeSelect.value = stored === 'dark' || stored === 'light' ? stored : 'auto';
+  themeChoice = stored === 'dark' || stored === 'light' ? stored : null;
   applyTheme();
-  themeSelect.addEventListener('change', () => {
+  // A tap back to the OS theme clears the choice, so the page follows the OS again.
+  themeBtn.addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    themeChoice = next === osTheme() ? null : next;
     try {
-      if (themeSelect.value === 'auto') localStorage.removeItem(THEME_KEY);
-      else localStorage.setItem(THEME_KEY, themeSelect.value);
+      if (themeChoice) localStorage.setItem(THEME_KEY, themeChoice);
+      else localStorage.removeItem(THEME_KEY);
     } catch { /* storage unavailable */ }
     applyTheme();
   });
-  prefersLight.addEventListener('change', () => { if (themeSelect.value === 'auto') applyTheme(); });
+  prefersLight.addEventListener('change', () => { if (!themeChoice) applyTheme(); });
 }
 const stateBadge = document.getElementById('state')!;
 stateBadge.hidden = !showStatus;
@@ -1853,6 +1861,19 @@ async function main(): Promise<void> {
 
   // ── Controls ──────────────────────────────────────────────────────
 
+  const setPlayIcon = (playing: boolean): void => {
+    playBtn.classList.toggle('playing', playing);
+    playBtn.title = playing ? 'Pause' : 'Play';
+    playBtn.setAttribute('aria-label', playBtn.title);
+  };
+  const setMuteIcon = (muted: boolean): void => {
+    muteBtn.classList.toggle('muted', muted);
+    muteBtn.title = muted ? 'Unmute' : 'Mute';
+    muteBtn.setAttribute('aria-label', muteBtn.title);
+  };
+  setPlayIcon(false);
+  setMuteIcon(player.muted);
+
   playBtn.addEventListener('click', () => {
     if (player.state === 'playing') player.pause();
     else player.play();
@@ -1860,7 +1881,7 @@ async function main(): Promise<void> {
 
   let pausedByUser = false;
   player.on('play', () => {
-    playBtn.textContent = 'Pause';
+    setPlayIcon(true);
     if (!pausedByUser) return;
     pausedByUser = false;
     // Delivery stops while paused: neither the skipped ids nor the buffered hole is loss.
@@ -1870,14 +1891,14 @@ async function main(): Promise<void> {
     if (ranges?.length) noteSkippedHole(ranges[ranges.length - 1]![1]);
   });
   player.on('pause', () => {
-    playBtn.textContent = 'Play';
+    setPlayIcon(false);
     pausedByUser = true;
   });
 
   seekBar.addEventListener('input', () => player.seek(Number(seekBar.value)));
   volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
   muteBtn.addEventListener('click', () => player.toggleMute());
-  player.on('volumechange', ({ muted }) => { muteBtn.textContent = muted ? 'Unmute' : 'Mute'; });
+  player.on('volumechange', ({ muted }) => setMuteIcon(muted));
 
   // Gear menu: closes on a choice, a click outside or Escape.
   menuBtn.addEventListener('click', () => setMenuOpen(menu.hidden));
