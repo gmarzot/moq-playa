@@ -536,12 +536,15 @@ async function refreshCameras(): Promise<void> {
   else startCameraBtn.removeAttribute('aria-haspopup');
 }
 
+/** A pick replaces any `?camera=`, so a reload takes the latest pick from any tab. */
 function setCameraChoice(choice: string): void {
   cameraChoice = choice;
   const url = new URL(window.location.href);
-  url.searchParams.set('camera', choice);
-  window.history.replaceState(null, '', url);
-  params.set('camera', choice);
+  if (url.searchParams.has('camera')) {
+    url.searchParams.delete('camera');
+    window.history.replaceState(null, '', url);
+  }
+  params.delete('camera');
   storageSet(() => localStorage, CAMERA_KEY, choice);
   void refreshCameras();
 }
@@ -559,6 +562,7 @@ function setCameraMenuOpen(open: boolean): void {
         setCameraMenuOpen(false);
         setCameraChoice(value);
         void startBroadcast('camera');
+        stopBtn.focus();
       });
       return item;
     }));
@@ -571,7 +575,11 @@ function setCameraMenuOpen(open: boolean): void {
 document.addEventListener('click', (e) => {
   if (!cameraMenu.hidden && !cameraMenu.parentElement!.contains(e.target as Node)) setCameraMenuOpen(false);
 });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !cameraMenu.hidden) setCameraMenuOpen(false); });
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || cameraMenu.hidden) return;
+  setCameraMenuOpen(false);
+  startCameraBtn.focus();
+});
 navigator.mediaDevices?.addEventListener?.('devicechange', () => { void refreshCameras(); });
 void refreshCameras();
 
