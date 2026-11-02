@@ -1901,7 +1901,11 @@ async function main(): Promise<void> {
   player.on('volumechange', ({ muted }) => setMuteIcon(muted));
 
   // Gear menu: closes on a choice, a click outside or Escape.
-  menuBtn.addEventListener('click', () => setMenuOpen(menu.hidden));
+  // With no choice to offer, the gear opens the settings dialog directly.
+  menuBtn.addEventListener('click', () => {
+    if (!menu.hidden || menu.querySelector('.menu-row:not([hidden])')) setMenuOpen(menu.hidden);
+    else document.getElementById('settings-btn')!.click();
+  });
   menu.addEventListener('change', () => setMenuOpen(false));
   document.addEventListener('click', (e) => {
     if (!menu.hidden && !menu.parentElement!.contains(e.target as Node)) setMenuOpen(false);
