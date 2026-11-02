@@ -502,44 +502,76 @@ const layoutEl = document.getElementById('layout')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
 const startScreenBtn = document.getElementById('start-screen') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop') as HTMLButtonElement;
-const cameraSelect = document.getElementById('camera') as HTMLSelectElement;
+const cameraMenu = document.getElementById('camera-menu')!;
+// Phone browsers cannot capture the screen.
+startScreenBtn.hidden = !navigator.mediaDevices?.getDisplayMedia;
 
 // ─── Camera choice ───────────────────────────────────────────────────
 
-/** `?camera=`: `front`, `back` or a device id; absent = the browser's default camera. */
-let cameraChoice: CameraChoice = params.get('camera') || null;
+const CAMERA_KEY = 'g5-broadcast.camera';
+/** `front`, `back` or a device id, from `?camera=` else the last pick; null = the browser's default. */
+let cameraChoice: CameraChoice = params.get('camera') || storageGet(() => localStorage, CAMERA_KEY) || null;
 /** Phones choose by facing; desktops by device. */
 const facingChoice = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+/** [choice, label], the current choice first; fewer than two starts without asking. */
+let cameraOptions: [string, string][] = [];
 
-/** Fills the camera list. Device labels and ids appear only after camera permission. */
+/** Rebuilds the camera list. Device labels and ids appear only after camera permission. */
 async function refreshCameras(): Promise<void> {
-  let cameras: MediaDeviceInfo[] = [];
-  try {
-    cameras = (await navigator.mediaDevices.enumerateDevices())
-      .filter((d) => d.kind === 'videoinput' && d.deviceId);
-  } catch { /* no media devices: default only */ }
-  const options: [string, string][] = [['', 'Default camera']];
-  if (facingChoice) options.push(['front', 'Front camera'], ['back', 'Back camera']);
-  else cameras.forEach((d, i) => options.push([d.deviceId, d.label || `Camera ${i + 1}`]));
-  // A saved choice not listed (yet) still shows as chosen.
-  if (cameraChoice && !options.some(([v]) => v === cameraChoice)) {
-    options.push([cameraChoice, cameraChoice === 'front' || cameraChoice === 'back'
-      ? `${cameraChoice.charAt(0).toUpperCase()}${cameraChoice.slice(1)} camera` : 'Saved camera']);
+  let options: [string, string][];
+  if (facingChoice) {
+    options = [['front', 'Front camera'], ['back', 'Back camera']];
+  } else {
+    let cameras: MediaDeviceInfo[] = [];
+    try {
+      cameras = (await navigator.mediaDevices.enumerateDevices())
+        .filter((d) => d.kind === 'videoinput' && d.deviceId);
+    } catch { /* no media devices: default only */ }
+    options = cameras.map((d, i) => [d.deviceId, d.label || `Camera ${i + 1}`]);
   }
-  cameraSelect.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
-  cameraSelect.value = cameraChoice ?? '';
-  cameraSelect.hidden = !facingChoice && cameras.length < 2 && !cameraChoice;
+  const current = options.findIndex(([v]) => v === cameraChoice);
+  if (current > 0) options.unshift(...options.splice(current, 1));
+  cameraOptions = options;
+  if (options.length > 1) startCameraBtn.setAttribute('aria-haspopup', 'menu');
+  else startCameraBtn.removeAttribute('aria-haspopup');
 }
 
-cameraSelect.addEventListener('change', () => {
-  cameraChoice = cameraSelect.value || null;
+function setCameraChoice(choice: string): void {
+  cameraChoice = choice;
   const url = new URL(window.location.href);
-  if (cameraChoice) url.searchParams.set('camera', cameraChoice);
-  else url.searchParams.delete('camera');
+  url.searchParams.set('camera', choice);
   window.history.replaceState(null, '', url);
-  if (cameraChoice) params.set('camera', cameraChoice);
-  else params.delete('camera');
+  params.set('camera', choice);
+  storageSet(() => localStorage, CAMERA_KEY, choice);
+  void refreshCameras();
+}
+
+function setCameraMenuOpen(open: boolean): void {
+  if (open) {
+    cameraMenu.replaceChildren(...cameraOptions.map(([value, label]) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'menu-item';
+      item.setAttribute('role', 'menuitemradio');
+      item.setAttribute('aria-checked', String(value === cameraChoice));
+      item.textContent = label;
+      item.addEventListener('click', () => {
+        setCameraMenuOpen(false);
+        setCameraChoice(value);
+        void startBroadcast('camera');
+      });
+      return item;
+    }));
+  }
+  cameraMenu.hidden = !open;
+  startCameraBtn.setAttribute('aria-expanded', String(open));
+  if (open) (cameraMenu.firstElementChild as HTMLElement | null)?.focus();
+}
+
+document.addEventListener('click', (e) => {
+  if (!cameraMenu.hidden && !cameraMenu.parentElement!.contains(e.target as Node)) setCameraMenuOpen(false);
 });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !cameraMenu.hidden) setCameraMenuOpen(false); });
 navigator.mediaDevices?.addEventListener?.('devicechange', () => { void refreshCameras(); });
 void refreshCameras();
 
@@ -871,7 +903,10 @@ function referenceStampClocks(): Pick<MediaPublisherOptions, 'wallClockUs' | 'ti
 
 // ─── Start ───────────────────────────────────────────────────────────
 
-startCameraBtn.addEventListener('click', () => startBroadcast('camera'));
+startCameraBtn.addEventListener('click', () => {
+  if (cameraOptions.length < 2) void startBroadcast('camera');
+  else setCameraMenuOpen(cameraMenu.hidden);
+});
 startScreenBtn.addEventListener('click', () => startBroadcast('screen'));
 stopBtn.addEventListener('click', stopBroadcast);
 
@@ -901,7 +936,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   claimNamespace();
   startCameraBtn.disabled = true;
   startScreenBtn.disabled = true;
-  cameraSelect.disabled = true;
   stopBtn.disabled = false;
   setState('connecting', 'starting');
 
@@ -1509,6 +1543,5 @@ function resetBroadcastUi(): void {
   lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
   startCameraBtn.disabled = false;
   startScreenBtn.disabled = false;
-  cameraSelect.disabled = false;
   stopBtn.disabled = true;
 }

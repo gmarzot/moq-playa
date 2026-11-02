@@ -22,9 +22,10 @@
     }
     h1 .conn > span { margin-right: 14px; }
     h1 .conn > span:last-of-type { margin-right: 0; }
+    /* Long URLs and namespaces break anywhere rather than run off a narrow screen. */
     h1 .conn b {
       color: #6cf; font-weight: 700;
-      text-transform: none; letter-spacing: 0;
+      text-transform: none; letter-spacing: 0; overflow-wrap: anywhere;
     }
     h1 .conn b.copyable { cursor: copy; position: relative; }
     h1 .conn b.copyable:hover { text-decoration: underline dotted; }
@@ -77,19 +78,40 @@
     button:disabled { opacity: 0.4; cursor: default; }
     button.mini { padding: 4px 12px; font-size: .8rem; color: #bbb; border-color: #444; }
 
-    /* One line always. The spacer absorbs the shrink; past that the layout
-       stacks, rather than the row overflowing under the catalog. */
+    /* One line above phone width. The spacer absorbs the shrink; past that the
+       layout stacks, rather than the row overflowing under the catalog. */
     .controls { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: nowrap; }
     .controls .spacer { flex: 1; min-width: 0; }
-    .controls select {
-      background: #333; color: #ddd; border: 1px solid #555; border-radius: 6px;
-      padding: 7px 8px; font-size: .85rem; max-width: 14rem; flex-shrink: 1; min-width: 0;
-    }
-    .controls select:disabled { opacity: 0.4; }
     .controls button.mini {
       font-size: .85rem; padding: 6px 12px;
       display: inline-flex; align-items: center; justify-content: center;
       gap: 5px; line-height: 1; white-space: nowrap; flex-shrink: 0;
+    }
+    .controls button.mini svg { width: 16px; height: 16px; }
+
+    /* Camera list: opens above the Camera button when there is a choice. */
+    .menu-wrap { position: relative; flex-shrink: 0; }
+    .menu {
+      position: absolute; left: 0; bottom: calc(100% + 6px); z-index: 20;
+      display: flex; flex-direction: column; gap: 2px; min-width: 200px; max-width: min(340px, 90vw);
+      background: #1a1a2e; border: 1px solid #3a3a52; border-radius: 8px;
+      padding: 6px; box-shadow: 0 6px 20px rgba(0, 0, 0, .5);
+    }
+    .menu .menu-item {
+      text-align: left; background: none; border: none; border-radius: 4px;
+      padding: 8px 10px; color: #ddd; font-size: .85rem;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .menu .menu-item:hover, .menu .menu-item:focus-visible { background: #333; outline: none; }
+    .menu .menu-item[aria-checked=true] { color: #fff; font-weight: 700; }
+
+    /* Phones: the bar wraps instead of overrunning; the list anchors to the bar. */
+    @media (max-width: 600px) {
+      .wrapper { padding: 16px 12px; }
+      .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
+      .menu-wrap { position: static; }
+      .controls > button:not(.mini), .menu-wrap > button { padding: 6px 14px; }
+      .controls button { min-height: 40px; }
     }
 
     /* State overlay: live is green; red is reserved for faults. */
@@ -287,14 +309,19 @@
         </div>
 
         <div class="controls">
-          <select id="camera" title="Camera to open on Start. Phones: front or back; desktops: one of the cameras." hidden></select>
-          <button id="start-camera">Camera</button>
-          <button id="start-screen">Screen</button>
-          <button id="stop" disabled>Stop</button>
+          <div class="menu-wrap">
+            <button id="start-camera" type="button" aria-expanded="false">Camera</button>
+            <div id="camera-menu" class="menu" role="menu" aria-label="Camera" hidden></div>
+          </div>
+          <button id="start-screen" type="button">Screen</button>
+          <button id="stop" type="button" disabled>Stop</button>
           <span class="spacer"></span>
-          <button id="settings-btn" class="mini" type="button" title="Broadcast settings">⚙ settings</button>
-          <button id="share-btn" class="mini" type="button" hidden>⧉ viewer link</button>
-          <button id="cat-restore" class="mini" hidden>catalog</button>
+          <button id="settings-btn" class="mini" type="button" title="Broadcast settings" aria-label="Broadcast settings">⚙</button>
+          <button id="share-btn" class="mini" type="button" title="Viewer link" aria-label="Viewer link" hidden>⧉</button>
+          <button id="cat-restore" class="mini" type="button" title="Show the catalog" aria-label="Show the catalog" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><rect
+              x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14"/></svg>
+          </button>
         </div>
 
       </div>
