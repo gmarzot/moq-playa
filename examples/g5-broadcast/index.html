@@ -167,7 +167,11 @@
       display: flex; flex-direction: column;
       background: #1a1a2e; border-radius: 8px; padding: 10px 14px;
     }
-    .cat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    /* The badges drop under the title when the panel is too narrow for both. */
+    .cat-head {
+      display: flex; flex-wrap: wrap; align-items: baseline;
+      justify-content: space-between; gap: 6px 12px;
+    }
     .cat-head .chart-label {
       font-size: .95rem; color: #fff; font-weight: 700; white-space: nowrap;
       text-transform: uppercase; letter-spacing: .04em;
