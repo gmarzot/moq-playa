@@ -835,7 +835,6 @@ const setCatalogHidden = (hidden: boolean): void => {
   layoutEl.classList.toggle('cat-hidden', hidden);
   catToggle.setAttribute('aria-pressed', String(!hidden));
   catToggle.title = hidden ? 'Show the catalog' : 'Hide the catalog';
-  catToggle.setAttribute('aria-label', catToggle.title);
 };
 catToggle.addEventListener('click', () => setCatalogHidden(!layoutEl.classList.contains('cat-hidden')));
 wireCopy(catCopy, () => catJson.textContent ?? '');

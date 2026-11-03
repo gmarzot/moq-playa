@@ -1854,7 +1854,6 @@ async function main(): Promise<void> {
     layoutEl.classList.toggle('cat-hidden', hidden);
     catToggle.setAttribute('aria-pressed', String(!hidden));
     catToggle.title = hidden ? 'Show the catalog' : 'Hide the catalog';
-    catToggle.setAttribute('aria-label', catToggle.title);
   };
   wireCopy(logCopy, () => logEl.textContent ?? '');
   wireCopy(catCopy, () => catJson.textContent ?? '');
