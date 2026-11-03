@@ -153,7 +153,6 @@ const nsBadge = document.getElementById('ns-badge')!;
 const catBadge = document.getElementById('cat-badge')!;
 const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
 const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
-const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
 const layoutEl = document.getElementById('layout')!;
 const logEl = document.getElementById('log')!;
 const playerContainer = document.getElementById('player-container')!;
@@ -1778,6 +1777,7 @@ async function main(): Promise<void> {
   // fields in display order; "parsed" shows the engine's catalog with deltas applied.
   let parsedCatalog: unknown = null;
   let receivedCatalog: string | null = null;
+  let receivedBytes = 0;
   let deltasSinceReceived = 0;
   let showParsed = false;
   function showCatalogJson(): void {
@@ -1787,18 +1787,20 @@ async function main(): Promise<void> {
       : JSON.stringify(orderCatalogForDisplay(parsedCatalog), null, 2);
     const deltas = deltasSinceReceived === 0 ? ''
       : ` +${deltasSinceReceived} delta${deltasSinceReceived > 1 ? 's' : ''}`;
-    catView.textContent = received ? `received${deltas}` : 'parsed';
+    catView.textContent = received ? `${receivedBytes}B${deltas}` : 'parsed';
     catView.title = received
       ? 'The catalog as received; click for the parsed catalog'
       : 'The parsed catalog; click for the catalog as received';
+    catSize.hidden = false;
   }
   /** A full catalog replaces the received view; a delta is counted against it. */
-  function noteReceivedCatalog(text: string): void {
+  function noteReceivedCatalog(text: string, bytes: number): void {
     let obj: unknown;
     try {
       obj = JSON.parse(text);
     } catch {
       receivedCatalog = text;
+      receivedBytes = bytes;
       deltasSinceReceived = 0;
       return;
     }
@@ -1806,6 +1808,7 @@ async function main(): Promise<void> {
       && 'version' in obj && (obj as { deltaUpdate?: unknown }).deltaUpdate !== true;
     if (full) {
       receivedCatalog = JSON.stringify(orderCatalogForDisplay(obj), null, 2);
+      receivedBytes = bytes;
       deltasSinceReceived = 0;
     } else {
       deltasSinceReceived++;
@@ -1837,10 +1840,9 @@ async function main(): Promise<void> {
   let rawSeen = 0;
   player.on('catalog_raw', ({ bytes, text }) => {
     rawSeen++;
-    catSize.textContent = ` · ${bytes}B`;
     // Empty text: the bytes were not UTF-8.
     if (text) {
-      noteReceivedCatalog(text);
+      noteReceivedCatalog(text, bytes);
       showCatalogJson();
     }
     if (!debug) return;
@@ -1850,13 +1852,14 @@ async function main(): Promise<void> {
 
   const setCatalogHidden = (hidden: boolean): void => {
     layoutEl.classList.toggle('cat-hidden', hidden);
-    catRestore.hidden = !hidden;
+    catToggle.setAttribute('aria-pressed', String(!hidden));
+    catToggle.title = hidden ? 'Show the catalog' : 'Hide the catalog';
+    catToggle.setAttribute('aria-label', catToggle.title);
   };
-  catRestore.addEventListener('click', () => setCatalogHidden(false));
   wireCopy(logCopy, () => logEl.textContent ?? '');
   wireCopy(catCopy, () => catJson.textContent ?? '');
   catToggle.addEventListener('click', () => {
-    setCatalogHidden(true);
+    setCatalogHidden(!layoutEl.classList.contains('cat-hidden'));
   });
 
   // ── Controls ──────────────────────────────────────────────────────
