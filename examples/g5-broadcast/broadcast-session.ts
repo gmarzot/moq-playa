@@ -613,13 +613,19 @@ export class BroadcastSession {
 
   /**
    * End every accepted subscription with PUBLISH_DONE TRACK_ENDED (§10.11):
-   * production stops first, then the terminals go out, bounded together. A
+   * production stops and its open subgroups FIN first (PUBLISH_DONE is refused
+   * while one is open), then the terminals go out, bounded together. A
    * relay passes them on to its viewers and drops its upstream state, so a
    * later broadcast under the same namespace starts clean.
    */
   async endSubscriptions(timeoutMs = END_SUBSCRIPTIONS_MS): Promise<void> {
     if (this.retired) return;
     this.stopCatalogReemission();
+    if (this.currentRequest.size === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); });
+    this.publisher.retire();
+    await Promise.race([this.drainPublication(), deadline]);
     const ends: Array<Promise<unknown>> = [];
     for (const [track, requestId] of [...this.currentRequest]) {
       this.currentRequest.delete(track);
@@ -634,13 +640,10 @@ export class BroadcastSession {
         this.wrapInt(requestId), this.wrapInt(TRACK_ENDED), 'broadcast stopped',
       ).catch(() => {}));
     }
-    if (ends.length === 0) return;
-    this.safeLog(`PUBLISH_DONE TRACK_ENDED on ${ends.length} subscription(s)`);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      Promise.all(ends),
-      new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
-    ]);
+    if (ends.length > 0) {
+      this.safeLog(`PUBLISH_DONE TRACK_ENDED on ${ends.length} subscription(s)`);
+      await Promise.race([Promise.all(ends), deadline]);
+    }
     clearTimeout(timer);
   }
 
@@ -792,6 +795,14 @@ export class BroadcastSession {
     void contained.then(() => this.pendingWork.delete(contained));
   }
 
+  /** Await in-flight publication and session work; FINs the open subgroups. Never rejects. */
+  private drainPublication(): Promise<void> {
+    return Promise.all([
+      this.publisher.drain().then(() => {}, () => {}),
+      ...this.pendingWork,
+    ]).then(() => {}, () => {});
+  }
+
   /** Resolve true if `p` settles within `ms`, false on timeout. `p` must never
    *  reject (callers pass contained promises). */
   private async settledWithin(p: Promise<void>, ms: number): Promise<boolean> {
@@ -811,10 +822,7 @@ export class BroadcastSession {
 
     // Every stage below is CONTAINED and BOUNDED: shutdown resolves even if
     // the drain, the logger, a tracked work item, or close() itself misbehaves.
-    const graceful = Promise.all([
-      this.publisher.drain().then(() => {}, () => {}),
-      ...this.pendingWork,
-    ]).then(() => {}, () => {});
+    const graceful = this.drainPublication();
 
     const graceMs = this.opts.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
     if (!await this.settledWithin(graceful, graceMs)) {
