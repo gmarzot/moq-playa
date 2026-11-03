@@ -496,7 +496,6 @@ const catTracks = document.getElementById('cat-tracks')!;
 const catJson = document.getElementById('cat-json')!;
 const catToggle = document.getElementById('cat-toggle') as HTMLButtonElement;
 const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
-const catRestore = document.getElementById('cat-restore') as HTMLButtonElement;
 const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
 const layoutEl = document.getElementById('layout')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
@@ -834,11 +833,10 @@ log(`Draft: ${broadcastDraft} · codec ${videoCodec} + ${AUDIO_CODECS[audioCodec
 
 const setCatalogHidden = (hidden: boolean): void => {
   layoutEl.classList.toggle('cat-hidden', hidden);
-  catRestore.hidden = !hidden;
-  catToggle.hidden = hidden;
+  catToggle.setAttribute('aria-pressed', String(!hidden));
+  catToggle.title = hidden ? 'Show the catalog' : 'Hide the catalog';
 };
-catToggle.addEventListener('click', () => setCatalogHidden(true));
-catRestore.addEventListener('click', () => setCatalogHidden(false));
+catToggle.addEventListener('click', () => setCatalogHidden(!layoutEl.classList.contains('cat-hidden')));
 wireCopy(catCopy, () => catJson.textContent ?? '');
 wireCopy(logCopy, () => document.getElementById('log')?.textContent ?? '');
 

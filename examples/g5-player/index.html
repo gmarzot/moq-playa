@@ -514,12 +514,14 @@
       white-space: nowrap; flex-shrink: 0;
     }
     .controls button.mini svg { width: 16px; height: 16px; }
-    /* A quiet link after the catalog size. */
-    .cat-head .cat-hide {
+    .controls #cat-toggle[aria-pressed="true"] { color: var(--text-strong); border-color: var(--text-muted); }
+    /* The catalog size: a quiet link that switches the JSON view. */
+    .cat-head .cat-link {
       background: none; border: none; padding: 0; cursor: pointer; font: inherit;
       color: var(--text-muted); font-weight: 400; text-transform: none; letter-spacing: 0;
+      text-decoration: underline dotted; text-underline-offset: 3px;
     }
-    .cat-head .cat-hide:hover { color: var(--text-hover); text-decoration: underline; }
+    .cat-head .cat-link:hover { color: var(--text-hover); text-decoration: underline; }
     /* MoQT state badges: one word; grey idle, yellow waiting or paused,
        green flowing, red fault. Right-justified on their line. */
     .badge {
@@ -737,7 +739,7 @@
           <button id="settings-btn" class="menu-item" type="button">Connection settings…</button>
         </div>
       </div>
-      <button id="cat-restore" class="mini" type="button" title="Show the catalog" aria-label="Show the catalog" hidden>
+      <button id="cat-toggle" class="mini" type="button" title="Hide the catalog" aria-label="Catalog" aria-pressed="true">
         <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><rect
           x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14"/></svg>
       </button>
@@ -748,9 +750,7 @@
     <div class="catalog-panel" id="catalog-panel">
       <div class="cat-head">
         <span class="chart-label">catalog: <b id="cat-meta">waiting…</b><span
-          class="aside" id="cat-size"></span><span class="aside"> · </span><button
-          id="cat-view" class="cat-hide" type="button">received</button><span class="aside"> · </span><button
-          id="cat-toggle" class="cat-hide" type="button" title="Hide the catalog panel">hide</button></span>
+          class="aside" id="cat-size" hidden> · <button id="cat-view" class="cat-link" type="button"></button></span></span>
         <span class="cat-badges">
           <span class="badge idle" id="setup-badge">SETUP</span>
           <span class="badge idle" id="ns-badge">SUB_NS</span>
