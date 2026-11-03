@@ -1078,6 +1078,46 @@ describe('BroadcastSession — ending its subscriptions (§10.11)', () => {
     expect(conn.dones).toHaveLength(3);
   });
 
+  it('FINs the open subgroups first: PUBLISH_DONE is refused while one is open', async () => {
+    const conn = recordingConnection();
+    const open = new Set<bigint>();
+    const openSubgroup = conn.openSubgroup;
+    conn.openSubgroup = async (...args: Parameters<typeof openSubgroup>) => {
+      const sid = await openSubgroup(...args);
+      open.add(sid as bigint);
+      return sid;
+    };
+    conn.closeSubgroup = async (sid) => { conn.calls.push('closeSubgroup'); open.delete(sid as bigint); };
+    conn.publishDone = async (requestId, statusCode) => {
+      if (open.size > 0) throw new Error(`${open.size} open subgroup(s) (§10.11)`);
+      conn.dones.push([requestId as bigint, statusCode as bigint]);
+    };
+    const { session } = fetchSession(conn);
+    session.handleSubscribe(3n, 'video');
+    session.handleSubscribe(5n, 'audio');
+    await settle();
+    session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
+    session.publisher.publishAudio(new Uint8Array([2]), { timestampUs: 2 });
+    await settle();
+    expect(open.size).toBeGreaterThan(0);
+
+    await session.endSubscriptions();
+    expect(open.size).toBe(0);
+    expect(conn.dones.sort((a, b) => Number(a[0] - b[0]))).toEqual([[3n, 2n], [5n, 2n]]);
+  });
+
+  it('ignores a SUBSCRIBE that arrives while the subscriptions end', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn);
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    const ending = session.endSubscriptions();
+    session.handleSubscribe(7n, 'audio');
+    await ending;
+    expect(conn.dones).toEqual([[3n, 2n]]);
+    expect(conn.calls.filter((c) => c === 'acceptSubscribe')).toHaveLength(1);
+  });
+
   it('a PUBLISH_DONE that never settles cannot stall the caller', async () => {
     vi.useFakeTimers();
     try {

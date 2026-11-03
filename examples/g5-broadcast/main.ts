@@ -1278,8 +1278,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       };
 
       // Cancellation must REACH the in-progress handshake: closing the
-      // transport makes a pending connect() settle instead of hanging.
+      // transport makes a pending connect() settle instead of hanging. After
+      // setup the teardown closes it, after the goodbye.
+      let handshaking = true;
       ctx.onCancel(() => {
+        if (!handshaking) return;
         try { (transport as unknown as { close(): void }).close(); } catch { /* already closed */ }
       });
       setupBadgeState = { tone: 'wait', detail: `SETUP sent to ${resolvedRelayUrl || relayUrl}; awaiting the relay` };
@@ -1287,6 +1290,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         maxRequestId: varint(100),
         ...(compatParam.compat.includes('request-credit') ? { requestsUncappedUntilMaxRequestId: true } : {}),
       });
+      handshaking = false;
       ctx.throwIfCancelled();
       if (conn.session?.uncappedRequestCredit.active) {
         log('Relay granted no request credit (SERVER_SETUP without MAX_REQUEST_ID); '
