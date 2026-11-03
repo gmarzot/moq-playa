@@ -1106,6 +1106,18 @@ describe('BroadcastSession — ending its subscriptions (§10.11)', () => {
     expect(conn.dones.sort((a, b) => Number(a[0] - b[0]))).toEqual([[3n, 2n], [5n, 2n]]);
   });
 
+  it('ignores a SUBSCRIBE that arrives while the subscriptions end', async () => {
+    const conn = recordingConnection();
+    const { session } = fetchSession(conn);
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    const ending = session.endSubscriptions();
+    session.handleSubscribe(7n, 'audio');
+    await ending;
+    expect(conn.dones).toEqual([[3n, 2n]]);
+    expect(conn.calls.filter((c) => c === 'acceptSubscribe')).toHaveLength(1);
+  });
+
   it('a PUBLISH_DONE that never settles cannot stall the caller', async () => {
     vi.useFakeTimers();
     try {
