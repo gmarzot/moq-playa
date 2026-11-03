@@ -499,11 +499,10 @@ const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
 const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
 const layoutEl = document.getElementById('layout')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
-const startScreenBtn = document.getElementById('start-screen') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop') as HTMLButtonElement;
 const cameraMenu = document.getElementById('camera-menu')!;
 // Phone browsers cannot capture the screen.
-startScreenBtn.hidden = !navigator.mediaDevices?.getDisplayMedia;
+const canCaptureScreen = !!navigator.mediaDevices?.getDisplayMedia;
 
 // ─── Camera choice ───────────────────────────────────────────────────
 
@@ -512,8 +511,10 @@ const CAMERA_KEY = 'g5-broadcast.camera';
 let cameraChoice: CameraChoice = params.get('camera') || storageGet(() => localStorage, CAMERA_KEY) || null;
 /** Phones choose by facing; desktops by device. */
 const facingChoice = window.matchMedia?.('(pointer: coarse)').matches ?? false;
-/** [choice, label], the current choice first; fewer than two starts without asking. */
+/** [choice, label], the current choice first. */
 let cameraOptions: [string, string][] = [];
+/** Menu entries: each camera (one default entry before camera permission), then the screen. */
+const sourceCount = (): number => Math.max(cameraOptions.length, 1) + (canCaptureScreen ? 1 : 0);
 
 /** Rebuilds the camera list. Device labels and ids appear only after camera permission. */
 async function refreshCameras(): Promise<void> {
@@ -531,7 +532,7 @@ async function refreshCameras(): Promise<void> {
   const current = options.findIndex(([v]) => v === cameraChoice);
   if (current > 0) options.unshift(...options.splice(current, 1));
   cameraOptions = options;
-  if (options.length > 1) startCameraBtn.setAttribute('aria-haspopup', 'menu');
+  if (sourceCount() > 1) startCameraBtn.setAttribute('aria-haspopup', 'menu');
   else startCameraBtn.removeAttribute('aria-haspopup');
 }
 
@@ -548,23 +549,33 @@ function setCameraChoice(choice: string): void {
   void refreshCameras();
 }
 
+/** A source entry; `checked` null for the screen, which is not a camera choice. */
+function sourceItem(label: string, source: 'camera' | 'screen', checked: boolean | null,
+  pick: () => void): HTMLButtonElement {
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.className = 'menu-item';
+  item.dataset['source'] = source;
+  item.setAttribute('role', checked === null ? 'menuitem' : 'menuitemradio');
+  if (checked !== null) item.setAttribute('aria-checked', String(checked));
+  item.textContent = label;
+  item.addEventListener('click', () => {
+    setCameraMenuOpen(false);
+    pick();
+    void startBroadcast(source);
+    stopBtn.focus();
+  });
+  return item;
+}
+
 function setCameraMenuOpen(open: boolean): void {
   if (open) {
-    cameraMenu.replaceChildren(...cameraOptions.map(([value, label]) => {
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'menu-item';
-      item.setAttribute('role', 'menuitemradio');
-      item.setAttribute('aria-checked', String(value === cameraChoice));
-      item.textContent = label;
-      item.addEventListener('click', () => {
-        setCameraMenuOpen(false);
-        setCameraChoice(value);
-        void startBroadcast('camera');
-        stopBtn.focus();
-      });
-      return item;
-    }));
+    const items = cameraOptions.length === 0
+      ? [sourceItem('Camera', 'camera', true, () => {})]
+      : cameraOptions.map(([value, label]) =>
+        sourceItem(label, 'camera', value === cameraChoice, () => setCameraChoice(value)));
+    if (canCaptureScreen) items.push(sourceItem('Screen', 'screen', null, () => {}));
+    cameraMenu.replaceChildren(...items);
   }
   cameraMenu.hidden = !open;
   startCameraBtn.setAttribute('aria-expanded', String(open));
@@ -910,10 +921,9 @@ function referenceStampClocks(): Pick<MediaPublisherOptions, 'wallClockUs' | 'ti
 // ─── Start ───────────────────────────────────────────────────────────
 
 startCameraBtn.addEventListener('click', () => {
-  if (cameraOptions.length < 2) void startBroadcast('camera');
+  if (sourceCount() < 2) void startBroadcast('camera');
   else setCameraMenuOpen(cameraMenu.hidden);
 });
-startScreenBtn.addEventListener('click', () => startBroadcast('screen'));
 stopBtn.addEventListener('click', stopBroadcast);
 
 /** Longest Stop waits for the namespace withdrawal before closing the session. */
@@ -940,8 +950,7 @@ const RECONNECT_STABLE_MS = 30_000;
 
 async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   claimNamespace();
-  startCameraBtn.disabled = true;
-  startScreenBtn.disabled = true;
+  setLiveSource(source);
   stopBtn.disabled = false;
   setState('connecting', 'starting');
 
@@ -1547,7 +1556,14 @@ function resetBroadcastUi(): void {
   setText('conn-draft', String(broadcastDraft));
   liveSinceMs = null;
   lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
-  startCameraBtn.disabled = false;
-  startScreenBtn.disabled = false;
+  setLiveSource(null);
   stopBtn.disabled = true;
+}
+
+/** While a broadcast runs, the source button is disabled and shows its source. */
+function setLiveSource(source: 'camera' | 'screen' | null): void {
+  startCameraBtn.disabled = source !== null;
+  startCameraBtn.classList.toggle('live', source !== null);
+  startCameraBtn.classList.toggle('screen', source === 'screen');
+  startCameraBtn.title = source === null ? 'Start a broadcast' : `Broadcasting the ${source}`;
 }
