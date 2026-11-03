@@ -457,12 +457,38 @@ describe('underrun resync', () => {
     expect(ctx.started).toHaveLength(2);
     expect(ctx.started[1]!.when).toBeCloseTo(1.56, 9);
     expect(ctx.started[1]!.offset).toBe(0);
-    expect(out.underrunCount).toBe(2);
-    expect(out.underrunGapSec).toBeCloseTo(0.54, 9); // 1.02 → 1.56, counted once
+    expect(out.underrunCount).toBe(1);
+    expect(out.underrunGapSec).toBeCloseTo(0.54, 9); // 1.02 → 1.56
 
     ctx.currentTime = 1.58;
     out.schedule(audioData(530 * MS) as unknown as AudioData, 1_530 * MS);
     expect(out.captureLeadSec).toBeCloseTo(0.05, 9);
+  });
+
+  it('reports one gap, through to the buffer that resumes playout', () => {
+    const { ctx, out } = startChain();
+    const gaps: Array<[number, number | null]> = [];
+    out.onUnderrun = (gap, late) => gaps.push([gap, late]);
+    ctx.currentTime = 1.5;
+    out.schedule(audioData(450 * MS) as unknown as AudioData, 1_450 * MS); // 50ms late: skipped
+    expect(gaps).toEqual([]);
+    ctx.currentTime = 1.53;
+    out.schedule(audioData(520 * MS) as unknown as AudioData, 1_520 * MS); // 10ms late: plays
+    expect(out.underrunCount).toBe(1);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]![0]).toBeCloseTo(0.51, 9);  // 1.02 → 1.53
+    expect(gaps[0]![1]).toBeCloseTo(0.05, 9);  // the first buffer after the chain ran dry
+  });
+
+  it('an on-time buffer after the burst window ends the same underrun', () => {
+    const { ctx, out } = startChain();
+    ctx.currentTime = 1.5;
+    out.schedule(audioData(450 * MS) as unknown as AudioData, 1_450 * MS); // skipped
+    ctx.currentTime = 1.56;
+    out.schedule(audioData(600 * MS) as unknown as AudioData, 1_600 * MS);
+    expect(ctx.started[1]).toMatchObject({ when: 1.6, offset: 0 });
+    expect(out.underrunCount).toBe(1);
+    expect(out.underrunGapSec).toBeCloseTo(0.58, 9); // 1.02 → 1.60
   });
 
   it('resyncs again only after audio has arrived on time', () => {

@@ -97,10 +97,10 @@ export class WebAudioOutput implements AudioOutputLike {
   private _underrunGapSec = 0;
 
   /**
-   * Each underrun: the silence it left (s), and how late the buffer that
-   * ended it was against its capture-aligned slot (s). Negative lateness
-   * means that buffer was on time and audio before it never arrived.
-   * Null lateness: no sync reference yet.
+   * Each underrun, when playout resumes: the silence it left (s), and how
+   * late the first buffer to arrive after the chain ran dry was against its
+   * capture-aligned slot (s). Negative lateness means that buffer was on
+   * time and audio before it never arrived. Null lateness: no sync reference yet.
    */
   onUnderrun: ((gapSec: number, lateSec: number | null) => void) | null = null;
 
@@ -112,6 +112,8 @@ export class WebAudioOutput implements AudioOutputLike {
   private suspendedDrops = 0;
   /** currentTime of the underrun whose late burst is being skipped; null when none. */
   private resyncSinceSec: number | null = null;
+  /** Lateness of the first buffer after the chain ran dry (s), reported when the gap ends. */
+  private gapLateSec: number | null = null;
   /** Audio arrived ahead of its slot since the last resync, so lateness is not persistent. */
   private resyncArmed = true;
 
@@ -307,32 +309,30 @@ export class WebAudioOutput implements AudioOutputLike {
       }
     } else if (this.nextScheduledTime !== null) {
       // Chain ran dry before this buffer arrived: an audible gap.
-      if (this.resyncSinceSec !== null && now - this.resyncSinceSec > RESYNC_BURST_SEC) {
-        // Burst over: a buffer still late starts a new underrun, timed from the last one.
-        this.nextScheduledTime = this.resyncSinceSec;
-        this.resyncSinceSec = null;
-      }
-      startTime = alignedTime !== null ? Math.max(alignedTime, now) : now + this.playbackDelaySec;
+      const lateSec = alignedTime !== null ? now - alignedTime : null;
       if (this.resyncSinceSec === null) {
         this._underrunCount++;
         this._chasing = false;
-        const gapSec = startTime - this.nextScheduledTime;
-        this._underrunGapSec += gapSec;
-        try {
-          this.onUnderrun?.(gapSec, alignedTime !== null ? now - alignedTime : null);
-        } catch { /* an observer must not break playout */ }
-        if (this.resyncArmed && alignedTime !== null && alignedTime < now) {
+        this.gapLateSec = lateSec;
+        if (this.resyncArmed && lateSec !== null && lateSec > 0) {
           this.resyncSinceSec = now;
           this.resyncArmed = false;
         }
       }
+      startTime = alignedTime !== null ? Math.max(alignedTime, now) : now + this.playbackDelaySec;
       if (this.resyncSinceSec !== null) {
-        // Resume on the aligned slot: skip a wholly late buffer, start a partly late one part-way in.
-        const lateSec = alignedTime !== null ? now - alignedTime : 0;
-        if (lateSec >= buf.duration) return;
-        offsetSec = Math.max(0, lateSec);
+        // Resume on the aligned slot: skip wholly late buffers in the burst, start a partly late one part-way in.
+        if (lateSec !== null && lateSec >= buf.duration
+            && now - this.resyncSinceSec <= RESYNC_BURST_SEC) return;
+        if (lateSec !== null && lateSec < buf.duration) offsetSec = Math.max(0, lateSec);
         this.resyncSinceSec = null;
       }
+      // The gap ends here, whether or not buffers were skipped.
+      const gapSec = startTime - this.nextScheduledTime;
+      this._underrunGapSec += gapSec;
+      try {
+        this.onUnderrun?.(gapSec, this.gapLateSec);
+      } catch { /* an observer must not break playout */ }
     } else if (alignedTime !== null) {
       // After stall — jump to sync-aligned position + playback delay
       startTime = Math.max(alignedTime, now);
