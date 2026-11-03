@@ -31,6 +31,8 @@ const CHASE_RATE = 1.02;
 const CHASE_ON_RATIO = 0.66;
 /** Lower bound on that band. */
 const CHASE_ON_MIN_SEC = 0.02;
+/** After an underrun, late audio arriving this soon after it is skipped to resume on schedule. */
+const RESYNC_BURST_SEC = 0.05;
 
 /**
  * WebAudio playout behind AudioOutputLike.
@@ -45,6 +47,10 @@ const CHASE_ON_MIN_SEC = 0.02;
  * schedule permanently. That lead is bounded: a soft rate chase drains it
  * toward `targetAheadSec`, and past `maxAheadSec` queued audio beyond the
  * landing point is dropped and the chain re-anchored there.
+ *
+ * After an underrun the chain resumes on its capture-aligned slot: the
+ * late part of the burst that ends it is skipped, as video drops late
+ * frames. Lateness that persists past the burst plays late instead.
  *
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
  */
@@ -91,10 +97,10 @@ export class WebAudioOutput implements AudioOutputLike {
   private _underrunGapSec = 0;
 
   /**
-   * Each underrun: the silence it left (s), and how late the buffer that
-   * ended it was against its capture-aligned slot (s). Negative lateness
-   * means that buffer was on time and audio before it never arrived.
-   * Null lateness: no sync reference yet.
+   * Each underrun, when playout resumes: the silence it left (s), and how
+   * late the first buffer to arrive after the chain ran dry was against its
+   * capture-aligned slot (s). Negative lateness means that buffer was on
+   * time and audio before it never arrived. Null lateness: no sync reference yet.
    */
   onUnderrun: ((gapSec: number, lateSec: number | null) => void) | null = null;
 
@@ -104,6 +110,12 @@ export class WebAudioOutput implements AudioOutputLike {
   private _liveEdgeSnapCount = 0;
   private _leadSec: number | null = null;
   private suspendedDrops = 0;
+  /** currentTime of the underrun whose late burst is being skipped; null when none. */
+  private resyncSinceSec: number | null = null;
+  /** Lateness of the first buffer after the chain ran dry (s), reported when the gap ends. */
+  private gapLateSec: number | null = null;
+  /** Audio arrived ahead of its slot since the last resync, so lateness is not persistent. */
+  private resyncArmed = true;
 
   /** Audio scheduled beyond the current playout point, in seconds. */
   get scheduledAheadSec(): number {
@@ -257,6 +269,7 @@ export class WebAudioOutput implements AudioOutputLike {
     // Where this buffer belongs on the capture-aligned timeline.
     const alignedTime = renderTimeUs > 0
       ? this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec : null;
+    if (alignedTime !== null && alignedTime >= now) this.resyncArmed = true;
 
     // Audio scheduling strategy:
     // - Normal playback: chain back-to-back (nextScheduledTime) for
@@ -267,6 +280,8 @@ export class WebAudioOutput implements AudioOutputLike {
     // - playbackDelaySec matches the video output delay so both media
     //   types start at the same wall-clock offset.
     let startTime: number;
+    // Seconds into the buffer playout starts at.
+    let offsetSec = 0;
     if (this.nextScheduledTime !== null && this.nextScheduledTime >= now) {
       // Normal playback — back-to-back for seamless audio
       startTime = this.nextScheduledTime;
@@ -294,13 +309,29 @@ export class WebAudioOutput implements AudioOutputLike {
       }
     } else if (this.nextScheduledTime !== null) {
       // Chain ran dry before this buffer arrived: an audible gap.
-      this._underrunCount++;
-      this._chasing = false;
+      const lateSec = alignedTime !== null ? now - alignedTime : null;
+      if (this.resyncSinceSec === null) {
+        this._underrunCount++;
+        this._chasing = false;
+        this.gapLateSec = lateSec;
+        if (this.resyncArmed && lateSec !== null && lateSec > 0) {
+          this.resyncSinceSec = now;
+          this.resyncArmed = false;
+        }
+      }
       startTime = alignedTime !== null ? Math.max(alignedTime, now) : now + this.playbackDelaySec;
+      if (this.resyncSinceSec !== null) {
+        // Resume on the aligned slot: skip wholly late buffers in the burst, start a partly late one part-way in.
+        if (lateSec !== null && lateSec >= buf.duration
+            && now - this.resyncSinceSec <= RESYNC_BURST_SEC) return;
+        if (lateSec !== null && lateSec < buf.duration) offsetSec = Math.max(0, lateSec);
+        this.resyncSinceSec = null;
+      }
+      // The gap ends here, whether or not buffers were skipped.
       const gapSec = startTime - this.nextScheduledTime;
       this._underrunGapSec += gapSec;
       try {
-        this.onUnderrun?.(gapSec, alignedTime !== null ? now - alignedTime : null);
+        this.onUnderrun?.(gapSec, this.gapLateSec);
       } catch { /* an observer must not break playout */ }
     } else if (alignedTime !== null) {
       // After stall — jump to sync-aligned position + playback delay
@@ -319,16 +350,18 @@ export class WebAudioOutput implements AudioOutputLike {
     const rate = this._chasing ? Math.max(this._playbackRate, CHASE_RATE) : this._playbackRate;
     source.playbackRate.value = rate;
     source.connect(this.destination);
-    source.start(startTime);
+    source.start(startTime, offsetSec);
     // Duration at adjusted rate — faster playout means shorter wall-clock time.
-    const durSec = buf.duration / rate;
+    const durSec = (buf.duration - offsetSec) / rate;
     this.nextScheduledTime = startTime + durSec;
 
     // Playhead observability: record what was scheduled where, so
     // playheadCaptureUs() can answer "what capture timestamp is being heard
     // right now." Also the drop set for a live-edge snap.
     this.pruneScheduledRing(now);
-    this.scheduledRing.push({ captureUs, startSec: startTime, durSec, rate, source });
+    this.scheduledRing.push({
+      captureUs: captureUs + offsetSec * 1_000_000, startSec: startTime, durSec, rate, source,
+    });
 
     // Track for flush/destroy cleanup
     this.activeSources.push(source);
@@ -422,6 +455,8 @@ export class WebAudioOutput implements AudioOutputLike {
     this.nextScheduledTime = null;
     this._chasing = false;
     this._leadSec = null;
+    this.resyncSinceSec = null;
+    this.resyncArmed = true;
   }
 
   /**
