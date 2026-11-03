@@ -85,12 +85,21 @@
     .controls button.mini {
       font-size: .85rem; padding: 6px 12px;
       display: inline-flex; align-items: center; justify-content: center;
-      gap: 5px; line-height: 1; white-space: nowrap; flex-shrink: 0;
+      gap: 5px; line-height: 1; white-space: nowrap; flex-shrink: 0; height: 34px;
     }
     .controls button.mini svg { width: 16px; height: 16px; }
     .controls #cat-toggle[aria-pressed="true"] { color: #fff; border-color: #777; }
+    /* Icon buttons hold one glyph per state; a fixed box keeps the row still. */
+    button.icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 40px; height: 34px; padding: 0; flex-shrink: 0;
+    }
+    button.icon svg { width: 20px; height: 20px; fill: currentColor; }
+    #start-camera:not(.screen) .i-screen, #start-camera.screen .i-camera { display: none; }
+    /* While live the source button shows what is broadcast, undimmed. */
+    #start-camera.live { opacity: 1; color: #fff; border-color: #3f8f43; }
 
-    /* Camera list: opens above the Camera button when there is a choice. */
+    /* Source list: the cameras and the screen, above the source button. */
     .menu-wrap { position: relative; flex-shrink: 0; }
     .menu {
       position: absolute; left: 0; bottom: calc(100% + 6px); z-index: 20;
@@ -111,7 +120,6 @@
       .wrapper { padding: 16px 12px; }
       .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
       .menu-wrap { position: static; }
-      .controls > button:not(.mini), .menu-wrap > button { padding: 6px 14px; }
       .controls button { min-height: 40px; }
     }
 
@@ -309,14 +317,30 @@
 
         <div class="controls">
           <div class="menu-wrap">
-            <button id="start-camera" type="button" aria-expanded="false">Camera</button>
-            <div id="camera-menu" class="menu" role="menu" aria-label="Camera" hidden></div>
+            <button id="start-camera" class="icon" type="button" title="Start a broadcast" aria-label="Start a broadcast"
+              aria-expanded="false">
+              <svg class="i-camera" viewBox="0 0 24 24" aria-hidden="true"><path
+                d="M3 7.5A2.5 2.5 0 0 1 5.5 5h8A2.5 2.5 0 0 1 16 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-8A2.5 2.5 0 0 1 3 16.5zM17 10l4-3v10l-4-3z"/></svg>
+              <svg class="i-screen" viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd"
+                d="M2 5.5A2.5 2.5 0 0 1 4.5 3h15A2.5 2.5 0 0 1 22 5.5v9a2.5 2.5 0 0 1-2.5 2.5h-15A2.5 2.5 0 0 1 2 14.5zM4 5v10h16V5zM8 19h8v2H8z"/></svg>
+            </button>
+            <div id="camera-menu" class="menu" role="menu" aria-label="Broadcast source" hidden></div>
           </div>
-          <button id="start-screen" type="button">Screen</button>
-          <button id="stop" type="button" disabled>Stop</button>
+          <button id="stop" class="icon" type="button" title="Stop the broadcast" aria-label="Stop the broadcast" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+          </button>
           <span class="spacer"></span>
-          <button id="settings-btn" class="mini" type="button" title="Broadcast settings" aria-label="Broadcast settings">⚙</button>
-          <button id="share-btn" class="mini" type="button" title="Viewer link" aria-label="Viewer link" hidden>⧉</button>
+          <button id="settings-btn" class="icon" type="button" title="Broadcast settings" aria-label="Broadcast settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="M19.69 9.79L22.34 10.18L22.34 13.82L19.69
+              14.21L19 15.88L20.6 18.02L18.02 20.6L15.88 19L14.21 19.69L13.82 22.34L10.18 22.34L9.79 19.69L8.12 19L5.98 20.6L3.4
+              18.02L5 15.88L4.31 14.21L1.66 13.82L1.66 10.18L4.31 9.79L5 8.12L3.4 5.98L5.98 3.4L8.12 5L9.79 4.31L10.18 1.66L13.82
+              1.66L14.21 4.31L15.88 5L18.02 3.4L20.6 5.98L19 8.12ZM15.5 12A3.5 3.5 0 1 0 8.5 12A3.5 3.5 0 1 0 15.5 12Z"/></svg>
+          </button>
+          <button id="share-btn" class="mini" type="button" title="Viewer link" aria-label="Viewer link" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path
+              d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
+          </button>
           <button id="cat-toggle" class="mini" type="button" title="Hide the catalog" aria-label="Catalog" aria-pressed="true">
             <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><rect
               x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14"/></svg>

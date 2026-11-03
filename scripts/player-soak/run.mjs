@@ -330,6 +330,8 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin
     // which moqx-main sends only when a viewer arrives.
     const goLive = async () => {
       await page.locator('#start-camera').click();
+      const camera = page.locator('#camera-menu [data-source="camera"]').first();
+      if (await camera.isVisible()) await camera.click();
       await page.waitForFunction(() => ['live', 'awaiting subscribe'].includes(document.querySelector('#state')?.textContent ?? ''),
         null, { timeout: 60_000 });
       return Date.now();
