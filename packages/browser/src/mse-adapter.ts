@@ -342,6 +342,11 @@ const STARTUP_SEEK_TOLERANCE_SEC = 0.1;
  */
 const STARTUP_SEEK_TIMEOUT_MS = 2000;
 
+/** Smooth startup: buffered media this close to the held delay counts as filled. */
+const SMOOTH_START_TOLERANCE_SEC = 0.05;
+/** Smooth startup plays anyway this long past when 1x arrival would have filled the held delay. */
+const SMOOTH_START_GRACE_MS = 1000;
+
 /**
  * How an awaited positioning operation ended. `timeout-accepted` is a timeout
  * whose postcondition nevertheless held (not seeking, landed at target) — it
@@ -627,6 +632,10 @@ export class MseMediaSource implements MediaSourceLike {
    * or a resolved play() from a superseded generation must never start playback.
    */
   private startupGeneration = 0;
+
+  /** Smooth: starts playback when the held delay never fills. */
+  private holdStartTimer: ReturnType<typeof setTimeout> | null = null;
+  private holdStartExpired = false;
 
   /** Removes the in-flight positioning listener + timer, whatever the outcome. */
   private startupCleanup: (() => void) | null = null;
@@ -959,6 +968,10 @@ export class MseMediaSource implements MediaSourceLike {
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
     this.targetAheadSec = options.targetAheadSec ?? 2;
+    if (options.smoothFloorSec !== undefined
+        && !(Number.isFinite(options.smoothFloorSec) && options.smoothFloorSec >= 0)) {
+      throw new Error(`smoothFloorSec must be finite and >= 0 (got ${String(options.smoothFloorSec)})`);
+    }
     this.latencyPolicy = options.latencyMode === 'smooth'
       ? new LatencyPolicy({
         mode: 'smooth',
@@ -2122,6 +2135,17 @@ export class MseMediaSource implements MediaSourceLike {
       // Bind every fact this attempt records to the session it started in.
       const facts = this.startupFacts;
       const { start, duration } = position;
+      // Smooth starts with its held delay buffered.
+      const holdSec = this.latencyPolicy && !this.holdStartExpired ? this.latencyPolicy.heldUs / 1e6 : 0;
+      if (duration + SMOOTH_START_TOLERANCE_SEC < holdSec) {
+        this.holdStartTimer ??= setTimeout(() => {
+          this.holdStartTimer = null;
+          this.holdStartExpired = true;
+          void this.requestStartup().catch(() => { /* contained */ });
+        }, holdSec * 1000 + SMOOTH_START_GRACE_MS);
+        return;
+      }
+      this.clearHoldStart();
       const needsSeek = this.video.currentTime < start
         || this.video.currentTime >= start + duration;
 
@@ -2357,6 +2381,8 @@ export class MseMediaSource implements MediaSourceLike {
    * unwinds instead of hanging forever.
    */
   private cancelStartup(): void {
+    this.clearHoldStart();
+    this.holdStartExpired = false;
     this.startupGeneration++;
     const settle = this.startupSettle;
     this.startupSettle = null;
@@ -2364,6 +2390,11 @@ export class MseMediaSource implements MediaSourceLike {
     else this.startupCleanup?.();
     this.startupCleanup = null;
     this.startupPhase = 'idle';
+  }
+
+  private clearHoldStart(): void {
+    if (this.holdStartTimer !== null) clearTimeout(this.holdStartTimer);
+    this.holdStartTimer = null;
   }
 
   // ─── Playhead-wedge watchdog ─────────────────────────────────────
