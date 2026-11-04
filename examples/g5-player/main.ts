@@ -82,6 +82,7 @@ const volumeBar = document.getElementById('volume') as HTMLInputElement;
 const muteBtn = document.getElementById('mute-btn') as HTMLButtonElement;
 const qualitySelect = document.getElementById('quality') as HTMLSelectElement;
 const viewSelect = document.getElementById('view') as HTMLSelectElement;
+const audioSelect = document.getElementById('audio') as HTMLSelectElement;
 const langSelect = document.getElementById('lang') as HTMLSelectElement;
 const menuBtn = document.getElementById('menu-btn') as HTMLButtonElement;
 const menu = document.getElementById('menu')!;
@@ -616,11 +617,36 @@ async function main(): Promise<void> {
     if (current) viewSelect.value = `${current.renderGroup ?? ''}:${current.altGroup}`;
     viewSelect.closest<HTMLElement>('.menu-row')!.hidden = catalogViews.length < 2;
   }
+  type AudioTrack = (typeof player.availableAudioTracks)[number];
+  /** The program's audio feeds: tracks sharing an altGroup are one feed in several languages. */
+  const audioFeeds = (): AudioTrack[][] => {
+    const feeds = new Map<string, AudioTrack[]>();
+    for (const t of player.availableAudioTracks) {
+      const key = t.altGroup === undefined ? `track:${t.name}` : `group:${t.altGroup}`;
+      feeds.set(key, [...(feeds.get(key) ?? []), t]);
+    }
+    return [...feeds.values()];
+  };
+  /** A language in its own name ("English", "Español"); the code when the browser cannot name it. */
+  const languageName = (lang: string): string => {
+    try {
+      const name = new Intl.DisplayNames([lang], { type: 'language' }).of(lang) ?? lang;
+      return name.charAt(0).toLocaleUpperCase(lang) + name.slice(1);
+    } catch {
+      return lang;
+    }
+  };
+  /** Audio lists the feeds; Language lists the languages of the feed playing. */
+  function fillAudioPickers(): void {
+    const feeds = audioFeeds();
+    const current = player.currentAudioTrackName;
+    const playing = feeds.find((f) => f.some((t) => t.name === current)) ?? feeds[0] ?? [];
+    fillPicker(audioSelect, feeds.map((f) => [f[0]!.name, f[0]!.label ?? f[0]!.name]), playing[0]?.name);
+    fillPicker(langSelect, playing.map((t) => [t.name, t.lang ? languageName(t.lang) : t.label ?? t.name]), current);
+  }
   function fillTrackPickers(): void {
     fillViewPicker();
-    fillPicker(langSelect,
-      player.availableAudioTracks.map((t) => [t.name, t.label ?? t.lang ?? t.name]),
-      player.currentAudioTrackName);
+    fillAudioPickers();
   }
   player.on('catalog_updated', () => fillTrackPickers());
   player.on('view_changed', ({ fromView, toView, trackName }) => {
@@ -2118,7 +2144,14 @@ async function main(): Promise<void> {
     }
     if (altGroup !== player.currentView) await player.selectView(altGroup);
   });
-  switchFrom(langSelect, 'Audio', () => player.selectAudioTrack(langSelect.value));
+  // A feed switch keeps the language playing when the feed has it.
+  switchFrom(audioSelect, 'Audio', () => {
+    const feed = audioFeeds().find((f) => f[0]!.name === audioSelect.value) ?? [];
+    const lang = player.availableAudioTracks.find((t) => t.name === player.currentAudioTrackName)?.lang;
+    const track = feed.find((t) => lang !== undefined && t.lang === lang) ?? feed[0];
+    return track ? player.selectAudioTrack(track.name) : Promise.resolve();
+  });
+  switchFrom(langSelect, 'Language', () => player.selectAudioTrack(langSelect.value));
 
   // ── Load ──────────────────────────────────────────────────────────
 

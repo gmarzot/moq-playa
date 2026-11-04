@@ -59,7 +59,8 @@ Forward State change, capture gaps, and the per-minute capture drift.
 
 Controls: play/pause, timeline, speaker (on phones it opens a volume slider
 with mute), ⚙ (View: every view of the catalog, grouped by program; Quality;
-Language; Latency: Live edge or Smooth; Connection settings), catalog panel.
+Audio: the program's audio feeds; Language: the languages of the feed playing;
+Latency: Live edge or Smooth; Connection settings), catalog panel.
 A view this browser cannot decode is listed as "not supported here" and
 cannot be chosen.
 
@@ -137,8 +138,9 @@ page looks for a relay on port 4433 of its host and falls back to moqx-main.
 Program 1 (NASA TV, Director's cut) and seven cameras in Program 2, one of them
 H.265 and one AV1; English, Spanish, commentary (Opus) and liftoff-call audio.
 The player takes one video and one audio at a time: ⚙ → View lists all nine
-views by program (picking a view in the other program switches both), and ⚙ →
-Language switches audio. It needs `compat=loc-bare` (the FFmpeg muxer sends
+views by program (picking a view in the other program switches both); ⚙ →
+Audio picks NASA TV, Commentary or Liftoff call, and ⚙ → Language picks English
+or Español for NASA TV. It needs `compat=loc-bare` (the FFmpeg muxer sends
 LOC frames without the private-properties block). An H.265 camera is listed as
 not supported where the browser cannot decode H.265.
 
