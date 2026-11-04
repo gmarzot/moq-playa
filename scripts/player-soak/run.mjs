@@ -149,6 +149,7 @@ async function playCase(browser, webUrl, c, impair = null) {
     followNamespace: '1', log: 'info' });
   if (c.packaging === 'loc') query.set('output', 'canvas');
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
+  if (c.profile?.latency) query.set('latency', c.profile.latency);
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
   // The disruption in progress; cleared only once its stop() succeeds.

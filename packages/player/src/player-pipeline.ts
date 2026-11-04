@@ -25,6 +25,7 @@ import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
+import { LatencyPolicy, SMOOTH_CEILING_MS } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 import { usesMsePath } from './packaging.js';
@@ -116,6 +117,8 @@ export interface PipelineSet {
    * smoother (only scheduling does). Absent for CMAF-only sessions.
    */
   getRenderCushionUs?: () => number;
+  /** The LOC smooth latency policy; absent in live mode or without LOC media. */
+  latencyPolicy?: LatencyPolicy;
 }
 
 /** Context for handlePipelineEvent. */
@@ -271,9 +274,31 @@ export function createPipelines(
     config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : defaultMaxUs,
     cushionFloorUs,
   );
-  const renderCushion = hasLoc
-    ? new RenderCushionSmoother({ floorUs: cushionFloorUs, maxUs: cushionMaxUs }, clock)
+  // Smooth latency: late media raises the cushion past the live cap, up to the ceiling.
+  const latencyPolicy = hasLoc && config.latencyMode === 'smooth'
+    ? new LatencyPolicy({
+      mode: 'smooth',
+      baseUs: cushionFloorUs,
+      ceilingUs: Math.max((config.smoothCeilingMs ?? SMOOTH_CEILING_MS) * 1000, cushionMaxUs),
+    }, clock)
     : null;
+  const renderCushion = hasLoc
+    ? new RenderCushionSmoother({ floorUs: cushionFloorUs, maxUs: latencyPolicy?.ceilingUs ?? cushionMaxUs }, clock)
+    : null;
+  /** The cushion in force: the jitter estimate within the live cap, or the smooth hold above it. */
+  const cushionUs = (): number => renderCushion?.update(Math.max(
+    Math.min(videoPipeline?.effectiveGapTimeoutUs ?? 0, cushionMaxUs), latencyPolicy?.heldUs ?? 0))
+    ?? cushionFloorUs;
+  /** Smooth: an arrival `slackUs` past its slot raises the cushion at once, and audio realigns to it. */
+  const noteSlack = (slackUs: number): number => {
+    if (!latencyPolicy || !renderCushion) return cushionUs();
+    const raised = latencyPolicy.noteArrival(slackUs, renderCushion.currentUs);
+    if (raised !== null && raised > renderCushion.currentUs) {
+      renderCushion.raiseTo(raised);
+      audioOutput?.realign?.();
+    }
+    return renderCushion.currentUs;
+  };
 
   if (videoDecoder || audioDecoder) {
     commandDispatcher = new CommandDispatcher(defined({
@@ -299,21 +324,27 @@ export function createPipelines(
       // are fresh relative to the current clock, not stale from pipeline processing.
       // Adds a playback delay cushion to absorb network jitter — frames are
       // scheduled slightly into the future so delivery stalls don't cause stutter.
-      recomputeVideoRenderTime: (captureTimestampUs: bigint) => {
+      recomputeVideoRenderTime: (captureTimestampUs: bigint, fromHoldQueue?: boolean) => {
         // The SMOOTHED shared playout cushion (the same smoothed value is
         // passed to audio scheduling via getPlaybackDelayUs; audio adopts it
         // at anchor/underrun boundaries) — slew-limited so raw gap-fuse
         // swings cannot step render times (a stepwise collapse froze video
         // in the field).
-        const playbackDelayUs = renderCushion?.update(videoPipeline?.effectiveGapTimeoutUs)
-          ?? cushionFloorUs;
+        let playbackDelayUs = cushionUs();
 
         // Sync reference is guaranteed here — CommandDispatcher holds frames
         // until hasSyncReference() returns true, so this callback only fires
         // after the reference is established. No speculative fallback needed.
         const timing = syncController.computeVideoRenderTime(captureTimestampUs);
         if (!timing) return clock.now() + playbackDelayUs; // safety: shouldn't happen
-        if (timing.shouldDrop) return clock.now();
+        // Frames held for the sync reference waited on the player, not the network.
+        if (latencyPolicy && !fromHoldQueue) {
+          playbackDelayUs = noteSlack(timing.renderTimeUs + playbackDelayUs - clock.now());
+        }
+        // Smooth renders a raised frame at its slot; past the ceiling it renders now, as in live.
+        if (timing.shouldDrop && (!latencyPolicy || timing.renderTimeUs + playbackDelayUs < clock.now())) {
+          return clock.now();
+        }
 
         // PTS-anchored render time + playback delay. No future cap — the
         // CaptureTimestamp spacing IS correct frame pacing. The maxFutureUs
@@ -321,8 +352,9 @@ export function createPipelines(
         return timing.renderTimeUs + playbackDelayUs;
       },
       hasSyncReference: () => syncController.hasReference,
-      getPlaybackDelayUs: () =>
-        renderCushion?.update(videoPipeline?.effectiveGapTimeoutUs) ?? cushionFloorUs,
+      getPlaybackDelayUs: (renderTimeUs?: number) => latencyPolicy && renderTimeUs !== undefined
+        ? noteSlack(renderTimeUs + cushionUs() - clock.now())
+        : cushionUs(),
     }));
   }
 
@@ -355,7 +387,8 @@ export function createPipelines(
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
       // The cushion the dispatcher adds to audio render times (peek only).
-      getPlaybackDelayUs: () => renderCushion?.currentUs ?? cushionFloorUs,
+      // Smooth drops before decode only audio late past the ceiling; the rest raises the cushion.
+      getPlaybackDelayUs: () => latencyPolicy?.ceilingUs ?? renderCushion?.currentUs ?? cushionFloorUs,
     });
   }
 
@@ -372,6 +405,7 @@ export function createPipelines(
       // smoother — polling player.stats must never mutate playback timing.
       getRenderCushionUs: () => renderCushion.currentUs,
     } : {}),
+    ...(latencyPolicy ? { latencyPolicy } : {}),
   };
 }
 

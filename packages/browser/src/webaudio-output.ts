@@ -33,6 +33,8 @@ const CHASE_ON_RATIO = 0.66;
 const CHASE_ON_MIN_SEC = 0.02;
 /** After an underrun, late audio arriving this soon after it is skipped to resume on schedule. */
 const RESYNC_BURST_SEC = 0.05;
+/** A realign waits for the slot only when the chain runs ahead of it by more than this. */
+const REALIGN_MIN_SEC = 0.02;
 
 /**
  * WebAudio playout behind AudioOutputLike.
@@ -116,6 +118,8 @@ export class WebAudioOutput implements AudioOutputLike {
   private gapLateSec: number | null = null;
   /** Audio arrived ahead of its slot since the last resync, so lateness is not persistent. */
   private resyncArmed = true;
+  /** realign() was called; the next buffer with a slot consumes it. */
+  private realignPending = false;
 
   /** Audio scheduled beyond the current playout point, in seconds. */
   get scheduledAheadSec(): number {
@@ -194,6 +198,11 @@ export class WebAudioOutput implements AudioOutputLike {
     this.audioCtx.addEventListener?.('statechange', this.onStateChange);
   }
 
+  /** The playout delay grew: the next buffer waits for its slot if the chain runs ahead of it. */
+  realign(): void {
+    this.realignPending = true;
+  }
+
   /** Band above target before the chase engages. */
   private get chaseOnSec(): number {
     return Math.max(CHASE_ON_MIN_SEC, this.targetAheadSec * CHASE_ON_RATIO);
@@ -270,6 +279,8 @@ export class WebAudioOutput implements AudioOutputLike {
     const alignedTime = renderTimeUs > 0
       ? this.toAudioCtxTime(renderTimeUs) + this.playbackDelaySec : null;
     if (alignedTime !== null && alignedTime >= now) this.resyncArmed = true;
+    const realign = this.realignPending && alignedTime !== null;
+    if (realign) this.realignPending = false;
 
     // Audio scheduling strategy:
     // - Normal playback: chain back-to-back (nextScheduledTime) for
@@ -285,6 +296,7 @@ export class WebAudioOutput implements AudioOutputLike {
     if (this.nextScheduledTime !== null && this.nextScheduledTime >= now) {
       // Normal playback — back-to-back for seamless audio
       startTime = this.nextScheduledTime;
+      if (realign && alignedTime !== null && alignedTime - startTime > REALIGN_MIN_SEC) startTime = alignedTime;
       if (alignedTime !== null) {
         // Lead = queued backlog + arrival lateness. Only the backlog can be
         // shed by dropping; lateness is left to the chase.
@@ -457,6 +469,7 @@ export class WebAudioOutput implements AudioOutputLike {
     this._leadSec = null;
     this.resyncSinceSec = null;
     this.resyncArmed = true;
+    this.realignPending = false;
   }
 
   /**

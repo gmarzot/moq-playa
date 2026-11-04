@@ -84,6 +84,13 @@ export class RenderCushionSmoother {
     return this._currentUs ?? this.floorUs;
   }
 
+  /** Step up to `us` (clamped) at once; a late arrival already cost the time. */
+  raiseTo(us: number): number {
+    this._currentUs = Math.max(this.currentUs, Math.min(us, this.maxUs));
+    this.lastUpdateUs = this.clock.now();
+    return this._currentUs;
+  }
+
   /**
    * Advance toward `clamp(max(rawAdaptiveUs, floor), floor, max)` at the
    * slew limits. The FIRST call snaps to the clamped target — no frames are

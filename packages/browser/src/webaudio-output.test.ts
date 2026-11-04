@@ -259,6 +259,32 @@ describe('unified playout cushion (delay unification)', () => {
     expect(ctx.started[1]!.when).toBeCloseTo(1.22, 5);
   });
 
+  it('realign(): the next buffer waits for a grown cushion\'s slot, once', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_200_000);      // anchor at 1.2
+    out.realign();                                                      // cushion grew 200 ms
+    out.schedule(audioData(20_000) as unknown as AudioData, 1_420_000); // chain at 1.22, slot 1.42
+    expect(ctx.started[1]!.when).toBeCloseTo(1.42, 5);
+    out.schedule(audioData(40_000) as unknown as AudioData, 1_640_000);
+    expect(ctx.started[2]!.when).toBeCloseTo(1.44, 5);                  // back-to-back again
+  });
+
+  it('realign() leaves a chain within 20 ms of its slot, and flush() cancels a pending one', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_200_000);
+    out.realign();
+    out.schedule(audioData(20_000) as unknown as AudioData, 1_230_000); // 10 ms past the chain
+    expect(ctx.started[1]!.when).toBeCloseTo(1.22, 5);
+    out.realign();
+    out.flush();
+    ctx.currentTime = 2.0;
+    out.schedule(audioData(40_000) as unknown as AudioData, 2_200_000); // anchor
+    out.schedule(audioData(60_000) as unknown as AudioData, 2_520_000);
+    expect(ctx.started[3]!.when).toBeCloseTo(2.22, 5);
+  });
+
   it('the next underrun re-anchor ADOPTS the grown cushion (adoption boundary)', () => {
     const { ctx, out } = makeOutput(0);
     ctx.currentTime = 1.0;

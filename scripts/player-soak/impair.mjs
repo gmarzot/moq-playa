@@ -22,6 +22,8 @@ export class Impairment {
     this.dev = dev;
     this.addresses = addresses;
     this.profile = { down: PASS, up: PASS };
+    /** Links, qdiscs and ingress filters found at setup, for the case evidence. */
+    this.found = null;
   }
 
   /** Resolve the relays' IPv4 addresses and the uplink device that reaches them. */
@@ -46,6 +48,11 @@ export class Impairment {
     await sudo(['ip', 'link', 'set', IFB, 'up']);
     // Hosted runners may already hook ingress with clsact; reuse it rather than replace it.
     const qdiscs = await sudo(['tc', 'qdisc', 'show', 'dev', this.dev]);
+    this.found = {
+      links: (await sudo(['ip', '-o', 'link', 'show'])).trim(),
+      qdiscs: qdiscs.trim(),
+      ingressFilters: (await sudo(['tc', 'filter', 'show', 'dev', this.dev, 'ingress']).catch((e) => String(e))).trim(),
+    };
     const ingress = /qdisc clsact ffff:/.test(qdiscs) ? 'ffff:fff2' : 'ffff:';
     if (!/qdisc (clsact|ingress) ffff:/.test(qdiscs)) {
       await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'handle', 'ffff:', 'ingress']);
@@ -56,8 +63,10 @@ export class Impairment {
       'priomap', '1', '2', '2', '2', '1', '2', '0', '0', '1', '1', '1', '1', '1', '1', '1', '1']);
     await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'parent', '1:4', 'handle', '40:', 'netem', ...split(PASS)]);
     for (const a of this.addresses) {
-      await sudo(['tc', 'filter', 'add', 'dev', this.dev, 'parent', ingress, 'protocol', 'ip', 'u32',
-        'match', 'ip', 'src', `${a}/32`, 'action', 'mirred', 'egress', 'redirect', 'dev', IFB]);
+      // First in line: a filter already on the hook that ends classification would skip ours.
+      const redirect = ['u32', 'match', 'ip', 'src', `${a}/32`, 'action', 'mirred', 'egress', 'redirect', 'dev', IFB];
+      const head = ['tc', 'filter', 'add', 'dev', this.dev, 'parent', ingress, 'protocol', 'ip'];
+      await sudo([...head, 'pref', '1', ...redirect]).catch(() => sudo([...head, ...redirect]));
       await sudo(['tc', 'filter', 'add', 'dev', this.dev, 'parent', '1:', 'protocol', 'ip', 'prio', '1', 'u32',
         'match', 'ip', 'dst', `${a}/32`, 'flowid', '1:4']);
     }
@@ -88,6 +97,8 @@ export class Impairment {
     return {
       down: (await sudo(['tc', '-s', 'qdisc', 'show', 'dev', IFB])).trim(),
       up: (await sudo(['tc', '-s', 'qdisc', 'show', 'dev', this.dev, 'parent', '1:4'])).trim(),
+      ingressFilters: (await sudo(['tc', '-s', 'filter', 'show', 'dev', this.dev, 'ingress']).catch((e) => String(e))).trim(),
+      found: this.found,
     };
   }
 }

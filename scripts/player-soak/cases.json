@@ -153,6 +153,15 @@
     "wifi": {
       "netem": "delay 10ms 5ms slot 20ms 60ms loss 0.5%"
     },
+    "bursty": {
+      "down": "delay 20ms slot 20ms 450ms",
+      "up": "delay 20ms"
+    },
+    "bursty-smooth": {
+      "down": "delay 20ms slot 20ms 450ms",
+      "up": "delay 20ms",
+      "latency": "smooth"
+    },
     "blackouts": {
       "events": [
         {

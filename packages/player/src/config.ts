@@ -19,6 +19,7 @@ import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/p
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
 import type { LogLevel, LoggerLike } from './logger.js';
+import type { LatencyMode } from './latency-policy.js';
 
 // ─── Known Track Metadata (TTFF optimization) ────────────────────────
 
@@ -414,6 +415,17 @@ export interface LatencyConfig {
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly catchUpRecoveryMs?: number;
+
+  /**
+   * `'live'` (default) holds playout at the target: late media is skipped or
+   * dropped. `'smooth'` raises the playout delay when media arrives late, up to
+   * `smoothCeilingMs`, so it plays instead; the delay steps back down after
+   * clean periods.
+   */
+  readonly latencyMode?: LatencyMode;
+
+  /** Ceiling of the smooth playout delay in milliseconds. Default: 2000. */
+  readonly smoothCeilingMs?: number;
 }
 
 /** Quality / ABR options. */
@@ -894,6 +906,7 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     ['livenessHealthyResetMs', config.livenessHealthyResetMs],
     ['renderCushionFloorMs', config.renderCushionFloorMs],
     ['renderCushionMaxMs', config.renderCushionMaxMs],
+    ['smoothCeilingMs', config.smoothCeilingMs],
   ];
 
   for (const [name, value] of msFields) {
@@ -907,6 +920,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(
       `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
     );
+  }
+
+  if (config.latencyMode !== undefined && config.latencyMode !== 'live' && config.latencyMode !== 'smooth') {
+    throw new RangeError(`latencyMode must be 'live' or 'smooth', got ${String(config.latencyMode)}`);
   }
 
   if (config.autoResume !== undefined && typeof config.autoResume !== 'boolean') {

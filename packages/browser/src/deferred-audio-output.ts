@@ -75,6 +75,10 @@ export class DeferredAudioOutput implements AudioOutputLike {
     return this.real?.playheadCaptureUs?.() ?? null;
   }
 
+  realign(): void {
+    this.real?.realign?.();
+  }
+
   setPlaybackRate(rate: number): void {
     this.pendingRate = rate;
     this.real?.setPlaybackRate?.(rate);

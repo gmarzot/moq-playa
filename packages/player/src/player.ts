@@ -70,6 +70,7 @@ interface LocmafChunkDetails {
   readonly baseMediaDecodeTime: bigint;
 }
 import type { MediaSourceLike, VideoPresentation } from './interfaces.js';
+import type { LatencyPolicy } from './latency-policy.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
@@ -521,6 +522,7 @@ export class MoqtPlayer {
   private announcingState = false;
   /** Smoothed LOC render cushion getter (slice A); null for CMAF sessions. */
   private getRenderCushionUs: (() => number) | null = null;
+  private latencyPolicy: LatencyPolicy | null = null;
 
   /** Whether mediaSource.initialize() has been called. */
   private cmafInitialized = false;
@@ -1387,7 +1389,11 @@ export class MoqtPlayer {
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
       audioLateDrops: this.audioPipeline?.lateAudioDrops ?? null,
     } : undefined;
-    return Object.freeze(this._stats.snapshot(locGauges));
+    // The policy of the path that renders video: LOC when there is a LOC video pipeline, else MSE.
+    const locLatency = this.latencyPolicy?.stats ?? null;
+    const mseLatency = this.mediaSource?.latencyStats?.() ?? null;
+    const latency = this.videoPipeline ? locLatency ?? mseLatency : mseLatency ?? locLatency;
+    return Object.freeze(this._stats.snapshot(locGauges, latency));
   }
 
   /**
@@ -8961,6 +8967,7 @@ export class MoqtPlayer {
       this.mediaSource?.setTargetAheadSec?.(targetLatencyMs / 1000);
     }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
+    this.latencyPolicy = pipelines.latencyPolicy ?? null;
 
     // Wire MSE stall detection to ABR emergency downshift.
     // CMAF has no pipeline-level stall handler — the MseMediaSource

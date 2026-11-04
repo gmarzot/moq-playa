@@ -51,6 +51,8 @@ another, first play draft only) under a profile from `cases.json`:
 | `jitter` | 60 ± 20 ms, normal distribution (reorders) |
 | `capped` | 3 Mbit/s down with a 200-packet queue, 30 ms each way |
 | `wifi` | netem slots (bursts every 20–60 ms), 0.5% loss |
+| `bursty` | downlink held and released in slots 20–450 ms apart, 20 ms each way |
+| `bursty-smooth` | `bursty`, played with `latencyMode: 'smooth'` |
 | `blackouts` | all relay traffic dropped for 3 s at 30 s and 10 s at 75 s |
 | `hidden-tab` | tab hidden for 5 s at 30 s and 20 s at 75 s |
 | `republish` | plays `…/<packaging>/restart`, whose broadcaster (`--variant restart`) stops and starts every `restartEveryS` |
@@ -77,4 +79,5 @@ pnpm test:player:soak --broadcast-player aiomoqt-relay:cmaf --tag t1 --profile b
 CI: `.github/workflows/player-soak.yml`, on demand and nightly; it needs the
 `MTT_API_KEY` repository secret (a moq-test-tracks key with the `run` role).
 Each profile gets one runner for the `adverse.broadcasts`; a pull request runs
-only the profiles marked `smoke`.
+only the profiles marked `smoke`. A dispatch's `only` takes a comma-separated
+list, e.g. `bursty,bursty-smooth` plays both against the same broadcasts.

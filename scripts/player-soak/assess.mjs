@@ -168,6 +168,7 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
   player.avSkewMs = { p50: median(skews), max: skews.length ? Math.max(...skews.map(Math.abs)) : null };
   player.cushionMs = { p50: median(cushions), min: cushions.length ? Math.min(...cushions) : null };
   player.timeToFirstFrameMs = lastStats?.timeToFirstFrameMs ?? null;
+  player.latency = lastStats?.latency ?? null;
 
   const events = {};
   for (const e of ticks.flatMap((t) => t.events ?? [])) events[e.type] = (events[e.type] ?? 0) + 1;

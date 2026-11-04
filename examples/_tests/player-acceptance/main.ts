@@ -48,6 +48,7 @@ const player = new Player(null, {
   ...(params.has('gestureAudio') ? { audioActivation: 'gesture' as const } : {}),
   startLevel: Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
+  ...(params.get('latency') === 'smooth' ? { latencyMode: 'smooth' as const } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : (['error', 'warn', 'info'] as const).find((l) => l === params.get('log')) ?? 'none',
     ...(params.get('warmStart') === '1' ? { warmStartCurrentGroup: true } : {}),

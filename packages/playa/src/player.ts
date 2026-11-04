@@ -380,6 +380,7 @@ export class Player {
       avSkewMs: s.avSkewEwmaMs ?? null,
       cushionMs: this.cushionMs(),
       audioUnderruns: this.audioOutput?.underrunCount ?? 0,
+      latency: s.latency,
     };
   }
 
@@ -733,8 +734,12 @@ export class Player {
     }
 
     Object.assign(base, {
-      createMediaSource: () => new MseMediaSource(this.videoElement!,
-        opts.targetLatencyMs !== undefined ? { targetAheadSec: opts.targetLatencyMs / 1000 } : {}),
+      // Latency settings are read from base when the adapter is built, after moqtPlayerConfig overrides merge.
+      createMediaSource: () => new MseMediaSource(this.videoElement!, {
+        ...(opts.targetLatencyMs !== undefined ? { targetAheadSec: opts.targetLatencyMs / 1000 } : {}),
+        ...(base.latencyMode !== undefined ? { latencyMode: base.latencyMode } : {}),
+        ...(base.smoothCeilingMs !== undefined ? { smoothCeilingSec: base.smoothCeilingMs / 1000 } : {}),
+      }),
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),
     });
@@ -748,6 +753,8 @@ export class Player {
     if (opts.targetLatencyMs !== undefined) {
       (base as unknown as Record<string, unknown>).targetLatencyMs = opts.targetLatencyMs;
     }
+    if (opts.latencyMode !== undefined) Object.assign(base, { latencyMode: opts.latencyMode });
+    if (opts.smoothCeilingMs !== undefined) Object.assign(base, { smoothCeilingMs: opts.smoothCeilingMs });
     if (opts.authTokens) {
       (base as unknown as Record<string, unknown>).authTokens = opts.authTokens;
     }
