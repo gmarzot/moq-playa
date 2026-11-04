@@ -87,7 +87,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `autoResume=0` | off: a hidden tab waits until it is viewed | on |
 | `locmaf=frame` | LOCMAF through WebCodecs instead of MSE | MSE |
 | `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
-| `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays | none |
+| `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays; `loc-bare`: LOC frames without the private-properties block | none |
 | `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
 | `hash=` | relay certificate hash (hex) | none |
 | `clockUrl=` | clock reference | the page host's `/time` |
@@ -114,12 +114,23 @@ be down; check before a demo. Each carries video, audio and an MSF catalog.
 
 | Namespace | Relay | Packaging |
 |---|---|---|
+| `openmoq/ffmpeg/artemis` | aiomoqt-relay, draft 18 | LOC, multitrack |
 | `openmoq/aiomoqt/mtt_00/artemis_directors/loc/h264/1080/30/aac/2` | aiomoqt-relay | LOC |
 | `openmoq/aiomoqt/mtt_00/bbb_4k30/cmaf/h264/1080/30/aac/2` | aiomoqt-relay | CMAF |
 | `openmoq/aiomoqt/mtt_00/bbb_4k30/cmaf/h264/1080/30/aac/2` | moqx-main (optional) | CMAF |
 
-On the deployed player: `/g5-player/?ns=<namespace>&v=22` (aiomoqt-relay is
-this host's relay), or add `url=` for moqx-main with `v=18`.
+Play with the relay given: `/g5-player/?url=https://aiomoqt-relay.marzresearch.net:4443/&ns=<namespace>&v=22`
+(`v=18` for moqx-main and for `openmoq/ffmpeg/artemis`). Without `url=` the
+page looks for a relay on port 4433 of its host and falls back to moqx-main.
+
+`openmoq/ffmpeg/artemis` is the FFmpeg multitrack Artemis II set: two views in
+Program 1 (NASA TV, Director's cut) and seven cameras in Program 2, one of them
+H.265 and one AV1; English, Spanish, commentary (Opus) and liftoff-call audio.
+The player takes one video and one audio at a time; the view picker and ⚙ →
+Language switch them. It needs `compat=loc-bare` (the FFmpeg muxer sends LOC
+frames without the private-properties block). The H.265 camera plays only where
+the browser decodes H.265; where it does not, the player stays on it until a
+reload.
 
 When one is not running, generate it yourself with the
 [moq-test-tracks](https://github.com/openmoq/moq-test-tracks) generator, under
