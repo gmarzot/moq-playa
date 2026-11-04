@@ -268,9 +268,13 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chrome
+      # The player runs in a network namespace and is shaped on its veth pair: the runner's
+      # own ingress hook (a BPF filter) would keep relay traffic from an IFB redirect.
       - name: Play the broadcasts under ${{ matrix.profile }}
         run: |
-          node scripts/player-soak/run.mjs --broadcast-player "${{ needs.cases.outputs.adverse_broadcasts }}" \
+          sudo sh scripts/player-soak/netns.sh soak
+          sudo -E ip netns exec soak sudo -E -u "$USER" env "PATH=$PATH" "HOME=$HOME" SOAK_NETNS=soak \
+            node scripts/player-soak/run.mjs --broadcast-player "${{ needs.cases.outputs.adverse_broadcasts }}" \
             --profile "${{ matrix.profile }}" --minutes "$ADVERSE_MINUTES"
       - uses: actions/upload-artifact@v4
         if: always()

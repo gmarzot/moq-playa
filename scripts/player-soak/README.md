@@ -57,9 +57,12 @@ another, first play draft only) under a profile from `cases.json`:
 | `hidden-tab` | tab hidden for 5 s at 30 s and 20 s at 75 s |
 | `republish` | plays `…/<packaging>/restart`, whose broadcaster (`--variant restart`) stops and starts every `restartEveryS` |
 
-Shaping uses `tc` netem through sudo (`impair.mjs`): only traffic with the
-relays' IPv4 addresses, ingress through an IFB device. It is for disposable CI
-runners, never a shared host. A hidden tab is a page brought to front over the
+Shaping uses `tc` netem through sudo (`impair.mjs`), on disposable CI runners,
+never a shared host. In CI the shaped player runs in a network namespace
+(`netns.sh`, `SOAK_NETNS`) and its veth pair is shaped in both directions; the
+runner's own BPF ingress filter would keep relay traffic from an ingress
+redirect. Elsewhere only traffic with the relays' IPv4 addresses is shaped,
+ingress through an IFB device. A hidden tab is a page brought to front over the
 player, or an emulated visibility state where headless Chrome keeps the covered
 page visible (`method` in the evidence).
 

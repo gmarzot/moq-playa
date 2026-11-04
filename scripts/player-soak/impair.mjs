@@ -1,7 +1,10 @@
 /**
  * Network impairment for a soak player on a disposable CI runner (Linux tc
- * netem, through sudo). Only traffic to and from the relays' addresses is
- * shaped: ingress through an IFB device, egress through a filtered prio band.
+ * netem, through sudo). With SOAK_NETNS set, the player runs in that network
+ * namespace (netns.sh) and the veth pair is shaped: veth-host egress is the
+ * player's downlink, veth-ns egress its uplink. Otherwise only traffic to and
+ * from the relays' addresses is shaped: ingress through an IFB device, egress
+ * through a filtered prio band.
  */
 import { execFile } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
@@ -17,6 +20,46 @@ const sudo = (argv) => new Promise((resolve, reject) => {
 });
 const split = (netem) => netem.trim().split(/\s+/);
 
+/** Shapes the namespace's veth pair; the host side is reached through pid 1's network namespace. */
+class VethImpairment {
+  constructor() {
+    this.dev = 'veth-ns';
+    this.addresses = ['all traffic of the namespace'];
+    this.profile = { down: PASS, up: PASS };
+    this.found = null;
+  }
+
+  async setup() {
+    await sudo(['nsenter', '-t', '1', '-n', 'tc', 'qdisc', 'add', 'dev', 'veth-host', 'root', 'netem', ...split(PASS)]);
+    await sudo(['tc', 'qdisc', 'add', 'dev', 'veth-ns', 'root', 'netem', ...split(PASS)]);
+  }
+
+  async apply(profile = {}) {
+    this.profile = { down: profile.down ?? profile.netem ?? PASS, up: profile.up ?? profile.netem ?? PASS };
+    await this.set(this.profile.down, this.profile.up);
+  }
+
+  async blackout() {
+    await this.set('loss 100%', 'loss 100%');
+  }
+
+  async restore() {
+    await this.set(this.profile.down, this.profile.up);
+  }
+
+  async set(down, up) {
+    await sudo(['nsenter', '-t', '1', '-n', 'tc', 'qdisc', 'replace', 'dev', 'veth-host', 'root', 'netem', ...split(down)]);
+    await sudo(['tc', 'qdisc', 'replace', 'dev', 'veth-ns', 'root', 'netem', ...split(up)]);
+  }
+
+  async stats() {
+    return {
+      down: (await sudo(['nsenter', '-t', '1', '-n', 'tc', '-s', 'qdisc', 'show', 'dev', 'veth-host'])).trim(),
+      up: (await sudo(['tc', '-s', 'qdisc', 'show', 'dev', 'veth-ns'])).trim(),
+    };
+  }
+}
+
 export class Impairment {
   constructor(dev, addresses) {
     this.dev = dev;
@@ -28,6 +71,7 @@ export class Impairment {
 
   /** Resolve the relays' IPv4 addresses and the uplink device that reaches them. */
   static async forRelays(urls) {
+    if (process.env.SOAK_NETNS) return new VethImpairment();
     const hosts = [...new Set(urls.map((u) => new URL(u).hostname))];
     const addresses = [...new Set((await Promise.all(hosts.map((h) => lookup(h, { all: true, family: 4 }))))
       .flat().map((a) => a.address))];
