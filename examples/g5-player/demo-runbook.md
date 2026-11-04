@@ -120,16 +120,19 @@ be down; check before a demo. Each carries video, audio and an MSF catalog.
 On the deployed player: `/g5-player/?ns=<namespace>&v=22` (aiomoqt-relay is
 this host's relay), or add `url=` for moqx-main with `v=18`.
 
-When one is not running, generate the same tracks yourself with the
+When one is not running, generate it yourself with the
 [moq-test-tracks](https://github.com/openmoq/moq-test-tracks) generator, under
-a prefix of your own, then play that namespace:
+a prefix of your own, then play that namespace. A clip's first run renders its
+loop, which can take a minute.
 
 ```
-mtt media fetch artemis_directors
-mtt run --relay moqt://aiomoqt-relay.marzresearch.net:4443 --ns <you>/mtt_00/artemis_directors/loc/h264/1080/30/aac/2 --ttl 3600
 mtt media fetch bbb_4k30
-mtt run --relay moqt://aiomoqt-relay.marzresearch.net:4443 --ns <you>/mtt_00/bbb_4k30/cmaf/h264/1080/30/aac/2 --ttl 3600
+mtt run --relay moqt://aiomoqt-relay.marzresearch.net:4443 --draft 22 --ns <you>/mtt_00/bbb_4k30/cmaf/h264/1080/30/aac/2 --ttl 3600
+mtt run --relay moqt://aiomoqt-relay.marzresearch.net:4443 --draft 22 --ns <you>/mtt_00/clock/loc/h264/720/30/aac/2 --ttl 3600
 ```
+
+The artemis_directors clip is built from local demo-set files (ask for them);
+the clock stream above is the LOC sample anyone can generate.
 
 ## Part 1 — browser only
 
