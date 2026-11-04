@@ -11,7 +11,7 @@ on:
         description: Minutes per case
         default: '5'
       only:
-        description: 'Run only this RELAY:CASE or adverse profile, e.g. aiomoqt-relay:cmaf or blackouts (empty: all)'
+        description: 'Run only these RELAY:CASEs or adverse profiles, comma-separated, e.g. aiomoqt-relay:cmaf,blackouts (empty: all)'
         default: ''
       broadcast:
         description: Also soak synthetic g5-broadcast streams
@@ -94,7 +94,7 @@ jobs:
         run: |
           node -e '
             const c = require("./scripts/player-soak/cases.json");
-            const only = process.env.ONLY;
+            const only = process.env.ONLY ? process.env.ONLY.split(",") : null;
             const key = (b) => `${b.relay}:${b.packaging}`;
             const mtt = c.mtt.map((g) => `${g.relay}:${g.id ?? g.packaging}`);
             const broadcast = process.env.BROADCAST === "true" ? c.broadcast.map(key) : [];
@@ -102,11 +102,12 @@ jobs:
               .filter((p) => process.env.SMOKE !== "true" || c.profiles[p].smoke) : [];
             if (process.env.SKIP === "true") { mtt.length = 0; broadcast.length = 0; profiles.length = 0; }
             const all = [...mtt, ...broadcast, ...profiles];
-            if (only && !all.includes(only)) {
-              console.error(`::error::unknown case ${only}; cases: ${all.join(" ")}`);
+            const unknown = (only ?? []).filter((o) => !all.includes(o));
+            if (unknown.length) {
+              console.error(`::error::unknown case ${unknown.join(",")}; cases: ${all.join(" ")}`);
               process.exit(1);
             }
-            const pick = (list) => (only ? list.filter((k) => k === only) : list);
+            const pick = (list) => (only ? list.filter((k) => only.includes(k)) : list);
             const player = pick(broadcast);
             const adverse = pick(profiles);
             const needed = new Set(player);
