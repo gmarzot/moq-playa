@@ -70,7 +70,8 @@ repair (`audio order restored/missing/late`) and catch-up starts.
 
 ### URL parameters
 
-The Connection settings dialog edits the same parameters. The page log prints
+The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
+`compat=` and `clockUrl=` are set in the URL only. The page log prints
 `Options: …` at load with what reached the engine.
 
 | Param | Meaning | Default |
