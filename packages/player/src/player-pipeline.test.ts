@@ -318,16 +318,17 @@ describe('createPipelines', () => {
       result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
       nowUs = 200_000;
       videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);  // slot 0.2 + 0.2 cushion
-      nowUs = 900_000;
-      videoDecoder.onFrame?.({ timestamp: 1_200_000, close: vi.fn() } as any, 0);  // slot 0.5: 400 ms late
+      // Past the startup grace: capture 4.2 s renders at 3.3 s, slot 3.5 s, decoded at 3.9 s.
+      nowUs = 3_900_000;
+      videoDecoder.onFrame?.({ timestamp: 4_200_000, close: vi.fn() } as any, 0);  // 400 ms late
       return { times: renderer.enqueue.mock.calls.map((c) => c[1]), policy: result.latencyPolicy };
     };
     const live = run('live');
-    expect(live.times).toEqual([400_000, 900_000]);
+    expect(live.times).toEqual([400_000, 3_900_000]);
     expect(live.policy).toBeUndefined();
     const smooth = run('smooth');
     // 200 ms cushion + 400 ms late + 50 ms margin.
-    expect(smooth.times).toEqual([400_000, 300_000 + 650_000]);
+    expect(smooth.times).toEqual([400_000, 3_300_000 + 650_000]);
     expect(smooth.policy?.raises).toBe(1);
   });
 

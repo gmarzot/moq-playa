@@ -285,6 +285,9 @@ describe('stall nudge and post-stall live-edge snap', () => {
         try {
             const live = stallSetup();
             const smooth = stallSetup({ latencyMode: 'smooth' });
+            // Past Smooth's startup grace.
+            (smooth.adapter as any).noteLatencySlack(1);
+            vi.advanceTimersByTime(3_000);
             for (const { adapter, video } of [live, smooth]) {
                 video.currentTime = 23.2;               // 1.8 s ahead, target 0.2 s
                 (adapter as any).handleWaiting();
