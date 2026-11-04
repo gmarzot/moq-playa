@@ -98,10 +98,26 @@ interface HeldSegment {
   end: bigint;
 }
 
+/** Decode-order repair counts; `passed` and `bypasses` are audio only. */
+export interface DecodeOrderStats {
+  restored: number;
+  missing: number;
+  late: number;
+  worstLateMs: number;
+  /** Gaps passed through without a hold while the audio gap bypass was on. */
+  passed: number;
+  /** Times the bypass switched on. */
+  bypasses: number;
+}
+
 interface DecodeOrder {
   readonly held: HeldSegment[];
   timer: ReturnType<typeof setTimeout> | null;
-  readonly stats: { restored: number; missing: number; late: number; worstLateMs: number };
+  readonly stats: DecodeOrderStats;
+  /** Holds that expired unfilled in a row. */
+  unfilledRun: number;
+  /** Audio gaps pass through without a hold until this Date.now(); null when holding. */
+  bypassUntilMs: number | null;
   /** The next segment follows a deliberate pause: its gap is not missing media. */
   resumed: boolean;
   /** Group of the newest segment emitted. */
@@ -112,9 +128,13 @@ interface DecodeOrder {
 }
 
 const newDecodeOrder = (): DecodeOrder => ({
-  held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0 }, resumed: false, lastGroup: null,
-  lastStart: null, lastSubgroup: null,
+  held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0, passed: 0, bypasses: 0 },
+  unfilledRun: 0, bypassUntilMs: null, resumed: false, lastGroup: null, lastStart: null, lastSubgroup: null,
 });
+
+/** Frames a decode gap stands for, at least one. */
+const gapFrames = (gap: bigint, duration: bigint): number =>
+  duration > 0n ? Math.max(1, Math.round(Number(gap) / Number(duration))) : 1;
 
 /**
  * Pairs moof+mdat MoQ objects into complete CMAF segments.
@@ -293,6 +313,10 @@ export class CmafAssembler {
   private static readonly STARTUP_DIAG_COUNT = 5;
   /** Buffered depth at which a hold gives up: Chrome reports `waiting` with ~100 ms still ahead. */
   private static readonly HOLD_RELEASE_MARGIN_MS = 150;
+  /** Audio gap holds that expire unfilled in a row before gaps pass straight through. */
+  private static readonly AUDIO_BYPASS_AFTER = 3;
+  /** How long audio gaps pass through before holding is tried again. */
+  private static readonly AUDIO_BYPASS_MS = 30_000;
   /** Backward decode-time jump after a resubscribe that is a publisher restart whatever its Group IDs. */
   private static readonly RESTART_JUMP_SEC = 10n;
   private diagVideoCount = 0;
@@ -552,13 +576,25 @@ export class CmafAssembler {
    * entirely behind the emitted audio end, and the furthest behind one was
    * (ms of audio already emitted past its start).
    */
-  get audioOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
+  get audioOrderStats(): DecodeOrderStats {
     return { ...this.order.audio.stats };
   }
 
   /** Video decode-order repair, as for audio; late video is dropped, not appended. */
-  get videoOrderStats(): { restored: number; missing: number; late: number; worstLateMs: number } {
+  get videoOrderStats(): DecodeOrderStats {
     return { ...this.order.video.stats };
+  }
+
+  /**
+   * Audio gaps pass straight through: the last holds expired unfilled, so a
+   * hold only drains the buffer ahead before the same gap is played anyway.
+   */
+  get audioGapBypass(): boolean {
+    const o = this.order.audio;
+    if (o.bypassUntilMs === null) return false;
+    if (Date.now() < o.bypassUntilMs) return true;
+    o.bypassUntilMs = null;
+    return false;
   }
 
   private emitInOrder(
@@ -595,13 +631,22 @@ export class CmafAssembler {
     const gap = span.start - emittedEnd > (span.end - span.start) / 2n;
     const mayFill = mediaType === 'audio' || o.lastGroup === null || groupId > o.lastGroup
       || (groupId === o.lastGroup && subgroupId !== undefined && subgroupId !== o.lastSubgroup);
+    if (gap && mayFill && mediaType === 'audio' && o.held.length === 0 && this.audioGapBypass) {
+      o.stats.missing += gapFrames(span.start - emittedEnd, span.end - span.start);
+      o.stats.passed++;
+      this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
+      return;
+    }
     if (gap && mayFill) {
       o.held.push({ segment, trackName, groupId, subgroupId, ...span });
       o.held.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
       this.armHeldTimer(mediaType);
       return;
     }
-    if (o.held.length > 0) o.stats.restored++;
+    if (o.held.length > 0) {
+      o.stats.restored++;
+      o.unfilledRun = 0;
+    }
     this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
     this.releaseHeld(mediaType, false);
   }
@@ -618,7 +663,12 @@ export class CmafAssembler {
       if (gap > duration / 2n) {
         if (!skipGap) break;
         skipGap = false;
-        o.stats.missing += duration > 0n ? Math.max(1, Math.round(Number(gap) / Number(duration))) : 1;
+        o.stats.missing += gapFrames(gap, duration);
+        if (mediaType === 'audio' && ++o.unfilledRun >= CmafAssembler.AUDIO_BYPASS_AFTER) {
+          o.unfilledRun = 0;
+          o.bypassUntilMs = Date.now() + CmafAssembler.AUDIO_BYPASS_MS;
+          o.stats.bypasses++;
+        }
       }
       o.held.shift();
       this.emitSegment(mediaType, head.segment, head.trackName, head.groupId, head.subgroupId);

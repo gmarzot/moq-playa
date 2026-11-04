@@ -675,6 +675,23 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     expect(reconstructAll(audioSends, audioInit).map((c) => c[c.length - 1])).toEqual([0, 1, 2, 3, 4, 0, 1, 2]);
   });
 
+  it('chains AAC-length audio on its real duration; the 20 ms default jumps every 8th frame', async () => {
+    const audioDeltas = async (durationUs?: number) => {
+      const conn = recordingConnection();
+      const pub = makePublisher(conn, { draft: 18, packaging: 'locmaf', cmafInit, wallClockUs: () => wall });
+      pub.setAudioAlias(3n);
+      for (let i = 0; i < 16; i++) {
+        pub.publishAudio(chunk(i), { timestampUs: Math.round(i * 21_333.33), ...(durationUs ? { durationUs } : {}) });
+      }
+      await settle();
+      const starts = decodeStarts(conn.sends, audioInit);
+      return starts.slice(1).map((d, i) => d! - starts[i]!);
+    };
+    expect(await audioDeltas(21_333)).toEqual(Array(15).fill(21_333n));
+    // 1.33 ms short per frame: past half a frame at the 8th, the chain snaps to capture time.
+    expect(await audioDeltas()).toEqual([...Array(7).fill(20_000n), 30_667n, ...Array(7).fill(20_000n)]);
+  });
+
   it('starts a new audio group after 2 s without a video group', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, {

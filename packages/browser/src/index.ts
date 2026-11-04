@@ -20,7 +20,7 @@ export { WebAudioOutput } from './webaudio-output.js';
 export { MseMediaSource } from './mse-adapter.js';
 export type { MseMediaSourceOptions, DrmConfig, MseImplementation, MseImplementationPreference, MseAttachment, MseAttachmentPreference, PlayheadWedgeInfo, GapJumpInfo, GapJumpReason, MseSeekOutcome, MseStartupSuccess, MseStartupRetriable, MseStartupReport } from './mse-adapter.js';
 export { CmafAssembler } from './cmaf-assembler.js';
-export type { CmafAssemblerOptions, CmafStartupGeometry } from './cmaf-assembler.js';
+export type { CmafAssemblerOptions, CmafStartupGeometry, DecodeOrderStats } from './cmaf-assembler.js';
 export { createWebTransport } from './webtransport-factory.js';
 export type { WebTransportFactoryOptions } from './webtransport-factory.js';
 export { detectStrategy } from './detect.js';
