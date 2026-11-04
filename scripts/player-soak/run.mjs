@@ -344,8 +344,10 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin
       await sleep(5000);
       if (restartEveryS > 0 && Date.now() - liveAt >= restartEveryS * 1000) {
         const stoppedAt = Date.now();
-        await page.locator('#stop').click();
-        await page.waitForFunction(() => !document.querySelector('#start-camera')?.disabled, null, { timeout: 30_000 });
+        // While a broadcast runs, the source button is its Stop.
+        await page.locator('#start-camera.live').click();
+        await page.waitForFunction(() => !document.querySelector('#start-camera')?.classList.contains('live'), null,
+          { timeout: 30_000 });
         liveAt = await goLive();
         log('broadcaster', b.namespace, `restarted: published again after ${liveAt - stoppedAt} ms`);
         await appendFile(join(dir, 'ticks.jsonl'), `${json({ t: liveAt, restart: { stoppedAt, liveAt } })}\n`);
@@ -388,7 +390,7 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin
     const pageLog = await page.locator('#log').textContent().catch(() => null) ?? '';
     await writeFile(join(dir, 'log.txt'), pageLog);
     if (!wentLive) log('broadcaster', b.namespace, `never published; page log:\n${pageLog.slice(-2000)}`);
-    await page.locator('#stop').click().catch(() => {});
+    await page.locator('#start-camera.live').click().catch(() => {});
     await sleep(1000);
     await browser.close();
   }

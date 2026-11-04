@@ -298,8 +298,9 @@
       width: 40px; height: 34px; padding: 0; flex-shrink: 0;
     }
     button.icon svg { width: 20px; height: 20px; fill: currentColor; }
+    button.icon svg.stroked { fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
     #play-btn:not(.playing) .i-pause, #play-btn.playing .i-play,
-    #mute-btn:not(.muted) .i-muted, #mute-btn.muted .i-sound { display: none; }
+    .mute-toggle:not(.muted) .i-muted, .mute-toggle.muted .i-sound { display: none; }
 
     /* Seek bar */
     .seek-bar {
@@ -330,6 +331,9 @@
        button plus the slider's minimum, or its children overflow the box and
        run under the next control. The slider's own flex does the shrinking. */
     .volume-group { display: flex; align-items: center; gap: 6px; }
+    /* The slider sits inline; on phones this becomes a popup above the speaker. */
+    .volume-pop { display: contents; }
+    #pop-mute { display: none; }
     .volume-bar {
       flex: 0 4 64px;
       min-width: 30px;
@@ -363,7 +367,6 @@
 
     /* Gear menu: track choices and connection settings, above the bar at its right. */
     .menu-wrap { position: relative; flex-shrink: 0; }
-    .controls #menu-btn { font-size: 1.15rem; padding: 4px 10px; }
     .controls #menu-btn:hover, .controls #menu-btn[aria-expanded="true"] {
       color: var(--gear-hot-fg); border-color: var(--gear-hot-border);
     }
@@ -504,8 +507,8 @@
       color: var(--text-soft); border-color: var(--control-border-soft);
     }
     /* Control-bar chips read at the resolution picker's size. Scoped so the
-       in-panel copy buttons keep the smaller treatment. Centred by flex rather
-       than baseline: the gear glyph's metrics differ from the text beside it. */
+       in-panel copy buttons keep the smaller treatment. Centred by flex, not
+       baseline, so an icon sits level with text. */
     .controls button.mini {
       font-size: .85rem; padding: 6px 12px;
       display: inline-flex; align-items: center; justify-content: center;
@@ -580,17 +583,31 @@
     .catalog-panel.collapsed .cat-tracks,
     .catalog-panel.collapsed .cat-json { display: none; }
 
-    /* Phones: the seek bar takes its own row above the buttons; the hardware
-       keys set the volume, so its slider goes. */
+    /* Phones: one row with the seek bar taking the slack; the speaker opens a
+       vertical volume popup; a view picker wraps to its own row. */
     @media (max-width: 600px) {
       .wrapper { padding: 16px 12px; }
-      /* The menu anchors to the whole bar, so it stays on screen wherever the gear wraps. */
+      /* The menu anchors to the whole bar, so it stays on screen. */
       .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
       .menu-wrap { position: static; }
       .menu { max-width: 100%; }
-      .seek-bar { order: -1; flex: 1 0 100%; }
-      .controls #view { flex: 1 1 0; min-width: 5em; }
-      .volume-bar { display: none; }
+      .seek-bar { flex: 1 1 0; min-width: 60px; }
+      .controls #view { order: 1; flex: 1 0 100%; max-width: none; }
+      .volume-group { position: relative; }
+      .volume-pop {
+        display: none; position: absolute; bottom: calc(100% + 6px); left: 50%; z-index: 20;
+        transform: translateX(-50%); flex-direction: column; align-items: center; gap: 10px;
+        padding: 14px 6px 6px; background: var(--surface); border: 1px solid var(--border);
+        border-radius: 8px; box-shadow: 0 6px 20px var(--shadow);
+      }
+      .volume-group.open .volume-pop { display: flex; }
+      /* Vertical, max at the top; the padding widens the touch target past the 4px track. */
+      .volume-pop .volume-bar {
+        writing-mode: vertical-lr; direction: rtl; flex: none; box-sizing: border-box;
+        width: 28px; min-width: 0; height: 120px; padding: 0 12px; background-clip: content-box;
+      }
+      .volume-pop .volume-bar::-webkit-slider-thumb { width: 16px; height: 16px; }
+      #pop-mute { display: inline-flex; }
       .controls button, .controls select { min-height: 40px; }
       .cat-head .chart-label { white-space: normal; }
     }
@@ -718,7 +735,7 @@
       <input type="range" class="seek-bar" id="seek" min="0" max="1000" value="0" disabled>
       <span class="time" id="time">0:00</span>
       <div class="volume-group">
-        <button id="mute-btn" class="icon" type="button" disabled>
+        <button id="mute-btn" class="icon mute-toggle" type="button" disabled>
           <svg class="i-sound" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9h4l5-4v14l-5-4H3z"/><path
             d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor"
             stroke-width="2" stroke-linecap="round"/></svg>
@@ -726,12 +743,30 @@
             d="M15.5 9.5l5 5M20.5 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round"/></svg>
         </button>
-        <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100">
+        <div class="volume-pop">
+          <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100" aria-label="Volume">
+          <button id="pop-mute" class="icon mute-toggle" type="button">
+            <svg class="i-sound" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9h4l5-4v14l-5-4H3z"/><path
+              d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round"/></svg>
+            <svg class="i-muted" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9h4l5-4v14l-5-4H3z"/><path
+              d="M15.5 9.5l5 5M20.5 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round"/></svg>
+          </button>
+        </div>
       </div>
       <select id="view" title="View" hidden></select>
       <div class="menu-wrap">
-        <button id="menu-btn" class="mini" type="button" title="Quality, audio and settings"
-          aria-haspopup="true" aria-expanded="false">⚙</button>
+        <button id="menu-btn" class="icon" type="button" title="Quality, audio and settings"
+          aria-label="Quality, audio and settings" aria-haspopup="true" aria-expanded="false">
+          <svg class="stroked" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.02 4.87L10.26 2.15A10 10 0 0 1 13.74
+            2.15L13.98 4.87A7.4 7.4 0 0 1 15.64 5.56L17.74 3.81A10 10 0 0 1 20.19 6.26L18.44 8.36A7.4 7.4 0 0 1 19.13
+            10.02L21.85 10.26A10 10 0 0 1 21.85 13.74L19.13 13.98A7.4 7.4 0 0 1 18.44 15.64L20.19 17.74A10 10 0 0 1
+            17.74 20.19L15.64 18.44A7.4 7.4 0 0 1 13.98 19.13L13.74 21.85A10 10 0 0 1 10.26 21.85L10.02 19.13A7.4 7.4 0 0 1
+            8.36 18.44L6.26 20.19A10 10 0 0 1 3.81 17.74L5.56 15.64A7.4 7.4 0 0 1 4.87 13.98L2.15 13.74A10 10 0 0 1 2.15
+            10.26L4.87 10.02A7.4 7.4 0 0 1 5.56 8.36L3.81 6.26A10 10 0 0 1 6.26 3.81L8.36 5.56A7.4 7.4 0 0 1 10.02 4.87Z"/><circle
+            cx="12" cy="12" r="3"/></svg>
+        </button>
         <div id="menu" class="menu" hidden>
           <label class="menu-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
           <label class="menu-row" hidden>Language <select id="lang"></select></label>
