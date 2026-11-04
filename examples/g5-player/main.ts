@@ -74,6 +74,16 @@ const menu = document.getElementById('menu')!;
 function setMenuOpen(open: boolean): void {
   menu.hidden = !open;
   menuBtn.setAttribute('aria-expanded', String(open));
+  if (open) setVolumePopOpen(false);
+}
+const popMuteBtn = document.getElementById('pop-mute') as HTMLButtonElement;
+const volumeGroup = muteBtn.parentElement!;
+/** Phone width: the speaker opens a volume popup that holds the mute toggle. */
+const phoneBar = window.matchMedia('(max-width: 600px)');
+function setVolumePopOpen(open: boolean): void {
+  volumeGroup.classList.toggle('open', open);
+  if (phoneBar.matches) muteBtn.setAttribute('aria-expanded', String(open));
+  if (open) setMenuOpen(false);
 }
 
 // ─── Theme ───────────────────────────────────────────────────────────
@@ -1868,13 +1878,31 @@ async function main(): Promise<void> {
     playBtn.title = playing ? 'Pause' : 'Play';
     playBtn.setAttribute('aria-label', playBtn.title);
   };
-  const setMuteIcon = (muted: boolean): void => {
-    muteBtn.classList.toggle('muted', muted);
-    muteBtn.title = muted ? 'Unmute' : 'Mute';
+  /** On phones the speaker opens the volume popup; elsewhere it mutes. */
+  const labelSpeaker = (): void => {
+    if (phoneBar.matches) {
+      muteBtn.title = 'Volume';
+      muteBtn.setAttribute('aria-haspopup', 'true');
+      muteBtn.setAttribute('aria-expanded', String(volumeGroup.classList.contains('open')));
+    } else {
+      setVolumePopOpen(false);
+      muteBtn.title = muteBtn.classList.contains('muted') ? 'Unmute' : 'Mute';
+      muteBtn.removeAttribute('aria-haspopup');
+      muteBtn.removeAttribute('aria-expanded');
+    }
     muteBtn.setAttribute('aria-label', muteBtn.title);
+  };
+  const setMuteIcon = (muted: boolean): void => {
+    for (const btn of [muteBtn, popMuteBtn]) {
+      btn.classList.toggle('muted', muted);
+      btn.title = muted ? 'Unmute' : 'Mute';
+      btn.setAttribute('aria-label', btn.title);
+    }
+    labelSpeaker();
   };
   setPlayIcon(false);
   setMuteIcon(player.muted);
+  phoneBar.addEventListener('change', labelSpeaker);
 
   playBtn.addEventListener('click', () => {
     if (player.state === 'playing') player.pause();
@@ -1899,7 +1927,11 @@ async function main(): Promise<void> {
 
   seekBar.addEventListener('input', () => player.seek(Number(seekBar.value)));
   volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
-  muteBtn.addEventListener('click', () => player.toggleMute());
+  muteBtn.addEventListener('click', () => {
+    if (phoneBar.matches) setVolumePopOpen(!volumeGroup.classList.contains('open'));
+    else void player.toggleMute();
+  });
+  popMuteBtn.addEventListener('click', () => player.toggleMute());
   player.on('volumechange', ({ muted }) => setMuteIcon(muted));
 
   // Gear menu: closes on a choice, a click outside or Escape.
@@ -1911,8 +1943,13 @@ async function main(): Promise<void> {
   menu.addEventListener('change', () => setMenuOpen(false));
   document.addEventListener('click', (e) => {
     if (!menu.hidden && !menu.parentElement!.contains(e.target as Node)) setMenuOpen(false);
+    if (!volumeGroup.contains(e.target as Node)) setVolumePopOpen(false);
   });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenuOpen(false); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    setMenuOpen(false);
+    setVolumePopOpen(false);
+  });
 
   qualitySelect.addEventListener('change', () => {
     const val = qualitySelect.value;

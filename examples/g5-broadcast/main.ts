@@ -499,7 +499,6 @@ const catCopy = document.getElementById('cat-copy') as HTMLButtonElement;
 const logCopy = document.getElementById('log-copy') as HTMLButtonElement;
 const layoutEl = document.getElementById('layout')!;
 const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElement;
-const stopBtn = document.getElementById('stop') as HTMLButtonElement;
 const cameraMenu = document.getElementById('camera-menu')!;
 // Phone browsers cannot capture the screen.
 const canCaptureScreen = !!navigator.mediaDevices?.getDisplayMedia;
@@ -532,8 +531,7 @@ async function refreshCameras(): Promise<void> {
   const current = options.findIndex(([v]) => v === cameraChoice);
   if (current > 0) options.unshift(...options.splice(current, 1));
   cameraOptions = options;
-  if (sourceCount() > 1) startCameraBtn.setAttribute('aria-haspopup', 'menu');
-  else startCameraBtn.removeAttribute('aria-haspopup');
+  syncSourcePopup();
 }
 
 /** A pick replaces any `?camera=`, so a reload takes the latest pick from any tab. */
@@ -563,7 +561,7 @@ function sourceItem(label: string, source: 'camera' | 'screen', checked: boolean
     setCameraMenuOpen(false);
     pick();
     void startBroadcast(source);
-    stopBtn.focus();
+    startCameraBtn.focus();
   });
   return item;
 }
@@ -920,11 +918,13 @@ function referenceStampClocks(): Pick<MediaPublisherOptions, 'wallClockUs' | 'ti
 
 // ─── Start ───────────────────────────────────────────────────────────
 
+// Live, the button stops the broadcast; a click while it stops does nothing.
 startCameraBtn.addEventListener('click', () => {
-  if (sourceCount() < 2) void startBroadcast('camera');
+  if (startCameraBtn.classList.contains('live')) {
+    if (currentAttempt !== null) void stopBroadcast();
+  } else if (sourceCount() < 2) void startBroadcast('camera');
   else setCameraMenuOpen(cameraMenu.hidden);
 });
-stopBtn.addEventListener('click', stopBroadcast);
 
 /** Longest Stop waits for the namespace withdrawal before closing the session. */
 const NS_WITHDRAW_MS = 500;
@@ -950,8 +950,7 @@ const RECONNECT_STABLE_MS = 30_000;
 
 async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   claimNamespace();
-  setLiveSource(source);
-  stopBtn.disabled = false;
+  setBroadcasting(true);
   setState('connecting', 'starting');
 
   // Attempt-local state threaded between steps (never module globals).
@@ -1560,14 +1559,23 @@ function resetBroadcastUi(): void {
   setText('conn-draft', String(broadcastDraft));
   liveSinceMs = null;
   lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
-  setLiveSource(null);
-  stopBtn.disabled = true;
+  setBroadcasting(false);
 }
 
-/** While a broadcast runs, the source button is disabled and shows its source. */
-function setLiveSource(source: 'camera' | 'screen' | null): void {
-  startCameraBtn.disabled = source !== null;
-  startCameraBtn.classList.toggle('live', source !== null);
-  startCameraBtn.classList.toggle('screen', source === 'screen');
-  startCameraBtn.title = source === null ? 'Start a broadcast' : `Broadcasting the ${source}`;
+/** While a broadcast runs, the source button is its Stop. */
+function setBroadcasting(on: boolean): void {
+  startCameraBtn.classList.toggle('live', on);
+  const label = on ? 'Stop the broadcast' : 'Start a broadcast';
+  startCameraBtn.title = label;
+  startCameraBtn.setAttribute('aria-label', label);
+  syncSourcePopup();
+}
+
+/** The source button opens a menu only while idle, with more than one source. */
+function syncSourcePopup(): void {
+  if (sourceCount() > 1 && !startCameraBtn.classList.contains('live')) {
+    startCameraBtn.setAttribute('aria-haspopup', 'menu');
+  } else {
+    startCameraBtn.removeAttribute('aria-haspopup');
+  }
 }
