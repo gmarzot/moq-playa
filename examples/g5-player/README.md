@@ -6,7 +6,8 @@ Two pages for testing live MoQT media in the browser:
 - `/g5-player/` plays a broadcast, with health counters, latency charts and the catalog.
 
 Both pages are deployed at https://aiomoqt-relay.marzresearch.net/. That relay is for
-light testing only.
+light testing only. Demos, settings, URL parameters and sample streams:
+[demo-runbook.md](demo-runbook.md).
 
 ## Acknowledgements
 
