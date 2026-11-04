@@ -199,7 +199,7 @@ describe('replay containment', () => {
 });
 
 describe('stall nudge and post-stall live-edge snap', () => {
-    function stallSetup(opts: { maxAheadSec?: number; latencyMode?: 'live' | 'smooth' } = {}) {
+    function stallSetup(opts: { maxAheadSec?: number; latencyMode?: 'live' | 'smooth'; smoothFloorSec?: number } = {}) {
         const video = new MockVideoElement();
         video.buffered = makeTimeRanges([[5, 25]]);
         video.currentTime = 10;
@@ -208,6 +208,7 @@ describe('stall nudge and post-stall live-edge snap', () => {
             targetAheadSec: 0.2,
             ...(opts.maxAheadSec !== undefined ? { maxAheadSec: opts.maxAheadSec } : {}),
             ...(opts.latencyMode !== undefined ? { latencyMode: opts.latencyMode } : {}),
+            ...(opts.smoothFloorSec !== undefined ? { smoothFloorSec: opts.smoothFloorSec } : {}),
         });
         (adapter as any).playTriggered = true;
         const adjusts: Array<[string, number, number]> = [];
@@ -284,7 +285,7 @@ describe('stall nudge and post-stall live-edge snap', () => {
         vi.useFakeTimers();
         try {
             const live = stallSetup();
-            const smooth = stallSetup({ latencyMode: 'smooth' });
+            const smooth = stallSetup({ latencyMode: 'smooth', smoothFloorSec: 0 });
             // Past Smooth's startup grace.
             (smooth.adapter as any).noteLatencySlack(1);
             vi.advanceTimersByTime(3_000);
@@ -304,6 +305,65 @@ describe('stall nudge and post-stall live-edge snap', () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it('smooth: the target starts at the 1 s floor, above a 0.2 s live target', () => {
+        const smooth = stallSetup({ latencyMode: 'smooth' });
+        expect((smooth.adapter as any).targetAheadSec).toBe(1);
+        expect(smooth.adapter.latencyStats()).toMatchObject({ mode: 'smooth', heldMs: 1000, floorMs: 1000 });
+        smooth.adapter.destroy();
+    });
+
+    it('smooth: playback starts once the held delay is buffered; live starts on the first range', async () => {
+        const start = (latencyMode?: 'smooth') => {
+            const video = new MockVideoElement();
+            video.buffered = makeTimeRanges([[10, 10.3]]);
+            video.currentTime = 10;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+                targetAheadSec: 0.2,
+                ...(latencyMode ? { latencyMode } : {}),
+            });
+            return { video, adapter };
+        };
+        const live = start();
+        const smooth = start('smooth');
+        await (live.adapter as any).requestStartup();
+        await (smooth.adapter as any).requestStartup();
+        await flush();
+        expect(live.video.playCalls).toBe(1);
+        expect(smooth.video.playCalls).toBe(0);
+        smooth.video.buffered = makeTimeRanges([[10, 10.97]]);   // within 50 ms of 1 s
+        await (smooth.adapter as any).requestStartup();
+        await flush();
+        expect(smooth.video.playCalls).toBe(1);
+        live.adapter.destroy();
+        smooth.adapter.destroy();
+    });
+
+    it('smooth: a held delay that never fills starts playback after it would have filled plus 1 s', async () => {
+        vi.useFakeTimers();
+        try {
+            const video = new MockVideoElement();
+            video.buffered = makeTimeRanges([[10, 10.3]]);
+            video.currentTime = 10;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+                targetAheadSec: 0.2, latencyMode: 'smooth',
+            });
+            await (adapter as any).requestStartup();
+            await vi.advanceTimersByTimeAsync(1_900);
+            expect(video.playCalls).toBe(0);
+            await vi.advanceTimersByTimeAsync(200);
+            expect(video.playCalls).toBe(1);
+            adapter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('rejects a non-finite or negative smoothFloorSec', () => {
+        const video = new MockVideoElement() as unknown as HTMLVideoElement;
+        expect(() => new MseMediaSource(video, { latencyMode: 'smooth', smoothFloorSec: Number.NaN })).toThrow(/smoothFloorSec/);
+        expect(() => new MseMediaSource(video, { latencyMode: 'smooth', smoothFloorSec: -1 })).toThrow(/smoothFloorSec/);
     });
 
     it('does not snap after an undetected wait, near target, or on a non-live stream', () => {

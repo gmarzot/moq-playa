@@ -344,6 +344,15 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 400 }))).not.toThrow();
   });
 
+  // ── smoothFloorMs ──
+
+  it('accepts a smooth floor of 0 or at most the ceiling, rejects a negative one or one above the ceiling', () => {
+    expect(() => validateConfig(minConfig({ smoothFloorMs: 0 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ smoothFloorMs: 1000, smoothCeilingMs: 1000 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ smoothFloorMs: -1 }))).toThrow(RangeError);
+    expect(() => validateConfig(minConfig({ smoothFloorMs: 1500, smoothCeilingMs: 1000 }))).toThrow(RangeError);
+  });
+
   // ── deliveryTimeoutMs ──
 
   it('rejects deliveryTimeoutMs <= 0', () => {

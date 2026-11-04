@@ -62,11 +62,14 @@ export interface PlayerOptions {
   readonly targetLatencyMs?: number;
   /**
    * `'live'` (default) holds the target and skips late media; `'smooth'`
-   * raises the playout delay when media arrives late, up to `smoothCeilingMs`.
+   * starts the playout delay at `smoothFloorMs` and raises it when media
+   * arrives late, up to `smoothCeilingMs`.
    */
   readonly latencyMode?: LatencyMode;
   /** Ceiling of the smooth playout delay in ms. Default: 2000. */
   readonly smoothCeilingMs?: number;
+  /** Floor of the smooth playout delay in ms, where it starts. Default: 1000. */
+  readonly smoothFloorMs?: number;
 
   // ── Quality ──
 

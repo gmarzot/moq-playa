@@ -756,6 +756,7 @@ export class Player {
         ...(opts.targetLatencyMs !== undefined ? { targetAheadSec: opts.targetLatencyMs / 1000 } : {}),
         ...(base.latencyMode !== undefined ? { latencyMode: base.latencyMode } : {}),
         ...(base.smoothCeilingMs !== undefined ? { smoothCeilingSec: base.smoothCeilingMs / 1000 } : {}),
+        ...(base.smoothFloorMs !== undefined ? { smoothFloorSec: base.smoothFloorMs / 1000 } : {}),
       }),
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),
@@ -772,6 +773,7 @@ export class Player {
     }
     if (opts.latencyMode !== undefined) Object.assign(base, { latencyMode: opts.latencyMode });
     if (opts.smoothCeilingMs !== undefined) Object.assign(base, { smoothCeilingMs: opts.smoothCeilingMs });
+    if (opts.smoothFloorMs !== undefined) Object.assign(base, { smoothFloorMs: opts.smoothFloorMs });
     if (opts.authTokens) {
       (base as unknown as Record<string, unknown>).authTokens = opts.authTokens;
     }

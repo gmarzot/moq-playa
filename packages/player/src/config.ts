@@ -418,14 +418,17 @@ export interface LatencyConfig {
 
   /**
    * `'live'` (default) holds playout at the target: late media is skipped or
-   * dropped. `'smooth'` raises the playout delay when media arrives late, up to
-   * `smoothCeilingMs`, so it plays instead; the delay steps back down after
-   * clean periods.
+   * dropped. `'smooth'` starts the playout delay at `smoothFloorMs` and raises
+   * it when media arrives late, up to `smoothCeilingMs`, so it plays instead;
+   * the delay steps back down to the floor after clean periods.
    */
   readonly latencyMode?: LatencyMode;
 
   /** Ceiling of the smooth playout delay in milliseconds. Default: 2000. */
   readonly smoothCeilingMs?: number;
+
+  /** Floor of the smooth playout delay in milliseconds, where it starts; 0 starts at the target. Default: 1000. */
+  readonly smoothFloorMs?: number;
 }
 
 /** Quality / ABR options. */
@@ -925,6 +928,16 @@ export function validateConfig(config: MoqtPlayerConfig): void {
       && config.renderCushionMaxMs < config.renderCushionFloorMs) {
     throw new RangeError(
       `renderCushionMaxMs must be >= renderCushionFloorMs, got ${config.renderCushionMaxMs} < ${config.renderCushionFloorMs}`,
+    );
+  }
+
+  if (config.smoothFloorMs !== undefined && !(config.smoothFloorMs >= 0)) {
+    throw new RangeError(`smoothFloorMs must be >= 0, got ${config.smoothFloorMs}`);
+  }
+  if (config.smoothFloorMs !== undefined && config.smoothCeilingMs !== undefined
+      && config.smoothCeilingMs < config.smoothFloorMs) {
+    throw new RangeError(
+      `smoothCeilingMs must be >= smoothFloorMs, got ${config.smoothCeilingMs} < ${config.smoothFloorMs}`,
     );
   }
 

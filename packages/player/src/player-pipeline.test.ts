@@ -311,6 +311,7 @@ describe('createPipelines', () => {
         createVideoDecoder: () => videoDecoder as any,
         createRenderer: () => renderer as any,
         latencyMode,
+        smoothFloorMs: 0,
       });
       const trackInfo: TrackInfo = { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined };
       const result = createPipelines(config, clock, trackInfo, mockCallbacks());
@@ -358,6 +359,33 @@ describe('createPipelines', () => {
     videoDecoder.onFrame?.({ timestamp: 2_000_000, close: vi.fn() } as any, 0);   // drains the held frame
     expect(renderer.enqueue).toHaveBeenCalledTimes(2);
     expect(result.latencyPolicy?.raises).toBe(0);
+  });
+
+  it('smooth latency: the cushion starts at the floor, so the first frame and audio play 1 s behind', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const result = createPipelines(minimalConfig({
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
+      latencyMode: 'smooth',
+    }), clock, { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
+    expect(result.getRenderCushionUs?.()).toBe(1_000_000);
+    nowUs = 100_000;
+    result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
+    nowUs = 200_000;
+    videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);  // slot 0.2 + 1 s
+    expect(renderer.enqueue.mock.calls.map((c) => c[1])).toEqual([1_200_000]);
+    expect(result.latencyPolicy?.stats).toMatchObject({ heldMs: 1000, floorMs: 1000, raises: 0 });
   });
 });
 

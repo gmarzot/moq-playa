@@ -84,6 +84,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
 | `targetLatency=` | overrides the catalog target (ms); see below | catalog value |
 | `latency=` | `live` or `smooth`; overrides the choice the ⚙ menu remembers | the remembered choice, else live |
+| `latencyMin=` | where Smooth starts and the lowest it steps back to (ms); 0 starts at the target | 1000 |
 | `latencyMax=` | Smooth's limit (ms) | 2000 |
 | `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
 | `catchUp=` | LOC max playback rate chasing the target | 1.0 (off) |
@@ -112,9 +113,10 @@ a reload.
   caps it. To run 2 s behind live on LOC, raise the floor too:
   `targetLatency=2000&cushion=2000`.
 - ⚙ → Latency: **Live edge** (default) keeps the target and skips media that
-  arrives late. **Smooth** raises the delay instead, by how late the media was
-  plus 50 ms, up to its limit (2 s, `latencyMax=`), and steps back toward the
-  target after 30 s with nothing late. TARGET then shows the delay in force,
+  arrives late. **Smooth** starts 1 s behind live (`latencyMin=`), raises the
+  delay when media arrives late, by how late it was plus 50 ms, up to its
+  limit (2 s, `latencyMax=`), and steps back toward 1 s after 30 s with
+  nothing late. TARGET then shows the delay in force,
   and the log records each raise and step down. The choice applies after a
   reload.
 

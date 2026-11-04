@@ -25,7 +25,7 @@ import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
-import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
+import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 import { usesMsePath } from './packaging.js';
@@ -280,12 +280,15 @@ export function createPipelines(
       mode: 'smooth',
       baseUs: cushionFloorUs,
       ceilingUs: Math.max((config.smoothCeilingMs ?? SMOOTH_CEILING_MS) * 1000, cushionMaxUs),
+      floorUs: (config.smoothFloorMs ?? SMOOTH_FLOOR_MS) * 1000,
       startupGraceUs: SMOOTH_STARTUP_GRACE_US,
     }, clock)
     : null;
   const renderCushion = hasLoc
     ? new RenderCushionSmoother({ floorUs: cushionFloorUs, maxUs: latencyPolicy?.ceilingUs ?? cushionMaxUs }, clock)
     : null;
+  // Smooth starts at its held delay: audio scheduled before the first frame uses it too.
+  if (latencyPolicy) renderCushion?.raiseTo(latencyPolicy.heldUs);
   /** The cushion in force: the jitter estimate within the live cap, or the smooth hold above it. */
   const cushionUs = (): number => renderCushion?.update(Math.max(
     Math.min(videoPipeline?.effectiveGapTimeoutUs ?? 0, cushionMaxUs), latencyPolicy?.heldUs ?? 0))

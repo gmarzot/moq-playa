@@ -863,6 +863,10 @@
         <input id="s-target" type="number" min="1" placeholder="from catalog">
         <div class="hint">Overrides the catalog's targetLatency.</div>
 
+        <label for="s-latency-min">Smooth latency start (ms)</label>
+        <input id="s-latency-min" type="number" min="0" placeholder="1000">
+        <div class="hint">Where Smooth starts and the lowest it steps back to; 0 starts at the target.</div>
+
         <label for="s-latency-max">Smooth latency limit (ms)</label>
         <input id="s-latency-max" type="number" min="1" placeholder="2000">
         <div class="hint">How far Smooth may raise the delay; past it, late media is skipped as in Live edge.</div>
