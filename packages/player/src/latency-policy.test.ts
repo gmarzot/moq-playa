@@ -75,4 +75,11 @@ describe('LatencyPolicy', () => {
     p.setBase(900_000);
     expect(p.heldUs).toBe(900_000);
   });
+
+  it('smooth: before any raise the held delay follows the base, down as well as up', () => {
+    const p = new LatencyPolicy({ mode: 'smooth', baseUs: 2_000_000 }, makeClock());
+    p.setBase(200_000);                                     // the catalog target replaces a default
+    expect(p.heldUs).toBe(200_000);
+    expect(p.noteArrival(-100_000, 200_000)).toBe(350_000);
+  });
 });

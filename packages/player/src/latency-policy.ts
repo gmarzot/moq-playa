@@ -55,7 +55,8 @@ export class LatencyPolicy {
   private readonly cleanWindowUs: number;
   private readonly clock: ClockSource;
 
-  private _heldUs: number;
+  /** The delay raises hold, 0 before any; the held delay is never below the base. */
+  private raisedUs = 0;
   private windowStartUs: number | null = null;
   private windowMinSlackUs = Infinity;
   private _raises = 0;
@@ -68,12 +69,11 @@ export class LatencyPolicy {
     this.marginUs = options.marginUs ?? SMOOTH_MARGIN_US;
     this.cleanWindowUs = options.cleanWindowUs ?? SMOOTH_CLEAN_WINDOW_US;
     this.clock = clock;
-    this._heldUs = options.baseUs;
   }
 
   /** The delay smooth mode holds (µs): at least the base, at most the ceiling. */
   get heldUs(): number {
-    return this._heldUs;
+    return Math.min(Math.max(this.raisedUs, this.baseUs), Math.max(this.ceilingUs, this.baseUs));
   }
 
   get raises(): number {
@@ -84,10 +84,9 @@ export class LatencyPolicy {
     return this._lowers;
   }
 
-  /** A new base (e.g. the catalog target); a held delay above it stays. */
+  /** A new base (e.g. the catalog target); a raised delay above it stays. */
   setBase(baseUs: number): void {
     this.baseUs = baseUs;
-    this._heldUs = Math.min(Math.max(this._heldUs, baseUs), Math.max(this.ceilingUs, baseUs));
   }
 
   /**
@@ -101,28 +100,28 @@ export class LatencyPolicy {
     if (slackUs < 0) {
       this.restartWindow(nowUs);
       const next = Math.min(this.ceilingUs, delayUs - slackUs + this.marginUs);
-      if (next <= this._heldUs) return null;
-      this._heldUs = next;
+      if (next <= this.heldUs) return null;
+      this.raisedUs = next;
       this._raises++;
-      return next;
+      return this.heldUs;
     }
     if (this.windowStartUs === null) this.windowStartUs = nowUs;
     this.windowMinSlackUs = Math.min(this.windowMinSlackUs, slackUs);
     if (nowUs - this.windowStartUs < this.cleanWindowUs) return null;
     // Clean window: step down by the spare slack, at most half the excess.
-    const excessUs = this._heldUs - this.baseUs;
+    const excessUs = this.heldUs - this.baseUs;
     const stepUs = Math.min(this.windowMinSlackUs - this.marginUs, excessUs / 2);
     this.restartWindow(nowUs);
     if (excessUs <= 0 || stepUs <= 0) return null;
-    this._heldUs = excessUs - stepUs < 1000 ? this.baseUs : this._heldUs - stepUs;
+    this.raisedUs = excessUs - stepUs < 1000 ? 0 : this.heldUs - stepUs;
     this._lowers++;
-    return this._heldUs;
+    return this.heldUs;
   }
 
   get stats(): LatencyStats {
     return {
       mode: this.mode,
-      heldMs: this._heldUs / 1000,
+      heldMs: this.heldUs / 1000,
       ceilingMs: this.ceilingUs / 1000,
       raises: this._raises,
       lowers: this._lowers,
