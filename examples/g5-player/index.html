@@ -363,7 +363,6 @@
       background: var(--control); color: var(--text); border: 1px solid var(--control-border);
       padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
     }
-    .controls #view { min-width: 0; max-width: 16em; flex: 0 1 auto; text-overflow: ellipsis; }
 
     /* Gear menu: track choices and connection settings, above the bar at its right. */
     .menu-wrap { position: relative; flex-shrink: 0; }
@@ -584,7 +583,7 @@
     .catalog-panel.collapsed .cat-json { display: none; }
 
     /* Phones: one row with the seek bar taking the slack; the speaker opens a
-       vertical volume popup; a view picker wraps to its own row. */
+       vertical volume popup. */
     @media (max-width: 600px) {
       .wrapper { padding: 16px 12px; }
       /* The menu anchors to the whole bar, so it stays on screen. */
@@ -592,7 +591,6 @@
       .menu-wrap { position: static; }
       .menu { max-width: 100%; }
       .seek-bar { flex: 1 1 0; min-width: 60px; }
-      .controls #view { order: 1; flex: 1 0 100%; max-width: none; }
       .volume-group { position: relative; }
       .volume-pop {
         display: none; position: absolute; bottom: calc(100% + 6px); left: 50%; z-index: 20;
@@ -755,7 +753,6 @@
           </button>
         </div>
       </div>
-      <select id="view" title="View" hidden></select>
       <div class="menu-wrap">
         <button id="menu-btn" class="icon" type="button" title="Quality, audio and settings"
           aria-label="Quality, audio and settings" aria-haspopup="true" aria-expanded="false">
@@ -768,9 +765,9 @@
             cx="12" cy="12" r="3"/></svg>
         </button>
         <div id="menu" class="menu" hidden>
+          <label class="menu-row" hidden>View <select id="view"></select></label>
           <label class="menu-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
           <label class="menu-row" hidden>Language <select id="lang"></select></label>
-          <label class="menu-row" hidden>Program <select id="program"></select></label>
           <label class="menu-row" title="Live edge skips late media to stay at the target; Smooth raises the delay instead, up to its limit">Latency
             <select id="latency"><option value="live">Live edge</option><option value="smooth">Smooth</option></select></label>
           <button id="settings-btn" class="menu-item" type="button">Connection settings…</button>

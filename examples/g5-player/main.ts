@@ -81,7 +81,6 @@ const timeDisplay = document.getElementById('time')!;
 const volumeBar = document.getElementById('volume') as HTMLInputElement;
 const muteBtn = document.getElementById('mute-btn') as HTMLButtonElement;
 const qualitySelect = document.getElementById('quality') as HTMLSelectElement;
-const programSelect = document.getElementById('program') as HTMLSelectElement;
 const viewSelect = document.getElementById('view') as HTMLSelectElement;
 const langSelect = document.getElementById('lang') as HTMLSelectElement;
 const menuBtn = document.getElementById('menu-btn') as HTMLButtonElement;
@@ -542,15 +541,83 @@ async function main(): Promise<void> {
     // Menu pickers hide their row; the view picker on the bar hides itself.
     (sel.closest<HTMLElement>('.menu-row') ?? sel).hidden = options.length < 2;
   }
+  /** One video view of the catalog: an altGroup within a program (renderGroup). */
+  interface CatalogView {
+    readonly renderGroup: number | undefined;
+    readonly altGroup: number;
+    readonly label: string;
+    readonly tracks: ReadonlyArray<{ codec: string; width?: number; height?: number; packaging?: string }>;
+  }
+  let catalogViews: CatalogView[] = [];
+  /** Whether this browser decodes a track, by `packaging|codec|WxH`; absent while checking. */
+  const decodable = new Map<string, boolean>();
+  const decodeKey = (t: CatalogView['tracks'][number]): string =>
+    `${t.packaging ?? ''}|${t.codec}|${t.width ?? ''}x${t.height ?? ''}`;
+  /** Asks the decoder MSE or WebCodecs would use; without that API the player is left to try. */
+  async function canDecode(t: CatalogView['tracks'][number]): Promise<boolean> {
+    try {
+      if (t.packaging === 'cmaf' || (t.packaging === 'locmaf' && !locmafFrame)) {
+        return typeof MediaSource === 'undefined' || MediaSource.isTypeSupported(`video/mp4; codecs="${t.codec}"`);
+      }
+      if (typeof VideoDecoder === 'undefined') return true;
+      const r = await VideoDecoder.isConfigSupported({
+        codec: t.codec, ...(t.width && t.height ? { codedWidth: t.width, codedHeight: t.height } : {}),
+      });
+      return r.supported === true;
+    } catch {
+      return false;
+    }
+  }
+  /** Every video view of every program, from the catalog; decode checks refill the picker. */
+  function noteCatalogViews(tracks: any[]): void {
+    const byView = new Map<string, { renderGroup: number | undefined; altGroup: number; label?: string; tracks: CatalogView['tracks'][number][] }>();
+    for (const t of tracks) {
+      const video = t.role === 'video' || (!t.role && /^(avc|hvc|hev|av01|vp0?[89])/.test(t.codec ?? ''));
+      if (!video || !Number.isFinite(Number(t.altGroup))) continue;
+      const renderGroup = Number.isFinite(Number(t.renderGroup)) ? Number(t.renderGroup) : undefined;
+      const key = `${renderGroup ?? ''}:${Number(t.altGroup)}`;
+      const view = byView.get(key) ?? { renderGroup, altGroup: Number(t.altGroup), tracks: [] };
+      view.label ??= typeof t.label === 'string' ? t.label : undefined;
+      const width = Number(t.width) || 0;
+      const height = Number(t.height) || 0;
+      view.tracks.push({ codec: String(t.codec ?? ''), ...(width ? { width } : {}), ...(height ? { height } : {}),
+        ...(typeof t.packaging === 'string' ? { packaging: t.packaging } : {}) });
+      byView.set(key, view);
+    }
+    catalogViews = [...byView.values()].map((v) => ({ ...v, label: v.label ?? `View ${v.altGroup}` }));
+    for (const t of catalogViews.flatMap((v) => v.tracks)) {
+      const key = decodeKey(t);
+      if (decodable.has(key)) continue;
+      void canDecode(t).then((ok) => {
+        decodable.set(key, ok);
+        fillTrackPickers();
+      });
+    }
+  }
+  /** View picker: every view, grouped by program; one this browser cannot decode is listed but disabled. */
+  function fillViewPicker(): void {
+    const programs = [...new Set(catalogViews.map((v) => v.renderGroup))];
+    const option = (v: CatalogView): HTMLOptionElement => {
+      const opt = document.createElement('option');
+      opt.value = `${v.renderGroup ?? ''}:${v.altGroup}`;
+      const unplayable = v.tracks.every((t) => decodable.get(decodeKey(t)) === false);
+      opt.textContent = unplayable ? `${v.label} (not supported here)` : v.label;
+      opt.disabled = unplayable;
+      return opt;
+    };
+    viewSelect.replaceChildren(...(programs.length < 2 ? catalogViews.map(option) : programs.map((rg) => {
+      const group = document.createElement('optgroup');
+      group.label = rg === undefined ? 'Every program' : `Program ${rg}`;
+      group.append(...catalogViews.filter((v) => v.renderGroup === rg).map(option));
+      return group;
+    })));
+    const current = catalogViews.find((v) => v.altGroup === player.currentView
+      && (v.renderGroup === undefined || v.renderGroup === player.currentProgram));
+    if (current) viewSelect.value = `${current.renderGroup ?? ''}:${current.altGroup}`;
+    viewSelect.closest<HTMLElement>('.menu-row')!.hidden = catalogViews.length < 2;
+  }
   function fillTrackPickers(): void {
-    const str = (v: number | undefined): string | undefined => (v === undefined ? undefined : String(v));
-    fillPicker(programSelect,
-      player.availablePrograms.map((p) => [String(p.renderGroup), `Program ${p.renderGroup}`]),
-      str(player.currentProgram));
-    fillPicker(viewSelect,
-      player.availableViews.map((v) => [String(v.altGroup),
-        v.label ?? (v.width && v.height ? `${v.width}×${v.height}` : `View ${v.altGroup}`)]),
-      str(player.currentView));
+    fillViewPicker();
     fillPicker(langSelect,
       player.availableAudioTracks.map((t) => [t.name, t.label ?? t.lang ?? t.name]),
       player.currentAudioTrackName);
@@ -1785,6 +1852,8 @@ async function main(): Promise<void> {
     audioCodec = tracks.find((t) => (t.role ?? t.name) === 'audio')?.codec ?? null;
     // Absent on the --ts path: the live demuxer has no framerate to declare.
     videoFps = Number(videoTrack?.framerate) || null;
+    noteCatalogViews(tracks);
+    fillTrackPickers();
     // The engine runs at the URL override when one is given.
     targetLatencyMs = targetLatencyOverrideMs ?? Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
@@ -2027,8 +2096,28 @@ async function main(): Promise<void> {
       });
     });
   };
-  switchFrom(programSelect, 'Program', () => player.selectProgram(Number(programSelect.value)));
-  switchFrom(viewSelect, 'View', () => player.selectView(Number(viewSelect.value)));
+  /** Resolves once the program switch has committed (selectProgram resolves when it starts). */
+  const programCommitted = (renderGroup: number): Promise<void> => new Promise((resolve, reject) => {
+    if (player.currentProgram === renderGroup) { resolve(); return; }
+    const timer = setTimeout(() => { off(); reject(new Error(`program ${renderGroup} did not start within 10 s`)); }, 10_000);
+    const off = player.on('program_changed', ({ toProgram }) => {
+      if (toProgram !== renderGroup) return;
+      clearTimeout(timer);
+      off();
+      resolve();
+    });
+  });
+  // A view in another program switches the program first, then the view within it.
+  switchFrom(viewSelect, 'View', async () => {
+    const [rgText, altText] = viewSelect.value.split(':');
+    const renderGroup = rgText ? Number(rgText) : undefined;
+    const altGroup = Number(altText);
+    if (renderGroup !== undefined && renderGroup !== player.currentProgram) {
+      await player.selectProgram(renderGroup);
+      await programCommitted(renderGroup);
+    }
+    if (altGroup !== player.currentView) await player.selectView(altGroup);
+  });
   switchFrom(langSelect, 'Audio', () => player.selectAudioTrack(langSelect.value));
 
   // ── Load ──────────────────────────────────────────────────────────
