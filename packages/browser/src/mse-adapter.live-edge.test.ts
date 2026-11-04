@@ -199,7 +199,7 @@ describe('replay containment', () => {
 });
 
 describe('stall nudge and post-stall live-edge snap', () => {
-    function stallSetup(opts: { maxAheadSec?: number; latencyMode?: 'live' | 'smooth' } = {}) {
+    function stallSetup(opts: { maxAheadSec?: number; latencyMode?: 'live' | 'smooth'; smoothFloorSec?: number } = {}) {
         const video = new MockVideoElement();
         video.buffered = makeTimeRanges([[5, 25]]);
         video.currentTime = 10;
@@ -208,6 +208,7 @@ describe('stall nudge and post-stall live-edge snap', () => {
             targetAheadSec: 0.2,
             ...(opts.maxAheadSec !== undefined ? { maxAheadSec: opts.maxAheadSec } : {}),
             ...(opts.latencyMode !== undefined ? { latencyMode: opts.latencyMode } : {}),
+            ...(opts.smoothFloorSec !== undefined ? { smoothFloorSec: opts.smoothFloorSec } : {}),
         });
         (adapter as any).playTriggered = true;
         const adjusts: Array<[string, number, number]> = [];
@@ -284,7 +285,7 @@ describe('stall nudge and post-stall live-edge snap', () => {
         vi.useFakeTimers();
         try {
             const live = stallSetup();
-            const smooth = stallSetup({ latencyMode: 'smooth' });
+            const smooth = stallSetup({ latencyMode: 'smooth', smoothFloorSec: 0 });
             // Past Smooth's startup grace.
             (smooth.adapter as any).noteLatencySlack(1);
             vi.advanceTimersByTime(3_000);
@@ -304,6 +305,13 @@ describe('stall nudge and post-stall live-edge snap', () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it('smooth: the target starts at the 1 s floor, above a 0.2 s live target', () => {
+        const smooth = stallSetup({ latencyMode: 'smooth' });
+        expect((smooth.adapter as any).targetAheadSec).toBe(1);
+        expect(smooth.adapter.latencyStats()).toMatchObject({ mode: 'smooth', heldMs: 1000, floorMs: 1000 });
+        smooth.adapter.destroy();
     });
 
     it('does not snap after an undetected wait, near target, or on a non-live stream', () => {

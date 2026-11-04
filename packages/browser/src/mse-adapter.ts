@@ -16,7 +16,7 @@
  */
 
 import type { MediaSourceLike, LatencyMode, LatencyStats } from '@openmoq/player';
-import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_STARTUP_GRACE_US } from '@openmoq/player';
+import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_STARTUP_GRACE_US } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -243,6 +243,8 @@ export interface MseMediaSourceOptions {
   readonly latencyMode?: LatencyMode;
   /** Ceiling of the smooth cushion target (s). Default 2. */
   readonly smoothCeilingSec?: number;
+  /** Floor of the smooth cushion target (s), where it starts. Default 1. */
+  readonly smoothFloorSec?: number;
   /**
    * Buffered-hole gap-jump: when the playhead is frozen at the end of a
    * buffered range with a bounded hole (≤ 2 s) and more buffered media
@@ -962,9 +964,11 @@ export class MseMediaSource implements MediaSourceLike {
         mode: 'smooth',
         baseUs: this.targetAheadSec * 1e6,
         ceilingUs: (options.smoothCeilingSec ?? SMOOTH_CEILING_MS / 1000) * 1e6,
+        floorUs: (options.smoothFloorSec ?? SMOOTH_FLOOR_MS / 1000) * 1e6,
         startupGraceUs: SMOOTH_STARTUP_GRACE_US,
       }, { now: () => performance.now() * 1000 })
       : null;
+    if (this.latencyPolicy) this.targetAheadSec = this.latencyPolicy.heldUs / 1e6;
     this.chase = new SoftChase(videoElement, () => this.targetAheadSec);
     const gapJumpMs = options.gapJumpMs ?? 2_000;
     this.stallThresholdMs = validateStallThresholdMs(options.stallThresholdMs);

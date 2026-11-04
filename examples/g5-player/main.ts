@@ -56,6 +56,12 @@ const smoothCeilingMs: number | undefined = (() => {
   const v = Number(new URLSearchParams(location.search).get('latencyMax'));
   return Number.isFinite(v) && v > 0 ? v : undefined;
 })();
+/** `?latencyMin=`: floor of the smooth playout delay (ms), where it starts; 0 starts at the target. */
+const smoothFloorMs: number | undefined = (() => {
+  const raw = new URLSearchParams(location.search).get('latencyMin');
+  const v = raw === null || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(v) && v >= 0 && (smoothCeilingMs === undefined || v <= smoothCeilingMs) ? v : undefined;
+})();
 
 /** `?congestionControl=low-latency|throughput`: a hint to the browser's QUIC
  *  congestion controller. Unset leaves the browser default. */
@@ -220,7 +226,7 @@ function log(msg: string): void {
 {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
-  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'latencyMax', 'cushion', 'cushionMax',
+  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'latencyMin', 'latencyMax', 'cushion', 'cushionMax',
     'catchUp', 'catalogBootstrap', 'warmStart', 'autoResume', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -230,6 +236,7 @@ function log(msg: string): void {
   const fNs = byId<HTMLInputElement>('s-ns');
   const fV = byId<HTMLSelectElement>('s-v');
   const fTarget = byId<HTMLInputElement>('s-target');
+  const fLatencyMin = byId<HTMLInputElement>('s-latency-min');
   const fLatencyMax = byId<HTMLInputElement>('s-latency-max');
   const fCushion = byId<HTMLInputElement>('s-cushion');
   const fCushionMax = byId<HTMLInputElement>('s-cushion-max');
@@ -253,6 +260,7 @@ function log(msg: string): void {
     fNs.value = p.get('ns') ?? '';
     fV.value = p.get('v') ?? '';
     fTarget.value = p.get('targetLatency') ?? '';
+    fLatencyMin.value = p.get('latencyMin') ?? '';
     fLatencyMax.value = p.get('latencyMax') ?? '';
     fCushion.value = p.get('cushion') ?? '';
     fCushionMax.value = p.get('cushionMax') ?? '';
@@ -300,6 +308,7 @@ function log(msg: string): void {
     if (ns && ns !== 'live') next.set('ns', ns);
     set('v', fV.value);
     set('targetLatency', fTarget.value.trim());
+    set('latencyMin', fLatencyMin.value.trim());
     set('latencyMax', fLatencyMax.value.trim());
     set('cushion', fCushion.value.trim());
     set('cushionMax', fCushionMax.value.trim());
@@ -407,11 +416,12 @@ async function main(): Promise<void> {
     ...(targetLatencyOverrideMs ? { targetLatencyMs: targetLatencyOverrideMs } : {}),
     ...(latencyMode === 'smooth' ? { latencyMode } : {}),
     ...(smoothCeilingMs ? { smoothCeilingMs } : {}),
+    ...(smoothFloorMs !== undefined ? { smoothFloorMs } : {}),
     moqtPlayerConfig: engineConfig,
   });
   const optionSummary = Object.entries({
     ...engineConfig, targetLatencyMs: targetLatencyOverrideMs,
-    latencyMode: latencyMode === 'smooth' ? latencyMode : undefined, smoothCeilingMs,
+    latencyMode: latencyMode === 'smooth' ? latencyMode : undefined, smoothFloorMs, smoothCeilingMs,
   })
     .filter(([, v]) => v !== undefined)
     .map(([k, v]) => `${k}=${String(v)}`)

@@ -1,6 +1,7 @@
 /**
- * LatencyPolicy — live holds the delay; smooth raises it on late arrivals and
- * steps it down after clean windows, never below the spare slack or the base.
+ * LatencyPolicy — live holds the delay; smooth starts at its floor, raises it
+ * on late arrivals and steps it down after clean windows, never below the
+ * spare slack or the floor.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -102,5 +103,32 @@ describe('LatencyPolicy', () => {
     p.setBase(200_000);                                     // the catalog target replaces a default
     expect(p.heldUs).toBe(200_000);
     expect(p.noteArrival(-100_000, 200_000)).toBe(350_000);
+  });
+
+  it('smooth: starts at the floor, raises above it, and steps back down to it and no further', () => {
+    const clock = makeClock();
+    const p = new LatencyPolicy({ mode: 'smooth', baseUs: 200_000, floorUs: 1_000_000 }, clock);
+    expect(p.heldUs).toBe(1_000_000);
+    expect(p.stats).toMatchObject({ heldMs: 1000, floorMs: 1000, ceilingMs: 2000 });
+    // Late against the floor: raised from it, not from the base.
+    expect(p.noteArrival(-300_000, 1_000_000)).toBe(1_350_000);
+    for (let i = 0; i < 20; i++) {
+      clock.advance(SMOOTH_CLEAN_WINDOW_US);
+      p.noteArrival(1_000_000, p.heldUs);
+    }
+    expect(p.heldUs).toBe(1_000_000);
+    expect(p.lowers).toBeGreaterThan(0);
+  });
+
+  it('smooth: the floor yields to a higher base and to the ceiling; live ignores it', () => {
+    const p = new LatencyPolicy({ mode: 'smooth', baseUs: 200_000, floorUs: 1_000_000, ceilingUs: 500_000 }, makeClock());
+    expect(p.floorUs).toBe(500_000);
+    expect(p.heldUs).toBe(500_000);
+    p.setBase(1_500_000);
+    expect(p.floorUs).toBe(1_500_000);
+    expect(p.heldUs).toBe(1_500_000);
+    const live = new LatencyPolicy({ mode: 'live', baseUs: 200_000, floorUs: 1_000_000 }, makeClock());
+    expect(live.heldUs).toBe(200_000);
+    expect(live.stats.floorMs).toBe(200);
   });
 });
