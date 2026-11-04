@@ -84,8 +84,9 @@ export interface CommandDispatcherOptions {
    */
   readonly recomputeVideoRenderTime?: (captureTimestampUs: bigint) => number;
   /** Current playback delay (µs) for A/V sync — applied to audio so it
-   *  matches the same delay that recomputeVideoRenderTime adds to video. */
-  readonly getPlaybackDelayUs?: () => number;
+   *  matches the same delay that recomputeVideoRenderTime adds to video.
+   *  Given the buffer's render time, a smooth latency policy may raise it. */
+  readonly getPlaybackDelayUs?: (renderTimeUs?: number) => number;
 
   /**
    * Returns true when the sync reference is established.
@@ -132,7 +133,7 @@ export class CommandDispatcher {
   private static readonly MAX_HOLD_QUEUE = 30; // 1 GOP at 30fps
   private readonly _hasSyncReference: (() => boolean) | undefined;
   private readonly _recomputeVideoRenderTime: ((captureTimestampUs: bigint) => number) | undefined;
-  private readonly _getPlaybackDelayUs: (() => number) | undefined;
+  private readonly _getPlaybackDelayUs: ((renderTimeUs?: number) => number) | undefined;
 
   constructor(opts: CommandDispatcherOptions) {
     this.videoDecoder = opts.videoDecoder;
@@ -204,7 +205,7 @@ export class CommandDispatcher {
         // anchor/underrun — video adopts per-frame. It does bound how far
         // the chain runs BEHIND renderTimeUs (rate chase, then a snap that
         // drops queued audio); pinned in webaudio-output.test.ts.
-        const cushionUs = this._getPlaybackDelayUs?.() ?? 0;
+        const cushionUs = this._getPlaybackDelayUs?.(renderTimeUs) ?? 0;
         audioOutput.schedule(data, renderTimeUs + cushionUs, captureUs);
         this.checkQueuePressure('audio', ad);
       };

@@ -16,6 +16,8 @@
  * @module
  */
 
+import type { LatencyStats } from './latency-policy.js';
+
 // ─── TTFF Breakdown ──────────────────────────────────────────────────
 
 /**
@@ -164,6 +166,9 @@ export interface PlayerStats {
    * skew steps with sync resets. Observability only — nothing acts on these.
    */
   readonly loc: LocDiagnostics;
+
+  /** The smooth latency policy's state; null in live mode. */
+  readonly latency: LatencyStats | null;
 }
 
 /** Kinds of LOC pipeline diagnostic events counted in {@link LocDiagnostics}. */
@@ -533,7 +538,7 @@ export class StatsAccumulator {
    * Computes relative TTFF, in-progress playback duration, session age,
    * and dropRatio. Returns a plain object (no class instance).
    */
-  snapshot(locGauges?: LocTimingGauges): PlayerStats {
+  snapshot(locGauges?: LocTimingGauges, latency?: LatencyStats | null): PlayerStats {
     const now = Date.now();
     const loadStart = this._loadStartMs;
 
@@ -628,6 +633,7 @@ export class StatsAccumulator {
         renderCushionMs: locGauges?.renderCushionMs ?? null,
         audioLateDrops: locGauges?.audioLateDrops ?? null,
       },
+      latency: latency ?? null,
     };
   }
 }

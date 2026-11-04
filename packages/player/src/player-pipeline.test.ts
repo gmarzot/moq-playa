@@ -292,6 +292,44 @@ describe('createPipelines', () => {
     // Both held + current should be enqueued
     expect(renderer.enqueue).toHaveBeenCalledTimes(2);
   });
+
+  it('smooth latency: a late frame raises the shared cushion and renders at its new slot; live renders it now', () => {
+    const run = (latencyMode: 'live' | 'smooth') => {
+      let nowUs = 0;
+      const clock: ClockSource = { now: () => nowUs };
+      const videoDecoder = {
+        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+        state: 'configured', decodeQueueSize: 0, ondequeue: null,
+        onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+        onError: null as ((error: Error) => void) | null,
+      };
+      const renderer = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+      };
+      const config = minimalConfig({
+        createVideoDecoder: () => videoDecoder as any,
+        createRenderer: () => renderer as any,
+        latencyMode,
+      });
+      const trackInfo: TrackInfo = { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined };
+      const result = createPipelines(config, clock, trackInfo, mockCallbacks());
+      nowUs = 100_000;
+      result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
+      nowUs = 200_000;
+      videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);  // slot 0.2 + 0.2 cushion
+      nowUs = 900_000;
+      videoDecoder.onFrame?.({ timestamp: 1_200_000, close: vi.fn() } as any, 0);  // slot 0.5: 400 ms late
+      return { times: renderer.enqueue.mock.calls.map((c) => c[1]), policy: result.latencyPolicy };
+    };
+    const live = run('live');
+    expect(live.times).toEqual([400_000, 900_000]);
+    expect(live.policy).toBeUndefined();
+    const smooth = run('smooth');
+    // 200 ms cushion + 400 ms late + 50 ms margin.
+    expect(smooth.times).toEqual([400_000, 300_000 + 650_000]);
+    expect(smooth.policy?.raises).toBe(1);
+  });
 });
 
 // ─── handlePipelineCommand ───────────────────────────────────────────

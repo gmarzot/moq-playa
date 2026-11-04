@@ -209,6 +209,8 @@ state and event lines above illustrate separate API calls, not a playback script
 | `muted` | boolean | false | Start muted |
 | `audioActivation` | 'auto' \| 'gesture' | 'auto' | Defer Web Audio activation until a user gesture when set to 'gesture' |
 | `targetLatencyMs` | number | — | Live edge target latency |
+| `latencyMode` | 'live' \| 'smooth' | 'live' | `'smooth'` raises the playout delay when media arrives late instead of skipping it |
+| `smoothCeilingMs` | number | 2000 | Ceiling of the smooth playout delay |
 | `autoQuality` | boolean | true | Enable ABR |
 | `startLevel` | number \| 'auto' \| 'lowest' | 'auto' | Initial quality level |
 | `videoAltGroup` | number | first video group | Initial video view; quality and ABR stay within it |
@@ -329,6 +331,8 @@ A language the viewer picks is preferred again on later program switches.
 | `preferredLanguage` | string | — | Audio language, e.g. `'es'`; primary subtag match, `spa`/`es` equivalent; never leaves you without audio |
 | `targetLatencyMs` | number | — | Live catch-up target |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
+| `latencyMode` | 'live' \| 'smooth' | 'live' | `'smooth'` raises the playout delay when media arrives late instead of skipping it |
+| `smoothCeilingMs` | number | 2000 | Ceiling of the smooth playout delay |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
 | `warmStartCurrentGroup` | boolean | false | Join live LOC tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |
 | `catalogBootstrap` | 'auto' \| 'joining-fetch' \| 'strict' \| 'subscribe' | 'auto' | Catalog bootstrap policy; draft 22 uses fills rather than Joining FETCH |

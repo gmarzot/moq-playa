@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig, TTFFBreakdown } from '@openmoq/player';
+import type { MoqtPlayerConfig, TTFFBreakdown, LatencyMode, LatencyStats } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -60,6 +60,13 @@ export interface PlayerOptions {
   readonly audioActivation?: 'auto' | 'gesture';
   /** Target latency in ms for live edge. */
   readonly targetLatencyMs?: number;
+  /**
+   * `'live'` (default) holds the target and skips late media; `'smooth'`
+   * raises the playout delay when media arrives late, up to `smoothCeilingMs`.
+   */
+  readonly latencyMode?: LatencyMode;
+  /** Ceiling of the smooth playout delay in ms. Default: 2000. */
+  readonly smoothCeilingMs?: number;
 
   // ── Quality ──
 
@@ -163,4 +170,6 @@ export interface PlayerStats {
   readonly cushionMs: number | null;
   /** WebCodecs audio buffers that arrived after the chain ran dry. */
   readonly audioUnderruns: number;
+  /** The smooth latency policy's state; null in live mode. */
+  readonly latency: LatencyStats | null;
 }

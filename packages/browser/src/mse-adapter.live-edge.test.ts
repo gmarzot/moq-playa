@@ -196,7 +196,7 @@ describe('replay containment', () => {
 });
 
 describe('stall nudge and post-stall live-edge snap', () => {
-    function stallSetup(opts: { maxAheadSec?: number } = {}) {
+    function stallSetup(opts: { maxAheadSec?: number; latencyMode?: 'live' | 'smooth' } = {}) {
         const video = new MockVideoElement();
         video.buffered = makeTimeRanges([[5, 25]]);
         video.currentTime = 10;
@@ -204,6 +204,7 @@ describe('stall nudge and post-stall live-edge snap', () => {
         const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
             targetAheadSec: 0.2,
             ...(opts.maxAheadSec !== undefined ? { maxAheadSec: opts.maxAheadSec } : {}),
+            ...(opts.latencyMode !== undefined ? { latencyMode: opts.latencyMode } : {}),
         });
         (adapter as any).playTriggered = true;
         const adjusts: Array<[string, number, number]> = [];
@@ -271,6 +272,29 @@ describe('stall nudge and post-stall live-edge snap', () => {
             const to = 25 - 0.2 - Math.min(outageSec!, 1);   // 24.5
             expect(video.currentTime).toBeCloseTo(to, 5);
             expect(adjusts).toEqual([['snap', 20, expect.closeTo(to, 5)]]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('smooth: a detected stall raises the target by its length, keeping the backlog live sheds', () => {
+        vi.useFakeTimers();
+        try {
+            const live = stallSetup();
+            const smooth = stallSetup({ latencyMode: 'smooth' });
+            for (const { adapter, video } of [live, smooth]) {
+                video.currentTime = 23.2;               // 1.8 s ahead, target 0.2 s
+                (adapter as any).handleWaiting();
+                vi.advanceTimersByTime(300);            // detected
+                (adapter as any).handlePlaying();
+            }
+            // Live: 25 - 0.2 - 0.3 = 24.5 is 1.3 s ahead of the playhead, so it snaps.
+            expect(live.adjusts.filter(([k]) => k === 'snap')).toHaveLength(1);
+            expect(live.adapter.latencyStats()).toBeNull();
+            // Smooth: the target rose to 0.2 + 0.3 + 0.05, inside the snap's excess.
+            expect(smooth.adjusts).toEqual([]);
+            expect(smooth.adapter.latencyStats()).toMatchObject({ mode: 'smooth', raises: 1 });
+            expect(smooth.adapter.latencyStats()!.heldMs).toBeCloseTo(550, 0);
         } finally {
             vi.useRealTimers();
         }

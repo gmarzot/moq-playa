@@ -15,6 +15,7 @@
  */
 
 import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
+import type { LatencyStats } from './latency-policy.js';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -216,6 +217,12 @@ export interface AudioOutputLike {
    * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
    */
   playheadCaptureUs?(): number | null;
+
+  /**
+   * The playout delay grew: a running chain ahead of its new slot waits for
+   * it once, so audio stays with video. Optional.
+   */
+  realign?(): void;
 
   /** Release resources. */
   destroy(): void;
@@ -432,6 +439,9 @@ export interface MediaSourceLike {
    * `targetLatencyMs` or the catalog's targetLatency.
    */
   setTargetAheadSec?(sec: number): void;
+
+  /** The latency policy's state, or null when the adapter has none. Optional. */
+  latencyStats?(): LatencyStats | null;
 
   /** Release all resources (MediaSource, SourceBuffers, object URLs). */
   destroy(): void;

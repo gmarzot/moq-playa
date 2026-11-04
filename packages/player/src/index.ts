@@ -149,6 +149,11 @@ export type { CommandDispatcherOptions } from './command-dispatcher.js';
 export { StatsAccumulator } from './stats.js';
 export type { PlayerStats, TTFFBreakdown } from './stats.js';
 
+// ─── Latency policy ──────────────────────────────────────────────────
+
+export { LatencyPolicy, SMOOTH_CEILING_MS } from './latency-policy.js';
+export type { LatencyMode, LatencyPolicyOptions, LatencyStats } from './latency-policy.js';
+
 // ─── Internal managers (exported for advanced use / testing) ─────────
 
 /** @experimental Advanced API — may change between minor versions. */

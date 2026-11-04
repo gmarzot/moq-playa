@@ -15,7 +15,8 @@
  * @module
  */
 
-import type { MediaSourceLike } from '@openmoq/player';
+import type { MediaSourceLike, LatencyMode, LatencyStats } from '@openmoq/player';
+import { LatencyPolicy, SMOOTH_CEILING_MS } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -238,6 +239,10 @@ export interface MseMediaSourceOptions {
   readonly maxAheadSec?: number;
   /** Where a behind-live jump lands: rangeEnd - targetAheadSec. Default 2. */
   readonly targetAheadSec?: number;
+  /** `'smooth'`: a stall raises the cushion target instead of being chased away. Default `'live'`. */
+  readonly latencyMode?: LatencyMode;
+  /** Ceiling of the smooth cushion target (s). Default 2. */
+  readonly smoothCeilingSec?: number;
   /**
    * Buffered-hole gap-jump: when the playhead is frozen at the end of a
    * buffered range with a bounded hole (≤ 2 s) and more buffered media
@@ -451,8 +456,25 @@ export class MseMediaSource implements MediaSourceLike {
   /** Playout cushion target (seek landings, chase set point). */
   setTargetAheadSec(sec: number): void {
     if (!Number.isFinite(sec) || sec <= 0) return;
-    this.targetAheadSec = sec;
-    this.diag('target-ahead %ss', sec.toFixed(2));
+    if (this.latencyPolicy) {
+      this.latencyPolicy.setBase(sec * 1e6);
+      this.targetAheadSec = this.latencyPolicy.heldUs / 1e6;
+    } else {
+      this.targetAheadSec = sec;
+    }
+    this.diag('target-ahead %ss', this.targetAheadSec.toFixed(2));
+  }
+
+  latencyStats(): LatencyStats | null {
+    return this.latencyPolicy?.stats ?? null;
+  }
+
+  /** Smooth: the cushion's slack (negative: a stall that long) moves the target. */
+  private noteLatencySlack(slackSec: number): void {
+    const held = this.latencyPolicy?.noteArrival(slackSec * 1e6, this.targetAheadSec * 1e6) ?? null;
+    if (held === null) return;
+    this.targetAheadSec = held / 1e6;
+    this.diag('smooth target-ahead %ss', this.targetAheadSec.toFixed(2));
   }
 
   setPlaybackIntent(intent: boolean): void {
@@ -805,6 +827,8 @@ export class MseMediaSource implements MediaSourceLike {
   private readonly maxAheadSec: number;
   /** Where a live-edge jump lands: rangeEnd - targetAheadSec. */
   private targetAheadSec: number;
+  /** Smooth latency: holds targetAheadSec above the base after stalls; null in live mode. */
+  private readonly latencyPolicy: LatencyPolicy | null;
   /** One evict+retry is allowed per quota error before escalating to flush. */
   private readonly quotaRetried: { video: boolean; audio: boolean } = { video: false, audio: false };
   /** A quota flush happened; the next committed append jumps playback to it. */
@@ -933,6 +957,13 @@ export class MseMediaSource implements MediaSourceLike {
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
     this.targetAheadSec = options.targetAheadSec ?? 2;
+    this.latencyPolicy = options.latencyMode === 'smooth'
+      ? new LatencyPolicy({
+        mode: 'smooth',
+        baseUs: this.targetAheadSec * 1e6,
+        ceilingUs: (options.smoothCeilingSec ?? SMOOTH_CEILING_MS / 1000) * 1e6,
+      }, { now: () => performance.now() * 1000 })
+      : null;
     this.chase = new SoftChase(videoElement, () => this.targetAheadSec);
     const gapJumpMs = options.gapJumpMs ?? 2_000;
     this.stallThresholdMs = validateStallThresholdMs(options.stallThresholdMs);
@@ -2977,7 +3008,10 @@ export class MseMediaSource implements MediaSourceLike {
 
     // The cushion is at its low point just before new media lands.
     const lowPoint = this.cushionAheadSec();
-    if (lowPoint !== null) this.chase.onLowPoint(lowPoint);
+    if (lowPoint !== null) {
+      this.chase.onLowPoint(lowPoint);
+      this.noteLatencySlack(lowPoint);
+    }
 
     // ── Step 3: mark pending + call appendBuffer ─────────────────
     this.appendErrored[mediaType] = false;
@@ -3327,6 +3361,8 @@ export class MseMediaSource implements MediaSourceLike {
       this.onFirstFrame?.();
     }
     if (recoveredMs !== null) {
+      // Smooth raises the target first, so the snap sheds only backlog past it.
+      this.noteLatencySlack(-recoveredMs / 1000);
       this.snapAfterStall(recoveredMs / 1000);
       this.onStallRecovered?.(recoveredMs);
     }
