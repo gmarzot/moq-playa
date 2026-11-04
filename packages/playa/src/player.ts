@@ -698,6 +698,23 @@ export class Player {
         draftVersion,
         opts.maxPendingStreams === undefined ? {} : { maxPendingUniStreams: opts.maxPendingStreams },
       ),
+      // Asks the decoder the track would use (MSE or WebCodecs); without that API, or on error, the track is tried.
+      canDecodeVideo: async (track): Promise<boolean> => {
+        const codec = track.codec;
+        if (!codec) return true;
+        try {
+          if (usesMsePath(track.packaging, this.locmafDecoding)) {
+            return typeof MediaSource === 'undefined' || MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`);
+          }
+          if (typeof VideoDecoder === 'undefined') return true;
+          const { supported } = await VideoDecoder.isConfigSupported({
+            codec, ...(track.width && track.height ? { codedWidth: track.width, codedHeight: track.height } : {}),
+          });
+          return supported === true;
+        } catch {
+          return true;
+        }
+      },
     };
 
     if (this.strategy === 'webcodecs') {

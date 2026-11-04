@@ -215,6 +215,8 @@ export class CommandDispatcher {
     if (this.videoDecoder) {
       this.videoDecoder.onError = (err) => {
         opts.onError?.('video', err);
+        // An unsupported configuration is not a stream fault: recovery cannot fix it.
+        if (err.name === 'NotSupportedError') return;
         this.onFeedback?.({ type: 'decode_error', mediaType: 'video', message: err.message });
       };
     }

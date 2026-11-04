@@ -13057,6 +13057,52 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
+  it('refuses a view whose track does not decode here, without subscribing to it', async () => {
+    const adapter = createMockAdapter();
+    const canDecodeVideo = vi.fn(async (t: { name: string }) => t.name !== 'video_portrait');
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'), { canDecodeVideo } as Partial<MoqtPlayerConfig>);
+
+    await expect(player.selectView(2)).rejects.toThrow(/does not decode here/);
+    await expect(player.selectView(2)).rejects.toThrow(/does not decode here/);
+    expect(canDecodeVideo).toHaveBeenCalledTimes(1);
+    expect(subscribedNames(adapter)).not.toContain('video_portrait');
+    expect(player.currentView).toBe(1);
+    await player.destroy();
+  });
+
+  it('leaves a track whose codec fails to decode for the one played before, once, without stream recovery', async () => {
+    const adapter = createMockAdapter();
+    const videoDecoder: Record<string, any> = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+      reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+    };
+    const renderer = { enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), onFirstFrame: null, onFrameRendered: null, onStall: null };
+    const player = await loadWithCatalog(adapter, twoViewCatalog('loc'), {
+      createVideoDecoder: () => videoDecoder, createRenderer: () => renderer,
+    } as Partial<MoqtPlayerConfig>);
+    const errors: string[] = [];
+    player.on('error', (e) => errors.push((e as { error: { message: string } }).error.message));
+    const feedback = vi.spyOn(player as any, 'handleFeedback');
+
+    await player.selectView(2);
+    await landLatestSubscription(adapter, new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67]));
+    expect(player.currentView).toBe(2);
+
+    const unsupported = Object.assign(new Error('Codec not supported: hvc1.1.6.H120.90'), { name: 'NotSupportedError' });
+    videoDecoder['onError'](unsupported);
+    videoDecoder['onError'](unsupported);
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(subscribedNames(adapter).filter(n => n === 'video_main')).toHaveLength(2);
+    expect(errors.filter((m) => m.includes('Switching to "video_main"'))).toHaveLength(1);
+    expect(feedback).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'decode_error' }));
+
+    await landLatestSubscription(adapter, new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67]));
+    expect(player.currentView).toBe(1);
+    await expect(player.selectView(2)).rejects.toThrow(/does not decode here/);
+    await player.destroy();
+  });
+
   it('splices a LOC switch in at a real keyframe, not at a delta frame numbered object 0', async () => {
     const adapter = createMockAdapter();
     const player = await loadWithCatalog(adapter, twoViewCatalog('loc'));

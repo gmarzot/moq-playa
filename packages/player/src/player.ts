@@ -923,6 +923,10 @@ export class MoqtPlayer {
   private videoSwitchStarting = false;
   /** Target of the switch `videoSwitchStarting` guards (a repeat request for it is a no-op). */
   private videoSwitchStartingTarget: string | null = null;
+  /** Video tracks found not to decode here; never switched to again this session. */
+  private readonly undecodableVideoTracks = new Set<string>();
+  /** The video track played before the current one, for leaving an undecodable track. */
+  private previousVideoTrack: string | undefined;
 
   /** In-flight audio track switch (`selectAudioTrack`), until its new track commits. */
   private pendingAudioSwitch: PendingAudioSwitch | null = null;
@@ -2831,6 +2835,41 @@ export class MoqtPlayer {
   }
 
   /**
+   * The playing video track does not decode here: mark it, report it once, and
+   * switch to the track played before it, else another track of its view, else
+   * another view of its program, else any other video track.
+   */
+  private leaveUndecodableVideo(error: Error): void {
+    const current = this.activeTrackName('video');
+    if (current === undefined || this.undecodableVideoTracks.has(current)) return;
+    this.undecodableVideoTracks.add(current);
+    const fallback = this.decodableFallbackVideoTrack(current);
+    this.emitError(createPlayerError(
+      'degraded', 'decoder', PlayerErrorCode.VIDEO_DECODE_ERROR,
+      `${error.message} ${fallback ? `Switching to "${fallback}".` : 'No other video track to switch to.'}`,
+      { cause: error, context: { mediaType: 'video' } },
+    ));
+    if (!fallback) return;
+    this.selectVideoTrack(fallback, 'recovery').catch((err) => {
+      this.log.warn('Leaving undecodable "%s" for "%s" failed: %s', current, fallback, err);
+    });
+  }
+
+  private decodableFallbackVideoTrack(current: string): string | undefined {
+    const tracks = this._catalogState?.tracks.filter((t: CatalogTrack) => t.role === 'video') ?? [];
+    const cur = tracks.find((t) => t.name === current);
+    const playable = (t: CatalogTrack): boolean => t.name !== current
+      && !this.undecodableVideoTracks.has(t.name) && isTrackPackagingSupported(t);
+    const sameProgram = (t: CatalogTrack): boolean => t.renderGroup === undefined
+      || cur?.renderGroup === undefined || t.renderGroup === cur.renderGroup;
+    const previous = tracks.find((t) => t.name === this.previousVideoTrack);
+    return (previous && playable(previous) ? previous
+      : tracks.find((t) => playable(t) && sameProgram(t) && t.altGroup === cur?.altGroup)
+        ?? tracks.find((t) => playable(t) && sameProgram(t))
+        ?? tracks.find(playable))?.name;
+  }
+
+  /**
    * Switch to a different video track from the altGroup.
    *
    * Subscribes to the new track, waits for SUBSCRIBE_OK, then
@@ -2888,6 +2927,13 @@ export class MoqtPlayer {
       throw new Error(
         `Cannot switch to "${trackName}": unsupported locmafVersion "${targetTrack.locmafVersion ?? ''}" (LOCMAF §5)`,
       );
+    }
+    if (!this.undecodableVideoTracks.has(trackName) && this.config.canDecodeVideo
+        && !(await this.config.canDecodeVideo(targetTrack))) {
+      this.undecodableVideoTracks.add(trackName);
+    }
+    if (this.undecodableVideoTracks.has(trackName)) {
+      throw new Error(`Cannot switch to "${trackName}": ${targetTrack.codec ?? 'its codec'} does not decode here`);
     }
 
     // Find the current video subscription
@@ -3080,6 +3126,7 @@ export class MoqtPlayer {
     const sw = this.pendingVideoSwitch;
     if (!sw) return;
     this.switchInProgress = true;
+    if (sw.oldTrackName) this.previousVideoTrack = sw.oldTrackName;
 
     // Clear the safety timeouts
     this.clearVideoSwitchTimers();
@@ -8886,6 +8933,13 @@ export class MoqtPlayer {
             this.transitionState(PlayerState.ERROR);
           }
           this.stopTicking();
+          return;
+        }
+
+        // A codec this browser cannot decode is not a stream fault: leave the
+        // track for one that plays rather than reset and retry into it.
+        if (mediaType === 'video' && error.name === 'NotSupportedError') {
+          this.leaveUndecodableVideo(error);
           return;
         }
 
