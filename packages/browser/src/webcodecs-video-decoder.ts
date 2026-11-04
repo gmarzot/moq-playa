@@ -403,10 +403,12 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
           const revision = this.lifecycleRevision;
           this.retireOwner(owner);
           if (this.destroyed || revision !== this.lifecycleRevision) return;
-          this.onError?.(new Error(
+          const unsupported = new Error(
             `Codec not supported: ${this.lastCodec} (${this.lastWidth ?? '?'}x${this.lastHeight ?? '?'}). ` +
             `VideoDecoder.isConfigSupported() returned false and decode failed.`,
-          ));
+          );
+          unsupported.name = 'NotSupportedError';
+          this.onError?.(unsupported);
           return;
         }
         this.publishDebugBundle();

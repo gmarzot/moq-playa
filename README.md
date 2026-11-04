@@ -104,7 +104,10 @@ path also needs these APIs:
 H.264, HEVC and AV1 decoding depends on the browser, OS, hardware and codec
 configuration. A browser version alone is not a codec-support guarantee.
 The WebCodecs adapter probes `VideoDecoder.isConfigSupported()`; MSE checks the
-selected codec's MIME type. Browser autoplay policy may require a user gesture
+selected codec's MIME type. A video view or quality the browser cannot decode
+is never switched to (`Player` asks MSE or WebCodecs first; `MoqtPlayer` takes a
+`canDecodeVideo` hook), and a track that fails to decode anyway is left for the
+one played before it, without retrying into it. Browser autoplay policy may require a user gesture
 to start audio. `Player` exposes `audioActivation: 'gesture'` and
 `prepareAudio()` / `unmute()` for application-controlled activation.
 

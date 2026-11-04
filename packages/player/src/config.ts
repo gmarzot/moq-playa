@@ -643,6 +643,12 @@ export interface FactoryConfig {
   /** Factory for the video decoder backend. */
   readonly createVideoDecoder?: () => VideoDecoderLike;
 
+  /**
+   * Whether this player can decode a video track. A track it cannot is never
+   * switched to. Absent: every track is tried.
+   */
+  readonly canDecodeVideo?: (track: CatalogTrack) => Promise<boolean>;
+
   /** Factory for the audio decoder backend. */
   readonly createAudioDecoder?: () => AudioDecoderLike;
 
