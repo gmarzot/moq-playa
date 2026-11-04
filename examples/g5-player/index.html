@@ -771,6 +771,8 @@
           <label class="menu-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
           <label class="menu-row" hidden>Language <select id="lang"></select></label>
           <label class="menu-row" hidden>Program <select id="program"></select></label>
+          <label class="menu-row" title="Live edge skips late media to stay at the target; Smooth raises the delay instead, up to its limit">Latency
+            <select id="latency"><option value="live">Live edge</option><option value="smooth">Smooth</option></select></label>
           <button id="settings-btn" class="menu-item" type="button">Connection settings…</button>
         </div>
       </div>
@@ -862,6 +864,10 @@
         <label for="s-target">Target latency (ms)</label>
         <input id="s-target" type="number" min="1" placeholder="from catalog">
         <div class="hint">Overrides the catalog's targetLatency.</div>
+
+        <label for="s-latency-max">Smooth latency limit (ms)</label>
+        <input id="s-latency-max" type="number" min="1" placeholder="2000">
+        <div class="hint">How far Smooth may raise the delay; past it, late media is skipped as in Live edge.</div>
 
         <label for="s-cushion">Render cushion floor / max (ms)</label>
         <input id="s-cushion" type="number" min="1" placeholder="engine default">

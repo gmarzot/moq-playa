@@ -42,6 +42,21 @@ const catchUpRate: number | undefined = (() => {
   return Number.isFinite(v) && v >= 1 ? v : undefined;
 })();
 
+const LATENCY_KEY = 'g5-latency';
+/** `?latency=live|smooth`, else the viewer's last choice; Live edge by default. */
+const latencyMode: 'live' | 'smooth' = (() => {
+  let v = new URLSearchParams(location.search).get('latency');
+  if (v === null) {
+    try { v = localStorage.getItem(LATENCY_KEY); } catch { /* storage unavailable */ }
+  }
+  return v === 'smooth' ? 'smooth' : 'live';
+})();
+/** `?latencyMax=`: ceiling of the smooth playout delay (ms). */
+const smoothCeilingMs: number | undefined = (() => {
+  const v = Number(new URLSearchParams(location.search).get('latencyMax'));
+  return Number.isFinite(v) && v > 0 ? v : undefined;
+})();
+
 /** `?congestionControl=low-latency|throughput`: a hint to the browser's QUIC
  *  congestion controller. Unset leaves the browser default. */
 const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
@@ -205,7 +220,7 @@ function log(msg: string): void {
 {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
-  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'cushion', 'cushionMax',
+  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'latencyMax', 'cushion', 'cushionMax',
     'catchUp', 'catalogBootstrap', 'warmStart', 'autoResume', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -215,6 +230,7 @@ function log(msg: string): void {
   const fNs = byId<HTMLInputElement>('s-ns');
   const fV = byId<HTMLSelectElement>('s-v');
   const fTarget = byId<HTMLInputElement>('s-target');
+  const fLatencyMax = byId<HTMLInputElement>('s-latency-max');
   const fCushion = byId<HTMLInputElement>('s-cushion');
   const fCushionMax = byId<HTMLInputElement>('s-cushion-max');
   const fCatchUp = byId<HTMLInputElement>('s-catchup');
@@ -237,6 +253,7 @@ function log(msg: string): void {
     fNs.value = p.get('ns') ?? '';
     fV.value = p.get('v') ?? '';
     fTarget.value = p.get('targetLatency') ?? '';
+    fLatencyMax.value = p.get('latencyMax') ?? '';
     fCushion.value = p.get('cushion') ?? '';
     fCushionMax.value = p.get('cushionMax') ?? '';
     fCatchUp.value = p.get('catchUp') ?? '';
@@ -283,6 +300,7 @@ function log(msg: string): void {
     if (ns && ns !== 'live') next.set('ns', ns);
     set('v', fV.value);
     set('targetLatency', fTarget.value.trim());
+    set('latencyMax', fLatencyMax.value.trim());
     set('cushion', fCushion.value.trim());
     set('cushionMax', fCushionMax.value.trim());
     set('catchUp', fCatchUp.value.trim());
@@ -387,9 +405,14 @@ async function main(): Promise<void> {
     ...(draftVersion ? { draftVersion } : {}),
     ...(congestionControl ? { congestionControl } : {}),
     ...(targetLatencyOverrideMs ? { targetLatencyMs: targetLatencyOverrideMs } : {}),
+    ...(latencyMode === 'smooth' ? { latencyMode } : {}),
+    ...(smoothCeilingMs ? { smoothCeilingMs } : {}),
     moqtPlayerConfig: engineConfig,
   });
-  const optionSummary = Object.entries({ ...engineConfig, targetLatencyMs: targetLatencyOverrideMs })
+  const optionSummary = Object.entries({
+    ...engineConfig, targetLatencyMs: targetLatencyOverrideMs,
+    latencyMode: latencyMode === 'smooth' ? latencyMode : undefined, smoothCeilingMs,
+  })
     .filter(([, v]) => v !== undefined)
     .map(([k, v]) => `${k}=${String(v)}`)
     .join(' ');
@@ -1497,6 +1520,8 @@ async function main(): Promise<void> {
   advPanel.addEventListener('toggle', () => { void renderTransport(); });
 
   let advTick = 0;
+  let latencyRaises = 0;
+  let latencyLowers = 0;
   setInterval(() => {
     watchVideo();
     if (++advTick % 4 === 0) void renderTransport();
@@ -1598,14 +1623,23 @@ async function main(): Promise<void> {
     drawSpark2(latSpark, tickNowMs, latP50Samples, chartColors.p50, latP95Samples, chartColors.p95, 0, undefined,
       peakAt >= 0 ? { atMs: sampleAtMs[peakAt]!, value: peakMs! } : null);
     drawSpark(jitSpark, tickNowMs, jitSamples, chartColors.jitter);
+    // Smooth moves the delay: show the one in force (the LOC cushion, else the MSE hold).
+    const smooth = player.stats.latency;
+    const targetNowMs = smooth ? Math.round(renderCushionMs() ?? smooth.heldMs) : targetLatencyMs;
+    if (smooth && (smooth.raises !== latencyRaises || smooth.lowers !== latencyLowers)) {
+      log(`Smooth latency: delay ${smooth.raises !== latencyRaises ? 'raised' : 'lowered'} to `
+        + `${Math.round(smooth.heldMs)} ms (limit ${smooth.ceilingMs} ms; ${smooth.raises} raised, ${smooth.lowers} lowered)`);
+      latencyRaises = smooth.raises;
+      latencyLowers = smooth.lowers;
+    }
     drawSpark2(cusSpark, tickNowMs, queuedASamples, chartColors.audio, queuedVSamples, chartColors.video,
-               targetLatencyMs, stallMarks);
+               targetNowMs, stallMarks);
     cusAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
     cusVVal.textContent = vMs != null ? vMs.toFixed(0) : '—';
     // a − v, following the order the pair is printed in.
     cusDVal.textContent = (vMs != null && aMs != null)
       ? `${aMs - vMs >= 0 ? '+' : ''}${(aMs - vMs).toFixed(0)}` : '—';
-    cusTarget.textContent = targetLatencyMs ? String(targetLatencyMs) : '—';
+    cusTarget.textContent = targetNowMs ? `${targetNowMs}${smooth ? ' smooth' : ''}` : '—';
     // One measurement (queued) against one setting (target). The render
     // cushion is a third name for the same region and pub_media pins it equal
     // to the target anyway, so it is not shown; rate and chase state are.
@@ -1939,6 +1973,17 @@ async function main(): Promise<void> {
     else document.getElementById('settings-btn')!.click();
   });
   menu.addEventListener('change', () => setMenuOpen(false));
+  // A latency choice applies from the start of a session: remember it and reload.
+  const latencySelect = document.getElementById('latency') as HTMLSelectElement;
+  latencySelect.value = latencyMode;
+  latencySelect.addEventListener('change', () => {
+    let stored = true;
+    try { localStorage.setItem(LATENCY_KEY, latencySelect.value); } catch { stored = false; }
+    const url = new URL(location.href);
+    if (stored || latencySelect.value === 'live') url.searchParams.delete('latency');
+    else url.searchParams.set('latency', 'smooth');
+    location.href = url.toString();
+  });
   document.addEventListener('click', (e) => {
     if (!menu.hidden && !menu.parentElement!.contains(e.target as Node)) setMenuOpen(false);
     if (!volumeGroup.contains(e.target as Node)) setVolumePopOpen(false);
