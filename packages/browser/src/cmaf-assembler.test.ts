@@ -1692,6 +1692,65 @@ describe('CmafAssembler — audio decode order', () => {
     }
   });
 
+  describe('audio gap bypass', () => {
+    /** Audio whose every frame leaves a one-frame gap: holds that never fill. */
+    function gappySetup() {
+      const starts: number[] = [];
+      const assembler = new CmafAssembler({
+        onSegment: (_t: string, seg: Uint8Array) => { starts.push(Number(readBaseMediaDecodeTime(seg)!) / FRAME); },
+        audioAheadMs: () => 300,
+      });
+      assembler.setInitSegment('audio', audioInit());
+      const push = (n: number) => assembler.push('audio', 'audio0', BigInt(n),
+        concat(buildMoof(n * FRAME, n + 1, FRAME), buildMdat(new Uint8Array([n]))));
+      return { assembler, push, starts };
+    }
+    const HOLD_MS = 300 - 150 + 1;
+
+    it('passes audio gaps through once three holds in a row expire unfilled, and holds again after 30 s', () => {
+      vi.useFakeTimers();
+      try {
+        const { assembler, push, starts } = gappySetup();
+        push(0);
+        for (const n of [2, 4, 6]) {
+          push(n);
+          expect(starts.at(-1)).toBe(n - 2);           // held
+          vi.advanceTimersByTime(HOLD_MS);
+          expect(starts.at(-1)).toBe(n);               // released past the gap
+        }
+        expect(assembler.audioOrderStats).toMatchObject({ missing: 3, passed: 0, bypasses: 1 });
+        expect(assembler.audioGapBypass).toBe(true);
+        push(8);
+        push(10);
+        expect(starts.slice(-2)).toEqual([8, 10]);       // no hold, no timer
+        expect(vi.getTimerCount()).toBe(0);
+        expect(assembler.audioOrderStats).toMatchObject({ missing: 5, passed: 2, bypasses: 1 });
+        vi.advanceTimersByTime(30_000);
+        expect(assembler.audioGapBypass).toBe(false);
+        push(12);
+        expect(starts.at(-1)).toBe(10);                  // held again
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a hold that fills resets the count of unfilled holds', () => {
+      vi.useFakeTimers();
+      try {
+        const { assembler, push } = gappySetup();
+        push(0);
+        for (const n of [2, 4]) { push(n); vi.advanceTimersByTime(HOLD_MS); }
+        push(6);
+        push(5);                                         // fills the gap before 6
+        for (const n of [8, 10]) { push(n); vi.advanceTimersByTime(HOLD_MS); }
+        expect(assembler.audioOrderStats).toMatchObject({ restored: 1, missing: 4, bypasses: 0 });
+        expect(assembler.audioGapBypass).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it('leaves video in arrival order', () => {
     const onSegment = vi.fn();
     const assembler = new CmafAssembler({ onSegment });

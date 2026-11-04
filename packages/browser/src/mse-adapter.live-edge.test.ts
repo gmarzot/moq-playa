@@ -24,6 +24,9 @@ describe('MseMediaSource — soft chase', () => {
         expect(rateAt(0.35)).toBe(1.05);  // past 0.2 + 0.132
         expect(rateAt(0.25)).toBe(1.05);  // still above target: keeps chasing
         expect(rateAt(0.20)).toBe(1);     // back at target: released
+        expect(adapter.chaseStarts).toBe(1);
+        rateAt(0.35);
+        expect(adapter.chaseStarts).toBe(2);
     });
 
     it('soft chase ends at the target measured before new media lands', () => {

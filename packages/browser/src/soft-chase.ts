@@ -24,6 +24,7 @@ export class SoftChase {
   private floorSec = 0;
   /** Duration (s) of the latest video sample. */
   private sampleSec: number | null = null;
+  private _starts = 0;
 
   constructor(
     private readonly element: ChasedElement,
@@ -32,6 +33,11 @@ export class SoftChase {
 
   get chasing(): boolean {
     return this.element.playbackRate !== 1;
+  }
+
+  /** Times a chase began. */
+  get starts(): number {
+    return this._starts;
   }
 
   /** The cushion a chase stops at: the target, or above a level a chase has stalled at. */
@@ -47,7 +53,10 @@ export class SoftChase {
   /** Cushion measured after new media lands: engage above the band, release at the release point. */
   onCushion(aheadSec: number): void {
     if (aheadSec > this.engageSec) {
-      if (this.element.playbackRate === 1) this.element.playbackRate = SoftChase.RATE;
+      if (this.element.playbackRate === 1) {
+        this.element.playbackRate = SoftChase.RATE;
+        this._starts++;
+      }
     } else if (aheadSec <= this.releaseSec) {
       this.stop();
     }

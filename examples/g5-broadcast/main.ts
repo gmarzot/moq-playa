@@ -1467,8 +1467,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       capture!.onError = (err) => log(`[Capture ERROR] ${err.message}`);
       if (audioEncoder) {
         const ae = audioEncoder;
-        ae.onChunk = (data, timestamp) => {
-          mediaPublisher.publishAudio(data, { timestampUs: timestamp });
+        ae.onChunk = (data, timestamp, duration) => {
+          mediaPublisher.publishAudio(data, { timestampUs: timestamp, ...(duration > 0 ? { durationUs: duration } : {}) });
         };
         ae.onError = (err) => log(`[AudioEncoder ERROR] ${err.message}`);
         ae.onInputDiscontinuity = (deltaUs) => {

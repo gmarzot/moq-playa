@@ -2827,6 +2827,11 @@ export class MseMediaSource implements MediaSourceLike {
     return end === null ? null : end - ct;
   }
 
+  /** Times the soft chase began. */
+  get chaseStarts(): number {
+    return this.chase.starts;
+  }
+
   /** A stall began: during a soft chase it raises the cushion the chase stops at. */
   private noteChaseStall(): void {
     const ahead = this.cushionAheadSec();
