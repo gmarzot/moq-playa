@@ -1882,12 +1882,10 @@ async function main(): Promise<void> {
   const labelSpeaker = (): void => {
     if (phoneBar.matches) {
       muteBtn.title = 'Volume';
-      muteBtn.setAttribute('aria-haspopup', 'true');
       muteBtn.setAttribute('aria-expanded', String(volumeGroup.classList.contains('open')));
     } else {
       setVolumePopOpen(false);
       muteBtn.title = muteBtn.classList.contains('muted') ? 'Unmute' : 'Mute';
-      muteBtn.removeAttribute('aria-haspopup');
       muteBtn.removeAttribute('aria-expanded');
     }
     muteBtn.setAttribute('aria-label', muteBtn.title);
@@ -1948,7 +1946,11 @@ async function main(): Promise<void> {
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     setMenuOpen(false);
+    // Focus inside the closing popup returns to the speaker.
+    const popFocused = volumeGroup.classList.contains('open')
+      && popMuteBtn.parentElement!.contains(document.activeElement);
     setVolumePopOpen(false);
+    if (popFocused) muteBtn.focus();
   });
 
   qualitySelect.addEventListener('change', () => {
