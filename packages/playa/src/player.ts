@@ -734,10 +734,11 @@ export class Player {
     }
 
     Object.assign(base, {
+      // Latency settings are read from base when the adapter is built, after moqtPlayerConfig overrides merge.
       createMediaSource: () => new MseMediaSource(this.videoElement!, {
         ...(opts.targetLatencyMs !== undefined ? { targetAheadSec: opts.targetLatencyMs / 1000 } : {}),
-        ...(opts.latencyMode !== undefined ? { latencyMode: opts.latencyMode } : {}),
-        ...(opts.smoothCeilingMs !== undefined ? { smoothCeilingSec: opts.smoothCeilingMs / 1000 } : {}),
+        ...(base.latencyMode !== undefined ? { latencyMode: base.latencyMode } : {}),
+        ...(base.smoothCeilingMs !== undefined ? { smoothCeilingSec: base.smoothCeilingMs / 1000 } : {}),
       }),
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),

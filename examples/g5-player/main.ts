@@ -1995,8 +1995,8 @@ async function main(): Promise<void> {
     let stored = true;
     try { localStorage.setItem(LATENCY_KEY, latencySelect.value); } catch { stored = false; }
     const url = new URL(location.href);
-    if (stored || latencySelect.value === 'live') url.searchParams.delete('latency');
-    else url.searchParams.set('latency', 'smooth');
+    if (stored) url.searchParams.delete('latency');
+    else url.searchParams.set('latency', latencySelect.value);
     location.href = url.toString();
   });
   document.addEventListener('click', (e) => {

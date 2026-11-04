@@ -1389,7 +1389,10 @@ export class MoqtPlayer {
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
       audioLateDrops: this.audioPipeline?.lateAudioDrops ?? null,
     } : undefined;
-    const latency = this.latencyPolicy?.stats ?? this.mediaSource?.latencyStats?.() ?? null;
+    // The policy of the path that renders video: LOC when there is a LOC video pipeline, else MSE.
+    const locLatency = this.latencyPolicy?.stats ?? null;
+    const mseLatency = this.mediaSource?.latencyStats?.() ?? null;
+    const latency = this.videoPipeline ? locLatency ?? mseLatency : mseLatency ?? locLatency;
     return Object.freeze(this._stats.snapshot(locGauges, latency));
   }
 

@@ -82,7 +82,7 @@ export interface CommandDispatcherOptions {
    *
    * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp)
    */
-  readonly recomputeVideoRenderTime?: (captureTimestampUs: bigint) => number;
+  readonly recomputeVideoRenderTime?: (captureTimestampUs: bigint, fromHoldQueue?: boolean) => number;
   /** Current playback delay (µs) for A/V sync — applied to audio so it
    *  matches the same delay that recomputeVideoRenderTime adds to video.
    *  Given the buffer's render time, a smooth latency policy may raise it. */
@@ -132,7 +132,7 @@ export class CommandDispatcher {
   private readonly videoHoldQueue: Array<{ frame: unknown; captureTimestampUs: bigint }> = [];
   private static readonly MAX_HOLD_QUEUE = 30; // 1 GOP at 30fps
   private readonly _hasSyncReference: (() => boolean) | undefined;
-  private readonly _recomputeVideoRenderTime: ((captureTimestampUs: bigint) => number) | undefined;
+  private readonly _recomputeVideoRenderTime: ((captureTimestampUs: bigint, fromHoldQueue?: boolean) => number) | undefined;
   private readonly _getPlaybackDelayUs: ((renderTimeUs?: number) => number) | undefined;
 
   constructor(opts: CommandDispatcherOptions) {
@@ -413,7 +413,7 @@ export class CommandDispatcher {
   private drainVideoHoldQueue(renderer: VideoRendererLike): void {
     for (const held of this.videoHoldQueue) {
       const renderTimeUs = this._recomputeVideoRenderTime
-        ? this._recomputeVideoRenderTime(held.captureTimestampUs)
+        ? this._recomputeVideoRenderTime(held.captureTimestampUs, true)
         : 0;
       renderer.enqueue(held.frame, renderTimeUs);
     }

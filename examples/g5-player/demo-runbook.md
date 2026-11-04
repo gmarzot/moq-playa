@@ -58,8 +58,8 @@ Forward State change, capture gaps, and the per-minute capture drift.
 ## Player
 
 Controls: play/pause, timeline, speaker (on phones it opens a volume slider
-with mute), ⚙ (quality, language and program when the catalog offers them;
-Connection settings), catalog panel.
+with mute), ⚙ (Latency: Live edge or Smooth; quality, language and program
+when the catalog offers them; Connection settings), catalog panel.
 
 Readouts: TTFF; BITRATE A/V; REORDER A/V; LAG; CLK DRIFT; SLOWEST T/A/D;
 RESYNCS; UNDERRUNS; LATE/SNAP; DROPPED; OBJ LOST A/V; STALLS. LATENCY
@@ -80,6 +80,8 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | `live` |
 | `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
 | `targetLatency=` | overrides the catalog target (ms); see below | catalog value |
+| `latency=` | `live` or `smooth`; overrides the choice the ⚙ menu remembers | the remembered choice, else live |
+| `latencyMax=` | Smooth's limit (ms) | 2000 |
 | `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
 | `catchUp=` | LOC max playback rate chasing the target | 1.0 (off) |
 | `catalogBootstrap=` | auto, joining-fetch, strict, subscribe, fetch | auto |
@@ -106,6 +108,12 @@ a reload.
 - LOC plays a render cushion between a floor and a cap, and the target only
   caps it. To run 2 s behind live on LOC, raise the floor too:
   `targetLatency=2000&cushion=2000`.
+- ⚙ → Latency: **Live edge** (default) keeps the target and skips media that
+  arrives late. **Smooth** raises the delay instead, by how late the media was
+  plus 50 ms, up to its limit (2 s, `latencyMax=`), and steps back toward the
+  target after 30 s with nothing late. TARGET then shows the delay in force,
+  and the log records each raise and step down. The choice applies after a
+  reload.
 
 ## Samples to play
 

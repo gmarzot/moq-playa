@@ -324,7 +324,7 @@ export function createPipelines(
       // are fresh relative to the current clock, not stale from pipeline processing.
       // Adds a playback delay cushion to absorb network jitter — frames are
       // scheduled slightly into the future so delivery stalls don't cause stutter.
-      recomputeVideoRenderTime: (captureTimestampUs: bigint) => {
+      recomputeVideoRenderTime: (captureTimestampUs: bigint, fromHoldQueue?: boolean) => {
         // The SMOOTHED shared playout cushion (the same smoothed value is
         // passed to audio scheduling via getPlaybackDelayUs; audio adopts it
         // at anchor/underrun boundaries) — slew-limited so raw gap-fuse
@@ -337,7 +337,10 @@ export function createPipelines(
         // after the reference is established. No speculative fallback needed.
         const timing = syncController.computeVideoRenderTime(captureTimestampUs);
         if (!timing) return clock.now() + playbackDelayUs; // safety: shouldn't happen
-        if (latencyPolicy) playbackDelayUs = noteSlack(timing.renderTimeUs + playbackDelayUs - clock.now());
+        // Frames held for the sync reference waited on the player, not the network.
+        if (latencyPolicy && !fromHoldQueue) {
+          playbackDelayUs = noteSlack(timing.renderTimeUs + playbackDelayUs - clock.now());
+        }
         // Smooth renders a raised frame at its slot; past the ceiling it renders now, as in live.
         if (timing.shouldDrop && (!latencyPolicy || timing.renderTimeUs + playbackDelayUs < clock.now())) {
           return clock.now();

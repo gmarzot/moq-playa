@@ -330,6 +330,34 @@ describe('createPipelines', () => {
     expect(smooth.times).toEqual([400_000, 300_000 + 650_000]);
     expect(smooth.policy?.raises).toBe(1);
   });
+
+  it('smooth latency: frames held for the sync reference do not raise the cushion', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const result = createPipelines(minimalConfig({
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
+      latencyMode: 'smooth',
+    }), clock, { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
+    // Decoded before any reference: held. Its capture time is 1 s behind the reference set later.
+    nowUs = 100_000;
+    videoDecoder.onFrame?.({ timestamp: 1_000_000, close: vi.fn() } as any, 0);
+    nowUs = 1_200_000;
+    result.syncController.setAudioReference(2_000_000n);
+    videoDecoder.onFrame?.({ timestamp: 2_000_000, close: vi.fn() } as any, 0);   // drains the held frame
+    expect(renderer.enqueue).toHaveBeenCalledTimes(2);
+    expect(result.latencyPolicy?.raises).toBe(0);
+  });
 });
 
 // ─── handlePipelineCommand ───────────────────────────────────────────

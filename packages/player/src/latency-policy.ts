@@ -49,7 +49,7 @@ export interface LatencyStats {
 
 export class LatencyPolicy {
   readonly mode: LatencyMode;
-  readonly ceilingUs: number;
+  private readonly configuredCeilingUs: number;
   private baseUs: number;
   private readonly marginUs: number;
   private readonly cleanWindowUs: number;
@@ -65,15 +65,20 @@ export class LatencyPolicy {
   constructor(options: LatencyPolicyOptions, clock: ClockSource) {
     this.mode = options.mode;
     this.baseUs = options.baseUs;
-    this.ceilingUs = Math.max(options.ceilingUs ?? SMOOTH_CEILING_MS * 1000, options.baseUs);
+    this.configuredCeilingUs = options.ceilingUs ?? SMOOTH_CEILING_MS * 1000;
     this.marginUs = options.marginUs ?? SMOOTH_MARGIN_US;
     this.cleanWindowUs = options.cleanWindowUs ?? SMOOTH_CLEAN_WINDOW_US;
     this.clock = clock;
   }
 
+  /** The smooth ceiling (µs), never below the base. */
+  get ceilingUs(): number {
+    return Math.max(this.configuredCeilingUs, this.baseUs);
+  }
+
   /** The delay smooth mode holds (µs): at least the base, at most the ceiling. */
   get heldUs(): number {
-    return Math.min(Math.max(this.raisedUs, this.baseUs), Math.max(this.ceilingUs, this.baseUs));
+    return Math.min(Math.max(this.raisedUs, this.baseUs), this.ceilingUs);
   }
 
   get raises(): number {
