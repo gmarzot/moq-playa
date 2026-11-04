@@ -205,6 +205,9 @@ The g5 namespace is one field (`g5-<hex>`), shown in each page's header
 ### M2 — aiomoqt publisher → browser player
 - With `AIOMOQT_PLAYER_URL` set, `pub_media` prints a `/g5-player/` URL per
   relay: demos A–C in aiomoqt's demo runbook.
+- moq-test-tracks streams generated locally, with aiomoqt checks on the wire:
+  [demo G](https://github.com/gmarzot/aiomoqt/blob/gmarzot-0.15.0/docs/demo-runbook.md#demo-g--moq-test-tracks-streams-generated-locally-no-token)
+  in aiomoqt's demo runbook (on the 0.15.0 branch until that release).
 
 ### M3 — path canary next to a g5 pair
 - Publisher first, then subscriber, while a G1/G2 pair runs:
