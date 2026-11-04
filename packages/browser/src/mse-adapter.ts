@@ -16,7 +16,7 @@
  */
 
 import type { MediaSourceLike, LatencyMode, LatencyStats } from '@openmoq/player';
-import { LatencyPolicy, SMOOTH_CEILING_MS } from '@openmoq/player';
+import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_STARTUP_GRACE_US } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -962,6 +962,7 @@ export class MseMediaSource implements MediaSourceLike {
         mode: 'smooth',
         baseUs: this.targetAheadSec * 1e6,
         ceilingUs: (options.smoothCeilingSec ?? SMOOTH_CEILING_MS / 1000) * 1e6,
+        startupGraceUs: SMOOTH_STARTUP_GRACE_US,
       }, { now: () => performance.now() * 1000 })
       : null;
     this.chase = new SoftChase(videoElement, () => this.targetAheadSec);

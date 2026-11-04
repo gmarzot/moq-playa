@@ -84,6 +84,19 @@ describe('LatencyPolicy', () => {
     expect(p.noteArrival(-900_000, 200_000)).toBe(500_000);
   });
 
+  it('smooth: lateness in the startup grace is ignored (a join backlog), then raises as usual', () => {
+    const clock = makeClock();
+    const p = new LatencyPolicy({ mode: 'smooth', baseUs: 200_000, startupGraceUs: 3_000_000 }, clock);
+    expect(p.armed).toBe(false);
+    expect(p.noteArrival(-1_500_000, 200_000)).toBeNull();
+    clock.advance(2_000_000);
+    expect(p.noteArrival(-500_000, 200_000)).toBeNull();
+    expect(p.armed).toBe(false);
+    clock.advance(1_000_000);
+    expect(p.armed).toBe(true);
+    expect(p.noteArrival(-300_000, 200_000)).toBe(200_000 + 300_000 + SMOOTH_MARGIN_US);
+  });
+
   it('smooth: before any raise the held delay follows the base, down as well as up', () => {
     const p = new LatencyPolicy({ mode: 'smooth', baseUs: 2_000_000 }, makeClock());
     p.setBase(200_000);                                     // the catalog target replaces a default

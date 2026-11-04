@@ -25,7 +25,7 @@ import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
-import { LatencyPolicy, SMOOTH_CEILING_MS } from './latency-policy.js';
+import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 import { usesMsePath } from './packaging.js';
@@ -280,6 +280,7 @@ export function createPipelines(
       mode: 'smooth',
       baseUs: cushionFloorUs,
       ceilingUs: Math.max((config.smoothCeilingMs ?? SMOOTH_CEILING_MS) * 1000, cushionMaxUs),
+      startupGraceUs: SMOOTH_STARTUP_GRACE_US,
     }, clock)
     : null;
   const renderCushion = hasLoc
@@ -387,8 +388,9 @@ export function createPipelines(
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
       // The cushion the dispatcher adds to audio render times (peek only).
-      // Smooth drops before decode only audio late past the ceiling; the rest raises the cushion.
-      getPlaybackDelayUs: () => latencyPolicy?.ceilingUs ?? renderCushion?.currentUs ?? cushionFloorUs,
+      // Armed Smooth drops before decode only audio late past the ceiling; the rest raises the cushion.
+      getPlaybackDelayUs: () => (latencyPolicy?.armed ? latencyPolicy.ceilingUs : undefined)
+        ?? renderCushion?.currentUs ?? cushionFloorUs,
     });
   }
 

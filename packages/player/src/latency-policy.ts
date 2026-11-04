@@ -25,6 +25,8 @@ export const SMOOTH_CEILING_MS = 2000;
 export const SMOOTH_MARGIN_US = 50_000;
 /** A window this long with no late arrival lets the delay step down. */
 export const SMOOTH_CLEAN_WINDOW_US = 30_000_000;
+/** Lateness is ignored this long after the first arrival: a join delivers its group's backlog. */
+export const SMOOTH_STARTUP_GRACE_US = 3_000_000;
 
 export interface LatencyPolicyOptions {
   readonly mode: LatencyMode;
@@ -34,6 +36,8 @@ export interface LatencyPolicyOptions {
   readonly ceilingUs?: number;
   readonly marginUs?: number;
   readonly cleanWindowUs?: number;
+  /** Default 0; players pass {@link SMOOTH_STARTUP_GRACE_US}. */
+  readonly startupGraceUs?: number;
 }
 
 export interface LatencyStats {
@@ -53,7 +57,9 @@ export class LatencyPolicy {
   private baseUs: number;
   private readonly marginUs: number;
   private readonly cleanWindowUs: number;
+  private readonly startupGraceUs: number;
   private readonly clock: ClockSource;
+  private firstArrivalUs: number | null = null;
 
   /** The delay raises hold, 0 before any; the held delay is never below the base. */
   private raisedUs = 0;
@@ -68,6 +74,7 @@ export class LatencyPolicy {
     this.configuredCeilingUs = options.ceilingUs ?? SMOOTH_CEILING_MS * 1000;
     this.marginUs = options.marginUs ?? SMOOTH_MARGIN_US;
     this.cleanWindowUs = options.cleanWindowUs ?? SMOOTH_CLEAN_WINDOW_US;
+    this.startupGraceUs = options.startupGraceUs ?? 0;
     this.clock = clock;
   }
 
@@ -79,6 +86,12 @@ export class LatencyPolicy {
   /** The delay smooth mode holds (µs): at least the base, at most the ceiling. */
   get heldUs(): number {
     return Math.min(Math.max(this.raisedUs, this.baseUs), this.ceilingUs);
+  }
+
+  /** Smooth and past its startup grace: lateness now moves the delay. */
+  get armed(): boolean {
+    return this.mode === 'smooth' && this.firstArrivalUs !== null
+      && this.clock.now() - this.firstArrivalUs >= this.startupGraceUs;
   }
 
   get raises(): number {
@@ -102,6 +115,8 @@ export class LatencyPolicy {
   noteArrival(slackUs: number, delayUs: number): number | null {
     if (this.mode !== 'smooth') return null;
     const nowUs = this.clock.now();
+    this.firstArrivalUs ??= nowUs;
+    if (nowUs - this.firstArrivalUs < this.startupGraceUs) return null;
     if (slackUs < 0) {
       this.restartWindow(nowUs);
       const next = Math.min(this.ceilingUs, delayUs - slackUs + this.marginUs);
