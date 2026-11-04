@@ -614,7 +614,7 @@ async function main(): Promise<void> {
     const text = (player as any).engine?.mediaSource?.describeBuffers?.() as string | undefined;
     return text ? ` · ${text}${audioOrderNote()}` : '';
   };
-  type OrderStats = { restored: number; missing: number; late: number; worstLateMs: number };
+  type OrderStats = { restored: number; missing: number; late: number; worstLateMs: number; passed?: number };
   /** CMAF decode-order repair so far (CmafAssembler audio/videoOrderStats). */
   const orderStats = (): Array<[string, OrderStats]> => {
     const asm = (player as any).engine?.cmafAssembler;
@@ -624,7 +624,8 @@ async function main(): Promise<void> {
   };
   const audioOrderNote = (): string => orderStats().map(([kind, o]) => {
     const worst = o.late > 0 && o.worstLateMs ? ` (worst ${o.worstLateMs.toFixed(0)}ms behind)` : '';
-    return ` · ${kind} order restored/missing/late ${o.restored}/${o.missing}/${o.late}${worst}`;
+    const passed = o.passed ? `, ${o.passed} gaps passed without a hold` : '';
+    return ` · ${kind} order restored/missing/late ${o.restored}/${o.missing}/${o.late}${worst}${passed}`;
   }).join('');
   player.on('stall', ({ durationMs }) => {
     const video = watchVideo();
@@ -884,6 +885,8 @@ async function main(): Promise<void> {
   let underrunWindow = emptyUnderrunWindow();
   let underrunReportAtMs = 0;
   let audioOrderReported = '';
+  let audioBypassesReported = 0;
+  let chaseStartsReported = 0;
   let staleDropsReported = 0;
   let staleDropsReportedAtMs = 0;
   const noteUnderrun = (gapSec: number, lateSec: number | null): void => {
@@ -1516,6 +1519,12 @@ async function main(): Promise<void> {
           + `catch-up now stops at ${Math.round(floorSec * 1000)}ms`);
     }
     if (debug && ms && ms.debug === false) ms.debug = true;
+    const bypasses: number = (player as any).engine?.cmafAssembler?.audioOrderStats?.bypasses ?? 0;
+    if (bypasses > audioBypassesReported) {
+      audioBypassesReported = bypasses;
+      log(`CMAF audio: gap holds keep expiring unfilled, so audio gaps pass through without a hold `
+        + `for 30 s (time ${bypasses})`);
+    }
     // Per-track depth ahead of the playhead: MSE SourceBuffers on CMAF; on LOC
     // the render queue and the audio scheduled in WebAudio.
     const tickNowMs = performance.now();
@@ -1627,6 +1636,12 @@ async function main(): Promise<void> {
       if (order && order !== audioOrderReported && anyRepair) {
         audioOrderReported = order;
         log(`CMAF${order}`);
+      }
+      const chaseStarts: number | undefined = (player as any).engine?.mediaSource?.chaseStarts;
+      if (chaseStarts !== undefined && chaseStarts !== chaseStartsReported) {
+        log(`[MSE] catch-up (1.05x) started ${chaseStarts - chaseStartsReported}× in the last `
+          + `${UNDERRUN_REPORT_MS / 1000}s · ${chaseStarts} in all`);
+        chaseStartsReported = chaseStarts;
       }
       const u = underrunWindow;
       if (u.count > 0) {
