@@ -58,8 +58,10 @@ Forward State change, capture gaps, and the per-minute capture drift.
 ## Player
 
 Controls: play/pause, timeline, speaker (on phones it opens a volume slider
-with mute), ⚙ (Latency: Live edge or Smooth; quality, language and program
-when the catalog offers them; Connection settings), catalog panel.
+with mute), ⚙ (View: every view of the catalog, grouped by program; Quality;
+Language; Latency: Live edge or Smooth; Connection settings), catalog panel.
+A view this browser cannot decode is listed as "not supported here" and
+cannot be chosen.
 
 Readouts: TTFF; BITRATE A/V; REORDER A/V; LAG; CLK DRIFT; SLOWEST T/A/D;
 RESYNCS; UNDERRUNS; LATE/SNAP; DROPPED; OBJ LOST A/V; STALLS. LATENCY
@@ -134,11 +136,11 @@ page looks for a relay on port 4433 of its host and falls back to moqx-main.
 `openmoq/ffmpeg/artemis` is the FFmpeg multitrack Artemis II set: two views in
 Program 1 (NASA TV, Director's cut) and seven cameras in Program 2, one of them
 H.265 and one AV1; English, Spanish, commentary (Opus) and liftoff-call audio.
-The player takes one video and one audio at a time; the view picker and ⚙ →
-Language switch them. It needs `compat=loc-bare` (the FFmpeg muxer sends LOC
-frames without the private-properties block). The H.265 camera plays only where
-the browser decodes H.265; where it does not, the player stays on it until a
-reload.
+The player takes one video and one audio at a time: ⚙ → View lists all nine
+views by program (picking a view in the other program switches both), and ⚙ →
+Language switches audio. It needs `compat=loc-bare` (the FFmpeg muxer sends
+LOC frames without the private-properties block). An H.265 camera is listed as
+not supported where the browser cannot decode H.265.
 
 When one is not running, generate it yourself with the
 [moq-test-tracks](https://github.com/openmoq/moq-test-tracks) generator, under
