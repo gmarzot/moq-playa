@@ -6,13 +6,11 @@
  *   out, uncapped until the relay sends one.
  * - `empty-objects`: empty Normal objects on media tracks are skipped and
  *   counted (player only).
- * - `loc-bare`: LOC payloads are the bare frame, without the Private Properties
- *   block (player only).
  */
 
 import type { PlayerCompat } from '@openmoq/player';
 
-const KNOWN: readonly PlayerCompat[] = ['request-credit', 'empty-objects', 'loc-bare'];
+const KNOWN: readonly PlayerCompat[] = ['request-credit', 'empty-objects'];
 
 /** The recognised behaviours, and any names that were not. */
 export function parseCompat(value: string | null): { compat: PlayerCompat[]; unknown: string[] } {

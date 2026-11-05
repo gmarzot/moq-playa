@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { varint } from '@openmoq/transport';
 import type { MoqtObject } from '@openmoq/transport';
 import type { MoqtConnection } from '@openmoq/webtransport';
-import { withLocPrivateProperties } from '@openmoq/loc';
 import { MoqtPlayer } from './player.js';
 import { audioInit, videoInit } from '../../locmaf/test-support/cmaf.js';
 
@@ -77,7 +76,7 @@ async function boot(options: {
     const payload = Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker);
     return {
       kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
-      payload: packaging === 'loc' ? withLocPrivateProperties(payload) : payload,
+      payload,
     };
   };
   const send = (alias: bigint, marker: number, stream = 100n) => adapter.onObject?.(stream, data(alias, marker));

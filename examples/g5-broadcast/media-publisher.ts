@@ -32,7 +32,7 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft, withLocPrivateProperties } from '@openmoq/loc';
+import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { LocHeaders } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
 import { isRequestStreamDraft } from '@openmoq/transport';
@@ -1062,7 +1062,7 @@ export class MediaPublisher {
       : this.cmafVideoChunk(data, meta, captureUs);
     const payload = this.locmaf
       ? this.toLocmaf('video', chunk, this.videoLocmafState, this.videoObjectId)
-      : this.cmaf ? chunk : withLocPrivateProperties(chunk);
+      : chunk;
     try {
       await this.connection.sendObject(
         this.videoStreamId, this.wrapInt(this.videoObjectId), payload, this.videoExtensions(meta, captureUs));
@@ -1101,7 +1101,7 @@ export class MediaPublisher {
       }), captureUs)
       : chunk;
     const payload = this.locmaf ? this.toLocmaf('audio', data, new LocmafGroupState(), 0n)
-      : this.cmaf ? data : withLocPrivateProperties(data);
+      : data;
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     if (this.audioDatagrams && this.connection.sendDatagram) {

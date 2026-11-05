@@ -12,7 +12,6 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { varint, PublishDoneCode18 } from '@openmoq/transport';
-import { withLocPrivateProperties } from '@openmoq/loc';
 import { createLoopback } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtConnection } from '../../webtransport/src/adapter.js';
 import { MoqtPlayer } from './player.js';
@@ -68,7 +67,7 @@ function relay(opts: { refusalDelayMs: number }) {
       while (sub.live) {
         if (published.objects) {
           const sid = await server.openSubgroup(sub.alias, group++, 0n, { publisherPriority: 128 });
-          await server.sendObject(sid, 0n, withLocPrivateProperties(Uint8Array.of(0xaa)));
+          await server.sendObject(sid, 0n, Uint8Array.of(0xaa));
           await server.closeSubgroup(sid);
         }
         await sleep(20);

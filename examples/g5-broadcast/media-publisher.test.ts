@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { AnchorReport, DriftReport } from './media-publisher.js';
 import { MediaPublisher, CMAF_VIDEO_TRACK_ID, CMAF_AUDIO_TRACK_ID } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
-import { parseLocHeaders, locWireProfileForDraft, stripLocPrivateProperties, withLocPrivateProperties } from '@openmoq/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import { readBaseMediaDecodeTime, readSegmentTimeRanges } from '../../packages/browser/src/mp4-box.js';
 import { buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE } from '../shared/browser/cmaf-mux.js';
@@ -13,13 +13,8 @@ import {
 
 const wrapInt = (n: bigint) => n;
 
-/** `frame`: a LOC payload's frame after its Private Properties block; undefined without one. */
 interface SendRecord {
-  streamId: bigint; objectId: bigint; payload: Uint8Array; frame: Uint8Array | undefined; extensions?: Uint8Array;
-}
-
-function locFrame(payload: Uint8Array): Uint8Array | undefined {
-  try { return stripLocPrivateProperties(payload); } catch { return undefined; }
+  streamId: bigint; objectId: bigint; payload: Uint8Array; extensions?: Uint8Array;
 }
 
 /**
@@ -50,7 +45,7 @@ function recordingConnection(opts: { holdSends?: boolean; holdCloses?: boolean }
     },
     sendObject: (streamId, objectId, payload, extensions) => {
       sends.push({
-        streamId, objectId: objectId as bigint, payload, frame: locFrame(payload),
+        streamId, objectId: objectId as bigint, payload,
         ...(extensions ? { extensions } : {}),
       });
       if (!opts.holdSends) return Promise.resolve();
@@ -113,7 +108,7 @@ describe('MediaPublisher — serialized video publication', () => {
 
     expect(conn.opened).toHaveLength(1); // one keyframe → one subgroup
     expect(conn.sends.map((s) => s.objectId)).toEqual([0n, 1n, 2n]);
-    expect(conn.sends.map((s) => s.frame![0])).toEqual([0, 1, 2]); // enqueue order preserved
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0, 1, 2]); // enqueue order preserved
     expect(new Set(conn.sends.map((s) => s.streamId)).size).toBe(1);
   });
 
@@ -179,7 +174,7 @@ describe('MediaPublisher — serialized video publication', () => {
     const successful = conn.sends.slice(1); // index 0 is the failed attempt
     expect(successful.every((x) => x.streamId !== brokenStream)).toBe(true);
     // The delta between the failure and the next keyframe never went out.
-    expect(successful.map((x) => x.frame![0])).toEqual([2, 3]);
+    expect(successful.map((x) => x.payload[0])).toEqual([2, 3]);
     // The fresh group starts at Object 0 with the INDEPENDENT frame.
     expect(successful.map((x) => x.objectId)).toEqual([0n, 1n]);
     expect(conn.opened).toHaveLength(2);
@@ -213,7 +208,7 @@ describe('MediaPublisher — serialized video publication', () => {
     // cleared BEFORE the open, so the failure could not revive it.
     const afterRotation = conn.sends.slice(1);
     expect(afterRotation.every((x) => x.streamId !== streamA)).toBe(true);
-    expect(afterRotation.map((x) => [x.frame![0], x.objectId])).toEqual([[3, 0n]]);
+    expect(afterRotation.map((x) => [x.payload[0], x.objectId])).toEqual([[3, 0n]]);
   });
 
   it('a throwing onError sink is contained: later chunks publish and stop() resolves', async () => {
@@ -231,7 +226,7 @@ describe('MediaPublisher — serialized video publication', () => {
     pub.publishVideo(chunk(0), kf());   // fails → onError throws → must not poison the chain
     pub.publishVideo(chunk(1), kf());   // fresh keyframe must still publish
     await settle();
-    expect(conn.sends.filter((x) => x.frame![0] === 1)).toHaveLength(1);
+    expect(conn.sends.filter((x) => x.payload[0] === 1)).toHaveLength(1);
     await expect(pub.stop()).resolves.toBeUndefined();
   });
 });
@@ -295,7 +290,7 @@ describe('MediaPublisher — Forward State 0 pause', () => {
     await settle();
 
     expect(pub.pausedTracks).toEqual([]);
-    expect(conn.sends.map((s) => s.frame![0])).toEqual([1]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1]);
     expect(statuses).toContain('video: Forward State 1 (a send went through)');
   });
 });
@@ -318,7 +313,7 @@ describe('MediaPublisher — audio publication', () => {
     expect(errors).toEqual(['audio publish: audio write blew up']);
     // BOTH streams were closed — the failed one via best-effort cleanup.
     expect(conn.closed.sort()).toEqual([conn.opened[0]!.streamId, conn.opened[1]!.streamId].sort());
-    expect(conn.sends.filter((x) => x.frame![0] === 1)).toHaveLength(1);
+    expect(conn.sends.filter((x) => x.payload[0] === 1)).toHaveLength(1);
   });
 
   it('publishes one object per group on sequential group IDs', async () => {
@@ -422,13 +417,15 @@ describe('MediaPublisher — CMAF packaging', () => {
     expect(decodeSteps(conn.sends)).toEqual([41_700, 1_500_000]);
   });
 
-  it('sends a LOC payload as the Private Properties block, then the frame', async () => {
+  it('sends a LOC payload as the bare frame', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn);
     pub.setAudioAlias(3n);
+    pub.setVideoAlias(2n);
     pub.publishAudio(chunk(9), { timestampUs: 500 });
+    pub.publishVideo(chunk(8), kf());
     await settle();
-    expect(conn.sends[0]!.payload).toEqual(withLocPrivateProperties(chunk(9)));
+    expect(conn.sends.map((s) => s.payload)).toEqual(expect.arrayContaining([chunk(9), chunk(8)]));
   });
 
   it('CMAF payloads carry no Private Properties block', async () => {
@@ -497,7 +494,7 @@ describe('MediaPublisher — LOC Video Config', () => {
     await settle();
     const profile = { wireProfile: locWireProfileForDraft(draft) };
     const configOf = (tag: number) =>
-      parseLocHeaders(conn.sends.find((s) => s.frame![0] === tag)!.extensions!, profile).videoConfig;
+      parseLocHeaders(conn.sends.find((s) => s.payload[0] === tag)!.extensions!, profile).videoConfig;
     expect(configOf(1)).toEqual(videoConfig);
     expect(configOf(2)).toBeUndefined();
     expect(configOf(3)).toBeUndefined();
@@ -521,7 +518,7 @@ describe('MediaPublisher — self-describing LOC objects', () => {
     await settle();
     const profile = { wireProfile: locWireProfileForDraft(draft) };
     const [video, audio] = [1, 2].map((tag) =>
-      parseLocHeaders(conn.sends.find((s) => s.frame![0] === tag)!.extensions!, profile));
+      parseLocHeaders(conn.sends.find((s) => s.payload[0] === tag)!.extensions!, profile));
     expect(video!.timescale).toBeUndefined();
     expect(video!.captureTimestamp).toBe(BigInt(wall));
     expect(codecOf(video!)).toBe('avc1.42001f');
@@ -542,7 +539,7 @@ describe('MediaPublisher — self-describing LOC objects', () => {
     await settle();
     const profile = { wireProfile: locWireProfileForDraft(draft) };
     for (const tag of [1, 2]) {
-      const h = parseLocHeaders(conn.sends.find((s) => s.frame![0] === tag)!.extensions!, profile);
+      const h = parseLocHeaders(conn.sends.find((s) => s.payload[0] === tag)!.extensions!, profile);
       expect(h.timescale).toBe(1_000_000n);
       expect(h.timestamp).toBe(BigInt(wall));
       expect(codecOf(h)).toBe(tag === 1 ? 'avc1.42001f' : 'opus');
@@ -764,7 +761,7 @@ describe('MediaPublisher — broadcast generations', () => {
     await stopPromise;
 
     // The held send completed; the queued chunk was dropped at drain.
-    expect(conn.sends.map((s) => s.frame![0])).toEqual([0]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0]);
     // The open subgroup was closed by stop().
     expect(conn.closed).toEqual([conn.opened[0]!.streamId]);
 
@@ -963,7 +960,7 @@ describe('MediaPublisher — bounded backpressure', () => {
       for (let i = 1; i < objectIds.length; i++) expect(objectIds[i]).toBe(objectIds[i - 1]! + 1n);
     }
     // The dropped post-overflow delta (payload 2) never went out.
-    expect(conn.sends.some((s) => s.frame![0] === 2)).toBe(false);
+    expect(conn.sends.some((s) => s.payload[0] === 2)).toBe(false);
     // Total sends stayed bounded (cap + recovery frames, not 500).
     expect(conn.sends.length).toBeLessThanOrEqual(15);
   });
@@ -992,7 +989,7 @@ describe('MediaPublisher — bounded backpressure', () => {
     // ever reaches the wire from a 300-chunk burst.
     expect(conn.sends.length).toBeLessThanOrEqual(QUEUE_MAX + MAX_IN_FLIGHT);
     // Recency policy: the LAST enqueued chunk survived the drops.
-    expect(conn.sends[conn.sends.length - 1]!.frame![0]).toBe(300 % 250);
+    expect(conn.sends[conn.sends.length - 1]!.payload[0]).toBe(300 % 250);
   });
 });
 
@@ -1209,7 +1206,7 @@ describe('MediaPublisher — subscription ended under us', () => {
     await settle();
     expect(conn.opened).toHaveLength(2);
     expect(conn.opened[1]!.alias).toBe(5n);
-    expect(conn.sends.slice(2).map((s) => [s.streamId, s.frame![0]]))
+    expect(conn.sends.slice(2).map((s) => [s.streamId, s.payload[0]]))
       .toEqual([[conn.opened[1]!.streamId, 4]]);
     expect(conn.closed).not.toContain(oldStream);   // the adapter already reset it
   });
@@ -1251,7 +1248,7 @@ describe('MediaPublisher — subscription ended under us', () => {
     pub.publishVideo(chunk(1), kf());
     await settle();
     expect(pub.pausedTracks).toEqual([]);
-    expect(conn.sends.map((s) => s.frame![0])).toEqual([1]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1]);
   });
 });
 
@@ -1324,7 +1321,7 @@ describe('MediaPublisher — relay Forward State changes', () => {
     await new Promise((r) => setTimeout(r, 5));   // past any retry window
     pub.publishVideo(chunk(3), kf());
     await settle();
-    expect(conn.sends.map((s) => s.frame![0])).toEqual([0]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0]);
     expect(pub.videoAliasArmed).toBe(2n);
     expect(errors).toEqual([]);
 
@@ -1333,7 +1330,7 @@ describe('MediaPublisher — relay Forward State changes', () => {
     pub.publishVideo(chunk(4), delta());          // no reference after the gap
     pub.publishVideo(chunk(5), kf());
     await settle();
-    expect(conn.sends.map((s) => s.frame![0])).toEqual([0, 5]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0, 5]);
   });
 
   it('reports the largest location sent per track', async () => {
@@ -1583,7 +1580,7 @@ describe('MediaPublisher — a new subscription replacing an old one', () => {
     expect(pub.endedTracks).toEqual([]);
     expect(pub.videoAliasArmed).toBe(5n);
     expect(conn.opened.at(-1)!.alias).toBe(5n);
-    expect(conn.sends.at(-1)!.frame![0]).toBe(2);
+    expect(conn.sends.at(-1)!.payload[0]).toBe(2);
   });
 
   it('a late video error from the previous subscription is ignored', async () => {
