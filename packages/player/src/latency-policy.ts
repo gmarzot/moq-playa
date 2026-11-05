@@ -5,10 +5,10 @@
  * dropped, and a chase sheds any backlog. `smooth` trades latency for
  * continuity: an arrival past its slot raises the playout delay by its
  * lateness plus a margin, up to a ceiling, so late media plays instead of
- * being skipped. It starts at a floor above the live target, so ordinary
- * arrival jitter costs no stall. After a window with no late arrival the delay
- * steps down, never below the floor, by at most the slack every arrival in
- * that window had to spare, so it never falls into a level that just failed.
+ * being skipped. It starts at a floor above the live target. After a window
+ * with no late arrival the delay steps down, never below the floor, by at most
+ * the slack every arrival in that window had to spare, so it never falls into
+ * a level that just failed.
  *
  * Path-agnostic: the LOC pipeline reports each decoded frame's slack against
  * the render cushion; the MSE path reports buffer low points and stalls.
