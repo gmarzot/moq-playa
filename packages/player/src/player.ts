@@ -3506,13 +3506,6 @@ export class MoqtPlayer {
     if (this.config.extensionParser) {
       this.subscriptionManager.extensionParser = this.config.extensionParser;
     }
-    if (this.config.compat?.includes('loc-prefixed')) {
-      this.subscriptionManager.locPrefixed = true;
-      this.log.warn('LOC payloads read behind a Private Properties block (compat loc-prefixed)');
-    }
-    if (this.config.compat?.includes('loc-bare')) {
-      this.log.info('compat loc-bare has no effect: LOC payloads are bare frames by default');
-    }
 
     // Wire object delivery → media_object events + pipeline routing
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers) => {

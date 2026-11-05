@@ -17,7 +17,7 @@ import { SubscriptionManager } from './subscription-manager.js';
 import { varint } from '@openmoq/transport';
 import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
 import type { LocHeaders } from '@openmoq/loc';
-import { encodeLocHeaders, withLocPrivateProperties } from '@openmoq/loc';
+import { encodeLocHeaders } from '@openmoq/loc';
 import type { LocHeaderOptions } from '@openmoq/loc';
 
 /** Create a mock MoqtObjectData. */
@@ -986,8 +986,8 @@ describe('SubscriptionManager', () => {
   });
 
   // In the clear the payload is the frame (LOC-04 §3.1.3, Secure Objects -01 §3.3).
-  describe('LOC Private Properties block', () => {
-    const frame = new Uint8Array([0x0a, 0x01, 0xff]);
+  describe('LOC payload', () => {
+    const frame = new Uint8Array([0x0a, 0x00, 0xff]);
 
     function setup(packaging: 'loc' | 'cmaf' = 'loc') {
       const mgr = new SubscriptionManager();
@@ -1001,50 +1001,24 @@ describe('SubscriptionManager', () => {
       return { mgr, onObject, onCmafObject, onMalformedTrack };
     }
 
-    it('delivers the payload as the frame', async () => {
+    it('is delivered as the frame, whatever it opens with', async () => {
       const { mgr, onObject, onMalformedTrack } = setup();
       await mgr.routeObject(0n, createMockObject({ payload: frame }));
       expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
       expect(onMalformedTrack).not.toHaveBeenCalled();
     });
 
-    it('locPrefixed delivers the frame after the block', async () => {
-      const { mgr, onObject } = setup();
-      mgr.locPrefixed = true;
-      await mgr.routeObject(0n, createMockObject({ payload: withLocPrivateProperties(frame) }));
-      expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
-    });
-
-    it('locPrefixed: a payload without the block is a malformed track', async () => {
+    it('an empty payload passes through', async () => {
       const { mgr, onObject, onMalformedTrack } = setup();
-      mgr.locPrefixed = true;
-      await mgr.routeObject(0n, createMockObject({ payload: new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x65]) }));
-      expect(onObject).not.toHaveBeenCalled();
-      expect(onMalformedTrack).toHaveBeenCalledTimes(1);
-    });
-
-    it('locPrefixed: an empty payload passes through', async () => {
-      const { mgr, onObject, onMalformedTrack } = setup();
-      mgr.locPrefixed = true;
       await mgr.routeObject(0n, createMockObject({ payload: new Uint8Array(0) }));
       expect(onObject.mock.calls[0]![2].payload.length).toBe(0);
       expect(onMalformedTrack).not.toHaveBeenCalled();
     });
 
-    it('locPrefixed: a custom extensionParser (not LOC) leaves the payload alone', async () => {
-      const { mgr, onObject } = setup();
-      mgr.locPrefixed = true;
-      mgr.extensionParser = () => ({});
-      await mgr.routeObject(0n, createMockObject({ payload: frame }));
-      expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
-    });
-
     it('CMAF payloads are untouched', async () => {
       const { mgr, onCmafObject } = setup('cmaf');
-      mgr.locPrefixed = true;
-      const payload = withLocPrivateProperties(frame);
-      await mgr.routeObject(0n, createMockObject({ payload }));
-      expect(onCmafObject.mock.calls[0]![2].payload).toEqual(payload);
+      await mgr.routeObject(0n, createMockObject({ payload: frame }));
+      expect(onCmafObject.mock.calls[0]![2].payload).toEqual(frame);
     });
   });
 });

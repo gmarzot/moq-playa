@@ -93,7 +93,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `autoResume=0` | off: a hidden tab waits until it is viewed | on |
 | `locmaf=frame` | LOCMAF through WebCodecs instead of MSE | MSE |
 | `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
-| `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays; `loc-prefixed`: LOC frames behind a private-properties block | none |
+| `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays | none |
 | `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
 | `hash=` | relay certificate hash (hex) | none |
 | `clockUrl=` | clock reference | the page host's `/time` |
