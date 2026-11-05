@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { SessionError, SessionState } from '@openmoq/transport';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
-import { withLocPrivateProperties } from '@openmoq/loc';
 import { MoqtPlayer } from './player.js';
 
 async function boot(packaging: 'loc' | 'cmaf') {
@@ -47,7 +46,7 @@ async function boot(packaging: 'loc' | 'cmaf') {
 }
 
 describe.each(['loc', 'cmaf'] as const)('%s alias routing over draft-18 streams', (packaging) => {
-  const frame = (marker: number) => packaging === 'loc' ? withLocPrivateProperties(Uint8Array.of(marker)) : Uint8Array.of(marker);
+  const frame = (marker: number) => Uint8Array.of(marker);
   it.each(['video-first', 'audio-first'])('accepts an alias equal to another request ID: %s', async (order) => {
     const h = await boot(packaging);
     try {

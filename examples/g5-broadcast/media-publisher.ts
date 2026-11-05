@@ -196,6 +196,10 @@ export interface MediaPublisherOptions {
    *  require one. The stamps then read as media time (LOC-04 §2.3.1.2), so
    *  receivers lose end-to-end latency. */
   locTimescale?: boolean;
+  /** LOC payloads open with an empty Private Properties block (`0x0A 0x00`),
+   *  for receivers that require one. In the clear the frame stands alone
+   *  (LOC-04 §3.1.3, Secure Objects -01 §3.3). */
+  locPrefixed?: boolean;
   /** The CMAF init segments, once built; `locmaf` encodes against them. */
   cmafInit?: () => { videoInit: Uint8Array; audioInit?: Uint8Array } | undefined;
   /** Video needs a keyframe now: a new subscription or a resume. The page
@@ -282,6 +286,7 @@ export class MediaPublisher {
   /** Capture time of each track's last in-band CMAF header. */
   private readonly cmafHeaderSentUs: { video: bigint | null; audio: bigint | null } = { video: null, audio: null };
   private readonly locTimescale: boolean;
+  private readonly locPrefixed: boolean;
   private readonly locmafEncoder = new LocmafEncoder();
   private readonly locmafContexts = new Map<'video' | 'audio', LocmafTrackContext>();
   /** LOCMAF chaining state of the open video group. */
@@ -404,6 +409,8 @@ export class MediaPublisher {
     this.cmaf = options.packaging === 'cmaf' || this.locmaf;
     this.cmafInit = options.cmafInit;
     this.locTimescale = options.locTimescale === true
+      && (options.packaging === undefined || options.packaging === 'loc');
+    this.locPrefixed = options.locPrefixed === true
       && (options.packaging === undefined || options.packaging === 'loc');
     this.selfDescribing = options.packaging === undefined || options.packaging === 'loc'
       ? options.selfDescribing
@@ -1062,7 +1069,7 @@ export class MediaPublisher {
       : this.cmafVideoChunk(data, meta, captureUs);
     const payload = this.locmaf
       ? this.toLocmaf('video', chunk, this.videoLocmafState, this.videoObjectId)
-      : this.cmaf ? chunk : withLocPrivateProperties(chunk);
+      : this.locPrefixed ? withLocPrivateProperties(chunk) : chunk;
     try {
       await this.connection.sendObject(
         this.videoStreamId, this.wrapInt(this.videoObjectId), payload, this.videoExtensions(meta, captureUs));
@@ -1101,7 +1108,7 @@ export class MediaPublisher {
       }), captureUs)
       : chunk;
     const payload = this.locmaf ? this.toLocmaf('audio', data, new LocmafGroupState(), 0n)
-      : this.cmaf ? data : withLocPrivateProperties(data);
+      : this.locPrefixed ? withLocPrivateProperties(data) : data;
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     if (this.audioDatagrams && this.connection.sendDatagram) {

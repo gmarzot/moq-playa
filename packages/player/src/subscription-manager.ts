@@ -103,11 +103,10 @@ export class SubscriptionManager {
   extensionParser: ((extensions: Uint8Array | undefined) => LocHeaders) | null = null;
 
   /**
-   * LOC payloads arrive as the bare frame, without the leading Private
-   * Properties block (compat `loc-bare`).
-   * @see draft-ietf-moq-loc-04 §2.2
+   * LOC payloads open with a Private Properties block, which is skipped
+   * (compat `loc-prefixed`).
    */
-  locBare = false;
+  locPrefixed = false;
 
   /**
    * Callback: LOC object routed to pipeline.
@@ -472,9 +471,8 @@ export class SubscriptionManager {
           if (headers[key]) this.objectConfigSeen.add(alias);
           else if (!this.objectConfigSeen.has(alias)) headers = { ...headers, [key]: initConfig };
         }
-        // The payload is the Private Properties block, then the frame (LOC-04 §2.2).
-        // An empty payload carries neither; a custom extensionParser means not LOC.
-        if (!this.locBare && !this.extensionParser
+        // An empty payload carries no block; a custom extensionParser means not LOC.
+        if (this.locPrefixed && !this.extensionParser
             && transformed.kind === 'data' && transformed.payload.byteLength > 0) {
           transformed = { ...transformed, payload: stripLocPrivateProperties(transformed.payload) };
         }

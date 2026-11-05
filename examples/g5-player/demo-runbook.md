@@ -93,7 +93,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `autoResume=0` | off: a hidden tab waits until it is viewed | on |
 | `locmaf=frame` | LOCMAF through WebCodecs instead of MSE | MSE |
 | `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
-| `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays; `loc-bare`: LOC frames without the private-properties block | none |
+| `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays; `loc-prefixed`: LOC frames behind a private-properties block | none |
 | `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
 | `hash=` | relay certificate hash (hex) | none |
 | `clockUrl=` | clock reference | the page host's `/time` |
@@ -141,8 +141,7 @@ H.265 and one AV1; English, Spanish, commentary (Opus) and liftoff-call audio.
 The player takes one video and one audio at a time: ⚙ → View lists all nine
 views by program (picking a view in the other program switches both); ⚙ →
 Audio picks NASA TV, Commentary or Liftoff call, and ⚙ → Language picks English
-or Español for NASA TV. It needs `compat=loc-bare` (the FFmpeg muxer sends
-LOC frames without the private-properties block). An H.265 camera is listed as
+or Español for NASA TV. An H.265 camera is listed as
 not supported where the browser cannot decode H.265.
 
 When one is not running, generate it yourself with the

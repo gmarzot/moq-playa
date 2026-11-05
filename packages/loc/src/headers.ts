@@ -162,10 +162,11 @@ export const LOC_PRIVATE_PROPERTIES_TYPE = 0x0a;
 const EMPTY_PRIVATE_PROPERTIES = new Uint8Array([LOC_PRIVATE_PROPERTIES_TYPE, 0x00]);
 
 /**
- * MOQ Object Payload for a LOC audio/video frame: an empty Private Properties
- * block (`0x0A 0x00`) followed by the frame.
+ * A LOC frame behind an empty Private Properties block (`0x0A 0x00`), for
+ * receivers that require one. In the clear a LOC payload is the frame alone:
+ * the block exists only inside a Secure Object's plaintext.
  *
- * @see draft-ietf-moq-loc-04 §2.2, §3.1.3
+ * @see draft-ietf-moq-loc-04 §3.1.3; draft-ietf-moq-secure-objects-01 §3.3
  */
 export function withLocPrivateProperties(frame: Uint8Array): Uint8Array {
     const out = new Uint8Array(EMPTY_PRIVATE_PROPERTIES.length + frame.length);
@@ -175,11 +176,11 @@ export function withLocPrivateProperties(frame: Uint8Array): Uint8Array {
 }
 
 /**
- * The LOC Payload after the leading Private Properties block (type 0x0A,
- * QUIC-varint length, contents skipped). Zero-copy view into `payload`.
+ * The LOC Payload after a leading Private Properties block (type 0x0A,
+ * QUIC-varint length, contents skipped), as `withLocPrivateProperties` sends
+ * it. Zero-copy view into `payload`.
  *
  * @throws {LocHeaderError} if the block is missing or overruns the payload.
- * @see draft-ietf-moq-loc-04 §2.2, §3.1.3
  */
 export function stripLocPrivateProperties(payload: Uint8Array): Uint8Array {
     try {
