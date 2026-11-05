@@ -117,7 +117,7 @@ a reload.
   delay when media arrives late, by how late it was plus 50 ms, up to its
   limit (2 s, `latencyMax=`), and steps back toward 1 s after 30 s with
   nothing late. TARGET then shows the delay in force, and the log records
-  each raise and step down. The choice applies after a reload.
+  each raise and step-down. The choice applies after a reload.
 
 ## Samples to play
 
