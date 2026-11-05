@@ -182,9 +182,6 @@ const selfDescribing = params.get('selfDescribing') === '1';
 /** `?timescale=1`: LOC objects carry Timescale 1000000, for players that require one.
  *  Stamps then read as media time: viewers lose end-to-end latency. */
 const locTimescale = params.get('timescale') === '1';
-/** `?locPrefixed=1`: LOC payloads open with an empty Private Properties block,
- *  for receivers that require one. */
-const locPrefixed = params.get('locPrefixed') === '1';
 /** `?bitrateMode=constant`: hold encoder output near the target instead of
  *  letting complex frames and keyframes burst. Unset uses the spec default. */
 const bitrateMode: 'constant' | 'variable' | undefined =
@@ -1341,7 +1338,6 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           audioDatagrams,
           packaging,
           ...(packaging === 'loc' && locTimescale ? { locTimescale: true } : {}),
-          ...(packaging === 'loc' && locPrefixed ? { locPrefixed: true } : {}),
           ...((packaging === 'loc' || packaging === 'cmaf') && selfDescribing ? {
             selfDescribing: {
               videoCodec: catalog.videoCodec,

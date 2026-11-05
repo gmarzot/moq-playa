@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { AnchorReport, DriftReport } from './media-publisher.js';
 import { MediaPublisher, CMAF_VIDEO_TRACK_ID, CMAF_AUDIO_TRACK_ID } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
-import { parseLocHeaders, locWireProfileForDraft, withLocPrivateProperties } from '@openmoq/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import { readBaseMediaDecodeTime, readSegmentTimeRanges } from '../../packages/browser/src/mp4-box.js';
 import { buildAudioInit, buildVideoInit, MICROSECOND_TIMESCALE } from '../shared/browser/cmaf-mux.js';
@@ -428,18 +428,9 @@ describe('MediaPublisher — CMAF packaging', () => {
     expect(conn.sends.map((s) => s.payload)).toEqual(expect.arrayContaining([chunk(9), chunk(8)]));
   });
 
-  it('locPrefixed puts an empty Private Properties block ahead of the frame', async () => {
-    const conn = recordingConnection();
-    const pub = makePublisher(conn, { locPrefixed: true });
-    pub.setAudioAlias(3n);
-    pub.publishAudio(chunk(9), { timestampUs: 500 });
-    await settle();
-    expect(conn.sends[0]!.payload).toEqual(withLocPrivateProperties(chunk(9)));
-  });
-
   it('CMAF payloads carry no Private Properties block', async () => {
     const conn = recordingConnection();
-    const pub = makePublisher(conn, { packaging: 'cmaf', locPrefixed: true, wallClockUs: () => wall });
+    const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
     pub.setVideoAlias(2n);
     pub.publishVideo(chunk(9), kf());
     await settle();
