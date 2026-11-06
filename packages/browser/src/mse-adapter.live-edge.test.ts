@@ -58,6 +58,7 @@ describe('MseMediaSource — soft chase', () => {
         const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.06, maxAheadSec: 5 });
         (adapter as any).playTriggered = true;
         expect(adapter.cushionTargetSec).toBe(0.14);
+        expect(adapter.minTargetAheadSec).toBe(0.14);
         adapter.setTargetAheadSec(0.1);
         expect(adapter.cushionTargetSec).toBe(0.14);
         const rateAt = (aheadSec: number): number => {

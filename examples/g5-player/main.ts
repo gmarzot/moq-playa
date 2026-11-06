@@ -868,7 +868,8 @@ async function main(): Promise<void> {
     // value change colour on its own.
     const settleMs = settleMaxMs();
     const lagWorst = Math.max(0, ...lagSamples.map(([, d]) => d));
-    const settleTone = targetLatencyMs > 0 && settleMs > targetLatencyMs ? 'fault' : '';
+    const minCushionMs: number = ((player as any).engine?.mediaSource?.minTargetAheadSec ?? 0) * 1000;
+    const settleTone = targetLatencyMs > 0 && settleMs > Math.max(targetLatencyMs, minCushionMs) ? 'fault' : '';
     diagGrid.innerHTML = [
       cell('ttff', s.timeToFirstFrameMs != null ? s.timeToFirstFrameMs.toFixed(0) : '…', 'ms', NUM, '',
         connectMs != null ? `${CELL_TIPS['ttff']} Connect: ${connectMs.toFixed(0)} ms.` : CELL_TIPS['ttff']),

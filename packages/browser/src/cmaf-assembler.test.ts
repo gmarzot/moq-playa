@@ -1739,6 +1739,41 @@ describe('CmafAssembler — audio decode order', () => {
       }
     });
 
+    it('a hidden arrival that fills the held gap is restored in order, not late', () => {
+      vi.useFakeTimers();
+      try {
+        const { assembler, push, emitted, setHidden } = hiddenSetup();
+        push(0);
+        push(2);
+        setHidden(true);
+        push(1);
+        expect(emitted()).toEqual([0, 1, 2]);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(assembler.audioOrderStats).toMatchObject({ restored: 1, missing: 0, late: 0 });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('flushing several held gaps does not switch the gap bypass on', () => {
+      vi.useFakeTimers();
+      try {
+        const { assembler, push, emitted, setHidden } = hiddenSetup();
+        [0, 2, 4, 6, 8].forEach(push);
+        expect(emitted()).toEqual([0]);
+        setHidden(true);
+        push(10);
+        expect(emitted()).toEqual([0, 2, 4, 6, 8, 10]);
+        expect(assembler.audioOrderStats).toMatchObject({ missing: 5, bypasses: 0 });
+        expect(assembler.audioGapBypass).toBe(false);
+        setHidden(false);
+        push(12);
+        expect(emitted().at(-1)).toBe(10);               // held: visible audio holds as before
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('holds again once the page is visible', () => {
       const { push, emitted, setHidden } = hiddenSetup();
       setHidden(true);

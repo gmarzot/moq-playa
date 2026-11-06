@@ -2897,6 +2897,11 @@ export class MseMediaSource implements MediaSourceLike {
     return end === null ? null : end - ct;
   }
 
+  /** The lowest cushion target (s). */
+  get minTargetAheadSec(): number {
+    return MIN_TARGET_AHEAD_SEC;
+  }
+
   /** The cushion in force (s): the target, or a level a chase has stalled at. */
   get cushionTargetSec(): number {
     return this.chase.releaseSec;
