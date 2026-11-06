@@ -237,7 +237,7 @@ export interface MseMediaSourceOptions {
    *  jumps toward the live edge (post-startup only). Default 15.
    *  Set Infinity to disable (VOD/time-shift). */
   readonly maxAheadSec?: number;
-  /** Where a behind-live jump lands: rangeEnd - targetAheadSec. Default 2. */
+  /** Where a behind-live jump lands: rangeEnd - targetAheadSec. Default 2; at least 0.14. */
   readonly targetAheadSec?: number;
   /** `'smooth'`: a stall raises the cushion target instead of being chased away. Default `'live'`. */
   readonly latencyMode?: LatencyMode;
@@ -344,6 +344,8 @@ const STARTUP_SEEK_TIMEOUT_MS = 2000;
 
 /** Smooth startup: buffered media this close to the held delay counts as filled. */
 const SMOOTH_START_TOLERANCE_SEC = 0.05;
+/** Lowest cushion target: Chrome reports `waiting` with about 130 ms still buffered. */
+const MIN_TARGET_AHEAD_SEC = 0.14;
 /** Smooth startup plays anyway this long past when 1x arrival would have filled the held delay. */
 const SMOOTH_START_GRACE_MS = 1000;
 
@@ -463,11 +465,12 @@ export class MseMediaSource implements MediaSourceLike {
   /** Playout cushion target (seek landings, chase set point). */
   setTargetAheadSec(sec: number): void {
     if (!Number.isFinite(sec) || sec <= 0) return;
+    const target = Math.max(sec, MIN_TARGET_AHEAD_SEC);
     if (this.latencyPolicy) {
-      this.latencyPolicy.setBase(sec * 1e6);
+      this.latencyPolicy.setBase(target * 1e6);
       this.targetAheadSec = this.latencyPolicy.heldUs / 1e6;
     } else {
-      this.targetAheadSec = sec;
+      this.targetAheadSec = target;
     }
     this.diag('target-ahead %ss', this.targetAheadSec.toFixed(2));
   }
@@ -967,7 +970,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video = videoElement;
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
-    this.targetAheadSec = options.targetAheadSec ?? 2;
+    this.targetAheadSec = Math.max(options.targetAheadSec ?? 2, MIN_TARGET_AHEAD_SEC);
     if (options.smoothFloorSec !== undefined
         && !(Number.isFinite(options.smoothFloorSec) && options.smoothFloorSec >= 0)) {
       throw new Error(`smoothFloorSec must be finite and >= 0 (got ${String(options.smoothFloorSec)})`);
@@ -2892,6 +2895,16 @@ export class MseMediaSource implements MediaSourceLike {
     const ct = this.video.currentTime;
     const end = this.containingRangeEnd(ct);
     return end === null ? null : end - ct;
+  }
+
+  /** The lowest cushion target (s). */
+  get minTargetAheadSec(): number {
+    return MIN_TARGET_AHEAD_SEC;
+  }
+
+  /** The cushion in force (s): the target, or a level a chase has stalled at. */
+  get cushionTargetSec(): number {
+    return this.chase.releaseSec;
   }
 
   /** Times the soft chase began. */

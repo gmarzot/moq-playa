@@ -81,6 +81,8 @@ export interface CmafAssemblerOptions {
   readonly audioAheadMs?: () => number | null;
   /** Video buffered ahead of the playhead (ms), or null when unknown; as for audio. */
   readonly videoAheadMs?: () => number | null;
+  /** The page is hidden. Default: `document.hidden`. */
+  readonly isHidden?: () => boolean;
   /**
    * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
    * Construction-time so it cannot change once an epoch is established.
@@ -104,7 +106,7 @@ export interface DecodeOrderStats {
   missing: number;
   late: number;
   worstLateMs: number;
-  /** Gaps passed through without a hold while the audio gap bypass was on. */
+  /** Gaps passed through without a hold: the audio gap bypass was on or the page was hidden. */
   passed: number;
   /** Times the bypass switched on. */
   bypasses: number;
@@ -154,6 +156,7 @@ export class CmafAssembler {
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
   private readonly audioAheadMs: CmafAssemblerOptions['audioAheadMs'];
   private readonly videoAheadMs: CmafAssemblerOptions['videoAheadMs'];
+  private readonly isHidden: () => boolean;
 
   /**
    * Pending moofs keyed by "mediaType:trackName:groupId".
@@ -311,7 +314,7 @@ export class CmafAssembler {
 
   /** How many startup fragments per media type carry a debug timing log. */
   private static readonly STARTUP_DIAG_COUNT = 5;
-  /** Buffered depth at which a hold gives up: Chrome reports `waiting` with ~100 ms still ahead. */
+  /** Buffered depth at which a hold gives up: Chrome reports `waiting` with about 130 ms still ahead. */
   private static readonly HOLD_RELEASE_MARGIN_MS = 150;
   /** Audio gap holds that expire unfilled in a row before gaps pass straight through. */
   private static readonly AUDIO_BYPASS_AFTER = 3;
@@ -327,6 +330,7 @@ export class CmafAssembler {
     this.onDiscontinuity = options.onDiscontinuity;
     this.audioAheadMs = options.audioAheadMs;
     this.videoAheadMs = options.videoAheadMs;
+    this.isHidden = options.isHidden ?? (() => typeof document !== 'undefined' && document.hidden);
     this.epochMode = options.epochMode ?? 'shared';
   }
 
@@ -604,6 +608,21 @@ export class CmafAssembler {
     groupId: bigint,
     subgroupId: bigint | undefined,
   ): void {
+    // A hidden page throttles the hold timer to 1 s or more, which drains the
+    // buffer; late audio still fills its gap.
+    const hidden = mediaType === 'audio' && this.isHidden();
+    this.orderSegment(mediaType, segment, trackName, groupId, subgroupId, hidden);
+    if (hidden) this.flushHeld('audio', false);
+  }
+
+  private orderSegment(
+    mediaType: 'video' | 'audio',
+    segment: Uint8Array,
+    trackName: string,
+    groupId: bigint,
+    subgroupId: bigint | undefined,
+    hidden: boolean,
+  ): void {
     const o = this.order[mediaType];
     const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     const span = this.segmentSpan(mediaType, segment);
@@ -631,7 +650,7 @@ export class CmafAssembler {
     const gap = span.start - emittedEnd > (span.end - span.start) / 2n;
     const mayFill = mediaType === 'audio' || o.lastGroup === null || groupId > o.lastGroup
       || (groupId === o.lastGroup && subgroupId !== undefined && subgroupId !== o.lastSubgroup);
-    if (gap && mayFill && mediaType === 'audio' && o.held.length === 0 && this.audioGapBypass) {
+    if (gap && mayFill && mediaType === 'audio' && o.held.length === 0 && (hidden || this.audioGapBypass)) {
       o.stats.missing += gapFrames(span.start - emittedEnd, span.end - span.start);
       o.stats.passed++;
       this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
@@ -651,8 +670,11 @@ export class CmafAssembler {
     this.releaseHeld(mediaType, false);
   }
 
-  /** Emit held segments that are now contiguous; on expiry, skip the gap ahead of the first. */
-  private releaseHeld(mediaType: 'video' | 'audio', expired: boolean): void {
+  /**
+   * Emit held segments that are now contiguous; on expiry, skip the gap ahead
+   * of the first. `countUnfilled`: the skip counts toward the audio gap bypass.
+   */
+  private releaseHeld(mediaType: 'video' | 'audio', expired: boolean, countUnfilled = expired): void {
     const o = this.order[mediaType];
     let skipGap = expired;
     while (o.held.length > 0) {
@@ -664,7 +686,7 @@ export class CmafAssembler {
         if (!skipGap) break;
         skipGap = false;
         o.stats.missing += gapFrames(gap, duration);
-        if (mediaType === 'audio' && ++o.unfilledRun >= CmafAssembler.AUDIO_BYPASS_AFTER) {
+        if (countUnfilled && mediaType === 'audio' && ++o.unfilledRun >= CmafAssembler.AUDIO_BYPASS_AFTER) {
           o.unfilledRun = 0;
           o.bypassUntilMs = Date.now() + CmafAssembler.AUDIO_BYPASS_MS;
           o.stats.bypasses++;
@@ -702,8 +724,8 @@ export class CmafAssembler {
   }
 
   /** Emit everything held for one media type, skipping its gaps. */
-  private flushHeld(mediaType: 'video' | 'audio'): void {
-    while (this.order[mediaType].held.length > 0) this.releaseHeld(mediaType, true);
+  private flushHeld(mediaType: 'video' | 'audio', countUnfilled = true): void {
+    while (this.order[mediaType].held.length > 0) this.releaseHeld(mediaType, true, countUnfilled);
   }
 
   /** Drop held segments and their timers (state reset). */
