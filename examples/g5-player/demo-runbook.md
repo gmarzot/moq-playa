@@ -106,9 +106,10 @@ a reload.
 
 ### Latency target and cushion
 
-- CMAF and LOCMAF hold the target as buffer ahead of the playhead; catch-up
-  (1.05×) sheds anything above it, and live-edge and gap-jump seeks land
-  there. To run 2 s behind live: `targetLatency=2000`.
+- CMAF and LOCMAF hold the target as buffer ahead of the playhead, at least
+  140 ms because Chrome's MSE stalls below that; catch-up (1.05×) sheds
+  anything above it, and live-edge and gap-jump seeks land there. To run 2 s
+  behind live: `targetLatency=2000`.
 - LOC plays a render cushion between a floor and a cap, and the target only
   caps it. To run 2 s behind live on LOC, raise the floor too:
   `targetLatency=2000&cushion=2000`.
@@ -197,6 +198,7 @@ the clock stream above is the LOC sample anyone can generate.
 ### G6 — latency targets
 - Target 200 → 150 → 100 (broadcaster setting, or `targetLatency=` on a
   single viewer). Watch QUEUED against TARGET, STALLS and the catch-up line.
+  CMAF and LOCMAF hold 140 ms at the lowest, which TARGET shows.
 - 2 s behind live: see [Latency target and cushion](#latency-target-and-cushion).
 - 60 fps: Screen with capture rate 60 (check the `Video:` log line).
 

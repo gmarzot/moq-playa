@@ -1737,7 +1737,9 @@ async function main(): Promise<void> {
     drawSpark(jitSpark, tickNowMs, jitSamples, chartColors.jitter);
     // Smooth moves the delay: show the one in force (the LOC cushion, else the MSE hold).
     const smooth = player.stats.latency;
-    const targetNowMs = smooth ? Math.round(renderCushionMs() ?? smooth.heldMs) : targetLatencyMs;
+    const cushionTargetSec: number | undefined = eng?.mediaSource?.cushionTargetSec;
+    const targetNowMs = smooth ? Math.round(renderCushionMs() ?? smooth.heldMs)
+      : cushionTargetSec !== undefined ? Math.round(cushionTargetSec * 1000) : targetLatencyMs;
     if (smooth && (smooth.raises !== latencyRaises || smooth.lowers !== latencyLowers)) {
       log(`Smooth latency: delay ${smooth.raises !== latencyRaises ? 'raised' : 'lowered'} to `
         + `${Math.round(smooth.heldMs)} ms (limit ${smooth.ceilingMs} ms; ${smooth.raises} raised, ${smooth.lowers} lowered)`);

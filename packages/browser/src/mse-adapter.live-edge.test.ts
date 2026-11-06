@@ -52,10 +52,45 @@ describe('MseMediaSource — soft chase', () => {
         expect(rate()).toBe(1);
     });
 
+    it('holds a target below 140 ms at 140 ms: the chase stops and live-edge seeks land there', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.06, maxAheadSec: 5 });
+        (adapter as any).playTriggered = true;
+        expect(adapter.cushionTargetSec).toBe(0.14);
+        adapter.setTargetAheadSec(0.1);
+        expect(adapter.cushionTargetSec).toBe(0.14);
+        const rateAt = (aheadSec: number): number => {
+            video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            video.currentTime = 10;
+            (adapter as any).maybeChaseLiveEdge();
+            return (video as unknown as { playbackRate: number }).playbackRate;
+        };
+        expect(rateAt(0.23)).toBe(1);     // inside the band
+        expect(rateAt(0.24)).toBe(1.05);  // past 0.14 + 0.0924
+        expect(rateAt(0.15)).toBe(1.05);
+        expect(rateAt(0.139)).toBe(1);    // released at the minimum
+
+        rateAt(6);                        // past maxAheadSec
+        expect(video.currentTime).toBeCloseTo(15.86, 5);
+        adapter.setTargetAheadSec(0.25);
+        expect(adapter.cushionTargetSec).toBe(0.25);
+        adapter.destroy();
+    });
+
+    it('smooth: a base below 140 ms is held at 140 ms', () => {
+        const video = new MockVideoElement() as unknown as HTMLVideoElement;
+        const adapter = new MseMediaSource(video, { targetAheadSec: 0.06, latencyMode: 'smooth', smoothFloorSec: 0 });
+        expect(adapter.latencyStats()!.heldMs).toBeCloseTo(140, 5);
+        adapter.setTargetAheadSec(0.1);
+        expect(adapter.latencyStats()!.heldMs).toBeCloseTo(140, 5);
+        adapter.destroy();
+    });
+
     it('a stall during a chase raises the cushion the chase stops at', () => {
         const video = new MockVideoElement();
         (video as unknown as { playbackRate: number }).playbackRate = 1;
-        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.1 });
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.14 });
         (adapter as any).playTriggered = true;
         (adapter as any).chase.noteSampleDuration(0.04);
         const floors: number[] = [];
@@ -76,7 +111,7 @@ describe('MseMediaSource — soft chase', () => {
         expect(rate()).toBe(1);
         (adapter as any).cancelStallEpisode();
 
-        expect(chaseAt(0.4)).toBe(1.05);                   // past 0.17 + 0.066
+        expect(chaseAt(0.4)).toBe(1.05);                   // past 0.17 + 0.0924
         expect(chaseAt(0.18)).toBe(1.05);
         expect(chaseAt(0.17)).toBe(1);                     // released at the floor, not the target
     });

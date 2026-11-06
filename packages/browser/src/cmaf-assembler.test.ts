@@ -1692,6 +1692,63 @@ describe('CmafAssembler — audio decode order', () => {
     }
   });
 
+  describe('hidden page', () => {
+    function hiddenSetup() {
+      let hidden = false;
+      const onSegment = vi.fn();
+      const assembler = new CmafAssembler({ onSegment, audioAheadMs: () => 300, isHidden: () => hidden });
+      assembler.setInitSegment('audio', audioInit());
+      const push = (n: number) => assembler.push('audio', 'audio0', BigInt(n), frame(n));
+      const emitted = () => onSegment.mock.calls.map(
+        (c) => Number(readBaseMediaDecodeTime(c[1] as Uint8Array)!) / FRAME);
+      return { assembler, push, emitted, setHidden: (v: boolean) => { hidden = v; } };
+    }
+
+    it('passes audio gaps through without a hold, and late audio still fills its gap', () => {
+      vi.useFakeTimers();
+      try {
+        const { assembler, push, emitted, setHidden } = hiddenSetup();
+        push(0);
+        setHidden(true);
+        push(2);
+        expect(emitted()).toEqual([0, 2]);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(assembler.audioOrderStats).toMatchObject({ missing: 1, passed: 1, bypasses: 0 });
+        push(1);
+        expect(emitted()).toEqual([0, 2, 1]);
+        expect(assembler.audioOrderStats.late).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('releases audio held when the page hides on the next arrival', () => {
+      vi.useFakeTimers();
+      try {
+        const { assembler, push, emitted, setHidden } = hiddenSetup();
+        push(0);
+        push(2);
+        expect(emitted()).toEqual([0]);                  // held while visible
+        setHidden(true);
+        push(3);
+        expect(emitted()).toEqual([0, 2, 3]);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(assembler.audioOrderStats).toMatchObject({ missing: 1, passed: 0 });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('holds again once the page is visible', () => {
+      const { push, emitted, setHidden } = hiddenSetup();
+      setHidden(true);
+      push(0);
+      setHidden(false);
+      push(2);
+      expect(emitted()).toEqual([0]);
+    });
+  });
+
   describe('audio gap bypass', () => {
     /** Audio whose every frame leaves a one-frame gap: holds that never fill. */
     function gappySetup() {
