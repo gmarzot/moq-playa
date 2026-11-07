@@ -1529,6 +1529,61 @@ describe('MseMediaSource — live-buffer management', () => {
         expect(resyncs).toContain('behind-live');
     });
 
+    describe('behind the cushion in force', () => {
+        let nowMs = 0;
+        beforeEach(() => { nowMs = 1_000; vi.spyOn(performance, 'now').mockImplementation(() => nowMs); });
+        afterEach(() => { vi.restoreAllMocks(); });
+
+        async function behind(ct: number, end: number, options?: { targetAheadSec?: number }) {
+            const ctx = await makePlayingAdapter();
+            if (options?.targetAheadSec !== undefined) ctx.adapter.setTargetAheadSec(options.targetAheadSec);
+            ctx.video.currentTime = ct;
+            ctx.video.buffered = makeTimeRanges([[0, end]]);
+            const resyncs: string[] = [];
+            ctx.adapter.onLiveEdgeResync = (r) => resyncs.push(r);
+            const tick = (): void => (ctx.adapter as any).maybeChaseLiveEdge();
+            return { ...ctx, resyncs, tick };
+        }
+
+        it('jumps to the target once a backlog has lasted the hold', async () => {
+            const { video, resyncs, tick } = await behind(20, 29);
+            tick();
+            nowMs += 1_999;
+            tick();
+            expect(video.currentTime).toBe(20);
+            nowMs += 1;
+            tick();
+            expect(video.currentTime).toBe(27);
+            expect(resyncs).toEqual(['behind-live']);
+        });
+
+        it('leaves a backlog that drains within the hold to the chase', async () => {
+            const { video, tick } = await behind(20, 29);
+            tick();
+            nowMs += 1_000;
+            video.buffered = makeTimeRanges([[0, 24]]);
+            tick();
+            nowMs += 1_500;
+            video.buffered = makeTimeRanges([[0, 29]]);
+            tick();
+            expect(video.currentTime).toBe(20);
+        });
+
+        it('measures from the target in force, as Smooth\'s held delay is', async () => {
+            const held = await behind(20, 27, { targetAheadSec: 5 });
+            held.tick();
+            nowMs += 5_000;
+            held.tick();
+            expect(held.video.currentTime).toBe(20);
+
+            const past = await behind(20, 29, { targetAheadSec: 5 });
+            past.tick();
+            nowMs += 2_000;
+            past.tick();
+            expect(past.video.currentTime).toBe(24);
+        });
+    });
+
     it('QuotaExceededError with played-out media: evicts, retries the SAME chunk once, no error events', async () => {
         const { adapter, video, vsb } = await makePlayingAdapter();
         const errors: Error[] = [];
@@ -3388,6 +3443,34 @@ describe('buffered-hole gap-jump', () => {
         expect(jumps[0].holeSec).toBeCloseTo(4.17, 2);
     });
 
+    it('jumps when audio carried the playhead deep into a hole, just short of the next range', () => {
+        const { video, jumps, check } = gapSetup({
+            ranges: [[22.14, 24.97], [28.14, 29.14], [30.14, 30.34], [32.14, 33.11]],
+            ct: 32.09,
+        });
+        check(0);
+        check(1_000);
+        expect(video.seekCount).toBe(0);
+        check(3_100);
+        expect(video.seekCount).toBe(1);
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0].from).toBeCloseTo(32.09, 5);
+        expect(jumps[0].holeSec).toBeCloseTo(1.8, 2);
+    });
+
+    it('a playhead deep in a wide hole still needs the frozen proof', () => {
+        const { video, jumps, check } = gapSetup({ ranges: [[0, 10], [20, 30]], ct: 15 });
+        check(0);
+        video.currentTime = 15.25;
+        video.seekCount = 0;
+        check(1_000);
+        video.currentTime = 15.5;
+        video.seekCount = 0;
+        check(10_000);
+        expect(video.seekCount).toBe(0);
+        expect(jumps).toHaveLength(0);
+    });
+
     it('a coasting playhead well short of the range end does not arm', () => {
         const { video, jumps, check } = gapSetup({
             ranges: [[132.68, 142.51], [146.68, 150.08]],
@@ -3519,8 +3602,8 @@ describe('buffered-hole gap-jump', () => {
         expect(jumps[0].holeSec).toBeCloseTo(1.59, 2);
     });
 
-    it('never arms when the playhead is outside every buffered range (this slice)', () => {
-        const { video, check } = gapSetup({ ranges: [[5, 15], [19.78, 25]], ct: 17 });
+    it('never arms when the playhead is before every buffered range', () => {
+        const { video, check } = gapSetup({ ranges: [[5, 15], [19.78, 25]], ct: 2 });
         check(0); check(1_000); check(2_100); check(3_200);
         expect(video.seekCount).toBe(0);
     });
