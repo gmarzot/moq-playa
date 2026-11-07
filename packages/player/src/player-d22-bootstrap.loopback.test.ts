@@ -104,8 +104,8 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         await player.load();
         await settle();
 
-        // FILL_PARAMETERS = LOCATION_FILTER [1]: the current group.
-        expect(state.catalogFill && Array.from(state.catalogFill)).toEqual([0x21, 0x01, 0x01]);
+        // FILL_PARAMETERS = one parameter, LOCATION_FILTER [1]: the current group.
+        expect(state.catalogFill && Array.from(state.catalogFill)).toEqual([0x01, 0x21, 0x01, 0x01]);
         expect(state.fetches).toBe(0);
         expect(events).toEqual(['received']);
         expect(received[0]).toEqual(['video', 'audio']);
@@ -249,7 +249,7 @@ describe('d22 loopback — migration', () => {
         await Promise.all([player.migrate(client2 as unknown as MoqtConnection), server2.connect(b, {})]);
         await settle();
 
-        expect(state2.catalogFill && Array.from(state2.catalogFill)).toEqual([0x21, 0x01, 0x01]);
+        expect(state2.catalogFill && Array.from(state2.catalogFill)).toEqual([0x01, 0x21, 0x01, 0x01]);
         expect(state2.fetches).toBe(0);
         expect(state2.mediaSubs.map((m) => [m.name, m.fill]).sort())
             .toEqual([['audio', warmStart], ['video', warmStart]]);
