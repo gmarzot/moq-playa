@@ -4203,3 +4203,230 @@ describe('fetch-only catalog (catalogBootstrap: fetch)', () => {
         expect(() => makePlayer(createMockAdapter(16), { catalogBootstrap: 'fetch' })).not.toThrow();
     });
 });
+
+describe('catalog SUBSCRIBE refused with a Retry Interval', () => {
+    const LIMIT_MS = 300_000;
+    const players: MoqtPlayer[] = [];
+    type Adapter = ReturnType<typeof createMockAdapter>;
+
+    /** A document whose visibility the test sets. */
+    class FakeDocument extends EventTarget {
+        visibilityState: 'visible' | 'hidden' = 'visible';
+        setHidden(hidden: boolean): void {
+            this.visibilityState = hidden ? 'hidden' : 'visible';
+            this.dispatchEvent(new Event('visibilitychange'));
+        }
+    }
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(async () => {
+        for (const player of players.splice(0)) await player.destroy();
+        vi.useRealTimers();
+        delete (globalThis as { document?: unknown }).document;
+    });
+
+    function hiddenDocument(): FakeDocument {
+        const doc = new FakeDocument();
+        (globalThis as { document?: unknown }).document = doc;
+        doc.setHidden(true);
+        return doc;
+    }
+
+    /** Refuse the latest catalog SUBSCRIBE. */
+    async function refuse(adapter: Adapter, retryInterval: bigint, errorCode = 0x9n): Promise<void> {
+        const requestId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId, errorCode, retryInterval, errorReason: 'relay overloaded',
+        } as ControlMessage);
+    }
+
+    /** Admit the latest catalog SUBSCRIBE and complete its Joining FETCH. */
+    async function admit(adapter: Adapter, alias: bigint): Promise<void> {
+        const subscribeId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const fetchId = BigInt(await adapter.joiningFetch.mock.results.at(-1)!.value);
+        ackCatalog(adapter, subscribeId, alias);
+        adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: fetchId } } as DataStreamHeader);
+        adapter._triggerObject(100n, {
+            kind: 'data', trackAlias: varint(0), groupId: varint(10), subgroupId: varint(0),
+            objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+        } as MoqtObject);
+        adapter._triggerMessage({
+            type: 'FETCH_OK', requestId: fetchId, endOfTrack: 0,
+            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+        adapter._triggerStreamClosed(100n);
+        await vi.advanceTimersByTimeAsync(0);
+    }
+
+    async function loaded(cfg?: Partial<MoqtPlayerConfig>, draft: 16 | 18 = 18) {
+        const adapter = createMockAdapter(draft);
+        const result = await loadPlayer(adapter, cfg);
+        players.push(result.player);
+        return { adapter, ...result };
+    }
+
+    it.each([[0x9n, 18], [0x1n, 16]] as const)('code 0x%s on draft %i waits out the interval and retries', async (code, draft) => {
+        const { adapter, player, errors } = await loaded(undefined, draft);
+        await refuse(adapter, 8001n, code);
+        expect(player.state).not.toBe('error');
+        expect(errors).toEqual([expect.objectContaining({
+            severity: 'degraded', source: 'catalog', message: expect.stringMatching(/relay overloaded.*retrying in 8 s/),
+        })]);
+        expect(player.catalogRetry).toMatchObject({ code, reason: 'relay overloaded', retryAtMs: Date.now() + 8000 });
+
+        await vi.advanceTimersByTimeAsync(7999);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('a later refusal uses its own interval and does not report again', async () => {
+        const { adapter, errors } = await loaded();
+        await refuse(adapter, 2001n);
+        await vi.advanceTimersByTimeAsync(2000);
+        await refuse(adapter, 5001n);
+        expect(errors).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(4999);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('being admitted delivers the catalog with no reload', async () => {
+        const { adapter, player, events, errors } = await loaded();
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        await admit(adapter, 40n);
+        expect(player.catalogRetry).toBeNull();
+        expect(events).toEqual(['catalog_received']);
+        expect(errors.filter((e) => (e as { severity: string }).severity === 'fatal')).toEqual([]);
+    });
+
+    it('a track that does not exist once admitted leaves the refusal behind', async () => {
+        const { adapter, player } = await loaded();
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        await refuse(adapter, 2001n, 0x10n);
+        expect(player.catalogRetry).toBeNull();
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('gives up at the limit and closes the session', async () => {
+        const { adapter, player, errors } = await loaded();
+        for (let waited = 0; waited < LIMIT_MS; waited += 15_000) {
+            await refuse(adapter, 15_001n);
+            expect(player.state).not.toBe('error');
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        const sent = adapter.subscribe.mock.calls.length;
+        expect(adapter.close).not.toHaveBeenCalled();
+        await refuse(adapter, 15_001n);
+        expect(player.state).toBe('error');
+        expect(player.catalogRetry).toBeNull();
+        expect(errors.at(-1)).toMatchObject({
+            severity: 'fatal', message: expect.stringMatching(/relay overloaded.*gave up after 300 s, reload/),
+        });
+        expect(adapter.close).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(sent);
+    });
+
+    it('a zero interval ends playback at once and closes the session', async () => {
+        const { adapter, player, errors } = await loaded();
+        await refuse(adapter, 0n);
+        expect(player.state).toBe('error');
+        expect(errors).toEqual([expect.objectContaining({ severity: 'fatal' })]);
+        expect(adapter.close).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('a refusal does not close a session the application owns', async () => {
+        const adapter = createMockAdapter(18);
+        const player = new MoqtPlayer({
+            url: 'https://relay.example.com/moq', namespace: 'live/broadcast',
+            connection: adapter as unknown as MoqtConnection,
+        });
+        players.push(player);
+        await player.load();
+        await refuse(adapter, 0n);
+        expect(player.state).toBe('error');
+        expect(adapter.close).not.toHaveBeenCalled();
+    });
+
+    it('a hidden page keeps retrying by default', async () => {
+        hiddenDocument();
+        const { adapter } = await loaded();
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('autoResume off: a hidden page sends nothing until viewed, and the wait is not held against it', async () => {
+        const doc = hiddenDocument();
+        const { adapter, player } = await loaded({ autoResume: false });
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(LIMIT_MS * 2);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+
+        doc.setHidden(false);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        await refuse(adapter, 5001n);
+        expect(player.state).not.toBe('error');
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('autoResume off: a visible page retries as usual', async () => {
+        const { adapter } = await loaded({ autoResume: false });
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('autoResume off: a track that does not exist is still retried while hidden', async () => {
+        hiddenDocument();
+        const { adapter } = await loaded({ autoResume: false });
+        await refuse(adapter, 2001n, 0x10n);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('a playing viewer refused on reconnect waits, then resumes its media', async () => {
+        const a1 = createMockAdapter(18);
+        const a2 = createMockAdapter(18);
+        const adapters = [a1, a2];
+        const player = makePlayer(a1, { createConnection: () => adapters.shift() as unknown as MoqtConnection });
+        players.push(player);
+        const errors: { severity: string }[] = [];
+        player.on('error', (e) => errors.push(e.error));
+        const load = player.load();
+        await vi.waitFor(() => expect(a1.connect).toHaveBeenCalled());
+        a1._connectResolve?.();
+        await load;
+        player.play();
+        await admit(a1, 40n);
+        const selected = a1.subscribe.mock.calls.length;
+        expect(selected).toBeGreaterThan(1);
+        expect(player.state).toBe('playing');
+
+        a1._triggerClose(0x1, 'connection lost');
+        await vi.waitFor(() => expect(a2.connect).toHaveBeenCalled());
+        a2._connectResolve?.();
+        await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(0);
+
+        await refuse(a2, 6001n);
+        expect(player.state).toBe('playing');
+        expect(player.catalogRetry).not.toBeNull();
+        await vi.advanceTimersByTimeAsync(6000);
+        expect(a2.subscribe).toHaveBeenCalledTimes(2);
+
+        await admit(a2, 41n);
+        expect(player.catalogRetry).toBeNull();
+        expect(a2.subscribe.mock.calls.length).toBeGreaterThan(2);
+        expect(player.state).toBe('playing');
+        expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+    });
+});

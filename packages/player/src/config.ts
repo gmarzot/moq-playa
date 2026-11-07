@@ -269,8 +269,9 @@ export interface ConnectionConfig {
 
   /**
    * Recover media while the page is hidden (background tab): resubscribes,
-   * liveness restarts and the media resumed after a reconnect run as when
-   * visible. False holds them until the page is visible. Default true.
+   * liveness restarts, the media resumed after a reconnect and retries of a
+   * catalog SUBSCRIBE refused with a Retry Interval run as when visible. False
+   * holds them until the page is visible. Default true.
    */
   readonly autoResume?: boolean;
 }
