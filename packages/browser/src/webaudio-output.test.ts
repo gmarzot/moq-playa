@@ -455,6 +455,33 @@ describe('lag after an underrun', () => {
     expect(out.captureLeadSec).toBeLessThanOrEqual(0.02 + 1e-9);
   });
 
+  it('is drained the same way when video re-anchors with no underrun', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(buffer(0), 1_000 * MS);
+    out.drainLag();
+    out.schedule(buffer(20 * MS), (1_000 + 20 - 90) * MS);
+    expect(out.chasing).toBe(true);
+  });
+
+  it('catches a lag that grows after the anchor, as video\'s cushion decays, until the window ends', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.drainLag();
+    out.schedule(buffer(0), 1_000 * MS);
+    expect(out.chasing).toBe(false);
+    out.schedule(buffer(20 * MS), (1_000 + 20 - 90) * MS);
+    expect(out.chasing).toBe(true);
+
+    const late = makeOutput(0);
+    late.ctx.currentTime = 1.0;
+    late.out.drainLag();
+    late.ctx.currentTime = 31.5;
+    late.out.schedule(buffer(0), 31_500 * MS);
+    late.out.schedule(buffer(20 * MS), (31_500 + 20 - 90) * MS);
+    expect(late.out.chasing).toBe(false);
+  });
+
   it('stays out of a chase without an underrun', () => {
     const { ctx, out } = makeOutput(0);
     ctx.currentTime = 1.0;

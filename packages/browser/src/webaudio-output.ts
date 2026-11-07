@@ -33,6 +33,8 @@ const CHASE_ON_RATIO = 0.66;
 const CHASE_ON_MIN_SEC = 0.02;
 /** After an underrun, late audio arriving this soon after it is skipped to resume on schedule. */
 const RESYNC_BURST_SEC = 0.05;
+/** How long after an underrun or a video re-anchor any lag is drained: video's cushion keeps decaying. */
+const DRAIN_WINDOW_SEC = 30;
 /** A realign waits for the slot only when the chain runs ahead of it by more than this. */
 const REALIGN_MIN_SEC = 0.02;
 
@@ -118,8 +120,8 @@ export class WebAudioOutput implements AudioOutputLike {
   private gapLateSec: number | null = null;
   /** Audio arrived ahead of its slot since the last resync, so lateness is not persistent. */
   private resyncArmed = true;
-  /** The chain resumed after running dry: drain the lag it came back with, below the target too. */
-  private drainAfterUnderrun = false;
+  /** Until this context time, drain the chain's lag below the target too. */
+  private drainUntilSec = 0;
   /** realign() was called; the next buffer with a slot consumes it. */
   private realignPending = false;
 
@@ -203,6 +205,10 @@ export class WebAudioOutput implements AudioOutputLike {
   /** The playout delay grew: the next buffer waits for its slot if the chain runs ahead of it. */
   realign(): void {
     this.realignPending = true;
+  }
+
+  drainLag(): void {
+    this.drainUntilSec = this.audioCtx.currentTime + DRAIN_WINDOW_SEC;
   }
 
   /** Band above target before the chase engages. */
@@ -316,17 +322,16 @@ export class WebAudioOutput implements AudioOutputLike {
           this._chasing = false;
           startTime = landing;
         } else if (lead > this.targetAheadSec + this.chaseOnSec
-            || (this.drainAfterUnderrun && lead > CHASE_ON_MIN_SEC)) {
+            || (now < this.drainUntilSec && lead > CHASE_ON_MIN_SEC)) {
           this._chasing = true;
-        } else if (lead <= (this.drainAfterUnderrun ? CHASE_ON_MIN_SEC : this.targetAheadSec)) {
+        } else if (lead <= (now < this.drainUntilSec ? CHASE_ON_MIN_SEC : this.targetAheadSec)) {
           this._chasing = false;
-          this.drainAfterUnderrun = false;
         }
       }
     } else if (this.nextScheduledTime !== null) {
       // Chain ran dry before this buffer arrived: an audible gap.
       const lateSec = alignedTime !== null ? now - alignedTime : null;
-      this.drainAfterUnderrun = true;
+      this.drainLag();
       if (this.resyncSinceSec === null) {
         this._underrunCount++;
         this._chasing = false;

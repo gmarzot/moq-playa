@@ -224,6 +224,9 @@ export interface AudioOutputLike {
    */
   realign?(): void;
 
+  /** Video re-anchored: drain any lag the chain now has against its slot, below the target too. Optional. */
+  drainLag?(): void;
+
   /** Release resources. */
   destroy(): void;
 }
@@ -395,9 +398,6 @@ export interface MediaSourceLike {
     holeStart: number;
     reason: 'hole' | 'resubscribe' | 'timeline';
   }) => void) | null;
-
-  /** OPTIONAL: the adapter jumped the playhead forward to the cushion in force. */
-  onLiveEdgeResync?: ((reason: 'quota' | 'behind-live') => void) | null;
 
   /**
    * OPTIONAL: the player resubscribed past what is buffered, so the next

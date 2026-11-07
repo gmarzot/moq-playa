@@ -269,6 +269,11 @@ export class CommandDispatcher {
     }
   }
 
+  /** Video re-anchored: audio drains the lag it now has against its slot. */
+  drainAudioLag(): void {
+    this.audioOutput?.drainLag?.();
+  }
+
   /** Historical draw evidence; unavailable without the optional renderer hook. */
   get videoPresentation(): VideoPresentation | null {
     if (this.renderFeedbackRetired) return null;

@@ -272,7 +272,7 @@ export interface TimelineJumpEvent {
   readonly jumpMs: number;
 }
 
-/** Objects resumed past a missing group: the relay skipped this subscriber ahead. */
+/** Objects resumed at a newer group, leaving one out or unfinished: the relay skipped this subscriber ahead. */
 export interface GroupSkipEvent {
   readonly type: 'group_skip';
   readonly mediaType: 'video' | 'audio';

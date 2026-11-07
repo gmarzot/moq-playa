@@ -114,7 +114,7 @@ export interface PlayerStats {
   // ── Errors ──────────────────────────────────────────────────
   /** Number of gap events detected by the pipeline. */
   readonly gapCount: number;
-  /** Times objects resumed past a missing group: the relay skipped this subscriber ahead. */
+  /** Times the relay skipped this subscriber ahead, leaving a group out or unfinished. */
   readonly groupSkipCount: number;
   /** Number of playback stalls. */
   readonly stallCount: number;
@@ -401,7 +401,7 @@ export class StatsAccumulator {
 
   // ── Errors ──────────────────────────────────────────────────
 
-  /** Objects resumed past a missing group. */
+  /** The relay skipped this subscriber ahead. */
   recordGroupSkip(): void {
     this._groupSkipCount++;
   }

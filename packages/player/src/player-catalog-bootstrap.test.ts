@@ -4588,13 +4588,21 @@ describe('media SUBSCRIBE refused with a Retry Interval', () => {
         const { player } = await subscribing();
         const skips: { fromGroupId: bigint; toGroupId: bigint; trackName: string }[] = [];
         player.on('group_skip', (e) => skips.push(e));
-        const note = (track: string, group: bigint): void =>
-            (player as unknown as { noteGroupSequence(m: string, t: string, g: bigint): void })
-                .noteGroupSequence('video', track, group);
-        for (const group of [5n, 6n, 6n, 9n, 8n, 10n]) note('video', group);
-        note('other', 100n);
+        const internal = player as unknown as {
+            noteGroupSequence(m: string, t: string, a: bigint, g: bigint): void;
+            abandonedMediaGroup: Map<bigint, bigint>;
+        };
+        const note = (alias: bigint, group: bigint): void => internal.noteGroupSequence('video', 'video', alias, group);
+        for (const group of [5n, 6n, 6n, 9n, 8n, 10n]) note(7n, group);
+        note(8n, 100n);
         expect(skips).toEqual([expect.objectContaining({ trackName: 'video', fromGroupId: 6n, toGroupId: 9n })]);
         expect(player.stats.groupSkipCount).toBe(1);
+
+        // The relay reset the group in progress and resumed at the very next one.
+        internal.abandonedMediaGroup.set(7n, 10n);
+        note(7n, 11n);
+        expect(skips.at(-1)).toMatchObject({ fromGroupId: 10n, toGroupId: 11n });
+        expect(player.stats.groupSkipCount).toBe(2);
     });
 
     it('spreads a first resubscribe over the spread window', async () => {

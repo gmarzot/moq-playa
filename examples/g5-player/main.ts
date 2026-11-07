@@ -1426,9 +1426,6 @@ async function main(): Promise<void> {
   (player as any).engine?.on('group_skip', (e: any) => {
     if (e.mediaType === 'video') log(`Relay skipped ahead [video]: group ${e.fromGroupId} → ${e.toGroupId}`);
   });
-  (player as any).engine?.on('recovery_action', (e: any) => {
-    if (e.action?.type === 'jump_to_live') log('Jumped to live: playback had fallen behind');
-  });
   (player as any).engine?.on('timeline_jump', (e: any) => {
     log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
     dropStaleLatency(([, , g]) => g !== undefined && g < e.toGroupId, e.mediaType === 'video');

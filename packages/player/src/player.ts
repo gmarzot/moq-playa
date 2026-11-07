@@ -21,7 +21,7 @@
  */
 
 import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
-import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openmoq/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError, StreamResetCode18 } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import type { BootstrapPhase } from './catalog-bootstrap.js';
@@ -883,11 +883,17 @@ export class MoqtPlayer {
   /** Shortest delay before re-issuing a refused catalog SUBSCRIBE. */
   private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
 
+  /** Stream resets by which a publisher gives up on a group for this subscriber. */
+  private static readonly SKIP_RESET_CODES: ReadonlySet<bigint> = new Set([
+    StreamResetCode18.CANCELLED, StreamResetCode18.DELIVERY_TIMEOUT,
+    StreamResetCode18.TOO_FAR_BEHIND, StreamResetCode18.EXCESSIVE_LOAD,
+  ].map(BigInt));
+
   /** A first resubscribe waits up to this long, so viewers ended together don't return together. */
   private static readonly RESUBSCRIBE_SPREAD_MS = 1_000;
 
   /** How long a session keeps retrying a SUBSCRIBE refused with a Retry Interval. */
-  private static readonly CATALOG_REFUSAL_LIMIT_MS = 300_000;
+  private static readonly REFUSAL_LIMIT_MS = 300_000;
 
   /** Media tracks being refused with a Retry Interval, with nothing else playing their media type. */
   private readonly mediaRefusals = new Map<string, {
@@ -896,8 +902,11 @@ export class MoqtPlayer {
     timer: ReturnType<typeof setTimeout> | null;
   }>();
 
-  /** The newest group seen per media track, to notice objects resuming past a missing group. */
-  private readonly lastMediaGroup = new Map<string, bigint>();
+  /** The newest group seen per media track alias, to notice objects resuming past it. */
+  private readonly lastMediaGroup = new Map<bigint, bigint>();
+
+  /** A subgroup a publisher gave up on, per track alias: a newer group after it is a skip. */
+  private readonly abandonedMediaGroup = new Map<bigint, bigint>();
 
   /** The current run of catalog refusals carrying a Retry Interval; null when none. */
   private catalogRefusal: {
@@ -1214,7 +1223,10 @@ export class MoqtPlayer {
       pendingMediaSubs: this.pendingMediaSubs,
       subscriptionManager: this.subscriptionManager,
     });
-    if (sub) this.lastMediaGroup.delete(sub.trackName);
+    if (sub?.trackAlias != null) {
+      this.lastMediaGroup.delete(BigInt(sub.trackAlias));
+      this.abandonedMediaGroup.delete(BigInt(sub.trackAlias));
+    }
     if (sub?.trackAlias != null && this.subscriptionManager?.getMediaType(sub.trackAlias) === undefined) {
       this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
@@ -2146,7 +2158,7 @@ export class MoqtPlayer {
       this._stats.recordMediaObject(bytes);
       this.recordDeliverySpans(obj);
       if (mediaType === 'video' || mediaType === 'audio') {
-        this.noteGroupSequence(mediaType, trackName, BigInt(obj.groupId));
+        this.noteGroupSequence(mediaType, trackName, BigInt(obj.trackAlias), BigInt(obj.groupId));
       }
       if (mediaType === 'video' && bytes > 0) {
         this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
@@ -3601,6 +3613,7 @@ export class MoqtPlayer {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
         this.recordDeliverySpans(obj);
+        this.noteGroupSequence(mediaType, trackName, BigInt(obj.trackAlias), BigInt(obj.groupId));
         if (mediaType === 'video' && bytes > 0) {
           const gid = BigInt(obj.groupId);
           if (gid !== this.bwEstimatorGroupId) {
@@ -3680,7 +3693,7 @@ export class MoqtPlayer {
         this._stats.recordMediaObject(bytes);
         this.recordDeliverySpans(obj);
         if (mediaType === 'video' || mediaType === 'audio') {
-          this.noteGroupSequence(mediaType, trackName, BigInt(obj.groupId));
+          this.noteGroupSequence(mediaType, trackName, BigInt(obj.trackAlias), BigInt(obj.groupId));
         }
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
@@ -4268,7 +4281,7 @@ export class MoqtPlayer {
     const prior = this.mediaRefusals.get(trackName);
     const current = prior?.conn === conn ? prior : null;
     const sinceMs = current?.sinceMs ?? nowMs;
-    if (nowMs - sinceMs >= MoqtPlayer.CATALOG_REFUSAL_LIMIT_MS) {
+    if (nowMs - sinceMs >= MoqtPlayer.REFUSAL_LIMIT_MS) {
       this.clearMediaRefusal(trackName);
       return false;
     }
@@ -4300,12 +4313,15 @@ export class MoqtPlayer {
     this.mediaRefusals.delete(trackName);
   }
 
-  /** Objects resuming past a missing group mean the relay skipped this subscriber ahead. */
-  private noteGroupSequence(mediaType: 'video' | 'audio', trackName: string, groupId: bigint): void {
-    const last = this.lastMediaGroup.get(trackName);
+  /** A relay skips a subscriber ahead by resetting the group in progress or leaving groups out. */
+  private noteGroupSequence(mediaType: 'video' | 'audio', trackName: string, alias: bigint, groupId: bigint): void {
+    const last = this.lastMediaGroup.get(alias);
     if (last !== undefined && groupId <= last) return;
-    this.lastMediaGroup.set(trackName, groupId);
-    if (last === undefined || groupId === last + 1n) return;
+    this.lastMediaGroup.set(alias, groupId);
+    if (last === undefined) return;
+    const abandoned = this.abandonedMediaGroup.get(alias);
+    this.abandonedMediaGroup.delete(alias);
+    if (groupId === last + 1n && abandoned !== last) return;
     this._stats.recordGroupSkip();
     this.emitter.emit('group_skip', {
       type: 'group_skip', mediaType, trackName, fromGroupId: last, toGroupId: groupId,
@@ -4319,7 +4335,7 @@ export class MoqtPlayer {
     const nowMs = Date.now();
     const prior = this.catalogRefusal?.conn === conn ? this.catalogRefusal : null;
     const sinceMs = prior?.sinceMs ?? nowMs;
-    if (nowMs - sinceMs >= MoqtPlayer.CATALOG_REFUSAL_LIMIT_MS) {
+    if (nowMs - sinceMs >= MoqtPlayer.REFUSAL_LIMIT_MS) {
       const waitedSec = Math.round((nowMs - sinceMs) / 1000);
       this.endRefusedPlayback(conn, `${refused}; gave up after ${waitedSec} s, reload to try again`);
       return;
@@ -4934,6 +4950,7 @@ export class MoqtPlayer {
     this.catalogRequestId = catalogReqId;
     this.legacyCatalogTerminal = null;
     this.lastMediaGroup.clear();
+    this.abandonedMediaGroup.clear();
     // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
     // one (new generation) binds to the committed session. Its joining fetch
     // fires immediately (Pending/Established association both legal on 16/18).
@@ -7878,6 +7895,9 @@ export class MoqtPlayer {
         if (subgroup !== undefined) {
           this.subgroupStreams.delete(streamId); // map never outlives the stream
           if (terminal === 'reset') {
+            if (error !== undefined && MoqtPlayer.SKIP_RESET_CODES.has(BigInt(error))) {
+              this.abandonedMediaGroup.set(subgroup.trackAlias, subgroup.groupId);
+            }
             this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
             for (const subscription of this.activeSubscriptions.values()) {
@@ -9220,14 +9240,6 @@ export class MoqtPlayer {
       // Buffered-hole gap-jump: the adapter skipped missing source media.
       // Surface it as stats + a typed public event (apps subscribe to the
       // player event; the adapter slot has exactly one owner — this one).
-      this.mediaSource.onLiveEdgeResync = (reason) => {
-        if (reason !== 'behind-live') return;
-        this.log.warn('Jump to live: %s', reason);
-        this.emitter.emit('recovery_action', {
-          type: 'recovery_action',
-          action: { type: 'jump_to_live' },
-        });
-      };
       this.mediaSource.onGapJump = (info) => {
         this._stats.recordGapJump();
         this.log.warn(
@@ -10165,7 +10177,10 @@ export class MoqtPlayer {
       syncController: this.syncController,
       syncResetThisTick: this.syncResetThisTick,
       setSyncResetThisTick: (v) => { this.syncResetThisTick = v; },
-      recordDiagnostic: (kind) => this._stats.recordLocDiagnostic(kind),
+      recordDiagnostic: (kind) => {
+        this._stats.recordLocDiagnostic(kind);
+        if (kind === 'sync_reset') this.commandDispatcher?.drainAudioLag();
+      },
       recoveryHook: (action, localSkip) => {
         const result = this.hooks.onRecovery.run(action);
         if (result) {
