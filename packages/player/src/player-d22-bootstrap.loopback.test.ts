@@ -8,13 +8,16 @@
  * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-22 §3.4
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { createLoopback } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtConnection as Connection } from '../../webtransport/src/adapter.js';
 import { MoqtPlayer } from './player.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import { varint } from '@openmoq/transport';
+
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
 
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const td = new TextDecoder();

@@ -21,7 +21,7 @@
  */
 
 import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
-import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openmoq/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError, StreamResetCode18 } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import type { BootstrapPhase } from './catalog-bootstrap.js';
@@ -883,8 +883,27 @@ export class MoqtPlayer {
   /** Shortest delay before re-issuing a refused catalog SUBSCRIBE. */
   private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
 
-  /** How long a session keeps retrying a catalog SUBSCRIBE refused with a Retry Interval. */
-  private static readonly CATALOG_REFUSAL_LIMIT_MS = 300_000;
+  /** Stream resets by which a publisher gives up on a group for this subscriber. */
+  private static readonly SKIP_RESET_CODES: ReadonlySet<bigint> = new Set([
+    StreamResetCode18.CANCELLED, StreamResetCode18.DELIVERY_TIMEOUT,
+    StreamResetCode18.TOO_FAR_BEHIND, StreamResetCode18.EXCESSIVE_LOAD,
+  ].map(BigInt));
+
+  /** A first resubscribe waits up to this long, so viewers ended together don't return together. */
+  private static readonly RESUBSCRIBE_SPREAD_MS = 1_000;
+
+  /** How long a session keeps retrying a SUBSCRIBE refused with a Retry Interval. */
+  private static readonly REFUSAL_LIMIT_MS = 300_000;
+
+  /** Media tracks being refused with a Retry Interval, with nothing else playing their media type. */
+  private readonly mediaRefusals = new Map<string, {
+    readonly conn: MoqtConnection;
+    readonly sinceMs: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>();
+
+  /** A group a publisher gave up on with a stream reset, per track alias: a newer one after it is a skip. */
+  private readonly abandonedMediaGroup = new Map<bigint, bigint>();
 
   /** The current run of catalog refusals carrying a Retry Interval; null when none. */
   private catalogRefusal: {
@@ -1201,6 +1220,7 @@ export class MoqtPlayer {
       pendingMediaSubs: this.pendingMediaSubs,
       subscriptionManager: this.subscriptionManager,
     });
+    if (sub?.trackAlias != null) this.abandonedMediaGroup.delete(BigInt(sub.trackAlias));
     if (sub?.trackAlias != null && this.subscriptionManager?.getMediaType(sub.trackAlias) === undefined) {
       this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
@@ -2131,6 +2151,9 @@ export class MoqtPlayer {
       const bytes = obj.payload ? obj.payload.byteLength : 0;
       this._stats.recordMediaObject(bytes);
       this.recordDeliverySpans(obj);
+      if (mediaType === 'video' || mediaType === 'audio') {
+        this.noteGroupSequence(mediaType, trackName, BigInt(obj.trackAlias), BigInt(obj.groupId));
+      }
       if (mediaType === 'video' && bytes > 0) {
         this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
       }
@@ -3584,6 +3607,7 @@ export class MoqtPlayer {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
         this.recordDeliverySpans(obj);
+        this.noteGroupSequence(mediaType, trackName, BigInt(obj.trackAlias), BigInt(obj.groupId));
         if (mediaType === 'video' && bytes > 0) {
           const gid = BigInt(obj.groupId);
           if (gid !== this.bwEstimatorGroupId) {
@@ -3662,6 +3686,9 @@ export class MoqtPlayer {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
         this.recordDeliverySpans(obj);
+        if (mediaType === 'video' || mediaType === 'audio') {
+          this.noteGroupSequence(mediaType, trackName, BigInt(obj.trackAlias), BigInt(obj.groupId));
+        }
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
           this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
@@ -4240,6 +4267,57 @@ export class MoqtPlayer {
     return minimum < floor ? floor : minimum;
   }
 
+  /** Retry a media SUBSCRIBE refused with a Retry Interval; false once refusals outlast the limit. */
+  private retryRefusedMedia(
+    conn: MoqtConnection, trackName: string, retryInterval: bigint, refused: string,
+  ): boolean {
+    const nowMs = Date.now();
+    const prior = this.mediaRefusals.get(trackName);
+    const current = prior?.conn === conn ? prior : null;
+    const sinceMs = current?.sinceMs ?? nowMs;
+    if (nowMs - sinceMs >= MoqtPlayer.REFUSAL_LIMIT_MS) {
+      this.clearMediaRefusal(trackName);
+      return false;
+    }
+    if (prior && !current) this.clearMediaRefusal(trackName);
+    const delayMs = Number(MoqtPlayer.catalogRetryDelayMs(retryInterval));
+    if (!current) {
+      this.emitError(createPlayerError('degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+        `${refused}; retrying in ${Math.ceil(delayMs / 1000)} s`));
+    }
+    const state = current ?? { conn, sinceMs, timer: null };
+    this.mediaRefusals.set(trackName, state);
+    const fire = (): void => {
+      state.timer = null;
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      if (this.reconnect !== null || this.holdWhileHidden()) {
+        state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
+        return;
+      }
+      this.replaceSubscription(trackName, 'refused', () => this.retryRefusedMedia(conn, trackName, retryInterval, refused));
+    };
+    if (state.timer !== null) clearTimeout(state.timer);
+    state.timer = setTimeout(fire, delayMs);
+    return true;
+  }
+
+  private clearMediaRefusal(trackName: string): void {
+    const state = this.mediaRefusals.get(trackName);
+    if (state?.timer != null) clearTimeout(state.timer);
+    this.mediaRefusals.delete(trackName);
+  }
+
+  /** A relay skips a subscriber ahead by resetting a group's stream and resuming at a newer group. */
+  private noteGroupSequence(mediaType: 'video' | 'audio', trackName: string, alias: bigint, groupId: bigint): void {
+    const abandoned = this.abandonedMediaGroup.get(alias);
+    if (abandoned === undefined || groupId <= abandoned) return;
+    this.abandonedMediaGroup.delete(alias);
+    this._stats.recordGroupSkip();
+    this.emitter.emit('group_skip', {
+      type: 'group_skip', mediaType, trackName, fromGroupId: abandoned, toGroupId: groupId,
+    });
+  }
+
   /** Retry a catalog SUBSCRIBE refused with a Retry Interval until refusals outlast the limit. */
   private retryRefusedCatalog(
     conn: MoqtConnection, code: bigint, reason: string, retryInterval: bigint, refused: string,
@@ -4247,7 +4325,7 @@ export class MoqtPlayer {
     const nowMs = Date.now();
     const prior = this.catalogRefusal?.conn === conn ? this.catalogRefusal : null;
     const sinceMs = prior?.sinceMs ?? nowMs;
-    if (nowMs - sinceMs >= MoqtPlayer.CATALOG_REFUSAL_LIMIT_MS) {
+    if (nowMs - sinceMs >= MoqtPlayer.REFUSAL_LIMIT_MS) {
       const waitedSec = Math.round((nowMs - sinceMs) / 1000);
       this.endRefusedPlayback(conn, `${refused}; gave up after ${waitedSec} s, reload to try again`);
       return;
@@ -4861,6 +4939,7 @@ export class MoqtPlayer {
     this.catalogTrackAlias = null;
     this.catalogRequestId = catalogReqId;
     this.legacyCatalogTerminal = null;
+    this.abandonedMediaGroup.clear();
     // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
     // one (new generation) binds to the committed session. Its joining fetch
     // fires immediately (Pending/Established association both legal on 16/18).
@@ -7034,6 +7113,7 @@ export class MoqtPlayer {
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
     this.removeVisibilityListener();
     this.cancelResumeWhenVisible();
+    for (const trackName of [...this.mediaRefusals.keys()]) this.clearMediaRefusal(trackName);
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -7804,6 +7884,9 @@ export class MoqtPlayer {
         if (subgroup !== undefined) {
           this.subgroupStreams.delete(streamId); // map never outlives the stream
           if (terminal === 'reset') {
+            if (error !== undefined && MoqtPlayer.SKIP_RESET_CODES.has(BigInt(error))) {
+              this.abandonedMediaGroup.set(subgroup.trackAlias, subgroup.groupId);
+            }
             this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
             for (const subscription of this.activeSubscriptions.values()) {
@@ -8312,10 +8395,21 @@ export class MoqtPlayer {
         }
       },
       onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
+        this.clearMediaRefusal(_trackName);
         this._mediaSubsOk++;
         this.mediaSubWire.delete(requestId);
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
+        // Told to come back later, with nothing else playing this media type.
+        if (BigInt(errorCode) !== BigInt(RequestError.DOES_NOT_EXIST)
+            && retryInterval !== undefined && BigInt(retryInterval) > 0n
+            && this.activeTrackName(mediaType) === undefined
+            && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName)
+            && this.retryRefusedMedia(conn, trackName, BigInt(retryInterval),
+              `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`)) {
+          this.mediaSubWire.delete(requestId);
+          return;
+        }
         this._mediaSubsFailed++;
         // DOES_NOT_EXIST: the namespace's return resumes the track, or ends a failed resume.
         if (this.config.followNamespace && BigInt(errorCode) === 0x10n) this.follower.noteTrackMissing();
@@ -10072,7 +10166,10 @@ export class MoqtPlayer {
       syncController: this.syncController,
       syncResetThisTick: this.syncResetThisTick,
       setSyncResetThisTick: (v) => { this.syncResetThisTick = v; },
-      recordDiagnostic: (kind) => this._stats.recordLocDiagnostic(kind),
+      recordDiagnostic: (kind) => {
+        this._stats.recordLocDiagnostic(kind);
+        if (kind === 'sync_reset') this.commandDispatcher?.drainAudioLag();
+      },
       recoveryHook: (action, localSkip) => {
         const result = this.hooks.onRecovery.run(action);
         if (result) {
@@ -10341,6 +10438,8 @@ export class MoqtPlayer {
     if (matching.length > 0) this.mediaSource?.expectDiscontinuity?.();
 
     for (const [requestId, sub] of matching) {
+      // This request can reset the group in progress: not the relay's skip.
+      if (sub.trackAlias != null) this.abandonedMediaGroup.delete(BigInt(sub.trackAlias));
       this.connection.requestUpdate(varint(requestId), {
         subscriptionFilter: startGroup !== undefined
           ? {
@@ -10737,8 +10836,10 @@ export class MoqtPlayer {
     }
     retry.lastDoneAtMs = nowMs;
     if (retry.timer !== null) return;
+    const spread = cause === 'too_far_behind' || cause === 'publish_done'
+      ? Math.random() * MoqtPlayer.RESUBSCRIBE_SPREAD_MS : 0;
     const delayMs = retry.attempts === 0
-      ? 0
+      ? spread
       : Math.min(PUBLISH_DONE_RETRY_BASE_MS * 2 ** (retry.attempts - 1), PUBLISH_DONE_RETRY_MAX_MS);
     retry.attempts++;
     const state = retry;

@@ -777,7 +777,11 @@ export class MseMediaSource implements MediaSourceLike {
   // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
   /** Minimum spacing between jumps (swiss-cheese streams keep jumping, bounded). */
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
-  /** How far past a range end a playhead parked in the following hole may be. */
+  /** Cushion above the target in force that counts as behind live. */
+  private static readonly BEHIND_EXCESS_SEC = 3;
+  /** How long it must last before the jump: a short burst drains by itself. */
+  private static readonly BEHIND_HOLD_MS = 2_000;
+  /** Past a range end by more than this, a playhead in the following hole needs the frozen proof. */
   private static readonly GAP_PARKED_PAST_END_MAX_SEC = 1.0;
   /** Wait floor and per-hole-second scaling: small holes clear fast, wide
    *  holes get proportionally longer for infill to arrive; gapJumpMs caps. */
@@ -814,6 +818,8 @@ export class MseMediaSource implements MediaSourceLike {
   } | null = null;
   /** Own last-observed playhead — never reads or writes wedgeLastTime. */
   private gapLastPlayheadTime: number | null = null;
+  /** When the cushion first went past the behind-live excess; null when it isn't. */
+  private behindSinceMs: number | null = null;
   private lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
   /** Buffered end when the player resubscribed: the next hole after it cannot fill. */
   private discontinuityMark: { afterSec: number; atMs: number } | null = null;
@@ -2569,16 +2575,17 @@ export class MseMediaSource implements MediaSourceLike {
         break;
       }
     }
-    // Audio can carry the playhead a little past the end of the video before
-    // it stops, parking it inside the hole itself.
+    // Audio can carry the playhead past the end of the video before it stops,
+    // parking it inside the hole itself, however wide.
+    let parkedDeep = false;
     if (curEnd === null) {
       for (let i = 0; i + 1 < buffered.length; i++) {
         const end = buffered.end(i);
-        if (ct > end && ct < buffered.start(i + 1)
-            && ct - end <= MseMediaSource.GAP_PARKED_PAST_END_MAX_SEC) {
+        if (ct > end && ct < buffered.start(i + 1)) {
           curEnd = end;
           nextStart = buffered.start(i + 1);
           nextEnd = buffered.end(i + 1);
+          parkedDeep = ct - end > MseMediaSource.GAP_PARKED_PAST_END_MAX_SEC;
           break;
         }
       }
@@ -2603,8 +2610,8 @@ export class MseMediaSource implements MediaSourceLike {
 
     // A hole that cannot fill needs no frozen playhead or infill wait.
     const mark = this.discontinuityMark;
-    const finalReason: GapJumpReason | null =
-      holeSec >= Math.max(MseMediaSource.GAP_TIMELINE_JUMP_SEC, this.gapJumpMs / 1000) ? 'timeline'
+    const finalReason: GapJumpReason | null = parkedDeep ? null
+      : holeSec >= Math.max(MseMediaSource.GAP_TIMELINE_JUMP_SEC, this.gapJumpMs / 1000) ? 'timeline'
       : mark !== null && curEnd! > mark.afterSec - MseMediaSource.GAP_MOVE_TOLERANCE_SEC ? 'resubscribe'
       : null;
     if (finalReason !== null) {
@@ -2853,12 +2860,16 @@ export class MseMediaSource implements MediaSourceLike {
   /**
    * Behind-live cap: when playback has fallen more than `maxAheadSec` behind the
    * buffered data it is inside of (a perpetually-behind live subscriber being
-   * burst-fed by the relay), jump to `rangeEnd - targetAheadSec`. Only acts after
-   * startup (playTriggered) and only within the range CONTAINING currentTime —
-   * never across gaps.
+   * burst-fed by the relay), or stayed BEHIND_EXCESS_SEC above the cushion in
+   * force for BEHIND_HOLD_MS, jump to the range end less that cushion. In Smooth
+   * mode the cushion is the held delay, so both are measured from the Smooth
+   * edge. Only acts after startup (playTriggered) and only within the range
+   * CONTAINING currentTime — never across gaps.
    */
   private maybeChaseLiveEdge(): void {
     if (!this.playTriggered) return;
+    const wasBehindSinceMs = this.behindSinceMs;
+    this.behindSinceMs = null;
     const v = this.video;
     // Never seek a paused element. The UA may pause playback autonomously
     // (e.g. power saving for muted, non-visible video), and seeking a
@@ -2874,8 +2885,16 @@ export class MseMediaSource implements MediaSourceLike {
       const end = buffered.end(i);
       if (ct < start || ct > end) continue;
       const ahead = end - ct;
-      if (ahead > this.maxAheadSec) {
-        const target = Math.max(start, end - this.targetAheadSec);
+      const nowMs = performance.now();
+      if (Number.isFinite(this.maxAheadSec)
+          && ahead > this.chase.releaseSec + MseMediaSource.BEHIND_EXCESS_SEC) {
+        this.behindSinceMs = wasBehindSinceMs ?? nowMs;
+      }
+      const heldBehind = this.behindSinceMs !== null
+        && nowMs - this.behindSinceMs >= MseMediaSource.BEHIND_HOLD_MS;
+      if (ahead > this.maxAheadSec || heldBehind) {
+        this.behindSinceMs = null;
+        const target = Math.max(start, end - this.chase.releaseSec);
         if (target > ct) {
           this.logWarn('[MSE] behind live by %ss — jumping %s -> %s', ahead.toFixed(1), ct.toFixed(2), target.toFixed(2));
           this.resetPlaybackRate();

@@ -1423,6 +1423,9 @@ async function main(): Promise<void> {
     for (const [a, b] of videoHolesSeen.values()) if (t >= a && t < b && !holeSkipped(a)) return a;
     return null;
   };
+  (player as any).engine?.on('group_skip', (e: any) => {
+    if (e.mediaType === 'video') log(`Relay skipped ahead [video]: group ${e.fromGroupId} → ${e.toGroupId}`);
+  });
   (player as any).engine?.on('timeline_jump', (e: any) => {
     log(`Timeline jump [${e.mediaType}]: group ${e.fromGroupId} → ${e.toGroupId} (+${(e.jumpMs / 1000).toFixed(1)} s)`);
     dropStaleLatency(([, , g]) => g !== undefined && g < e.toGroupId, e.mediaType === 'video');

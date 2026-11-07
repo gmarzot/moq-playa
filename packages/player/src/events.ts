@@ -272,6 +272,15 @@ export interface TimelineJumpEvent {
   readonly jumpMs: number;
 }
 
+/** A publisher reset a group's stream and objects resumed at a newer group: the relay skipped this subscriber ahead. */
+export interface GroupSkipEvent {
+  readonly type: 'group_skip';
+  readonly mediaType: 'video' | 'audio';
+  readonly trackName: string;
+  readonly fromGroupId: bigint;
+  readonly toGroupId: bigint;
+}
+
 /** A partial video GOP was abandoned before END_OF_GROUP was received. */
 export interface PartialGroupAbandonedEvent {
   readonly type: 'partial_group_abandoned';
@@ -789,6 +798,7 @@ export interface PlayerEventMap {
   track_subscribed: TrackSubscribedEvent;
   track_unsubscribed: TrackUnsubscribedEvent;
   track_subscribe_failed: TrackSubscribeFailedEvent;
+  group_skip: GroupSkipEvent;
 
   // Decoder commands
   decoder_command: DecoderCommandEvent;

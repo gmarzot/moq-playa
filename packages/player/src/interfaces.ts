@@ -224,6 +224,9 @@ export interface AudioOutputLike {
    */
   realign?(): void;
 
+  /** Video re-anchored: drain any lag the chain now has against its slot, below the target too. Optional. */
+  drainLag?(): void;
+
   /** Release resources. */
   destroy(): void;
 }
