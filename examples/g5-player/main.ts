@@ -564,6 +564,7 @@ async function main(): Promise<void> {
     qualitySelect.closest<HTMLElement>('.menu-row')!.hidden = levels.length < 2;
   }
   player.on('levelsloaded', ({ levels }) => fillQuality(levels));
+  player.on('qualitychange', ({ level, auto }) => { if (!auto) qualitySelect.value = String(level.index); });
 
   // Program / View / Language pickers, shown only when the catalog offers a choice.
   function fillPicker(sel: HTMLSelectElement, options: ReadonlyArray<[string, string]>, current: string | undefined): void {
