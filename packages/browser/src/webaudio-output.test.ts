@@ -433,6 +433,38 @@ describe('live-edge lead clamp', () => {
   });
 });
 
+describe('lag after an underrun', () => {
+  const MS = 1_000;
+  const buffer = (ts: number): AudioData => ({
+    timestamp: ts, duration: 20 * MS, numberOfFrames: 960, numberOfChannels: 1, sampleRate: 48_000,
+    format: 'f32', copyTo: () => {}, close: () => {}, allocationSize: () => 3_840,
+  }) as unknown as AudioData;
+
+  it('is drained below the target, where a chase would not otherwise start', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(buffer(0), 1_000 * MS);
+    ctx.currentTime = 2.0;                 // the chain ran dry
+    out.schedule(buffer(0), 2_000 * MS);   // anchors on its slot
+    out.schedule(buffer(20 * MS), (2_000 + 20 - 90) * MS);
+    expect(out.captureLeadSec).toBeCloseTo(0.09, 3);
+    expect(out.chasing).toBe(true);
+    // 90 ms sheds at about 0.39 ms per 20 ms buffer.
+    for (let i = 2; i < 400; i++) out.schedule(buffer(i * 20 * MS), (2_000 + i * 20 - 90) * MS);
+    expect(out.chasing).toBe(false);
+    expect(out.captureLeadSec).toBeLessThanOrEqual(0.02 + 1e-9);
+  });
+
+  it('stays out of a chase without an underrun', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(buffer(0), 1_000 * MS);
+    out.schedule(buffer(20 * MS), (1_000 - 70) * MS);
+    expect(out.captureLeadSec).toBeGreaterThan(0.02);
+    expect(out.chasing).toBe(false);
+  });
+});
+
 describe('underrun resync', () => {
   const MS = 1_000; // µs per ms
   /** One on-time 20ms buffer at ctx 1.0: the chain ends at 1.02. */

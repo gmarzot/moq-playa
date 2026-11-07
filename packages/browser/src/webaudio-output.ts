@@ -118,6 +118,8 @@ export class WebAudioOutput implements AudioOutputLike {
   private gapLateSec: number | null = null;
   /** Audio arrived ahead of its slot since the last resync, so lateness is not persistent. */
   private resyncArmed = true;
+  /** The chain resumed after running dry: drain the lag it came back with, below the target too. */
+  private drainAfterUnderrun = false;
   /** realign() was called; the next buffer with a slot consumes it. */
   private realignPending = false;
 
@@ -313,15 +315,18 @@ export class WebAudioOutput implements AudioOutputLike {
           this._liveEdgeSnapCount++;
           this._chasing = false;
           startTime = landing;
-        } else if (lead > this.targetAheadSec + this.chaseOnSec) {
+        } else if (lead > this.targetAheadSec + this.chaseOnSec
+            || (this.drainAfterUnderrun && lead > CHASE_ON_MIN_SEC)) {
           this._chasing = true;
-        } else if (lead <= this.targetAheadSec) {
+        } else if (lead <= (this.drainAfterUnderrun ? CHASE_ON_MIN_SEC : this.targetAheadSec)) {
           this._chasing = false;
+          this.drainAfterUnderrun = false;
         }
       }
     } else if (this.nextScheduledTime !== null) {
       // Chain ran dry before this buffer arrived: an audible gap.
       const lateSec = alignedTime !== null ? now - alignedTime : null;
+      this.drainAfterUnderrun = true;
       if (this.resyncSinceSec === null) {
         this._underrunCount++;
         this._chasing = false;
