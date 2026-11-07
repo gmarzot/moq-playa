@@ -6796,7 +6796,9 @@ export class MoqtPlayer {
     const { socketFirstMs, socketStartMs, socketLastMs, assemblyBusyMs } = obj;
     if (socketFirstMs === undefined || socketLastMs === undefined) return;
     if (socketStartMs !== undefined) {
-      this.bandwidthEstimator?.recordBurst(obj.payload?.byteLength ?? 0, socketLastMs - socketStartMs, this.clock.now());
+      this.bandwidthEstimator?.recordBurst(
+        obj.payload?.byteLength ?? 0, socketLastMs - socketStartMs, this.clock.now(), Number(obj.objectId) === 0,
+      );
     }
     const assemblyMs = assemblyBusyMs ?? 0;
     this.deliverySpans.unshift({

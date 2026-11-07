@@ -18,6 +18,19 @@ describe('BandwidthEstimator link rate', () => {
         expect(est.getBurstKbps(500_000)).toBe(0);
     });
 
+    it('accepts a smaller object at a group start', () => {
+        const est = new BandwidthEstimator();
+        for (let i = 0; i < 3; i++) est.recordBurst(12_000, 3, i, true);
+        expect(est.getBurstKbps(3)).toBe(32_000);
+    });
+
+    it('still ignores a group start below two packets or below timer resolution', () => {
+        const est = new BandwidthEstimator();
+        for (let i = 0; i < 3; i++) est.recordBurst(1_000, 5, i, true);
+        for (let i = 0; i < 3; i++) est.recordBurst(12_000, 0.5, i, true);
+        expect(est.getBurstKbps(3)).toBe(0);
+    });
+
     it('takes the lower median, so one fast outlier cannot raise it', () => {
         const est = new BandwidthEstimator();
         // 8, 16 and 800 Mbps, then 24 Mbps: lower median of four is 16 Mbps.

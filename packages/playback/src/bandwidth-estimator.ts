@@ -29,6 +29,8 @@ export class BandwidthEstimator {
 
     /** Smallest object that spans enough packets to time the link. */
     static readonly BURST_MIN_BYTES = 16_384;
+    /** A group's first object: about two packets, and one per group cannot crowd out the window. */
+    static readonly BURST_MIN_GROUP_START_BYTES = 2_400;
     /** Shorter transfers are below timer resolution. */
     static readonly BURST_MIN_MS = 1;
     static readonly BURST_WINDOW_US = 20_000_000;
@@ -83,8 +85,9 @@ export class BandwidthEstimator {
      * Record one object's first-to-last-byte transfer. On live the arrival rate
      * is the publisher's pace; a large object's transfer time measures the link.
      */
-    recordBurst(bytes: number, transferMs: number, timestampUs: number): void {
-        if (bytes < BandwidthEstimator.BURST_MIN_BYTES || transferMs < BandwidthEstimator.BURST_MIN_MS) return;
+    recordBurst(bytes: number, transferMs: number, timestampUs: number, groupStart = false): void {
+        const minBytes = groupStart ? BandwidthEstimator.BURST_MIN_GROUP_START_BYTES : BandwidthEstimator.BURST_MIN_BYTES;
+        if (bytes < minBytes || transferMs < BandwidthEstimator.BURST_MIN_MS) return;
         this.bursts.push({ kbps: (bytes * 8) / transferMs, atUs: timestampUs });
         if (this.bursts.length > BandwidthEstimator.BURST_MAX_SAMPLES) this.bursts.shift();
     }
