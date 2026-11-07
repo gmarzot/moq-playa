@@ -1436,6 +1436,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       const nsRid = await nsConn.publishNamespace(nsBytes);
       let liveNsRid = nsRid;
       let nsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+      let nsRetired = false;
       retryRefusedNamespace = (delayMs, why) => {
         const inSec = Math.ceil(delayMs / 1000);
         nsBadgeState = { tone: 'wait', detail: `PUBLISH_NAMESPACE refused: ${why}; retrying in ${inSec} s` };
@@ -1444,6 +1445,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         nsRetryTimer = setTimeout(() => {
           nsRetryTimer = null;
           void nsConn.publishNamespace(nsBytes).then((rid) => {
+            // Stopped while it was in flight: withdraw it and leave a newer broadcast's state alone.
+            if (nsRetired) {
+              void nsConn.publishNamespaceDone(rid).catch(() => {});
+              return;
+            }
             liveNsRid = rid;
             nsRequestId = String(rid);
           }).catch((err: unknown) => log(`PUBLISH_NAMESPACE retry: ${(err as Error)?.message ?? err}`));
@@ -1454,6 +1460,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // relay drops its state through the protocol instead of holding it for a
       // timeout. Bounded: a dead session must not stall Stop.
       ctx.adopt(nsRid, async () => {
+        nsRetired = true;
         retryRefusedNamespace = null;
         if (nsRetryTimer !== null) clearTimeout(nsRetryTimer);
         await session.endSubscriptions();

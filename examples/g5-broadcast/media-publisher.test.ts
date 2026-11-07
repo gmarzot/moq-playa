@@ -1639,4 +1639,3 @@ describe('MediaPublisher — status reports', () => {
     expect(statuses).toEqual(['audio: Forward State 0 (a send was refused)']);
   });
 });    let keyframes = 0;
-

@@ -4584,7 +4584,7 @@ describe('media SUBSCRIBE refused with a Retry Interval', () => {
         expect(fatal(errors)).toEqual([]);
     });
 
-    it('reports objects resuming past a missing group, once per skip', async () => {
+    it('reports a skip only from a reset group followed by a newer one', async () => {
         const { player } = await subscribing();
         const skips: { fromGroupId: bigint; toGroupId: bigint; trackName: string }[] = [];
         player.on('group_skip', (e) => skips.push(e));
@@ -4593,16 +4593,21 @@ describe('media SUBSCRIBE refused with a Retry Interval', () => {
             abandonedMediaGroup: Map<bigint, bigint>;
         };
         const note = (alias: bigint, group: bigint): void => internal.noteGroupSequence('video', 'video', alias, group);
-        for (const group of [5n, 6n, 6n, 9n, 8n, 10n]) note(7n, group);
-        note(8n, 100n);
-        expect(skips).toEqual([expect.objectContaining({ trackName: 'video', fromGroupId: 6n, toGroupId: 9n })]);
+        // Streams reorder: a forward gap with no reset says nothing.
+        for (const group of [5n, 6n, 9n, 8n, 10n]) note(7n, group);
+        expect(skips).toEqual([]);
+
+        // Reset, then late objects of that group, then the very next group.
+        internal.abandonedMediaGroup.set(7n, 10n);
+        note(7n, 10n);
+        expect(skips).toEqual([]);
+        note(7n, 11n);
+        expect(skips).toEqual([expect.objectContaining({ trackName: 'video', fromGroupId: 10n, toGroupId: 11n })]);
         expect(player.stats.groupSkipCount).toBe(1);
 
-        // The relay reset the group in progress and resumed at the very next one.
-        internal.abandonedMediaGroup.set(7n, 10n);
-        note(7n, 11n);
-        expect(skips.at(-1)).toMatchObject({ fromGroupId: 10n, toGroupId: 11n });
-        expect(player.stats.groupSkipCount).toBe(2);
+        note(7n, 12n);
+        note(8n, 100n);
+        expect(player.stats.groupSkipCount).toBe(1);
     });
 
     it('spreads a first resubscribe over the spread window', async () => {
@@ -4623,4 +4628,3 @@ describe('media SUBSCRIBE refused with a Retry Interval', () => {
         expect(subscribesOf(adapter, 'video')).toBe(2);
     });
 });
-

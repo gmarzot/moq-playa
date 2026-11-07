@@ -114,7 +114,7 @@ export interface PlayerStats {
   // ── Errors ──────────────────────────────────────────────────
   /** Number of gap events detected by the pipeline. */
   readonly gapCount: number;
-  /** Times the relay skipped this subscriber ahead, leaving a group out or unfinished. */
+  /** Times the relay skipped this subscriber ahead: a reset group's stream, then a newer group. */
   readonly groupSkipCount: number;
   /** Number of playback stalls. */
   readonly stallCount: number;

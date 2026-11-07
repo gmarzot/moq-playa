@@ -902,10 +902,7 @@ export class MoqtPlayer {
     timer: ReturnType<typeof setTimeout> | null;
   }>();
 
-  /** The newest group seen per media track alias, to notice objects resuming past it. */
-  private readonly lastMediaGroup = new Map<bigint, bigint>();
-
-  /** A subgroup a publisher gave up on, per track alias: a newer group after it is a skip. */
+  /** A group a publisher gave up on with a stream reset, per track alias: a newer one after it is a skip. */
   private readonly abandonedMediaGroup = new Map<bigint, bigint>();
 
   /** The current run of catalog refusals carrying a Retry Interval; null when none. */
@@ -1223,10 +1220,7 @@ export class MoqtPlayer {
       pendingMediaSubs: this.pendingMediaSubs,
       subscriptionManager: this.subscriptionManager,
     });
-    if (sub?.trackAlias != null) {
-      this.lastMediaGroup.delete(BigInt(sub.trackAlias));
-      this.abandonedMediaGroup.delete(BigInt(sub.trackAlias));
-    }
+    if (sub?.trackAlias != null) this.abandonedMediaGroup.delete(BigInt(sub.trackAlias));
     if (sub?.trackAlias != null && this.subscriptionManager?.getMediaType(sub.trackAlias) === undefined) {
       this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
@@ -4313,18 +4307,14 @@ export class MoqtPlayer {
     this.mediaRefusals.delete(trackName);
   }
 
-  /** A relay skips a subscriber ahead by resetting the group in progress or leaving groups out. */
+  /** A relay skips a subscriber ahead by resetting a group's stream and resuming at a newer group. */
   private noteGroupSequence(mediaType: 'video' | 'audio', trackName: string, alias: bigint, groupId: bigint): void {
-    const last = this.lastMediaGroup.get(alias);
-    if (last !== undefined && groupId <= last) return;
-    this.lastMediaGroup.set(alias, groupId);
-    if (last === undefined) return;
     const abandoned = this.abandonedMediaGroup.get(alias);
+    if (abandoned === undefined || groupId <= abandoned) return;
     this.abandonedMediaGroup.delete(alias);
-    if (groupId === last + 1n && abandoned !== last) return;
     this._stats.recordGroupSkip();
     this.emitter.emit('group_skip', {
-      type: 'group_skip', mediaType, trackName, fromGroupId: last, toGroupId: groupId,
+      type: 'group_skip', mediaType, trackName, fromGroupId: abandoned, toGroupId: groupId,
     });
   }
 
@@ -4949,7 +4939,6 @@ export class MoqtPlayer {
     this.catalogTrackAlias = null;
     this.catalogRequestId = catalogReqId;
     this.legacyCatalogTerminal = null;
-    this.lastMediaGroup.clear();
     this.abandonedMediaGroup.clear();
     // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
     // one (new generation) binds to the committed session. Its joining fetch
@@ -10449,6 +10438,8 @@ export class MoqtPlayer {
     if (matching.length > 0) this.mediaSource?.expectDiscontinuity?.();
 
     for (const [requestId, sub] of matching) {
+      // This request can reset the group in progress: not the relay's skip.
+      if (sub.trackAlias != null) this.abandonedMediaGroup.delete(BigInt(sub.trackAlias));
       this.connection.requestUpdate(varint(requestId), {
         subscriptionFilter: startGroup !== undefined
           ? {

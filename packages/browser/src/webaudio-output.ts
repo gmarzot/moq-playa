@@ -331,7 +331,7 @@ export class WebAudioOutput implements AudioOutputLike {
     } else if (this.nextScheduledTime !== null) {
       // Chain ran dry before this buffer arrived: an audible gap.
       const lateSec = alignedTime !== null ? now - alignedTime : null;
-      this.drainLag();
+      if (alignedTime !== null) this.drainLag();
       if (this.resyncSinceSec === null) {
         this._underrunCount++;
         this._chasing = false;
@@ -480,6 +480,7 @@ export class WebAudioOutput implements AudioOutputLike {
     this.resyncSinceSec = null;
     this.resyncArmed = true;
     this.realignPending = false;
+    this.drainUntilSec = 0;
   }
 
   /**

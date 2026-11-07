@@ -4379,4 +4379,3 @@ describe('seam-overlap default visibility (non-silent accountability)', () => {
         warn.mockRestore();
     });
 });
-
