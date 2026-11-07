@@ -433,7 +433,10 @@ async function main(): Promise<void> {
   player.on('statechange', ({ state }) => {
     stateBadge.textContent = state;
     stateBadge.className = `state-badge ${state}`;
-    if (state === 'error') setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
+    if (state === 'error') {
+      setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
+      nsBadgeState = { tone: 'idle', detail: 'No namespace subscription: the session ended' };
+    }
   });
 
   // ── MoQT state badges ─────────────────────────────────────────────
@@ -443,6 +446,27 @@ async function main(): Promise<void> {
   let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
   /** The catalog SUBSCRIBE can be accepted long before any catalog arrives. */
   let catalogArrived = false;
+  /** The catalog's own label; a refusal or a failure shows in its place. */
+  const catalogWaitingText = catMeta.textContent ?? '';
+  let catalogLabelText = catalogWaitingText;
+  const renderCatalogStatus = (): void => {
+    const retry = (player as any).engine?.catalogRetry;
+    let text = catalogLabelText;
+    let color = text === catalogWaitingText ? 'var(--badge-idle-fg)' : '';
+    let detail = '';
+    if (player.state === 'error' && !catalogArrived) {
+      text = 'failed';
+      color = 'var(--badge-bad-fg)';
+    } else if (retry) {
+      const inSec = Math.ceil((retry.retryAtMs - Date.now()) / 1000);
+      text = inSec > 0 ? `relay busy, retrying in ${inSec} s` : 'relay busy, retrying';
+      color = 'var(--badge-wait-fg)';
+      detail = `catalog SUBSCRIBE refused: ${retry.reason} (code=0x${retry.code.toString(16)})`;
+    }
+    if (catMeta.textContent !== text) catMeta.textContent = text;
+    catMeta.style.color = color;
+    catMeta.title = detail;
+  };
   let catalogWaitSinceMs: number | null = null;
   let catalogWaitLogged = false;
   let lastCatalogPhase: string | null = null;
@@ -484,6 +508,7 @@ async function main(): Promise<void> {
     setBadge(el, 'FWD 1', 'ok', `${req} · Forward State 1`);
   };
   const renderStatusBadges = (nowMs: number): void => {
+    renderCatalogStatus();
     setBadge(setupBadge, 'SETUP', setupBadgeState.tone, setupBadgeState.detail);
     setBadge(nsBadge, 'SUB_NS', nsBadgeState.tone, nsBadgeState.detail);
     const subs = player.subscriptions;
@@ -1897,7 +1922,8 @@ async function main(): Promise<void> {
     targetLatencyMs = targetLatencyOverrideMs ?? Math.max(0,
       ...tracks.map((t) => Number(t.targetLatency) || 0));
     // Same header as the broadcaster's catalog panel.
-    catMeta.textContent = catalogLabel(tracks.map((t) => t.packaging), cat?.version);
+    catalogLabelText = catalogLabel(tracks.map((t) => t.packaging), cat?.version);
+    renderCatalogStatus();
 
     // Display order only; the catalog keeps its published order.
     const ordered = [...tracks].sort((a, b) => trackRank(a.role ?? a.name) - trackRank(b.role ?? b.name));

@@ -90,7 +90,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `catchUp=` | LOC max playback rate chasing the target | 1.0 (off) |
 | `catalogBootstrap=` | auto, joining-fetch, strict, subscribe, fetch | auto |
 | `warmStart=0` | off: LOC no longer fetches the current group, CMAF/LOCMAF no longer ask for a new one | on |
-| `autoResume=0` | off: a hidden tab waits until it is viewed | on |
+| `autoResume=0` | off: a hidden tab waits until it is viewed, retries after a relay refusal included | on |
 | `locmaf=frame` | LOCMAF through WebCodecs instead of MSE | MSE |
 | `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
 | `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays | none |

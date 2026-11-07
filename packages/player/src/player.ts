@@ -880,8 +880,20 @@ export class MoqtPlayer {
   /** Pending catalog-subscribe retry timer; null when none is pending. */
   private catalogSubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Delay before re-issuing a catalog SUBSCRIBE refused with DOES_NOT_EXIST. */
+  /** Shortest delay before re-issuing a refused catalog SUBSCRIBE. */
   private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
+
+  /** How long a session keeps retrying a catalog SUBSCRIBE refused with a Retry Interval. */
+  private static readonly CATALOG_REFUSAL_LIMIT_MS = 300_000;
+
+  /** The current run of catalog refusals carrying a Retry Interval; null when none. */
+  private catalogRefusal: {
+    readonly conn: MoqtConnection;
+    readonly sinceMs: number;
+    readonly code: bigint;
+    readonly reason: string;
+    readonly retryAtMs: number;
+  } | null = null;
 
   /** Stored catalog state for track switching. */
   private _catalogState: CatalogState | null = null;
@@ -1425,6 +1437,12 @@ export class MoqtPlayer {
   /** The catalog retrieval step (SUBSCRIBE + Joining FETCH ladder); null in subscribe-only mode. */
   get catalogBootstrapPhase(): BootstrapPhase | null {
     return this.catalogBootstrapCoord?.phase ?? null;
+  }
+
+  /** The refused catalog SUBSCRIBE being retried, or null. `retryAtMs` is on the `Date.now()` clock. */
+  get catalogRetry(): { readonly code: bigint; readonly reason: string; readonly retryAtMs: number } | null {
+    const refusal = this.catalogRefusal;
+    return refusal && refusal.conn === this.connection && !this.isTerminalState() ? refusal : null;
   }
 
   /** The followed namespace's state, or null when not following (config `followNamespace`). */
@@ -4215,11 +4233,55 @@ export class MoqtPlayer {
     }
   }
 
+  /** The wait a Retry Interval asks for (its minimum delay plus one), floored at the shortest retry delay. */
+  private static catalogRetryDelayMs(retryInterval: bigint): bigint {
+    const minimum = retryInterval - 1n;
+    const floor = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
+    return minimum < floor ? floor : minimum;
+  }
+
+  /** Retry a catalog SUBSCRIBE refused with a Retry Interval until refusals outlast the limit. */
+  private retryRefusedCatalog(
+    conn: MoqtConnection, code: bigint, reason: string, retryInterval: bigint, refused: string,
+  ): void {
+    const nowMs = Date.now();
+    const prior = this.catalogRefusal?.conn === conn ? this.catalogRefusal : null;
+    const sinceMs = prior?.sinceMs ?? nowMs;
+    if (nowMs - sinceMs >= MoqtPlayer.CATALOG_REFUSAL_LIMIT_MS) {
+      const waitedSec = Math.round((nowMs - sinceMs) / 1000);
+      this.endRefusedPlayback(conn, `${refused}; gave up after ${waitedSec} s, reload to try again`);
+      return;
+    }
+    const delayMs = Number(MoqtPlayer.catalogRetryDelayMs(retryInterval));
+    this.catalogRefusal = { conn, sinceMs, code, reason, retryAtMs: nowMs + delayMs };
+    if (!prior) {
+      this.emitError(createPlayerError('degraded', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+        `${refused}; retrying in ${Math.ceil(delayMs / 1000)} s`));
+    }
+    this.scheduleCatalogSubscribeRetry(conn, retryInterval, true);
+  }
+
+  /** End playback on a catalog refusal; an owned session closes so it holds nothing at the relay. */
+  private endRefusedPlayback(conn: MoqtConnection, message: string): void {
+    this.catalogRefusal = null;
+    try {
+      this.failCatalogPlayback(createPlayerError(
+        'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED, message,
+      ));
+    } finally {
+      if (this._adapterOwned) {
+        this.detachConnectionCallbacks(conn);
+        void conn.close().catch(() => { /* transport already failed/closed */ });
+      }
+    }
+  }
+
   /**
-   * Honor the peer's retry guidance for DOES_NOT_EXIST. Draft-16 9.8 and
-   * draft-18 10.6.2 encode the minimum delay plus one; zero means no retry.
+   * Honor the peer's retry guidance. Draft-16 9.8 and draft-18 10.6.2 encode
+   * the minimum delay plus one; zero means no retry. With `holdable`, a due
+   * retry waits for a visible page when autoResume is off.
    */
-  private scheduleCatalogSubscribeRetry(conn: MoqtConnection, retryInterval: bigint): void {
+  private scheduleCatalogSubscribeRetry(conn: MoqtConnection, retryInterval: bigint, holdable = false): void {
     if (retryInterval <= 0n) return;
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
@@ -4227,9 +4289,15 @@ export class MoqtPlayer {
       && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
     if (this.catalogSubscribeRetryTimer !== null) return;
-    let remaining = retryInterval - 1n;
-    const backoff = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
-    if (remaining < backoff) remaining = backoff;
+    let remaining = MoqtPlayer.catalogRetryDelayMs(retryInterval);
+    const resend = (): void => {
+      if (!live()) return;
+      this.log.info('Retrying catalog subscription for namespace "%s"', this.config.namespace);
+      this.subscribeCatalog(conn).catch((err) => {
+        this.log.warn('Catalog subscribe retry failed to send: %s',
+          err instanceof Error ? err.message : String(err));
+      });
+    };
     const arm = (): void => {
       // Wire intervals can be uint64; platform timers are signed 32-bit.
       const delay = Number(remaining > 0x7fffffffn ? 0x7fffffffn : remaining);
@@ -4239,13 +4307,20 @@ export class MoqtPlayer {
         if (!live()) return;
         remaining -= BigInt(delay);
         if (remaining > 0n) { arm(); return; }
-        this.log.info('Retrying catalog subscription for namespace "%s" (no publisher yet)',
-          this.config.namespace);
-        if (!live()) return;
-        this.subscribeCatalog(conn).catch((err) => {
-          this.log.warn('Catalog subscribe retry failed to send: %s',
-            err instanceof Error ? err.message : String(err));
-        });
+        if (holdable && this.holdWhileHidden()) {
+          this.log.info('Catalog retry held until the page is visible (autoResume off)');
+          const heldAtMs = Date.now();
+          const refusal = this.catalogRefusal;
+          this.resumeWhenVisible(() => {
+            // Time held does not count toward the refusal limit.
+            if (live() && refusal && this.catalogRefusal === refusal) {
+              this.catalogRefusal = { ...refusal, sinceMs: refusal.sinceMs + Date.now() - heldAtMs };
+            }
+            resend();
+          });
+          return;
+        }
+        resend();
       }, delay);
       this.catalogSubscribeRetryTimer = timer;
     };
@@ -8275,19 +8350,20 @@ export class MoqtPlayer {
         }
       },
       onCatalogSubscribeOk: (largest) => {
+        this.catalogRefusal = null;
         this.catalogBootstrapCoord?.onSubscribeOk(largest);
       },
       onCatalogSubscribeError: (errorCode, reason, retryInterval) => {
         if (conn !== this.connection) return;
         this.cancelCatalogBootstrap();
-        // Only "not published yet" is retriable; other codes are real refusals.
+        const refused = `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)})`;
         if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) {
-          this.failCatalogPlayback(createPlayerError(
-            'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)})`,
-          ));
+          // A nonzero Retry Interval invites a retry, whatever the code.
+          if (retryInterval === 0n) this.endRefusedPlayback(conn, refused);
+          else this.retryRefusedCatalog(conn, errorCode, reason, retryInterval, refused);
           return;
         }
+        this.catalogRefusal = null;
         // followNamespace: the namespace's publication resumes the catalog.
         if (this.follower.awaitPublisher(conn)) {
           this.emitError(createPlayerError(
@@ -8297,10 +8373,7 @@ export class MoqtPlayer {
           return;
         }
         if (retryInterval === 0n) {
-          this.failCatalogPlayback(createPlayerError(
-            'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-            `catalog SUBSCRIBE refused: ${reason} (code=0x${errorCode.toString(16)})`,
-          ));
+          this.endRefusedPlayback(conn, refused);
           return;
         }
         this.scheduleCatalogSubscribeRetry(conn, retryInterval);
