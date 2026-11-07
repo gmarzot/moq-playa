@@ -968,10 +968,15 @@ async function main(): Promise<void> {
   const TICK_MS = 250;
   /** Time span each chart shows. */
   const CHART_SPAN_MS = 45_000;
-  /** Charts start this long after the first media object, past the join's burst and the queue's fill. */
-  const CHART_STARTUP_HOLD_MS = 4_000;
+  /** Latency and jitter start this long after the first media object, past the join's burst. */
+  const ARRIVAL_CHARTS_HOLD_MS = 1_000;
+  /** The queued chart starts this long after it, past the queue's fill. */
+  const QUEUED_CHART_HOLD_MS = 2_500;
   /** performance.now() of the first media object; null before it. */
   let firstMediaObjectMs: number | null = null;
+  /** Whether `nowMs` is within `holdMs` of the first media object, or before it. */
+  const inStartupHold = (nowMs: number, holdMs: number): boolean =>
+    firstMediaObjectMs === null || nowMs - firstMediaObjectMs < holdMs;
   /** Tick times; every chart series holds one value per entry. */
   const sampleAtMs: number[] = [];
   /** [arrival ms, latency ms, group]: the group lets a timeline jump take its samples back out. */
@@ -1032,7 +1037,9 @@ async function main(): Promise<void> {
   const screenWindow: Array<[number, number]> = [];
   const noteFrameDrawn = (captureUs: number, drawnAtWallMs: number): void => {
     const ageMs = drawnAtWallMs + (referenceClock.offset?.offsetMs ?? 0) - captureUs / 1000;
-    if (Math.abs(ageMs) < 120_000) screenWindow.push([performance.now(), ageMs]);
+    const nowMs = performance.now();
+    // Drawn frames are still draining the queue's fill.
+    if (Math.abs(ageMs) < 120_000 && !inStartupHold(nowMs, QUEUED_CHART_HOLD_MS)) screenWindow.push([nowMs, ageMs]);
   };
   /** Underruns since the last report: buffers late past their slot, buffers on
    *  time after missing audio, silence, and the worst lateness. */
@@ -1452,7 +1459,10 @@ async function main(): Promise<void> {
     const latGroup = sampleGroup === undefined ? undefined : BigInt(sampleGroup);
     if (e.mediaType === 'audio' && picked) {
       const audioLatencyMs = wallNowMs() - picked.us / 1000;
-      if (Math.abs(audioLatencyMs) < 120_000) audioLatWindow.push([performance.now(), audioLatencyMs, latGroup]);
+      const nowMs = performance.now();
+      if (Math.abs(audioLatencyMs) < 120_000 && !inStartupHold(nowMs, ARRIVAL_CHARTS_HOLD_MS)) {
+        audioLatWindow.push([nowMs, audioLatencyMs, latGroup]);
+      }
     }
     if (e.mediaType !== 'video' || e.kind !== 'data') return;
 
@@ -1490,8 +1500,8 @@ async function main(): Promise<void> {
       // or an unsynchronised pair of machines, is an offset the tick removes.
       // Only a stamp too far out to be a clock difference is dropped.
       // Arrivals go on while the picture is frozen; they are not what is on screen.
-      if (Math.abs(latencyMs) < 120_000 && frozenSinceMs === null) {
-        const now = performance.now();
+      const now = performance.now();
+      if (Math.abs(latencyMs) < 120_000 && frozenSinceMs === null && !inStartupHold(now, ARRIVAL_CHARTS_HOLD_MS)) {
         const sample: [number, number, bigint | undefined] = [now, latencyMs, latGroup];
         latWindow.push(sample);
         latHistory.push(sample);
@@ -1721,16 +1731,9 @@ async function main(): Promise<void> {
     frozenSinceMs = freezeSince;
     const frozen = frozenSinceMs !== null;
 
-    const settling = firstMediaObjectMs === null || tickNowMs - firstMediaObjectMs < CHART_STARTUP_HOLD_MS;
-    if (settling) {
-      // Nothing from the hold reaches a window, the MAX dot or the drift fit.
-      latWindow.length = 0;
-      latHistory.length = 0;
-      audioLatWindow.length = 0;
-      screenWindow.length = 0;
-      tickWorstRawMs = -Infinity;
-      jitterEwma = 0;
-    }
+    const arrivalsSettling = inStartupHold(tickNowMs, ARRIVAL_CHARTS_HOLD_MS);
+    const queueSettling = inStartupHold(tickNowMs, QUEUED_CHART_HOLD_MS);
+    if (arrivalsSettling) jitterEwma = 0;
 
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
@@ -1753,7 +1756,7 @@ async function main(): Promise<void> {
     // MSE plays behind its buffered end, so on screen is roughly arrival plus that buffer.
     // The buffered-ahead term is a sawtooth between appends: report its p50
     // over the chart's window, as the drawn-frame E2E is on LOC.
-    if (byKind && latVals.length && !frozen) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
+    if (byKind && latVals.length && !frozen && !queueSettling) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
     while (playoutWindow.length && tickNowMs - playoutWindow[0]![0] > LAT_WINDOW_MS) playoutWindow.shift();
     cmafPlayoutMs = playoutWindow.length ? percentile(playoutWindow.map(([, v]) => v), 0.5) : null;
     while (screenWindow.length && tickNowMs - screenWindow[0]![0] > LAT_WINDOW_MS) screenWindow.shift();
@@ -1766,9 +1769,9 @@ async function main(): Promise<void> {
     latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
     latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
     latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) && !frozen ? tickWorstRawMs - driftCorrectionMs : NaN);
-    jitSamples.push(!settling && (prevCaptureMs || expectedIntervalMs) ? jitterEwma : NaN);
-    queuedASamples.push(queued && !settling ? (aMs ?? NaN) : NaN);
-    queuedVSamples.push(queued && !settling ? (vMs ?? NaN) : NaN);
+    jitSamples.push(!arrivalsSettling && (prevCaptureMs || expectedIntervalMs) ? jitterEwma : NaN);
+    queuedASamples.push(queued && !queueSettling ? (aMs ?? NaN) : NaN);
+    queuedVSamples.push(queued && !queueSettling ? (vMs ?? NaN) : NaN);
     tickWorstRawMs = -Infinity;
     trimSamples(tickNowMs);
 
