@@ -4309,9 +4309,15 @@ export class MoqtPlayer {
         if (remaining > 0n) { arm(); return; }
         if (holdable && this.holdWhileHidden()) {
           this.log.info('Catalog retry held until the page is visible (autoResume off)');
-          // The refusal limit counts retrying, not time spent held.
-          this.catalogRefusal = null;
-          this.resumeWhenVisible(resend);
+          const heldAtMs = Date.now();
+          const refusal = this.catalogRefusal;
+          this.resumeWhenVisible(() => {
+            // Time held does not count toward the refusal limit.
+            if (live() && refusal && this.catalogRefusal === refusal) {
+              this.catalogRefusal = { ...refusal, sinceMs: refusal.sinceMs + Date.now() - heldAtMs };
+            }
+            resend();
+          });
           return;
         }
         resend();

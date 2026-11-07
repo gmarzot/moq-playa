@@ -4378,6 +4378,34 @@ describe('catalog SUBSCRIBE refused with a Retry Interval', () => {
         expect(adapter.subscribe).toHaveBeenCalledTimes(3);
     });
 
+    it('autoResume off: a hold excludes its own time from the limit and keeps the refusal', async () => {
+        const doc = new FakeDocument();
+        (globalThis as { document?: unknown }).document = doc;
+        const { adapter, player, errors } = await loaded({ autoResume: false });
+        for (let waited = 0; waited < 210_000; waited += 15_000) {
+            await refuse(adapter, 15_001n);
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        doc.setHidden(true);
+        await refuse(adapter, 15_001n);
+        const sent = adapter.subscribe.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(15_000 + LIMIT_MS * 2);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(sent);
+        expect(player.catalogRetry).not.toBeNull();
+
+        doc.setHidden(false);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(sent + 1);
+        for (let waited = 0; waited < 75_000; waited += 15_000) {
+            await refuse(adapter, 15_001n);
+            expect(player.state).not.toBe('error');
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        expect(errors).toHaveLength(1);
+        await refuse(adapter, 15_001n);
+        expect(player.state).toBe('error');
+        expect(errors.at(-1)).toMatchObject({ message: expect.stringMatching(/gave up after 300 s/) });
+    });
+
     it('autoResume off: a visible page retries as usual', async () => {
         const { adapter } = await loaded({ autoResume: false });
         await refuse(adapter, 5001n);
