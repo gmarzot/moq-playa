@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { BroadcastSession } from './broadcast-session.js';
+import { BroadcastSession, refusalRetryDelayMs } from './broadcast-session.js';
 import type { BroadcastSessionConnection, CarriedCatalog } from './broadcast-session.js';
 import type { Fetch, TrackStatus } from '@openmoq/transport';
 import { readLocation } from '@openmoq/transport';
@@ -1179,5 +1179,17 @@ describe('BroadcastSession — draft-22 fills', () => {
     fresh.handleSubscribe(3n, 'video', FILL);
     await settle();
     expect(empty.calls.some((c) => c.startsWith('openFillStream'))).toBe(false);
+  });
+});
+
+describe('refusalRetryDelayMs', () => {
+  it('reads the minimum delay plus one, at least a second', () => {
+    expect(refusalRetryDelayMs(8001n)).toBe(8000);
+    expect(refusalRetryDelayMs(1n)).toBe(1000);
+  });
+
+  it('is null when the request may not be retried', () => {
+    expect(refusalRetryDelayMs(0n)).toBeNull();
+    expect(refusalRetryDelayMs(undefined)).toBeNull();
   });
 });

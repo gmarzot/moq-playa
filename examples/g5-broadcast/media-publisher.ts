@@ -614,6 +614,7 @@ export class MediaPublisher {
         this.videoContinuityLost = true;
         this.report('video publish', new Error(
           `video queue overflow (${this.videoQueueMax} frames): dropping until the next keyframe`));
+        this.requestKeyframe();
       }
     }
     if (this.videoContinuityLost) {

@@ -19,6 +19,15 @@ import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
 
 /** The subset of MoqtConnection a broadcast generation uses. */
+/**
+ * The wait a refusal's Retry Interval asks for, in ms: its minimum delay plus
+ * one on the wire, at least a second. Null when it may not be retried.
+ */
+export function refusalRetryDelayMs(retryInterval: bigint | number | undefined): number | null {
+  if (retryInterval === undefined || BigInt(retryInterval) === 0n) return null;
+  return Math.max(Number(BigInt(retryInterval) - 1n), 1_000);
+}
+
 export interface BroadcastSessionConnection extends MediaPublishConnection {
   acceptSubscribe(requestId: unknown, alias: unknown, options?: {
     parameters?: Map<bigint, unknown[]>; trackProperties?: Map<bigint, bigint[]>;

@@ -16,7 +16,7 @@
 import { MoqtConnection } from '@openmoq/webtransport';
 import { initBuildInfo } from '../shared/build-info.js';
 import { varint } from '@openmoq/transport';
-import { BroadcastSession } from './broadcast-session.js';
+import { BroadcastSession, refusalRetryDelayMs } from './broadcast-session.js';
 import type { BroadcastSessionConnection, CarriedCatalog, TrackStatus } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
@@ -616,6 +616,8 @@ let currentTransport: { close(): void } | null = null;
 let currentSession: BroadcastSession | null = null;
 /** The PUBLISH_NAMESPACE awaiting or holding the relay's reply, and its badge. */
 let nsRequestId: string | null = null;
+/** Set while a namespace is published: try again after a refusal that allows it. */
+let retryRefusedNamespace: ((delayMs: number, why: string) => void) | null = null;
 let nsBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'PUBLISH_NAMESPACE not sent' };
 /** The MoQT session itself: SETUP, established, or closed. */
 let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
@@ -1272,6 +1274,11 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         } else if (msg.type === 'REQUEST_ERROR' || msg.type === 'PUBLISH_NAMESPACE_ERROR') {
           const why = (msg as { errorReason?: string; reasonPhrase?: string }).errorReason
             ?? (msg as { reasonPhrase?: string }).reasonPhrase ?? '';
+          const delayMs = msg.type === 'REQUEST_ERROR' ? refusalRetryDelayMs(msg.retryInterval) : null;
+          if (delayMs !== null && retryRefusedNamespace) {
+            retryRefusedNamespace(delayMs, why);
+            return;
+          }
           nsBadgeState = { tone: 'bad', detail: `PUBLISH_NAMESPACE reqId=${nsRequestId} · ${msg.type} ${why}`.trim() };
         }
       };
@@ -1427,14 +1434,31 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       log(`Sending PUBLISH_NAMESPACE for [${namespace}]...`);
       const nsConn = connection!;
       const nsRid = await nsConn.publishNamespace(nsBytes);
+      let liveNsRid = nsRid;
+      let nsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+      retryRefusedNamespace = (delayMs, why) => {
+        const inSec = Math.ceil(delayMs / 1000);
+        nsBadgeState = { tone: 'wait', detail: `PUBLISH_NAMESPACE refused: ${why}; retrying in ${inSec} s` };
+        log(`PUBLISH_NAMESPACE refused: ${why}; retrying in ${inSec} s`);
+        if (nsRetryTimer !== null) clearTimeout(nsRetryTimer);
+        nsRetryTimer = setTimeout(() => {
+          nsRetryTimer = null;
+          void nsConn.publishNamespace(nsBytes).then((rid) => {
+            liveNsRid = rid;
+            nsRequestId = String(rid);
+          }).catch((err: unknown) => log(`PUBLISH_NAMESPACE retry: ${(err as Error)?.message ?? err}`));
+        }, delayMs);
+      };
       // Disposed before the session (LIFO): Stop and reconnect end each
       // subscription with PUBLISH_DONE, then withdraw the namespace, so the
       // relay drops its state through the protocol instead of holding it for a
       // timeout. Bounded: a dead session must not stall Stop.
-      ctx.adopt(nsRid, async (rid) => {
+      ctx.adopt(nsRid, async () => {
+        retryRefusedNamespace = null;
+        if (nsRetryTimer !== null) clearTimeout(nsRetryTimer);
         await session.endSubscriptions();
         await Promise.race([
-          nsConn.publishNamespaceDone(rid).catch(() => {}),
+          nsConn.publishNamespaceDone(liveNsRid).catch(() => {}),
           new Promise<void>((resolve) => setTimeout(resolve, NS_WITHDRAW_MS)),
         ]);
       });

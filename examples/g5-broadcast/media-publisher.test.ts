@@ -928,9 +928,11 @@ describe('MediaPublisher — bounded backpressure', () => {
     const errors: string[] = [];
     const pub = makePublisher(conn, {
       videoQueueMax: 10,
+      onKeyframeNeeded: () => { keyframes++; },
       onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
     });
     pub.setVideoAlias(2n);
+    keyframes = 0;
 
     // One keyframe starts a group; its send is held. 500 deltas pour in.
     pub.publishVideo(chunk(0), kf());
@@ -940,6 +942,7 @@ describe('MediaPublisher — bounded backpressure', () => {
     // Enqueued state is BOUNDED: nothing beyond the cap is retained.
     expect((pub as unknown as { videoQueue: unknown[] }).videoQueue.length).toBeLessThanOrEqual(10);
     expect(errors.filter((e) => /overflow/.test(e)).length).toBeGreaterThanOrEqual(1);
+    expect(keyframes).toBe(1);
 
     // A post-overflow delta is dropped; the next keyframe recovers.
     pub.publishVideo(chunk(2), delta());
@@ -1635,4 +1638,5 @@ describe('MediaPublisher — status reports', () => {
     await settle();
     expect(statuses).toEqual(['audio: Forward State 0 (a send was refused)']);
   });
-});
+});    let keyframes = 0;
+
