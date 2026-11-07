@@ -482,6 +482,17 @@ describe('lag after an underrun', () => {
     expect(late.out.chasing).toBe(false);
   });
 
+  it('keeps draining through the flush a video re-anchor brings', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(buffer(0), 1_000 * MS);
+    out.drainLag();
+    out.flush();
+    out.schedule(buffer(0), 1_000 * MS);
+    out.schedule(buffer(20 * MS), (1_000 + 20 - 90) * MS);
+    expect(out.chasing).toBe(true);
+  });
+
   it('stays out of a chase without an underrun', () => {
     const { ctx, out } = makeOutput(0);
     ctx.currentTime = 1.0;

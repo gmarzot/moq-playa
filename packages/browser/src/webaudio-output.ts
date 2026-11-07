@@ -480,7 +480,6 @@ export class WebAudioOutput implements AudioOutputLike {
     this.resyncSinceSec = null;
     this.resyncArmed = true;
     this.realignPending = false;
-    this.drainUntilSec = 0;
   }
 
   /**
