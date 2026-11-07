@@ -968,8 +968,10 @@ async function main(): Promise<void> {
   const TICK_MS = 250;
   /** Time span each chart shows. */
   const CHART_SPAN_MS = 45_000;
-  /** Charts start this long after the first media object, past the join's burst and the queue's fill. */
-  const CHART_STARTUP_HOLD_MS = 4_000;
+  /** Latency and jitter start this long after the first media object, past the join's burst. */
+  const ARRIVAL_CHARTS_HOLD_MS = 1_000;
+  /** The queued chart starts this long after it, past the queue's fill. */
+  const QUEUED_CHART_HOLD_MS = 2_500;
   /** performance.now() of the first media object; null before it. */
   let firstMediaObjectMs: number | null = null;
   /** Tick times; every chart series holds one value per entry. */
@@ -1721,16 +1723,19 @@ async function main(): Promise<void> {
     frozenSinceMs = freezeSince;
     const frozen = frozenSinceMs !== null;
 
-    const settling = firstMediaObjectMs === null || tickNowMs - firstMediaObjectMs < CHART_STARTUP_HOLD_MS;
-    if (settling) {
+    const sinceFirstObjectMs = firstMediaObjectMs === null ? -Infinity : tickNowMs - firstMediaObjectMs;
+    const arrivalsSettling = sinceFirstObjectMs < ARRIVAL_CHARTS_HOLD_MS;
+    const queueSettling = sinceFirstObjectMs < QUEUED_CHART_HOLD_MS;
+    if (arrivalsSettling) {
       // Nothing from the hold reaches a window, the MAX dot or the drift fit.
       latWindow.length = 0;
       latHistory.length = 0;
       audioLatWindow.length = 0;
-      screenWindow.length = 0;
       tickWorstRawMs = -Infinity;
       jitterEwma = 0;
     }
+    // Drawn frames are still draining the queue's fill.
+    if (queueSettling) screenWindow.length = 0;
 
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
@@ -1753,7 +1758,7 @@ async function main(): Promise<void> {
     // MSE plays behind its buffered end, so on screen is roughly arrival plus that buffer.
     // The buffered-ahead term is a sawtooth between appends: report its p50
     // over the chart's window, as the drawn-frame E2E is on LOC.
-    if (byKind && latVals.length && !frozen) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
+    if (byKind && latVals.length && !frozen && !queueSettling) playoutWindow.push([tickNowMs, percentile(latVals, 0.5) + byKind.video]);
     while (playoutWindow.length && tickNowMs - playoutWindow[0]![0] > LAT_WINDOW_MS) playoutWindow.shift();
     cmafPlayoutMs = playoutWindow.length ? percentile(playoutWindow.map(([, v]) => v), 0.5) : null;
     while (screenWindow.length && tickNowMs - screenWindow[0]![0] > LAT_WINDOW_MS) screenWindow.shift();
@@ -1766,9 +1771,9 @@ async function main(): Promise<void> {
     latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
     latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
     latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) && !frozen ? tickWorstRawMs - driftCorrectionMs : NaN);
-    jitSamples.push(!settling && (prevCaptureMs || expectedIntervalMs) ? jitterEwma : NaN);
-    queuedASamples.push(queued && !settling ? (aMs ?? NaN) : NaN);
-    queuedVSamples.push(queued && !settling ? (vMs ?? NaN) : NaN);
+    jitSamples.push(!arrivalsSettling && (prevCaptureMs || expectedIntervalMs) ? jitterEwma : NaN);
+    queuedASamples.push(queued && !queueSettling ? (aMs ?? NaN) : NaN);
+    queuedVSamples.push(queued && !queueSettling ? (vMs ?? NaN) : NaN);
     tickWorstRawMs = -Infinity;
     trimSamples(tickNowMs);
 
