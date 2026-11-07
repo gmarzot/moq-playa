@@ -639,4 +639,79 @@ describe('QualityController — programs (renderGroups) and audio languages', ()
     expect(qc.audioTracks.map(t => t.name)).toEqual(['shared_audio']);
     expect(qc.currentAudioTrack?.name).toBe('shared_audio');
   });
+
+  describe('updateCatalog follows the ladder', () => {
+    const rung = (name: string, bitrate: number, height = 720): CatalogTrack => ({
+      name, packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.64001f', bitrate,
+      width: Math.round(height * 16 / 9), height,
+    });
+    const catalog = (...tracks: CatalogTrack[]): CatalogState => ({ version: 1, tracks }) as CatalogState;
+    const playing = (cfg: object, ...tracks: CatalogTrack[]) => {
+      const qc = new QualityController(config({ startLevel: tracks.length - 1, ...cfg }));
+      qc.selectInitialTracks(catalog(...tracks));
+      return qc;
+    };
+
+    it('keeps the current rung by name when a higher one is added', () => {
+      const qc = playing({}, rung('mid', 2e6), rung('low', 1e6));
+      expect(qc.currentVideoTrack?.name).toBe('low');
+      expect(qc.updateCatalog(catalog(rung('top', 4e6), rung('mid', 2e6), rung('low', 1e6)))).toBe(true);
+      expect(qc.alternatives.map(t => t.name)).toEqual(['top', 'mid', 'low']);
+      expect(qc.currentVideoTrack?.name).toBe('low');
+      expect(qc.currentIndex).toBe(2);
+    });
+
+    it('reports no change for a re-sent catalog, and a change for a new bitrate', () => {
+      const qc = playing({}, rung('mid', 2e6), rung('low', 1e6));
+      expect(qc.updateCatalog(catalog(rung('mid', 2e6), rung('low', 1e6)))).toBe(false);
+      expect(qc.updateCatalog(catalog(rung('mid', 3e6), rung('low', 1e6)))).toBe(true);
+    });
+
+    it('holds a removed current rung until the switch away, aiming at the nearest one left', () => {
+      const qc = playing({ startLevel: 1 }, rung('top', 4e6), rung('mid', 2e6), rung('low', 1e6));
+      expect(qc.currentVideoTrack?.name).toBe('mid');
+      expect(qc.removedTrackReplacement).toBeUndefined();
+
+      expect(qc.updateCatalog(catalog(rung('top', 4e6), rung('low', 1e6)))).toBe(true);
+      expect(qc.currentVideoTrack?.name).toBe('mid');
+      expect(qc.removedTrackReplacement?.name).toBe('low');
+      expect(qc.alternatives.map(t => t.name)).toEqual(['top', 'low']);
+
+      qc.commitVideoTrack('low');
+      expect(qc.currentVideoTrack?.name).toBe('low');
+      expect(qc.removedTrackReplacement).toBeUndefined();
+    });
+
+    it('stops replacing a removed rung the catalog brings back', () => {
+      const qc = playing({ startLevel: 1 }, rung('top', 4e6), rung('mid', 2e6));
+      qc.updateCatalog(catalog(rung('top', 4e6)));
+      expect(qc.removedTrackReplacement?.name).toBe('top');
+      qc.updateCatalog(catalog(rung('top', 4e6), rung('mid', 2e6)));
+      expect(qc.removedTrackReplacement).toBeUndefined();
+      expect(qc.currentVideoTrack?.name).toBe('mid');
+    });
+
+    it('keeps the old ladder when the update leaves nothing to move to', () => {
+      const qc = playing({}, rung('only', 2e6));
+      expect(qc.updateCatalog(catalog())).toBe(false);
+      expect(qc.currentVideoTrack?.name).toBe('only');
+      expect(qc.removedTrackReplacement).toBeUndefined();
+    });
+
+    it('applies the resolution cap to an added rung', () => {
+      const qc = playing({ capLevelToResolution: { width: 1280, height: 720 } }, rung('mid', 2e6), rung('low', 1e6));
+      expect(qc.updateCatalog(catalog(rung('top', 8e6, 1080), rung('mid', 2e6), rung('low', 1e6)))).toBe(false);
+      expect(qc.allAlternatives.map(t => t.name)).toEqual(['mid', 'low']);
+    });
+
+    it('keeps a manual pick above the cap on the ladder across a re-sent catalog', () => {
+      const cap = { capLevelToResolution: { width: 1280, height: 720 } };
+      const tracks = [rung('top', 8e6, 1080), rung('mid', 2e6), rung('low', 1e6)];
+      const qc = playing(cap, ...tracks);
+      qc.commitVideoTrack('top');
+      expect(qc.currentVideoTrack?.name).toBe('top');
+      qc.updateCatalog(catalog(...tracks.map(t => ({ ...t }))));
+      expect(qc.currentVideoTrack?.name).toBe('top');
+    });
+  });
 });

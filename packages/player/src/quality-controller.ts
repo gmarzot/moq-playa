@@ -134,6 +134,8 @@ export class QualityController {
 
   /** Current index into videoAlternatives. */
   private videoIndex = 0;
+  /** The playing rung once the catalog has removed it; cleared by the switch away. */
+  private removedVideoTrack: CatalogTrack | undefined;
 
   /** Selected audio track. */
   private _audioTrack: CatalogTrack | undefined;
@@ -155,7 +157,12 @@ export class QualityController {
 
   /** Current video track. */
   get currentVideoTrack(): CatalogTrack | undefined {
-    return this.videoAlternatives[this.videoIndex];
+    return this.removedVideoTrack ?? this.videoAlternatives[this.videoIndex];
+  }
+
+  /** Nearest rung left when the catalog removed the playing one; undefined otherwise. */
+  get removedTrackReplacement(): CatalogTrack | undefined {
+    return this.removedVideoTrack && this.videoAlternatives[this.videoIndex];
   }
 
   /** Current audio track. */
@@ -378,6 +385,7 @@ export class QualityController {
     }
     const idx = this.videoAlternatives.findIndex(t => t.name === trackName);
     if (idx >= 0) {
+      this.removedVideoTrack = undefined;
       this.videoIndex = idx;
       this.lastSwitchTimeUs = this.clock.now();
     }
@@ -431,9 +439,10 @@ export class QualityController {
 
   /**
    * Re-read the catalog after an update (delta or re-sent catalog): programs,
-   * views and audio tracks follow it, while the current program, view and
-   * tracks are kept by name. A current track the update removed stays current
-   * until the player switches away from it.
+   * views, audio tracks and the video ladder follow it, while the current
+   * program, view and tracks are kept by name. A current track the update
+   * removed stays current until the player switches away from it; the ABR
+   * position moves to the nearest rung left.
    *
    * @returns Whether the video ABR ladder changed (callers rebuild ABR state).
    */
@@ -450,17 +459,28 @@ export class QualityController {
     }
     this._audioTrack = usable.find(t => t.role === 'audio' && t.name === this._audioTrack?.name) ?? this._audioTrack;
 
-    const track = usable.find(t => t.role === 'video' && t.name === video?.name);
-    if (!track) return false;
-    const view = this.views.find(v => v.tracks.includes(track));
-    this.currentViewEntry = view;
-    this.allVideoAlternatives = this.cappedAlternatives(view
+    if (!video) return false;
+    const track = usable.find(t => t.role === 'video' && t.name === video.name);
+    const view = track
+      ? this.views.find(v => v.tracks.includes(track))
+      : this.views.find(v => v.altGroup === video.altGroup);
+    const ladder = this.cappedAlternatives(view
       ? view.tracks
       : usable.filter(t => t.role === 'video' && t.altGroup === undefined && inProgram(t, this._currentProgram)));
-    this.videoAlternatives = sameCodecFamily(this.allVideoAlternatives, track);
-    this.videoIndex = Math.max(0, this.videoAlternatives.indexOf(track));
-    return this.videoAlternatives.length !== ladderBefore.length
-      || this.videoAlternatives.some((t, i) => t.name !== ladderBefore[i]?.name);
+    // A manual pick above the resolution cap stays on the ladder, as in commitVideoTrack.
+    if (track && !ladder.includes(track)) {
+      ladder.push(track);
+      ladder.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+    }
+    const family = sameCodecFamily(ladder, video);
+    if (!track && family.length === 0) return false;
+    this.currentViewEntry = view;
+    this.allVideoAlternatives = ladder;
+    this.videoAlternatives = family;
+    this.removedVideoTrack = track ? undefined : video;
+    this.videoIndex = track ? Math.max(0, family.indexOf(track)) : nearestBitrateIndex(family, video.bitrate ?? 0);
+    return family.length !== ladderBefore.length
+      || family.some((t, i) => t.name !== ladderBefore[i]?.name || t.bitrate !== ladderBefore[i]?.bitrate);
   }
 
   /**
@@ -600,6 +620,15 @@ export class QualityController {
     if (this.videoIndex <= 0) return undefined;
     return this.videoAlternatives[this.videoIndex - 1];
   }
+}
+
+/** Index of the rung closest to `bitrate` in a highest-first ladder; a tie takes the lower rung. */
+function nearestBitrateIndex(ladder: readonly CatalogTrack[], bitrate: number): number {
+  let best = 0;
+  ladder.forEach((t, i) => {
+    if (Math.abs((t.bitrate ?? 0) - bitrate) <= Math.abs((ladder[best]!.bitrate ?? 0) - bitrate)) best = i;
+  });
+  return best;
 }
 
 /** Alternatives sharing `track`'s codec family ('avc1', 'hvc1', 'av01'); all of them when it has no codec. */

@@ -9593,6 +9593,24 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it('LOC: climbs onto a rung added after startup', async () => {
+      const { player, feedGroups, simulateRenderedFrames, hasSubscribeTo, adapter } = await setupAbrTest();
+      const full = (player as any)._catalogState;
+      (player as any).applyCatalogUpdate({ ...full, tracks: full.tracks.filter((t: any) => t.name !== 'video-0') });
+
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      const subsBefore = (adapter.subscribe as any).mock.calls.length;
+      advanceClock(16_000_000);
+      player.tick();
+      expect(hasSubscribeTo('video-0', subsBefore)).toBe(false);
+
+      (player as any).applyCatalogUpdate(full);
+      player.tick();
+      expect(hasSubscribeTo('video-0', subsBefore)).toBe(true);
+      await player.destroy();
+    });
+
     it('LOC: no upshift when recent stall within stability window (timestamp proves it)', async () => {
       const { player, renderer, feedGroups, simulateRenderedFrames, hasSubscribeTo } = await setupAbrTest();
 
@@ -10411,7 +10429,7 @@ describe('MoqtPlayer', () => {
       const clock = { now: () => clockUs };
       const S = 1_000_000;
 
-      async function loadLive(bufferAheadUs: number) {
+      async function loadLive(bufferAheadUs: number, catalog = CMAF_ABR_CATALOG) {
         clockUs = 0;
         const adapter = createMockAdapter();
         const ms = createMockMediaSource(bufferAheadUs);
@@ -10432,14 +10450,32 @@ describe('MoqtPlayer', () => {
         ackCatalog(adapter);
         adapter._triggerObject(0n, {
           kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
-          payload: new TextEncoder().encode(CMAF_ABR_CATALOG),
+          payload: new TextEncoder().encode(catalog),
         } as MoqtObject);
         await new Promise(r => setTimeout(r, 0));
         expect((player as any).qualityController.currentVideoTrack?.name).toBe('video-1');
         const subsBefore = (adapter.subscribe as any).mock.calls.length;
         const subscribedTo = (name: string): boolean => (adapter.subscribe as any).mock.calls.slice(subsBefore)
           .some((c: any) => { try { return new TextDecoder().decode(c[1]) === name; } catch { return false; } });
-        return { player, subscribedTo };
+        return { player, adapter, subscribedTo };
+      }
+
+      /** The ABR catalog without the named tracks, plus any extra tracks and root fields. */
+      function ladderWithout(names: string[], extra: object[] = [], root: object = {}): string {
+        const catalog = JSON.parse(CMAF_ABR_CATALOG);
+        return JSON.stringify({
+          ...catalog, ...root,
+          tracks: [...catalog.tracks.filter((t: { name: string }) => !names.includes(t.name)), ...extra],
+        });
+      }
+
+      /** A later independent catalog: object 0 of a new group. */
+      async function deliverCatalog(adapter: ReturnType<typeof createMockAdapter>, group: number, catalog: string) {
+        adapter._triggerObject(0n, {
+          kind: 'data', trackAlias: varint(1), groupId: varint(group), subgroupId: varint(0), objectId: varint(0),
+          payload: new TextEncoder().encode(catalog),
+        } as MoqtObject);
+        await new Promise(r => setTimeout(r, 0));
       }
 
       /** Large objects that each took the time `kbps` implies from first to last byte. */
@@ -10523,6 +10559,121 @@ describe('MoqtPlayer', () => {
         player.tick();
         expect(subscribedTo('video-0')).toBe(true);
         await player.destroy();
+      });
+
+      describe('rungs that follow the catalog', () => {
+        it('climbs onto a higher rung added after startup', async () => {
+          const { player, adapter, subscribedTo } = await loadLive(500_000, ladderWithout(['video-0', 'video-2']));
+          expect((player as any).bufferAbrController).toBeNull();
+          clockUs = 10 * S;
+          timeObjects(player, 20_000);
+          player.tick();
+          expect(subscribedTo('video-0')).toBe(false);
+
+          await deliverCatalog(adapter, 1, ladderWithout(['video-2']));
+          expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video-0', 'video-1']);
+          expect(player.currentVideoTrack).toBe('video-1');
+          timeObjects(player, 20_000);
+          player.tick();
+          expect(subscribedTo('video-0')).toBe(true);
+          await player.destroy();
+        });
+
+        it('does not climb onto a late rung the link cannot carry', async () => {
+          const { player, adapter, subscribedTo } = await loadLive(500_000, ladderWithout(['video-0', 'video-2']));
+          clockUs = 10 * S;
+          await deliverCatalog(adapter, 1, ladderWithout(['video-2']));
+          timeObjects(player, 5_000);
+          player.tick();
+          expect(subscribedTo('video-0')).toBe(false);
+          await player.destroy();
+        });
+
+        it('a re-sent catalog leaves the ABR state alone', async () => {
+          const { player, adapter } = await loadLive(500_000);
+          const abr = (player as any).bufferAbrController;
+          await deliverCatalog(adapter, 1, CMAF_ABR_CATALOG);
+          expect((player as any).bufferAbrController).toBe(abr);
+          await player.destroy();
+        });
+
+        it('switches to a late CMAF rung whose init is a new initDataList entry', async () => {
+          const { player, adapter, subscribedTo } = await loadLive(500_000);
+          await expect(player.selectVideoTrack('late', 'manual')).rejects.toThrow(/Unknown video track/);
+          await deliverCatalog(adapter, 1, ladderWithout([], [{
+            name: 'late', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1, altGroup: 1,
+            codec: 'hvc1.1.6.L93.90', width: 1920, height: 1080, bitrate: 2_000_000, initRef: 'late-init',
+          }], { initDataList: [{ id: 'late-init', type: 'inline', data: 'AAAA' }] }));
+          await player.selectVideoTrack('late', 'manual');
+          expect(subscribedTo('late')).toBe(true);
+          await player.destroy();
+        });
+
+        it('moves off a removed playing rung to the nearest one, keeping a manual lock', async () => {
+          const { player, adapter, subscribedTo } = await loadLive(500_000);
+          await player.selectVideoTrack('video-1', 'manual');
+          expect(player.autoQuality).toBe(false);
+
+          await deliverCatalog(adapter, 1, ladderWithout(['video-1']));
+          await new Promise(r => setTimeout(r, 0));
+          expect(subscribedTo('video-2')).toBe(true);
+          expect(subscribedTo('video-0')).toBe(false);
+          expect(player.currentVideoTrack).toBe('video-1');
+          expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video-0', 'video-2']);
+          expect(player.autoQuality).toBe(false);
+          await player.destroy();
+        });
+
+        it('replaces a playing rung whose subscription ended before the catalog removed it', async () => {
+          const { player, adapter, subscribedTo } = await loadLive(500_000);
+          const switched = vi.fn();
+          player.on('quality_switched', switched);
+          const reqId = [...(player as any).activeSubscriptions.entries()]
+            .find(([, sub]: any) => sub.mediaType === 'video')![0];
+          adapter._triggerMessage({
+            type: 'PUBLISH_DONE', requestId: varint(reqId), statusCode: varint(0x2), streamCount: varint(1),
+            errorReason: 'Track ended',
+          } as any);
+          await new Promise(r => setTimeout(r, 0));
+          expect((player as any).activeTrackName('video')).toBeUndefined();
+
+          await deliverCatalog(adapter, 1, ladderWithout(['video-1']));
+          await new Promise(r => setTimeout(r, 0));
+          expect(subscribedTo('video-2')).toBe(true);
+          expect(player.currentVideoTrack).toBe('video-2');
+          expect(switched).toHaveBeenCalledWith(expect.objectContaining({
+            fromTrackName: 'video-1', toTrackName: 'video-2', reason: 'catalog',
+          }));
+          await player.destroy();
+        });
+
+        it('retries a move blocked by a running switch once that switch fails', async () => {
+          const { player, adapter, subscribedTo } = await loadLive(500_000);
+          await player.selectVideoTrack('video-0', 'manual');
+          await deliverCatalog(adapter, 1, ladderWithout(['video-1']));
+          expect(subscribedTo('video-2')).toBe(false);
+
+          (player as any).abortPendingVideoSwitch((player as any).pendingVideoSwitch, new Error('refused'));
+          clockUs += 3 * S;
+          player.tick();
+          await new Promise(r => setTimeout(r, 0));
+          expect(subscribedTo('video-2')).toBe(true);
+          await player.destroy();
+        });
+
+        it('abandons a switch to a rung the catalog removed', async () => {
+          const { player, adapter } = await loadLive(500_000);
+          const failed = vi.fn();
+          player.on('quality_switch_failed', failed);
+          await player.selectVideoTrack('video-0', 'manual');
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-0');
+
+          await deliverCatalog(adapter, 1, ladderWithout(['video-0']));
+          expect((player as any).pendingVideoSwitch).toBeNull();
+          expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video-0' }));
+          expect(player.currentVideoTrack).toBe('video-1');
+          await player.destroy();
+        });
       });
 
       it('no upshift without link-rate samples', async () => {

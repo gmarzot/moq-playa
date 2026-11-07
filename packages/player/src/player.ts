@@ -1969,15 +1969,15 @@ export class MoqtPlayer {
     if (this.pendingAudioSwitch !== sw) return;
     this.pendingAudioSwitch = null;
     clearTimeout(sw.noDataTimer);
+    if (sw.newRequestId !== null && this.connection) {
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
+    }
     // A liveness / TOO_FAR_BEHIND renewal of the old track was held back for
     // the switch; with the switch gone, bring the old track back if it lapsed.
     const oldAlive = [...this.activeSubscriptions.values()]
       .some(sub => sub.mediaType === 'audio' && sub.trackName === sw.oldTrackName);
     if (!oldAlive && sw.oldTrackName) this.replaceSubscription(sw.oldTrackName, 'liveness');
-    if (sw.newRequestId !== null && this.connection) {
-      this.retireMediaSubscription(sw.newRequestId, this.connection);
-      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
-    }
     this.emitter.emit('audio_track_switch_failed', {
       type: 'audio_track_switch_failed',
       fromTrackName: sw.oldTrackName,
@@ -2004,6 +2004,7 @@ export class MoqtPlayer {
    * in case a liveness or TOO_FAR_BEHIND replacement renewed it meanwhile.
    */
   private retireOldAudioTrack(sw: PendingAudioSwitch): void {
+    this.stopRecoveringTrack('audio', sw.oldTrackName);
     if (!this.connection || !this.subscriptionManager) return;
     for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
       if (sub.mediaType !== 'audio' || sub.trackName !== sw.oldTrackName || sub.trackName === sw.newTrackName) continue;
@@ -2366,12 +2367,45 @@ export class MoqtPlayer {
   /**
    * Adopt an updated catalog (delta, re-sent catalog or recovery adoption):
    * cache it, let the controller follow its programs, views and tracks
-   * (keeping the current ones by name), and report it.
+   * (keeping the current ones by name), report it, and leave a rung it removed.
    */
   private applyCatalogUpdate(state: CatalogState): void {
     this._catalogState = state;
     if (this.qualityController?.updateCatalog(state)) this.syncBufferAbrController();
     this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
+    const sw = this.pendingVideoSwitch;
+    if (sw && !this.switchInProgress && !state.tracks.some(t => t.role === 'video' && t.name === sw.newTrackName)) {
+      this.abortPendingVideoSwitch(sw, new Error(`the catalog removed "${sw.newTrackName}"`));
+    }
+    this.moveOffRemovedVideoTrack();
+  }
+
+  /**
+   * The catalog removed the playing rung: switch to the nearest one left,
+   * keeping a manual lock. Called every tick, so a blocked or failed move retries.
+   */
+  private moveOffRemovedVideoTrack(): void {
+    const qc = this.qualityController;
+    const next = qc?.removedTrackReplacement;
+    if (!qc || !next || this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) return;
+    const now = this.clock.now();
+    if (now < this.nextRemovedTrackMoveUs) return;
+    this.nextRemovedTrackMoveUs = now + MoqtPlayer.REMOVED_TRACK_RETRY_US;
+    const from = qc.currentVideoTrack?.name ?? '';
+    this.log.info('Catalog removed playing track "%s": moving to "%s"', from, next.name);
+    if (this.activeTrackName('video') !== undefined) {
+      this.selectVideoTrack(next.name, 'catalog').catch((err) => {
+        this.log.warn('Move off removed track "%s" failed: %s', from, err);
+      });
+      return;
+    }
+    // Its subscription has already ended: there is nothing to overlap with.
+    qc.commitVideoTrack(next.name);
+    this.syncBufferAbrController();
+    this.replaceSubscription(next.name, 'publish_done', () => this.scheduleResubscribe(next.name, 'publish_done'));
+    this.emitter.emit('quality_switched', {
+      type: 'quality_switched', fromTrackName: from, toTrackName: next.name, reason: 'catalog',
+    });
   }
 
   /**
@@ -2988,7 +3022,9 @@ export class MoqtPlayer {
       }
     }
 
-    const currentTrack = this._catalogState.tracks.find(t => t.role === 'video' && t.name === currentVideoTrackName);
+    const removed = this.qualityController?.currentVideoTrack;
+    const currentTrack = this._catalogState.tracks.find(t => t.role === 'video' && t.name === currentVideoTrackName)
+      ?? (removed?.name === currentVideoTrackName ? removed : undefined);
     if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
 
     // A rejected selection must not change the active group's ABR policy.
@@ -3333,6 +3369,7 @@ export class MoqtPlayer {
    * `mediaSource.changeType` resolves).
    */
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
+    this.stopRecoveringTrack('video', sw.oldTrackName);
     if (!this.connection || !this.subscriptionManager) return;
     this.retireMediaSubscription(sw.oldRequestId, this.connection);
     void this.connection.unsubscribe(varint(sw.oldRequestId)).catch(() => { /* already gone */ });
@@ -6531,9 +6568,8 @@ export class MoqtPlayer {
     if (recovery.fetch) {
       this.bootstrapFetch = { conn: recovery.conn, reqId: recovery.fetch.reqId, attempt: recovery.fetch.attempt, gen: this.bootstrapGeneration };
     }
-    // Adoption is an ordinary catalog update: no second catalog_received, no
-    // media churn (documented limitation: a removed currently-active track
-    // keeps its old media subscription running until a later selection).
+    // Adoption is an ordinary catalog update: no second catalog_received, and
+    // media moves only off a rung the catalog removed.
     this.applyCatalogUpdate(state);
   }
 
@@ -6832,6 +6868,7 @@ export class MoqtPlayer {
     this.audioPipeline?.tick();
     this.videoPipeline?.tick();
 
+    this.moveOffRemovedVideoTrack();
     // Proactive quality adaptation: if estimated bandwidth is below
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
@@ -6846,6 +6883,8 @@ export class MoqtPlayer {
   private lastSkewEmitMs = 0;
 
   private static readonly ABR_LIVE_UPSHIFT_WAIT_US = 5_000_000;
+  private static readonly REMOVED_TRACK_RETRY_US = 2_000_000;
+  private nextRemovedTrackMoveUs = 0;
   private static readonly ABR_UPSHIFT_WAIT_MAX_US = 120_000_000;
   /** A downshift this soon after an ABR upshift fails the upshift. */
   private static readonly ABR_UPSHIFT_TRIAL_US = 30_000_000;
@@ -10865,6 +10904,24 @@ export class MoqtPlayer {
     else state.timer = setTimeout(fire, delayMs);
   }
 
+  /** The player switched away from this track: end its liveness ladder and any pending re-subscribe. */
+  private stopRecoveringTrack(mediaType: 'video' | 'audio', trackName: string): void {
+    const restart = this.livenessRestarts.get(`${mediaType}:${trackName}`);
+    if (restart) restart.cancelled = true;
+    const retry = this.publishDoneRetries.get(trackName);
+    if (retry?.timer != null) clearTimeout(retry.timer);
+    this.publishDoneRetries.delete(trackName);
+  }
+
+  /** Whether a different media track of this type is subscribed; init tracks register as 'video' too. */
+  private otherTrackPlaying(mediaType: 'video' | 'audio', trackName: string): boolean {
+    const initRequestIds = new Set(this.initTrackRequestIds.values());
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      if (sub.mediaType === mediaType && sub.trackName !== trackName && !initRequestIds.has(requestId)) return true;
+    }
+    return false;
+  }
+
   /**
    * Replace a track's subscription with a fresh one.
    *
@@ -10905,6 +10962,11 @@ export class MoqtPlayer {
     }
 
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
+    // One decoder per media type: a second track would interleave into it.
+    if (this.otherTrackPlaying(mediaType, trackName)) {
+      this.log.info('Ignoring %s replacement for "%s" — another %s track is playing', cause, trackName, mediaType);
+      return;
+    }
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
     if (isMsePackaging(packaging)) {
