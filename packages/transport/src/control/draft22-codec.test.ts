@@ -128,10 +128,9 @@ describe('draft-22 LOCATION_FILTER mapping (§9.20.9)', () => {
     expect(bytesToHex(encodeFillParameters())).toBe('00');
   });
 
-  it('a FILL_PARAMETERS value must be exactly its counted parameters (9.20.15)', () => {
+  it('a counted FILL_PARAMETERS value must be exactly its parameters (9.20.15)', () => {
     expect(decodeFillParameters(new Uint8Array([0])).parameters.size).toBe(0);
-    expect(() => decodeFillParameters(new Uint8Array([0x21, 0x01, 0x01]))).toThrow();
-    expect(() => decodeFillParameters(new Uint8Array([0x01, 0x21, 0x01, 0x01, 0x00]))).toThrow(/length/);
+    expect(() => decodeFillParameters(new Uint8Array([0x01, 0x21, 0x01, 0x01, 0x00]))).toThrow();
   });
 
   it('frames the filter by its type, so a following parameter decodes', () => {

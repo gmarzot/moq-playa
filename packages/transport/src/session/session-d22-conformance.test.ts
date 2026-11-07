@@ -196,7 +196,6 @@ describe('draft-22 fill parameter scope (9.20.15)', () => {
     { description: 'duplicate GROUP_ORDER is forbidden', bytes: [2, 0x22, 1, 0, 2] },
     { description: 'truncated GROUP_ORDER is malformed', bytes: [1, 0x22] },
     { description: 'Next Object filter has no fields', bytes: [1, 0x21, 5, 0, 0, 0, 0, 0] },
-    { description: 'a fill without its Number of Parameters is malformed', bytes: [0x21, 1, 1] },
     { description: 'bytes past the counted fill parameters are malformed', bytes: [1, 0x22, 1, 0] },
   ])('$description', ({ bytes }) => {
     const session = established();

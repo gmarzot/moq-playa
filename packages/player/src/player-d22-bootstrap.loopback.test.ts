@@ -249,7 +249,7 @@ describe('d22 loopback — migration', () => {
         await Promise.all([player.migrate(client2 as unknown as MoqtConnection), server2.connect(b, {})]);
         await settle();
 
-        expect(state2.catalogFill && Array.from(state2.catalogFill)).toEqual([0x21, 0x01, 0x01]);
+        expect(state2.catalogFill && Array.from(state2.catalogFill)).toEqual([0x01, 0x21, 0x01, 0x01]);
         expect(state2.fetches).toBe(0);
         expect(state2.mediaSubs.map((m) => [m.name, m.fill]).sort())
             .toEqual([['audio', warmStart], ['video', warmStart]]);
