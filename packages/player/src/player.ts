@@ -1969,15 +1969,15 @@ export class MoqtPlayer {
     if (this.pendingAudioSwitch !== sw) return;
     this.pendingAudioSwitch = null;
     clearTimeout(sw.noDataTimer);
+    if (sw.newRequestId !== null && this.connection) {
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
+    }
     // A liveness / TOO_FAR_BEHIND renewal of the old track was held back for
     // the switch; with the switch gone, bring the old track back if it lapsed.
     const oldAlive = [...this.activeSubscriptions.values()]
       .some(sub => sub.mediaType === 'audio' && sub.trackName === sw.oldTrackName);
     if (!oldAlive && sw.oldTrackName) this.replaceSubscription(sw.oldTrackName, 'liveness');
-    if (sw.newRequestId !== null && this.connection) {
-      this.retireMediaSubscription(sw.newRequestId, this.connection);
-      void this.connection.unsubscribe(varint(sw.newRequestId)).catch(() => { /* gone */ });
-    }
     this.emitter.emit('audio_track_switch_failed', {
       type: 'audio_track_switch_failed',
       fromTrackName: sw.oldTrackName,
@@ -2004,6 +2004,7 @@ export class MoqtPlayer {
    * in case a liveness or TOO_FAR_BEHIND replacement renewed it meanwhile.
    */
   private retireOldAudioTrack(sw: PendingAudioSwitch): void {
+    this.stopRecoveringTrack('audio', sw.oldTrackName);
     if (!this.connection || !this.subscriptionManager) return;
     for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
       if (sub.mediaType !== 'audio' || sub.trackName !== sw.oldTrackName || sub.trackName === sw.newTrackName) continue;
@@ -3333,6 +3334,7 @@ export class MoqtPlayer {
    * `mediaSource.changeType` resolves).
    */
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
+    this.stopRecoveringTrack('video', sw.oldTrackName);
     if (!this.connection || !this.subscriptionManager) return;
     this.retireMediaSubscription(sw.oldRequestId, this.connection);
     void this.connection.unsubscribe(varint(sw.oldRequestId)).catch(() => { /* already gone */ });
@@ -10863,6 +10865,24 @@ export class MoqtPlayer {
     else state.timer = setTimeout(fire, delayMs);
   }
 
+  /** The player switched away from this track: end its liveness ladder and any pending re-subscribe. */
+  private stopRecoveringTrack(mediaType: 'video' | 'audio', trackName: string): void {
+    const restart = this.livenessRestarts.get(`${mediaType}:${trackName}`);
+    if (restart) restart.cancelled = true;
+    const retry = this.publishDoneRetries.get(trackName);
+    if (retry?.timer != null) clearTimeout(retry.timer);
+    this.publishDoneRetries.delete(trackName);
+  }
+
+  /** Whether a different media track of this type is subscribed; init tracks register as 'video' too. */
+  private otherTrackPlaying(mediaType: 'video' | 'audio', trackName: string): boolean {
+    const initRequestIds = new Set(this.initTrackRequestIds.values());
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      if (sub.mediaType === mediaType && sub.trackName !== trackName && !initRequestIds.has(requestId)) return true;
+    }
+    return false;
+  }
+
   /**
    * Replace a track's subscription with a fresh one.
    *
@@ -10903,6 +10923,11 @@ export class MoqtPlayer {
     }
 
     const mediaType: 'video' | 'audio' = track.role === 'audio' ? 'audio' : 'video';
+    // One decoder per media type: a second track would interleave into it.
+    if (this.otherTrackPlaying(mediaType, trackName)) {
+      this.log.info('Ignoring %s replacement for "%s" — another %s track is playing', cause, trackName, mediaType);
+      return;
+    }
     const packaging = mediaTrackPackaging(track.packaging);
     const isLive = track.isLive === true;
     if (isMsePackaging(packaging)) {
