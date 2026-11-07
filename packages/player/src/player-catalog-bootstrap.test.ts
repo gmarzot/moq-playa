@@ -675,6 +675,44 @@ describe('catalog retry with Joining FETCH', () => {
 });
 
 describe('catalog bootstrap wiring — subscribe + join', () => {
+    it.each(['auto', 'joining-fetch', 'strict', 'subscribe'] as const)(
+        '%s: a live update reaches the video ladder', async (mode) => {
+            const adapter = createMockAdapter(18);
+            const twoRungs = { ...CATALOG, tracks: [...CATALOG.tracks, { ...CATALOG.tracks[0]!, name: 'hd', bitrate: 4_000_000 }] };
+            const { player, events, errors } = await loadPlayer(adapter, { catalogBootstrap: mode });
+            await flush();
+            ackCatalog(adapter);
+            if (mode === 'subscribe') {
+                adapter._triggerObject(200n, {
+                    kind: 'data', trackAlias: varint(1n), groupId: varint(5n), subgroupId: varint(0n),
+                    objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+                } as unknown as MoqtObject);
+            } else {
+                const fetchId = BigInt((adapter.joiningFetch.mock.results[0]!.value as { requestId?: bigint })?.requestId ?? 3n);
+                await deliverFetchObject(adapter, fetchId, 100n, 5n, 0n, enc(CATALOG));
+                adapter._triggerMessage({
+                    type: 'FETCH_OK', requestId: varint(fetchId), endOfTrack: 0,
+                    endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+                } as unknown as ControlMessage);
+                adapter._triggerStreamClosed(100n);
+            }
+            await flush();
+            await flush();
+            expect(events).toEqual(['catalog_received']);
+            expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video']);
+
+            adapter._triggerObject(200n, {
+                kind: 'data', trackAlias: varint(1n), groupId: varint(6n), subgroupId: varint(0n),
+                objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: enc(twoRungs),
+            } as unknown as MoqtObject);
+            await flush();
+            expect(events).toEqual(['catalog_received', 'catalog_updated']);
+            expect(player.availableVideoTracks.map(t => t.name)).toEqual(['hd', 'video']);
+            expect(player.currentVideoTrack).toBe('video');
+            expect(errors).toEqual([]);
+            await player.destroy();
+        });
+
     it('#2/#22: default auto on d16 → catalog subscribe LargestObject + relative join offset 0 referencing it, chosen atomically', async () => {
         const adapter = createMockAdapter(16);
         await loadPlayer(adapter);

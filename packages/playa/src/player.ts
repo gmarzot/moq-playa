@@ -57,6 +57,7 @@ import { detectStrategy } from './auto-detect.js';
 import type { DecoderStrategy } from './auto-detect.js';
 import { VolumeController } from './volume-controller.js';
 import { TimeController } from './time-controller.js';
+import type { CatalogState } from '@openmoq/msf';
 import { mapLevels, mapAudioTracks } from './level-mapper.js';
 import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 import type { PlayerEventMap } from './events.js';
@@ -797,6 +798,7 @@ export class Player {
     // and the engine is not public.
     this.engine.on('catalog_updated', (e) => {
       this.emitter.emit('catalog_updated', { catalog: e.catalog });
+      this.followCatalogLevels(e.catalog);
     });
     // Size and text only: the payload itself stays inside the engine.
     this.engine.on('catalog_raw', (e) => {
@@ -964,6 +966,18 @@ export class Player {
         this.setState('error');
       }
     });
+  }
+
+  /** Rebuild the levels when a catalog update changes the ladder, keeping the current level by track name. */
+  private followCatalogLevels(catalog: CatalogState): void {
+    const ladder = new Set(this.engine.availableVideoTracks.map(t => t.name));
+    if (ladder.size === 0) return;
+    const levels = mapLevels({ ...catalog, tracks: catalog.tracks.filter(t => t.role === 'video' && ladder.has(t.name)) });
+    if (JSON.stringify(levels) === JSON.stringify(this._levels)) return;
+    this._levels = levels;
+    const current = this.engine.currentVideoTrack;
+    this._currentLevel = levels.findIndex(l => l.trackName === current);
+    this.emitter.emit('levelsloaded', { levels });
   }
 
   /** A view switch replaced the quality ladder. */

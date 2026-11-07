@@ -96,6 +96,90 @@ describe('Player — programs, views and audio languages', () => {
     } finally { await player.destroy(); }
   });
 
+  describe('quality levels follow catalog updates', () => {
+    const LATE = { name: 'main_top', role: 'video', packaging: 'loc', isLive: true, codec: 'avc1.640028',
+      width: 2560, height: 1440, bitrate: 8_000_000, altGroup: 1, renderGroup: 1 };
+    const ladder = (...names: string[]) => names.map((name) => ({ name }));
+
+    function started(current: string) {
+      const ctx = setup();
+      ctx.emit('catalog_received', { catalog: CATALOG });
+      vi.spyOn(ctx.engine, 'availableVideoTracks', 'get').mockReturnValue(ladder('main_hi', 'main_lo'));
+      vi.spyOn(ctx.engine, 'currentVideoTrack', 'get').mockReturnValue(current);
+      const loaded = vi.fn();
+      ctx.player.on('levelsloaded', loaded);
+      return { ...ctx, loaded };
+    }
+
+    it('lists a rung added after startup and keeps the current level by track name', async () => {
+      const { player, engine, emit, loaded } = started('main_lo');
+      try {
+        emit('quality_switched', { fromTrackName: 'main_hi', toTrackName: 'main_lo', reason: 'bandwidth' });
+        expect(player.currentLevel).toBe(1);
+        const quality = vi.fn();
+        player.on('qualitychange', quality);
+
+        vi.spyOn(engine, 'availableVideoTracks', 'get').mockReturnValue(ladder('main_top', 'main_hi', 'main_lo'));
+        emit('catalog_updated', { catalog: { ...CATALOG, tracks: [...CATALOG.tracks, LATE] } });
+
+        expect(player.levels.map((l) => [l.index, l.trackName])).toEqual(
+          [[0, 'main_top'], [1, 'main_hi'], [2, 'main_lo']]);
+        expect(player.currentLevel).toBe(2);
+        expect(loaded).toHaveBeenCalledTimes(1);
+        expect(loaded).toHaveBeenCalledWith({ levels: player.levels });
+        expect(quality).not.toHaveBeenCalled();
+      } finally { await player.destroy(); }
+    });
+
+    it('stays quiet when a re-sent catalog changes nothing', async () => {
+      const { player, emit, loaded } = started('main_hi');
+      try {
+        emit('catalog_updated', { catalog: CATALOG });
+        expect(loaded).not.toHaveBeenCalled();
+      } finally { await player.destroy(); }
+    });
+
+    it('a manual pick by index selects the track at the rebuilt index', async () => {
+      const { player, engine, emit } = started('main_lo');
+      try {
+        const select = vi.spyOn(engine, 'selectVideoTrack').mockResolvedValue(undefined);
+        vi.spyOn(engine, 'availableVideoTracks', 'get').mockReturnValue(ladder('main_top', 'main_hi', 'main_lo'));
+        emit('catalog_updated', { catalog: { ...CATALOG, tracks: [...CATALOG.tracks, LATE] } });
+        await player.setQuality(0);
+        expect(select).toHaveBeenCalledWith('main_top', 'manual');
+        expect(player.autoQuality).toBe(false);
+      } finally { await player.destroy(); }
+    });
+
+    it('drops a removed rung, unknown as current until the switch away commits', async () => {
+      const { player, engine, emit } = started('main_hi');
+      try {
+        vi.spyOn(engine, 'availableVideoTracks', 'get').mockReturnValue(ladder('main_lo'));
+        emit('catalog_updated', { catalog: { ...CATALOG, tracks: CATALOG.tracks.filter((t) => t.name !== 'main_hi') } });
+        expect(player.levels.map((l) => l.trackName)).toEqual(['main_lo']);
+        expect(player.currentLevel).toBe(-1);
+
+        const quality = vi.fn();
+        player.on('qualitychange', quality);
+        emit('quality_switched', { fromTrackName: 'main_hi', toTrackName: 'main_lo', reason: 'catalog' });
+        expect(player.currentLevel).toBe(0);
+        expect(quality).toHaveBeenCalledWith({ level: player.levels[0], auto: true });
+      } finally { await player.destroy(); }
+    });
+
+    it('follows only the current view and leaves the levels without a ladder', async () => {
+      const { player, engine, emit, loaded } = started('main_hi');
+      try {
+        emit('catalog_updated', { catalog: CATALOG });
+        expect(player.levels.map((l) => l.trackName)).toEqual(['main_hi', 'main_lo']);
+        vi.spyOn(engine, 'availableVideoTracks', 'get').mockReturnValue([]);
+        emit('catalog_updated', { catalog: { ...CATALOG, tracks: [] } });
+        expect(player.levels.map((l) => l.trackName)).toEqual(['main_hi', 'main_lo']);
+        expect(loaded).not.toHaveBeenCalled();
+      } finally { await player.destroy(); }
+    });
+  });
+
   it('re-emits program and audio-track events without the engine type field', async () => {
     const { player, emit } = setup();
     try {
