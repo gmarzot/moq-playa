@@ -10545,6 +10545,22 @@ describe('MoqtPlayer', () => {
         await player.destroy();
       });
 
+      it('climbs from a rung whose only measurable objects are small group starts', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        const span = (objectId: bigint) => (player as any).recordDeliverySpans({
+          kind: 'data', objectId: varint(objectId), payload: new Uint8Array(12_000),
+          socketFirstMs: 0, socketStartMs: 100, socketLastMs: 102,
+        });
+        clockUs = 10 * S;
+        for (let i = 0; i < 3; i++) span(5n);
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        for (let i = 0; i < 3; i++) span(0n);
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(true);
+        await player.destroy();
+      });
+
       describe('rungs that follow the catalog', () => {
         it('climbs onto a higher rung added after startup', async () => {
           const { player, adapter, subscribedTo } = await loadLive(500_000, ladderWithout(['video-0', 'video-2']));
