@@ -1731,10 +1731,11 @@ async function main(): Promise<void> {
       latWindow.length = 0;
       latHistory.length = 0;
       audioLatWindow.length = 0;
-      screenWindow.length = 0;
       tickWorstRawMs = -Infinity;
       jitterEwma = 0;
     }
+    // Drawn frames are still draining the queue's fill.
+    if (queueSettling) screenWindow.length = 0;
 
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
