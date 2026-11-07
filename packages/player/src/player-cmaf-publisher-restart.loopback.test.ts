@@ -10,13 +10,16 @@
  * export of @openmoq/webtransport, and @openmoq/browser depends on this package.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { varint } from '@openmoq/transport';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { CmafAssembler, type CmafAssemblerOptions } from '../../browser/src/cmaf-assembler.js';
 import { readBaseMediaDecodeTime } from '../../browser/src/mp4-box.js';
 import { MoqtPlayer } from './player.js';
+
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
 
 const VIDEO_TS = 90_000;
 const AUDIO_TS = 48_000;

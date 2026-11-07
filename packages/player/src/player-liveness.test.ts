@@ -13,7 +13,7 @@
  * @module
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
 import { PlayerState } from './state.js';
@@ -22,6 +22,9 @@ import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/transport';
 import { varint } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
+
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 

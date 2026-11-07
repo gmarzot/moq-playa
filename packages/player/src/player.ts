@@ -883,8 +883,21 @@ export class MoqtPlayer {
   /** Shortest delay before re-issuing a refused catalog SUBSCRIBE. */
   private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
 
-  /** How long a session keeps retrying a catalog SUBSCRIBE refused with a Retry Interval. */
+  /** A first resubscribe waits up to this long, so viewers ended together don't return together. */
+  private static readonly RESUBSCRIBE_SPREAD_MS = 1_000;
+
+  /** How long a session keeps retrying a SUBSCRIBE refused with a Retry Interval. */
   private static readonly CATALOG_REFUSAL_LIMIT_MS = 300_000;
+
+  /** Media tracks being refused with a Retry Interval, with nothing else playing their media type. */
+  private readonly mediaRefusals = new Map<string, {
+    readonly conn: MoqtConnection;
+    readonly sinceMs: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>();
+
+  /** The newest group seen per media track, to notice objects resuming past a missing group. */
+  private readonly lastMediaGroup = new Map<string, bigint>();
 
   /** The current run of catalog refusals carrying a Retry Interval; null when none. */
   private catalogRefusal: {
@@ -1201,6 +1214,7 @@ export class MoqtPlayer {
       pendingMediaSubs: this.pendingMediaSubs,
       subscriptionManager: this.subscriptionManager,
     });
+    if (sub) this.lastMediaGroup.delete(sub.trackName);
     if (sub?.trackAlias != null && this.subscriptionManager?.getMediaType(sub.trackAlias) === undefined) {
       this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
@@ -2131,6 +2145,9 @@ export class MoqtPlayer {
       const bytes = obj.payload ? obj.payload.byteLength : 0;
       this._stats.recordMediaObject(bytes);
       this.recordDeliverySpans(obj);
+      if (mediaType === 'video' || mediaType === 'audio') {
+        this.noteGroupSequence(mediaType, trackName, BigInt(obj.groupId));
+      }
       if (mediaType === 'video' && bytes > 0) {
         this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
       }
@@ -3662,6 +3679,9 @@ export class MoqtPlayer {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
         this.recordDeliverySpans(obj);
+        if (mediaType === 'video' || mediaType === 'audio') {
+          this.noteGroupSequence(mediaType, trackName, BigInt(obj.groupId));
+        }
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
           this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
@@ -4238,6 +4258,58 @@ export class MoqtPlayer {
     const minimum = retryInterval - 1n;
     const floor = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
     return minimum < floor ? floor : minimum;
+  }
+
+  /** Retry a media SUBSCRIBE refused with a Retry Interval; false once refusals outlast the limit. */
+  private retryRefusedMedia(
+    conn: MoqtConnection, trackName: string, retryInterval: bigint, refused: string,
+  ): boolean {
+    const nowMs = Date.now();
+    const prior = this.mediaRefusals.get(trackName);
+    const current = prior?.conn === conn ? prior : null;
+    const sinceMs = current?.sinceMs ?? nowMs;
+    if (nowMs - sinceMs >= MoqtPlayer.CATALOG_REFUSAL_LIMIT_MS) {
+      this.clearMediaRefusal(trackName);
+      return false;
+    }
+    if (prior && !current) this.clearMediaRefusal(trackName);
+    const delayMs = Number(MoqtPlayer.catalogRetryDelayMs(retryInterval));
+    if (!current) {
+      this.emitError(createPlayerError('degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+        `${refused}; retrying in ${Math.ceil(delayMs / 1000)} s`));
+    }
+    const state = current ?? { conn, sinceMs, timer: null };
+    this.mediaRefusals.set(trackName, state);
+    const fire = (): void => {
+      state.timer = null;
+      if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
+      if (this.reconnect !== null || this.holdWhileHidden()) {
+        state.timer = setTimeout(fire, HIDDEN_RETRY_POLL_MS);
+        return;
+      }
+      this.replaceSubscription(trackName, 'refused', () => this.retryRefusedMedia(conn, trackName, retryInterval, refused));
+    };
+    if (state.timer !== null) clearTimeout(state.timer);
+    state.timer = setTimeout(fire, delayMs);
+    return true;
+  }
+
+  private clearMediaRefusal(trackName: string): void {
+    const state = this.mediaRefusals.get(trackName);
+    if (state?.timer != null) clearTimeout(state.timer);
+    this.mediaRefusals.delete(trackName);
+  }
+
+  /** Objects resuming past a missing group mean the relay skipped this subscriber ahead. */
+  private noteGroupSequence(mediaType: 'video' | 'audio', trackName: string, groupId: bigint): void {
+    const last = this.lastMediaGroup.get(trackName);
+    if (last !== undefined && groupId <= last) return;
+    this.lastMediaGroup.set(trackName, groupId);
+    if (last === undefined || groupId === last + 1n) return;
+    this._stats.recordGroupSkip();
+    this.emitter.emit('group_skip', {
+      type: 'group_skip', mediaType, trackName, fromGroupId: last, toGroupId: groupId,
+    });
   }
 
   /** Retry a catalog SUBSCRIBE refused with a Retry Interval until refusals outlast the limit. */
@@ -4861,6 +4933,7 @@ export class MoqtPlayer {
     this.catalogTrackAlias = null;
     this.catalogRequestId = catalogReqId;
     this.legacyCatalogTerminal = null;
+    this.lastMediaGroup.clear();
     // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
     // one (new generation) binds to the committed session. Its joining fetch
     // fires immediately (Pending/Established association both legal on 16/18).
@@ -7034,6 +7107,7 @@ export class MoqtPlayer {
     this.cmafFirstFrameDeferredTimeoutMs = undefined;
     this.removeVisibilityListener();
     this.cancelResumeWhenVisible();
+    for (const trackName of [...this.mediaRefusals.keys()]) this.clearMediaRefusal(trackName);
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -8312,10 +8386,21 @@ export class MoqtPlayer {
         }
       },
       onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
+        this.clearMediaRefusal(_trackName);
         this._mediaSubsOk++;
         this.mediaSubWire.delete(requestId);
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
+        // Told to come back later, with nothing else playing this media type.
+        if (BigInt(errorCode) !== BigInt(RequestError.DOES_NOT_EXIST)
+            && retryInterval !== undefined && BigInt(retryInterval) > 0n
+            && this.activeTrackName(mediaType) === undefined
+            && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName)
+            && this.retryRefusedMedia(conn, trackName, BigInt(retryInterval),
+              `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`)) {
+          this.mediaSubWire.delete(requestId);
+          return;
+        }
         this._mediaSubsFailed++;
         // DOES_NOT_EXIST: the namespace's return resumes the track, or ends a failed resume.
         if (this.config.followNamespace && BigInt(errorCode) === 0x10n) this.follower.noteTrackMissing();
@@ -9135,6 +9220,14 @@ export class MoqtPlayer {
       // Buffered-hole gap-jump: the adapter skipped missing source media.
       // Surface it as stats + a typed public event (apps subscribe to the
       // player event; the adapter slot has exactly one owner — this one).
+      this.mediaSource.onLiveEdgeResync = (reason) => {
+        if (reason !== 'behind-live') return;
+        this.log.warn('Jump to live: %s', reason);
+        this.emitter.emit('recovery_action', {
+          type: 'recovery_action',
+          action: { type: 'jump_to_live' },
+        });
+      };
       this.mediaSource.onGapJump = (info) => {
         this._stats.recordGapJump();
         this.log.warn(
@@ -10737,8 +10830,10 @@ export class MoqtPlayer {
     }
     retry.lastDoneAtMs = nowMs;
     if (retry.timer !== null) return;
+    const spread = cause === 'too_far_behind' || cause === 'publish_done'
+      ? Math.random() * MoqtPlayer.RESUBSCRIBE_SPREAD_MS : 0;
     const delayMs = retry.attempts === 0
-      ? 0
+      ? spread
       : Math.min(PUBLISH_DONE_RETRY_BASE_MS * 2 ** (retry.attempts - 1), PUBLISH_DONE_RETRY_MAX_MS);
     retry.attempts++;
     const state = retry;

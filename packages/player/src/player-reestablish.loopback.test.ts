@@ -18,6 +18,9 @@ import { MoqtPlayer } from './player.js';
 import { NamespaceFollower } from './namespace-follow.js';
 import { PlayerState } from './state.js';
 
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
+
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const td = new TextDecoder();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

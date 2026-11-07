@@ -396,6 +396,9 @@ export interface MediaSourceLike {
     reason: 'hole' | 'resubscribe' | 'timeline';
   }) => void) | null;
 
+  /** OPTIONAL: the adapter jumped the playhead forward to the cushion in force. */
+  onLiveEdgeResync?: ((reason: 'quota' | 'behind-live') => void) | null;
+
   /**
    * OPTIONAL: the player resubscribed past what is buffered, so the next
    * hole after the current buffered end cannot fill and needs no infill wait.

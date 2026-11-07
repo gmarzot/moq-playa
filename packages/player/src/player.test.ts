@@ -30,6 +30,9 @@ import { encodeLocHeaders } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
 import type { DataStreamTerminal, GoawayNotice } from '@openmoq/webtransport';
 
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
+
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
 /** Minimal mock of MoqtConnection for testing. */

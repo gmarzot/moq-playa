@@ -114,6 +114,8 @@ export interface PlayerStats {
   // ── Errors ──────────────────────────────────────────────────
   /** Number of gap events detected by the pipeline. */
   readonly gapCount: number;
+  /** Times objects resumed past a missing group: the relay skipped this subscriber ahead. */
+  readonly groupSkipCount: number;
   /** Number of playback stalls. */
   readonly stallCount: number;
   /** Bounded buffered-hole gap-jumps performed by the MSE adapter (source
@@ -260,6 +262,7 @@ export class StatsAccumulator {
 
   // ── Errors ──────────────────────────────────────────────────
   private _gapCount = 0;
+  private _groupSkipCount = 0;
   private _stallCount = 0;
   private _gapJumpCount = 0;
   private _locmafObjectsRejected = 0;
@@ -397,6 +400,11 @@ export class StatsAccumulator {
   }
 
   // ── Errors ──────────────────────────────────────────────────
+
+  /** Objects resumed past a missing group. */
+  recordGroupSkip(): void {
+    this._groupSkipCount++;
+  }
 
   /** Record a gap detected by the pipeline. */
   recordGapDetected(): void {
@@ -605,6 +613,7 @@ export class StatsAccumulator {
 
       // Errors
       gapCount: this._gapCount,
+      groupSkipCount: this._groupSkipCount,
       stallCount: this._stallCount,
       gapJumpCount: this._gapJumpCount,
       locmafObjectsRejected: this._locmafObjectsRejected,

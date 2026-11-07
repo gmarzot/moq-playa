@@ -19,6 +19,9 @@ import type { ControlMessage, MoqtObject, DataStreamHeader } from '@openmoq/tran
 import { varint } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
+
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const CATALOG = {
     version: 'draft-01',
@@ -4458,3 +4461,158 @@ describe('catalog SUBSCRIBE refused with a Retry Interval', () => {
         expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
     });
 });
+
+describe('media SUBSCRIBE refused with a Retry Interval', () => {
+    const LIMIT_MS = 300_000;
+    const players: MoqtPlayer[] = [];
+    type Adapter = ReturnType<typeof createMockAdapter>;
+    const td = new TextDecoder();
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(async () => {
+        for (const player of players.splice(0)) await player.destroy();
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+    });
+
+    const subscribesOf = (adapter: Adapter, track: string): number =>
+        adapter.subscribe.mock.calls.filter((c: unknown[]) => td.decode(c[1] as Uint8Array) === track).length;
+
+    async function lastRequestId(adapter: Adapter, track: string): Promise<bigint> {
+        for (let i = adapter.subscribe.mock.calls.length - 1; i >= 0; i--) {
+            if (td.decode(adapter.subscribe.mock.calls[i]![1] as Uint8Array) === track) {
+                return BigInt(await adapter.subscribe.mock.results[i]!.value);
+            }
+        }
+        throw new Error(`no SUBSCRIBE for ${track}`);
+    }
+
+    async function refuse(adapter: Adapter, track: string, retryInterval: bigint, errorCode = 0x9n): Promise<void> {
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: await lastRequestId(adapter, track), errorCode, retryInterval,
+            errorReason: 'relay overloaded',
+        } as ControlMessage);
+        await vi.advanceTimersByTimeAsync(0);
+    }
+
+    /** A player past its catalog, with its media SUBSCRIBEs sent and unanswered. */
+    async function subscribing(cfg?: Partial<MoqtPlayerConfig>) {
+        const adapter = createMockAdapter(18);
+        const loaded = await loadPlayer(adapter, cfg);
+        players.push(loaded.player);
+        loaded.player.play();
+        const subscribeId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const fetchId = BigInt(await adapter.joiningFetch.mock.results.at(-1)!.value);
+        ackCatalog(adapter, subscribeId, 40n);
+        adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: fetchId } } as DataStreamHeader);
+        adapter._triggerObject(100n, {
+            kind: 'data', trackAlias: varint(0), groupId: varint(10), subgroupId: varint(0),
+            objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+        } as MoqtObject);
+        adapter._triggerMessage({
+            type: 'FETCH_OK', requestId: fetchId, endOfTrack: 0,
+            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+        adapter._triggerStreamClosed(100n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+        return { adapter, ...loaded };
+    }
+
+    const fatal = (errors: unknown[]): unknown[] =>
+        errors.filter((e) => (e as { severity: string }).severity === 'fatal');
+
+    it('every track refused waits out the interval and retries, with no fatal error', async () => {
+        const { adapter, player, errors } = await subscribing();
+        await refuse(adapter, 'video', 5001n);
+        await refuse(adapter, 'audio', 5001n);
+        expect(fatal(errors)).toEqual([]);
+        expect(player.state).not.toBe('error');
+        await vi.advanceTimersByTimeAsync(4999);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(subscribesOf(adapter, 'video')).toBe(2);
+        expect(subscribesOf(adapter, 'audio')).toBe(2);
+    });
+
+    it('reports a run of refusals once', async () => {
+        const { adapter, errors } = await subscribing();
+        await refuse(adapter, 'video', 2001n);
+        await vi.advanceTimersByTimeAsync(2000);
+        await refuse(adapter, 'video', 2001n);
+        expect(errors.filter((e) => /Track "video" refused/.test((e as Error).message))).toHaveLength(1);
+    });
+
+    it('stops at the limit, and then counts as a refusal', async () => {
+        const { adapter, errors } = await subscribing();
+        await refuse(adapter, 'audio', 0n, 0x1n);
+        for (let waited = 0; waited < LIMIT_MS; waited += 15_000) {
+            await refuse(adapter, 'video', 15_001n);
+            expect(fatal(errors)).toEqual([]);
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        await refuse(adapter, 'video', 15_001n);
+        expect(fatal(errors)).toEqual([expect.objectContaining({ message: expect.stringMatching(/All media track/) })]);
+        const sent = subscribesOf(adapter, 'video');
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(subscribesOf(adapter, 'video')).toBe(sent);
+    });
+
+    it('a zero interval stays a refusal', async () => {
+        const { adapter, errors } = await subscribing();
+        await refuse(adapter, 'video', 0n);
+        await refuse(adapter, 'audio', 0n);
+        expect(fatal(errors)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+    });
+
+    it('a resubscribe after TOO_FAR_BEHIND that is refused also retries', async () => {
+        const { adapter, errors } = await subscribing();
+        const id = await lastRequestId(adapter, 'video');
+        adapter._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(41n), parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        adapter._triggerMessage({
+            type: 'PUBLISH_DONE', requestId: varint(id), statusCode: 0x5n, streamCount: 0n, errorReason: 'behind',
+        } as unknown as ControlMessage);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(subscribesOf(adapter, 'video')).toBe(2);
+        await refuse(adapter, 'video', 3001n);
+        await vi.advanceTimersByTimeAsync(3000);
+        expect(subscribesOf(adapter, 'video')).toBe(3);
+        expect(fatal(errors)).toEqual([]);
+    });
+
+    it('reports objects resuming past a missing group, once per skip', async () => {
+        const { player } = await subscribing();
+        const skips: { fromGroupId: bigint; toGroupId: bigint; trackName: string }[] = [];
+        player.on('group_skip', (e) => skips.push(e));
+        const note = (track: string, group: bigint): void =>
+            (player as unknown as { noteGroupSequence(m: string, t: string, g: bigint): void })
+                .noteGroupSequence('video', track, group);
+        for (const group of [5n, 6n, 6n, 9n, 8n, 10n]) note('video', group);
+        note('other', 100n);
+        expect(skips).toEqual([expect.objectContaining({ trackName: 'video', fromGroupId: 6n, toGroupId: 9n })]);
+        expect(player.stats.groupSkipCount).toBe(1);
+    });
+
+    it('spreads a first resubscribe over the spread window', async () => {
+        const statics = MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number };
+        statics.RESUBSCRIBE_SPREAD_MS = 1_000;
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        const { adapter } = await subscribing();
+        const id = await lastRequestId(adapter, 'video');
+        adapter._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(41n), parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        adapter._triggerMessage({
+            type: 'PUBLISH_DONE', requestId: varint(id), statusCode: 0x5n, streamCount: 0n, errorReason: 'behind',
+        } as unknown as ControlMessage);
+        await vi.advanceTimersByTimeAsync(499);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(subscribesOf(adapter, 'video')).toBe(2);
+    });
+});
+
