@@ -26,8 +26,20 @@ export type {
   LevelsloadedEvent,
   QualitychangeEvent,
   StallEvent,
+  StallRecoveredEvent,
+  LifecycleEvent,
+  SessionClosedEvent,
+  SessionReconnectingEvent,
+  NamespaceStateEvent,
+  TrackUnsubscribedEvent,
+  TrackSubscribeFailedEvent,
   ErrorEvent,
   StatechangeEvent,
 } from './events.js';
+export type { SubscriptionStatus, NamespaceState, BootstrapPhase } from '@openmoq/player';
+export { pickCaptureTime } from '@openmoq/player';
+export type { ViewChangedEvent, ProgramChangedEvent, AudioTrackChangedEvent, AudioTrackSwitchFailedEvent } from './events.js';
+export type { ProgramInfo, VideoViewInfo, AudioTrackInfo } from '@openmoq/player';
+export type { CaptureTimes, CaptureTimeSource } from '@openmoq/player';
 export { detectStrategy } from './auto-detect.js';
 export type { DecoderStrategy } from './auto-detect.js';

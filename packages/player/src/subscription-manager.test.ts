@@ -305,6 +305,41 @@ describe('SubscriptionManager', () => {
     );
   });
 
+  it('a declared track timescale reads object Timestamps as media time', () => {
+    const mgr = new SubscriptionManager();
+    const onObject = vi.fn();
+    mgr.registerTrack(1n, 'video', 'video', 'loc', { timescale: 1000n });
+    mgr.registerTrack(2n, 'audio', 'audio');
+    mgr.onObject = onObject;
+    const extensions = encodeLocHeaders({ captureTimestamp: 5000n }, { locVersion: 4 });
+
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions }));
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(2), extensions }));
+
+    expect(onObject.mock.calls[0]![3]).toEqual(
+      expect.objectContaining({ captureTimestamp: 5_000_000n, timestampIsWallClock: false }));
+    expect(onObject.mock.calls[1]![3]).toEqual(
+      expect.objectContaining({ captureTimestamp: 5000n, timestampIsWallClock: true }));
+  });
+
+  it('the catalog\'s decoder configuration fills in until objects carry their own', () => {
+    const mgr = new SubscriptionManager();
+    const onObject = vi.fn();
+    const catalogConfig = new Uint8Array([1, 2, 3]);
+    const objectConfig = new Uint8Array([4, 5, 6]);
+    mgr.registerTrack(1n, 'video', 'video', 'loc', { initConfig: catalogConfig });
+    mgr.onObject = onObject;
+    const plain = encodeLocHeaders({ captureTimestamp: 1000n });
+    const configured = encodeLocHeaders({ captureTimestamp: 1000n, videoConfig: objectConfig }, { locVersion: 4 });
+
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions: plain }));
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions: configured }));
+    mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions: plain }));
+
+    const configs = onObject.mock.calls.map((c) => (c[3] as LocHeaders).videoConfig);
+    expect(configs).toEqual([catalogConfig, objectConfig, undefined]);
+  });
+
   it('does not call onMalformedTrack for valid objects', () => {
     const mgr = new SubscriptionManager();
     const onMalformedTrack = vi.fn();
@@ -456,7 +491,7 @@ describe('SubscriptionManager', () => {
 
   // ─── CMAF packaging routing (draft-ietf-moq-cmsf-00 §3.3) ────────
 
-  it('routes CMAF objects to onCmafObject, skipping LOC header parsing (§3.3)', async () => {
+  it('routes CMAF objects to onCmafObject, not the decode pipeline (§3.3)', async () => {
     const mgr = new SubscriptionManager();
     const onObject = vi.fn();
     const onCmafObject = vi.fn();
@@ -472,8 +507,25 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.objectContaining({ kind: 'data' }),
+      expect.anything(),
     );
     expect(onObject).not.toHaveBeenCalled();
+  });
+
+  it('CMAF objects carry parsed object properties (capture timestamp)', async () => {
+    const mgr = new SubscriptionManager();
+    const onCmafObject = vi.fn();
+    mgr.registerTrack(1n, 'video', 'video', 'cmaf');
+    mgr.onCmafObject = onCmafObject;
+
+    const extensions = encodeLocHeaders({ captureTimestamp: 1000n });
+    await mgr.routeObject(0n, createMockObject({
+      trackAlias: varint(1),
+      extensions,
+    }));
+
+    const headers: LocHeaders = onCmafObject.mock.calls[0]![3];
+    expect(headers.captureTimestamp).toBe(1000n);
   });
 
   it('LOC tracks still route to onObject when CMAF tracks exist (backward compat)', async () => {
@@ -518,7 +570,7 @@ describe('SubscriptionManager', () => {
     expect(onObject).toHaveBeenCalledTimes(1);
     expect(onObject).toHaveBeenCalledWith('video', 'video-loc', expect.anything(), expect.anything());
     expect(onCmafObject).toHaveBeenCalledTimes(1);
-    expect(onCmafObject).toHaveBeenCalledWith('audio', 'audio-cmaf', expect.anything());
+    expect(onCmafObject).toHaveBeenCalledWith('audio', 'audio-cmaf', expect.anything(), expect.anything());
   });
 
   it('objectTransform applies to CMAF objects before routing', async () => {
@@ -538,6 +590,7 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.objectContaining({ payload: new Uint8Array([0xCA, 0xFE]) }),
+      expect.anything(),
     );
   });
 
@@ -588,22 +641,26 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.objectContaining({ kind: 'data' }),
+      expect.anything(),
     );
     expect(onCmafObject).not.toHaveBeenCalled();
     expect(onObject).not.toHaveBeenCalled();
   });
 
-  it('locmaf objects skip LOC header parsing (a custom extensionParser is never invoked)', async () => {
+  it('locmaf object properties are annotations: parsed, and a malformed block loses only them', async () => {
     const mgr = new SubscriptionManager();
-    const parser = vi.fn();
-    mgr.extensionParser = parser;
-    mgr.onLocmafObject = vi.fn();
+    const onLocmafObject = vi.fn();
+    mgr.onLocmafObject = onLocmafObject;
     mgr.registerTrack(1n, 'video', 'video', 'locmaf');
 
+    mgr.extensionParser = () => ({ captureTimestamp: 123n });
     await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1) }));
+    expect(onLocmafObject).toHaveBeenLastCalledWith('video', 'video', expect.anything(), { captureTimestamp: 123n });
 
-    expect(parser).not.toHaveBeenCalled();
-    expect(mgr.onLocmafObject).toHaveBeenCalledTimes(1);
+    mgr.extensionParser = () => { throw new Error('malformed property block'); };
+    await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1) }));
+    expect(onLocmafObject).toHaveBeenCalledTimes(2);
+    expect(onLocmafObject).toHaveBeenLastCalledWith('video', 'video', expect.anything(), {});
   });
 
   it('objectTransform applies to locmaf objects before routing, and null drops them', async () => {
@@ -618,6 +675,7 @@ describe('SubscriptionManager', () => {
       'audio',
       'audio',
       expect.objectContaining({ payload: new Uint8Array([0xCA, 0xFE]) }),
+      expect.anything(),
     );
 
     mgr.objectTransform = () => null;
@@ -642,11 +700,11 @@ describe('SubscriptionManager', () => {
     await mgr.routeObject(0n, createMockObject({ trackAlias: varint(3) }));
 
     expect(onLocmafObject).toHaveBeenCalledTimes(1);
-    expect(onLocmafObject).toHaveBeenCalledWith('video', 'video', expect.anything());
+    expect(onLocmafObject).toHaveBeenCalledWith('video', 'video', expect.anything(), expect.anything());
     expect(onObject).toHaveBeenCalledTimes(1);
     expect(onObject).toHaveBeenCalledWith('audio', 'audio', expect.anything(), expect.anything());
     expect(onCmafObject).toHaveBeenCalledTimes(1);
-    expect(onCmafObject).toHaveBeenCalledWith('video', 'video-cmaf', expect.anything());
+    expect(onCmafObject).toHaveBeenCalledWith('video', 'video-cmaf', expect.anything(), expect.anything());
   });
 
   // ─── Mediatimeline packaging routing (draft-ietf-moq-msf-00 §7) ────
@@ -924,6 +982,43 @@ describe('SubscriptionManager', () => {
       await mgr.routeObject(0n, obj);
       const fallback = callback.mock.calls[0]?.[3] as LocHeaders | undefined;
       expect(fallback?.captureTimestamp).not.toBe(TS);
+    });
+  });
+
+  // In the clear the payload is the frame (LOC-04 §3.1.3, Secure Objects -01 §3.3).
+  describe('LOC payload', () => {
+    const frame = new Uint8Array([0x0a, 0x00, 0xff]);
+
+    function setup(packaging: 'loc' | 'cmaf' = 'loc') {
+      const mgr = new SubscriptionManager();
+      const onObject = vi.fn();
+      const onCmafObject = vi.fn();
+      const onMalformedTrack = vi.fn();
+      mgr.registerTrack(1n, 'video', 'video', packaging);
+      mgr.onObject = onObject;
+      mgr.onCmafObject = onCmafObject;
+      mgr.onMalformedTrack = onMalformedTrack;
+      return { mgr, onObject, onCmafObject, onMalformedTrack };
+    }
+
+    it('is delivered as the frame, whatever it opens with', async () => {
+      const { mgr, onObject, onMalformedTrack } = setup();
+      await mgr.routeObject(0n, createMockObject({ payload: frame }));
+      expect(onObject.mock.calls[0]![2].payload).toEqual(frame);
+      expect(onMalformedTrack).not.toHaveBeenCalled();
+    });
+
+    it('an empty payload passes through', async () => {
+      const { mgr, onObject, onMalformedTrack } = setup();
+      await mgr.routeObject(0n, createMockObject({ payload: new Uint8Array(0) }));
+      expect(onObject.mock.calls[0]![2].payload.length).toBe(0);
+      expect(onMalformedTrack).not.toHaveBeenCalled();
+    });
+
+    it('CMAF payloads are untouched', async () => {
+      const { mgr, onCmafObject } = setup('cmaf');
+      await mgr.routeObject(0n, createMockObject({ payload: frame }));
+      expect(onCmafObject.mock.calls[0]![2].payload).toEqual(frame);
     });
   });
 });

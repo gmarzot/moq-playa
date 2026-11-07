@@ -66,6 +66,46 @@ describe('WebCodecsVideoDecoder', () => {
     vi.unstubAllGlobals();
   });
 
+  describe('parameter sets in the keyframe (LOC-04 §2.1.1)', () => {
+    const avcc = buildAvccDescription();
+    const sps = avcc.subarray(8, 32);
+    const pps = avcc.subarray(35, 39);
+    const idr = new Uint8Array([0x65, 0x88, 0x99, 0xaa]);
+    const lastConfig = () => (createdDecoders.at(-1) as unknown as { lastConfig: any }).lastConfig;
+
+    it('configures from an Annex B keyframe\'s SPS/PPS when no description was given', () => {
+      const decoder = new WebCodecsVideoDecoder();
+      decoder.configure(new Uint8Array(0), 'avc1.42c01f', 640, 368);
+      expect(lastConfig().description).toBeUndefined();
+
+      decoder.decode({ type: 'key', timestamp: 1, duration: 33333, data: annexb([sps, pps, idr]) }, 0);
+
+      expect(Array.from(lastConfig().description)).toEqual(Array.from(avcc));
+      expect(decodeSpy).toHaveBeenCalledOnce();
+      const chunk = decodeSpy.mock.calls[0]![0] as MockEncodedVideoChunk;
+      expect(Array.from(chunk.data.subarray(0, 5))).toEqual([0, 0, 0, sps.byteLength, 0x67]);
+    });
+
+    it('keeps a configured description over in-band parameter sets', () => {
+      const decoder = new WebCodecsVideoDecoder();
+      const given = buildAvccDescription();
+      decoder.configure(given, 'avc1.42c01f', 640, 368);
+      const otherSps = Uint8Array.from(sps);
+      otherSps[3] = 0x28;
+
+      decoder.decode({ type: 'key', timestamp: 1, duration: 33333, data: annexb([otherSps, pps, idr]) }, 0);
+
+      expect(lastConfig().description).toBe(given);
+    });
+
+    it('a keyframe without parameter sets leaves the decoder as configured', () => {
+      const decoder = new WebCodecsVideoDecoder();
+      decoder.configure(new Uint8Array(0), 'avc1.42c01f', 640, 368);
+      decoder.decode({ type: 'key', timestamp: 1, duration: 33333, data: annexb([idr]) }, 0);
+      expect(lastConfig().description).toBeUndefined();
+    });
+  });
+
   it('drops reserved NAL type 0 chunks before decode', () => {
     const decoder = new WebCodecsVideoDecoder();
     decoder.configure(buildAvccDescription(), 'avc1.42c01f', 640, 368);

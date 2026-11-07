@@ -7,12 +7,12 @@
  * State transitions:
  * - PENDING: SUBSCRIBE_NAMESPACE sent/received, awaiting REQUEST_OK or REQUEST_ERROR
  * - ACTIVE: REQUEST_OK exchanged, receiving/sending NAMESPACE messages
- * - TERMINATED: REQUEST_ERROR received or NAMESPACE_DONE sent/received
+ * - TERMINATED: REQUEST_ERROR, the response stream ended, or a local cancel
  *
- * The subscriber discovers namespaces matching their prefix via NAMESPACE messages.
- * The publisher announces matching namespaces until sending NAMESPACE_DONE.
+ * NAMESPACE adds a suffix and NAMESPACE_DONE withdraws one; neither ends the
+ * subscription.
  *
- * @see draft-ietf-moq-transport-16 §6.1
+ * @see draft-ietf-moq-transport-18 §10.17, §10.18
  * @module
  */
 
@@ -175,16 +175,12 @@ export class NamespaceStateMachine {
   }
 
   /**
-   * Withdraw a previously discovered namespace (per-namespace removal).
+   * Withdraw a previously discovered namespace (per-namespace removal):
+   * NAMESPACE_DONE on either side, PUBLISH_NAMESPACE_DONE / _CANCEL on d14.
+   * The subscription stays ACTIVE and the suffix may be announced again.
    *
-   * Used when PUBLISH_NAMESPACE_DONE or PUBLISH_NAMESPACE_CANCEL arrives
-   * for a specific namespace. The subscription stays ACTIVE — new
-   * PUBLISH_NAMESPACE messages can still arrive for other namespaces.
-   *
-   * @see draft-ietf-moq-transport-14 §9.26: "withdraws a previous
-   *   PUBLISH_NAMESPACE, although it is not a protocol error for the
-   *   subscriber to send a SUBSCRIBE or FETCH message for a track in a
-   *   namespace after receiving a PUBLISH_NAMESPACE_DONE."
+   * @see draft-ietf-moq-transport-18 §10.17
+   * @see draft-ietf-moq-transport-14 §9.26
    */
   withdrawNamespace(namespace: Uint8Array[]): void {
     this.assertState(NamespaceState.ACTIVE, 'withdrawNamespace');
@@ -198,12 +194,12 @@ export class NamespaceStateMachine {
   }
 
   /**
-   * Handle NAMESPACE_DONE received (subscriber side).
-   * Transitions from ACTIVE to TERMINATED.
+   * End the subscription (subscriber side): the response stream closed or the
+   * subscriber cancelled. Transitions from ACTIVE to TERMINATED.
    */
-  handleNamespaceDone(): void {
-    this.assertState(NamespaceState.ACTIVE, 'handleNamespaceDone');
-    this.assertNotPublisher('handleNamespaceDone');
+  terminate(): void {
+    this.assertState(NamespaceState.ACTIVE, 'terminate');
+    this.assertNotPublisher('terminate');
 
     this._state = NamespaceState.TERMINATED;
   }
@@ -244,17 +240,6 @@ export class NamespaceStateMachine {
 
     // Publisher tracks what was sent (for completeness)
     this._discoveredNamespaces.push(namespaceSuffix);
-  }
-
-  /**
-   * Send NAMESPACE_DONE (publisher side).
-   * Transitions from ACTIVE to TERMINATED.
-   */
-  sendNamespaceDone(): void {
-    this.assertState(NamespaceState.ACTIVE, 'sendNamespaceDone');
-    this.assertPublisher('sendNamespaceDone');
-
-    this._state = NamespaceState.TERMINATED;
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────

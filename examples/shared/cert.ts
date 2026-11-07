@@ -49,15 +49,34 @@ export const authority: string | undefined = (() => {
   return value || undefined;
 })();
 
-/** `?warmStart=1`: joining-FETCH warm start of the current group (live LOC tracks). */
+/** `?warmStart=1`: LOC fetches the current group; CMAF/LOCMAF video asks for a new group. */
 export const warmStart: boolean = params.get('warmStart') === '1';
 
-/** Catalog retrieval mode override (?catalogBootstrap=auto|joining-fetch|strict|subscribe).
- *  For manual relay verification of the MSF-01 §5 bootstrap; unset = player default. */
-export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | undefined = (() => {
+/** Catalog retrieval mode override (?catalogBootstrap=auto|joining-fetch|strict|subscribe|fetch);
+ *  unset = player default. */
+export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | 'fetch' | undefined = (() => {
   const v = params.get('catalogBootstrap');
-  return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' ? v : undefined;
+  return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' || v === 'fetch'
+    ? v : undefined;
 })();
+
+/** A positive millisecond parameter, or undefined when absent or invalid. */
+function positiveMs(name: string): number | undefined {
+  const v = Number(params.get(name));
+  return Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+/** `?cushion=MS` / `?cushionMax=MS`: LOC render-cushion floor and cap. */
+export const renderCushionFloorMs: number | undefined = positiveMs('cushion');
+export const renderCushionMaxMs: number | undefined = positiveMs('cushionMax');
+
+/** `?targetLatency=MS`: catch-up set point; on CMAF also where live-edge
+ *  and gap-jump seeks land. Overrides the catalog's targetLatency. */
+export const targetLatencyMs: number | undefined = positiveMs('targetLatency');
+
+/** `?debug=1`: engine debug logging, MSE adapter tracing, and media-element
+ *  events mirrored into the on-page log. */
+export const debug: boolean = params.get('debug') === '1';
 
 /** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18, ?v=22 for draft-22). */
 export const draftVersion: 14 | 16 | 18 | 22 | undefined = (() => {

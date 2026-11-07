@@ -46,6 +46,8 @@ export class AudioAlignedClock implements ClockSource {
 
   /** Last returned value — enforces monotonic contract of ClockSource. */
   private lastNowUs = 0;
+  /** Whether the context was running at the last read: a suspension stops its clock. */
+  private wasRunning = false;
 
   /**
    * Current time in microseconds.
@@ -55,7 +57,11 @@ export class AudioAlignedClock implements ClockSource {
    * Otherwise falls back to performance.now() * 1000.
    */
   now(): number {
-    if (this.audioCtx && this.audioCtx.state === 'running') {
+    const running = this.audioCtx?.state === 'running';
+    // Context time stood still while suspended: re-anchor once it runs again.
+    if (running && !this.wasRunning) this.anchored = false;
+    this.wasRunning = running;
+    if (this.audioCtx && running) {
       const ts = this.audioCtx.getOutputTimestamp();
 
       const ctxTime = ts.contextTime ?? 0;

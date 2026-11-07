@@ -56,6 +56,19 @@ describe('parseCatalogFormat01', () => {
         expect(result.rawDocument).toBeDefined();
     });
 
+    it('leaves out a track whose own or inherited packaging is unknown', () => {
+        const { catalog } = parseCatalogFormat01(JSON.stringify({
+            ...MOQ_RS_CATALOG,
+            commonTrackFields: { ...MOQ_RS_CATALOG.commonTrackFields, packaging: 'm2ts' },
+            tracks: [
+                { ...MOQ_RS_CATALOG.tracks[0], packaging: 'cmaf' },
+                { ...MOQ_RS_CATALOG.tracks[1] },
+            ],
+        }));
+        expect(catalog.tracks.map((t) => t.name)).toEqual(['1.m4s']);
+        expect(catalog.ignoredTracks).toEqual([{ name: '2.m4s', packaging: 'm2ts' }]);
+    });
+
     it('inherits commonTrackFields via generic spread', () => {
         const result = parseCatalogFormat01(JSON.stringify(MOQ_RS_CATALOG));
         const video = result.catalog.tracks[0]!;

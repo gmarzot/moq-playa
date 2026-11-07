@@ -93,6 +93,12 @@ export interface CodecStrategy {
 
   /** Human-readable config record summary for diagnostics. Optional. */
   describeConfig?(description: Uint8Array | undefined): string;
+
+  /**
+   * A description built from parameter sets carried in a keyframe's payload
+   * (LOC-04 §2.1.1), or null when it carries none. Optional.
+   */
+  descriptionFromKeyframe?(data: Uint8Array): Uint8Array | null;
 }
 
 // ─── Factory ────────────────────────────────────────────────────────

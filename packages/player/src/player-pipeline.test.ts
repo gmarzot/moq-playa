@@ -167,6 +167,25 @@ describe('createPipelines', () => {
     expect(result.syncController).not.toBeNull();
   });
 
+  it('gives the default recovery controller the clock, so sustained stalls reduce quality', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const trackInfo: TrackInfo = {
+      video: { codec: 'avc1.64001e', packaging: 'loc' },
+      audio: undefined,
+    };
+    const { recoveryController } = createPipelines(minimalConfig(), clock, trackInfo, mockCallbacks());
+
+    // Five sustained stalls a second apart: inside the 30s window. Without a
+    // clock the windowed counter never runs and every stall only skips forward.
+    const actions: RecoveryAction['type'][] = [];
+    for (let i = 0; i < 5; i++) {
+      nowUs += 1_000_000;
+      actions.push(recoveryController.evaluate({ type: 'stall', durationMs: 500 }).type);
+    }
+    expect(actions).toEqual(['skip_forward', 'skip_forward', 'skip_forward', 'skip_forward', 'reduce_quality']);
+  });
+
   it('creates CommandDispatcher when video decoder factory provided', () => {
     const config = minimalConfig({
       createVideoDecoder: () => ({
@@ -292,6 +311,101 @@ describe('createPipelines', () => {
     // Both held + current should be enqueued
     expect(renderer.enqueue).toHaveBeenCalledTimes(2);
   });
+
+  it('smooth latency: a late frame raises the shared cushion and renders at its new slot; live renders it now', () => {
+    const run = (latencyMode: 'live' | 'smooth') => {
+      let nowUs = 0;
+      const clock: ClockSource = { now: () => nowUs };
+      const videoDecoder = {
+        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+        state: 'configured', decodeQueueSize: 0, ondequeue: null,
+        onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+        onError: null as ((error: Error) => void) | null,
+      };
+      const renderer = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+      };
+      const config = minimalConfig({
+        createVideoDecoder: () => videoDecoder as any,
+        createRenderer: () => renderer as any,
+        latencyMode,
+        smoothFloorMs: 0,
+      });
+      const trackInfo: TrackInfo = { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined };
+      const result = createPipelines(config, clock, trackInfo, mockCallbacks());
+      nowUs = 100_000;
+      result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
+      nowUs = 200_000;
+      videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);  // slot 0.2 + 0.2 cushion
+      // Past the startup grace: capture 4.2 s renders at 3.3 s, slot 3.5 s, decoded at 3.9 s.
+      nowUs = 3_900_000;
+      videoDecoder.onFrame?.({ timestamp: 4_200_000, close: vi.fn() } as any, 0);  // 400 ms late
+      return { times: renderer.enqueue.mock.calls.map((c) => c[1]), policy: result.latencyPolicy };
+    };
+    const live = run('live');
+    expect(live.times).toEqual([400_000, 3_900_000]);
+    expect(live.policy).toBeUndefined();
+    const smooth = run('smooth');
+    // 200 ms cushion + 400 ms late + 50 ms margin.
+    expect(smooth.times).toEqual([400_000, 3_300_000 + 650_000]);
+    expect(smooth.policy?.raises).toBe(1);
+  });
+
+  it('smooth latency: frames held for the sync reference do not raise the cushion', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const result = createPipelines(minimalConfig({
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
+      latencyMode: 'smooth',
+    }), clock, { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
+    // Decoded before any reference: held. Its capture time is 1 s behind the reference set later.
+    nowUs = 100_000;
+    videoDecoder.onFrame?.({ timestamp: 1_000_000, close: vi.fn() } as any, 0);
+    nowUs = 1_200_000;
+    result.syncController.setAudioReference(2_000_000n);
+    videoDecoder.onFrame?.({ timestamp: 2_000_000, close: vi.fn() } as any, 0);   // drains the held frame
+    expect(renderer.enqueue).toHaveBeenCalledTimes(2);
+    expect(result.latencyPolicy?.raises).toBe(0);
+  });
+
+  it('smooth latency: the cushion starts at the floor, so the first frame and audio play 1 s behind', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const result = createPipelines(minimalConfig({
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
+      latencyMode: 'smooth',
+    }), clock, { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
+    expect(result.getRenderCushionUs?.()).toBe(1_000_000);
+    nowUs = 100_000;
+    result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
+    nowUs = 200_000;
+    videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);  // slot 0.2 + 1 s
+    expect(renderer.enqueue.mock.calls.map((c) => c[1])).toEqual([1_200_000]);
+    expect(result.latencyPolicy?.stats).toMatchObject({ heldMs: 1000, floorMs: 1000, raises: 0 });
+  });
 });
 
 // ─── handlePipelineCommand ───────────────────────────────────────────
@@ -368,6 +482,21 @@ describe('handlePipelineEvent', () => {
     }));
   });
 
+  it('an audio skip_forward keeps the sync reference', () => {
+    const syncController = { reset: vi.fn() };
+    const setSyncReset = vi.fn();
+    const recordDiagnostic = vi.fn();
+    handlePipelineEvent('audio', { type: 'skip_forward', fromGroupId: 40n, toGroupId: 42n }, {
+      emitEvent: vi.fn(), log: mockLog, syncController: syncController as any,
+      syncResetThisTick: false, setSyncResetThisTick: setSyncReset, recordDiagnostic,
+      recoveryHook: (a: RecoveryAction) => a,
+    });
+    expect(syncController.reset).not.toHaveBeenCalled();
+    expect(setSyncReset).not.toHaveBeenCalled();
+    expect(recordDiagnostic).toHaveBeenCalledWith('skip_forward');
+    expect(recordDiagnostic).not.toHaveBeenCalledWith('sync_reset');
+  });
+
   it('does not double-reset sync within same tick', () => {
     const emitEvent = vi.fn();
     const syncController = { reset: vi.fn() };
@@ -403,6 +532,31 @@ describe('handlePipelineEvent', () => {
     }));
   });
 
+  it('a timeline jump resets sync for either media type and emits the player event', () => {
+    const emitEvent = vi.fn();
+    const syncController = { reset: vi.fn() };
+    const setSyncReset = vi.fn();
+    handlePipelineEvent('audio', { type: 'timeline_jump', fromGroupId: 100n, toGroupId: 3600n, jumpUs: 70_000_000 }, {
+      emitEvent, log: mockLog, syncController: syncController as any,
+      syncResetThisTick: false, setSyncResetThisTick: setSyncReset,
+      recoveryHook: (a: RecoveryAction) => a,
+    });
+    expect(syncController.reset).toHaveBeenCalledTimes(1);
+    expect(setSyncReset).toHaveBeenCalledWith(true);
+    expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'timeline_jump', mediaType: 'audio', fromGroupId: 100n, toGroupId: 3600n, jumpMs: 70_000,
+    }));
+  });
+
+  it('passes a local skip through to the recovery hook', () => {
+    const recoveryHook = vi.fn((a: RecoveryAction) => a);
+    handlePipelineEvent('video', { type: 'recovery', action: { type: 'skip_forward' }, localSkip: true }, {
+      emitEvent: vi.fn(), log: mockLog, syncController: null,
+      syncResetThisTick: false, setSyncResetThisTick: vi.fn(), recoveryHook,
+    });
+    expect(recoveryHook).toHaveBeenCalledWith({ type: 'skip_forward' }, true);
+  });
+
   it('emits track_ended', () => {
     const emitEvent = vi.fn();
     const evt: PlaybackEvent = { type: 'track_ended' };
@@ -434,6 +588,18 @@ describe('handleRecoveryAction', () => {
     const action: RecoveryAction = { type: 'resubscribe' };
     handleRecoveryAction(action, 'video', null, mockLog, callbacks);
     expect(callbacks.onResubscribe).toHaveBeenCalledWith('video', undefined);
+  });
+
+  it('a video skip_forward re-requests the next group', () => {
+    const callbacks = { onQualityReduced: vi.fn(), onResubscribe: vi.fn(), onTerminate: vi.fn() };
+    handleRecoveryAction({ type: 'skip_forward' }, 'video', null, mockLog, callbacks);
+    expect(callbacks.onResubscribe).toHaveBeenCalledWith('video');
+  });
+
+  it('a local video skip_forward requests nothing', () => {
+    const callbacks = { onQualityReduced: vi.fn(), onResubscribe: vi.fn(), onTerminate: vi.fn() };
+    handleRecoveryAction({ type: 'skip_forward' }, 'video', null, mockLog, callbacks, true);
+    expect(callbacks.onResubscribe).not.toHaveBeenCalled();
   });
 
   it('calls onTerminate for fatal recovery', () => {
@@ -515,6 +681,24 @@ describe('computePlaybackDelayUs — the ONE shared playout cushion', () => {
     expect(computePlaybackDelayUs(undefined, undefined)).toBe(200_000);
     expect(computePlaybackDelayUs(undefined, 2)).toBe(50_000);
   });
+
+  // The static floor is a guess about jitter; a declared target is what the
+  // publisher asked for. The guess must not silently overrule it.
+  it('a declared target caps the floor, including the adaptive component', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 50_000)).toBe(50_000);
+    expect(computePlaybackDelayUs(400_000, 40, 50_000)).toBe(50_000);
+    expect(computePlaybackDelayUs(120_000, undefined, 30_000)).toBe(30_000);
+  });
+
+  it('a target above the floor does not raise it', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 900_000)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 2, 900_000)).toBe(50_000);
+  });
+
+  it('a zero or absent target leaves the floor alone', () => {
+    expect(computePlaybackDelayUs(undefined, 40, 0)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 40)).toBe(200_000);
+  });
 });
 
 describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
@@ -560,6 +744,57 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     // detector consumes — remains the raw adaptive 2000ms, untouched by
     // the smoother.
     expect(result.videoPipeline!.effectiveGapTimeoutUs).toBe(2_000_000);
+  });
+
+  it('renderCushionFloorMs overrides the RTT-derived floor', () => {
+    const low = createPipelines(minimalConfig({ renderCushionFloorMs: 50 }), mockClock, LOC_AV, mockCallbacks(), 40);
+    expect(low.getRenderCushionUs!()).toBe(50_000);
+    const high = createPipelines(minimalConfig({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks(), 2);
+    expect(high.getRenderCushionUs!()).toBe(900_000);
+  });
+
+  it('renderCushionMaxMs caps scheduled adoption; a floor above the default cap lifts it', () => {
+    const withDecoder = (overrides: Partial<MoqtPlayerConfig>) => minimalConfig({
+      ...overrides,
+      createVideoDecoder: () => ({
+        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+        state: 'unconfigured', decodeQueueSize: 0, ondequeue: null,
+      }) as any,
+    });
+    // The scheduling path advances the smoother; its first update snaps to
+    // the clamped target.
+    const schedule = (r: ReturnType<typeof createPipelines>) => {
+      Object.defineProperty(r.videoPipeline, 'effectiveGapTimeoutUs', {
+        get: () => 2_000_000, configurable: true,
+      });
+      (r.commandDispatcher as any)._getPlaybackDelayUs();
+    };
+
+    const capped = createPipelines(withDecoder({ renderCushionFloorMs: 50, renderCushionMaxMs: 120 }), mockClock, LOC_AV, mockCallbacks());
+    schedule(capped);
+    expect(capped.getRenderCushionUs!()).toBe(120_000);
+
+    const lifted = createPipelines(withDecoder({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks());
+    schedule(lifted);
+    expect(lifted.getRenderCushionUs!()).toBe(900_000);
+
+    // No explicit cap: the catalog target latency is the ceiling, and a
+    // config target latency overrides the catalog's.
+    const byCatalog = createPipelines(withDecoder({ renderCushionFloorMs: 50 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(byCatalog);
+    expect(byCatalog.getRenderCushionUs!()).toBe(100_000);
+
+    const byConfig = createPipelines(withDecoder({ renderCushionFloorMs: 50, targetLatencyMs: 300 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(byConfig);
+    expect(byConfig.getRenderCushionUs!()).toBe(300_000);
+
+    // An explicit cap still wins over the target.
+    const explicit = createPipelines(withDecoder({ renderCushionFloorMs: 50, renderCushionMaxMs: 600 }), mockClock,
+      { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
+    schedule(explicit);
+    expect(explicit.getRenderCushionUs!()).toBe(600_000);
   });
 
   it('CMAF sessions expose no LOC render cushion', () => {

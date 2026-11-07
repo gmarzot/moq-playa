@@ -40,6 +40,9 @@ export interface CatalogBuilderTrack {
   readonly channelConfig?: string;
   /** Render group for A/V sync. @see §5.1.18 */
   readonly renderGroup?: number;
+  /** Playout set point in ms. Must match across a renderGroup, and must be
+   *  absent when isLive is false. @see §5.1.16 */
+  readonly targetLatency?: number;
   /** Alternative encoding group. @see draft-ietf-moq-msf-01 section 5.2.12 */
   readonly altGroup?: number;
   /** BCP 47 language tag. @see draft-ietf-moq-msf-01 section 5.2.32 */
@@ -67,9 +70,10 @@ export interface BuildCatalogOptions {
    * Catalog version to emit. `1` (default) writes the numeric MSF-00 form; the
    * string `"1"` writes the MSF-01/CMSF-01 form, which a compliant parser reads
    * identically but which pairs with the init-by-reference fields below.
+   * `"draft-01"` is MSF-01's spelling for use against that draft release.
    * @see draft-ietf-moq-msf-00 §5.1.1 / draft-ietf-moq-msf-01 §5.1.1
    */
-  readonly version?: 1 | '1';
+  readonly version?: 1 | '1' | 'draft-01';
   /**
    * Root Initialization Data List (MSF-01/CMSF-01). When present it is emitted at
    * the catalog root and tracks reference entries by `initRef` instead of
@@ -109,6 +113,7 @@ export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
     if (t.samplerate !== undefined) track.samplerate = t.samplerate;
     if (t.channelConfig !== undefined) track.channelConfig = t.channelConfig;
     if (t.renderGroup !== undefined) track.renderGroup = t.renderGroup;
+    if (t.targetLatency !== undefined) track.targetLatency = t.targetLatency;
     if (t.altGroup !== undefined) track.altGroup = t.altGroup;
     if (t.lang !== undefined) track.lang = t.lang;
     if (t.label !== undefined) track.label = t.label;

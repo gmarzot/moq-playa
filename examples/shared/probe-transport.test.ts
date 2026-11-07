@@ -102,9 +102,9 @@ describe('probeTransport option building', () => {
     expect(constructed[1]!.options.protocols).toEqual(['moqt-16']);
   });
 
-  it('offers moqt-16 when no draft version is specified (factory default)', async () => {
+  it('offers every draft, newest first, when no draft version is specified (factory default)', async () => {
     await probeTransport('https://r:4433/moq');
-    expect(constructed[0]!.options.protocols).toEqual(['moqt-16']);
+    expect(constructed[0]!.options.protocols).toEqual(['moqt-22', 'moqt-18', 'moqt-16']);
   });
 
   it('offers no protocols for draft 14 (h3 ALPN fallback)', async () => {

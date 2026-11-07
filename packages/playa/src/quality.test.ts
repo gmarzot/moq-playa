@@ -22,6 +22,7 @@ function mockElement(): any {
     appendChild: vi.fn(),
     removeChild: vi.fn(),
     addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
     getContext: vi.fn(() => ({ drawImage: vi.fn() })),
     width: 0, height: 0,
     hidden: false, muted: false, volume: 1, playsInline: false,

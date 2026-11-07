@@ -346,4 +346,38 @@ describe('RequestIdAllocator', () => {
       }
     });
   });
+
+  describe('uncapped until MAX_REQUEST_ID (compat)', () => {
+    it('allocates without credit and counts it', () => {
+      const allocator = new RequestIdAllocator('client');
+      allocator.allowUncappedUntilMaxRequestId();
+      expect(allocator.canAllocate()).toBe(true);
+      expect(allocator.allocate()).toBe(0n);
+      expect(allocator.allocate()).toBe(2n);
+      expect(allocator.uncappedAllocations).toBe(2);
+      expect(allocator.isBlocked()).toBe(false);
+    });
+
+    it('ends at the first MAX_REQUEST_ID, even one below the IDs already used', () => {
+      const allocator = new RequestIdAllocator('client');
+      allocator.allowUncappedUntilMaxRequestId();
+      allocator.allocate(); // 0
+      allocator.allocate(); // 2
+      allocator.updatePeerMaxRequestId(varint(2n));
+      expect(allocator.isUncapped).toBe(false);
+      expect(allocator.canAllocate()).toBe(false);
+      expect(() => allocator.allocate()).toThrow(RequestIdError);
+      allocator.updatePeerMaxRequestId(varint(10n));
+      expect(allocator.allocate()).toBe(4n);
+    });
+
+    it('is a no-op once the peer has granted credit', () => {
+      const allocator = new RequestIdAllocator('client');
+      allocator.updatePeerMaxRequestId(varint(2n));
+      allocator.allowUncappedUntilMaxRequestId();
+      expect(allocator.isUncapped).toBe(false);
+      allocator.allocate(); // 0
+      expect(() => allocator.allocate()).toThrow(RequestIdError);
+    });
+  });
 });

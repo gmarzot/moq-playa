@@ -124,26 +124,29 @@ describe('WebCodecsAudioDecoder', () => {
     expect(received).toEqual([100, 999]);
   });
 
-  it('preserves the chunk timestamp through decode (CaptureTimestamp fidelity)', () => {
-    // LOC sets EncodedAudioChunk.timestamp = CaptureTimestamp; the playhead
-    // mapping (WebAudioOutput.playheadCaptureUs) depends on that value
-    // surviving decode untouched. Our decoder must (a) pass the chunk
-    // timestamp into the EncodedAudioChunk verbatim and (b) hand the
-    // decoder's AudioData to onData unmodified. (The browser preserving
-    // chunk→AudioData timestamps is WebCodecs-spec behavior, verified
-    // end-to-end in Chrome by the skew harness.)
+  it('reports each chunk\'s capture timestamp, not the decoder\'s rebased output timestamp', () => {
+    // Measured in Chrome (AAC, ADTS): outputs carry first-chunk time plus
+    // decoded samples. With every other chunk withheld, outputs stayed
+    // contiguous and ended at 1.49 s against 2.99 s of input — so
+    // AudioData.timestamp drifts from CaptureTimestamp whenever audio goes
+    // missing, which drove the A/V skew stat to equal the session runtime.
     const decoder = configuredDecoder();
-    const received: any[] = [];
-    decoder.onData = (data) => received.push(data);
+    const received: Array<{ renderTimeUs: number; captureUs?: number; data: any }> = [];
+    decoder.onData = (data, renderTimeUs, captureUs) => received.push({ data, renderTimeUs, captureUs });
 
-    decoder.decode({ type: 'key', timestamp: 1_234_567, duration: 20_000, data: new Uint8Array([1]) }, 99);
+    decoder.decode({ type: 'key', timestamp: 1_000_000, duration: 21_333, data: new Uint8Array([1]) }, 10);
+    decoder.decode({ type: 'key', timestamp: 1_042_666, duration: 21_333, data: new Uint8Array([1]) }, 20);
 
-    const submitted = decodeSpy.mock.calls[0]![0] as { timestamp: number };
-    expect(submitted.timestamp).toBe(1_234_567);
+    const submitted = decodeSpy.mock.calls.map((c) => (c[0] as { timestamp: number }).timestamp);
+    expect(submitted).toEqual([1_000_000, 1_042_666]);
 
-    const fakeAudioData = { timestamp: 1_234_567 };
-    createdDecoders[0]!.output(fakeAudioData);
-    expect(received[0]).toBe(fakeAudioData); // same object, timestamp untouched
+    // Chrome rebases: the second output is contiguous by samples, not 1_042_666.
+    const mock = createdDecoders[0]!;
+    mock.output({ timestamp: 1_000_000 });
+    mock.output({ timestamp: 1_021_333 });
+
+    expect(received.map((r) => r.captureUs)).toEqual([1_000_000, 1_042_666]);
+    expect(received.map((r) => r.renderTimeUs)).toEqual([10, 20]);
   });
 
   it('pairs output after an Audio Config change with the new chunk render time', () => {
@@ -208,6 +211,32 @@ describe('WebCodecsAudioDecoder', () => {
     expect(createdDecoders).toHaveLength(2);
     expect(createdDecoders[1]!.lastConfig?.description).toEqual(description);
     decoder.destroy();
+  });
+
+  it('configures Opus at 48 kHz whatever rate the catalog names; AAC keeps its rate', () => {
+    const decoder = new WebCodecsAudioDecoder();
+    decoder.configure(new Uint8Array(0), 'opus', 44100, 2);
+    expect(createdDecoders.at(-1)!.lastConfig!.sampleRate).toBe(48000);
+    decoder.configure(new Uint8Array(0), 'mp4a.40.2', 44100, 2);
+    expect(createdDecoders.at(-1)!.lastConfig!.sampleRate).toBe(44100);
+  });
+
+  it('reports an unsupported configuration once and does not rebuild until reconfigured', () => {
+    const decoder = configuredDecoder();
+    const errors: Error[] = [];
+    decoder.onError = (e) => errors.push(e);
+    const created = createdDecoders.length;
+
+    createdDecoders.at(-1)!.error(new DOMException('Unsupported configuration.', 'NotSupportedError'));
+    decoder.decode(chunk(0), 0);
+    decoder.reset();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.name).toBe('NotSupportedError');
+    expect(errors[0]!.message).toContain('opus at 48000 Hz');
+    expect(createdDecoders).toHaveLength(created);
+    decoder.configure(new Uint8Array(0), 'opus', 48000, 2);
+    expect(createdDecoders).toHaveLength(created + 1);
   });
 
   it('resets and reports on decode queue overflow instead of dropping silently', () => {

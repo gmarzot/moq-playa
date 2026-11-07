@@ -23,6 +23,7 @@ export type {
     PlaybackEvent,
     GapDetectedEvent,
     SkipForwardEvent,
+    TimelineJumpEvent,
     SyncDriftEvent,
     KeyframeWaitingEvent,
     KeyframeValidationFailedEvent,
