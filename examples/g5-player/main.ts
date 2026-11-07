@@ -447,11 +447,12 @@ async function main(): Promise<void> {
   /** The catalog SUBSCRIBE can be accepted long before any catalog arrives. */
   let catalogArrived = false;
   /** The catalog's own label; a refusal or a failure shows in its place. */
-  let catalogLabelText = catMeta.textContent ?? '';
+  const catalogWaitingText = catMeta.textContent ?? '';
+  let catalogLabelText = catalogWaitingText;
   const renderCatalogStatus = (): void => {
     const retry = (player as any).engine?.catalogRetry;
     let text = catalogLabelText;
-    let color = '';
+    let color = text === catalogWaitingText ? 'var(--badge-idle-fg)' : '';
     let detail = '';
     if (player.state === 'error' && !catalogArrived) {
       text = 'failed';
