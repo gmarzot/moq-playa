@@ -968,6 +968,10 @@ async function main(): Promise<void> {
   const TICK_MS = 250;
   /** Time span each chart shows. */
   const CHART_SPAN_MS = 45_000;
+  /** Charts start this long after the first media object, past the join's burst and the queue's fill. */
+  const CHART_STARTUP_HOLD_MS = 4_000;
+  /** performance.now() of the first media object; null before it. */
+  let firstMediaObjectMs: number | null = null;
   /** Tick times; every chart series holds one value per entry. */
   const sampleAtMs: number[] = [];
   /** [arrival ms, latency ms, group]: the group lets a timeline jump take its samples back out. */
@@ -1437,6 +1441,7 @@ async function main(): Promise<void> {
   (player as any).on('media_object', (e: any) => {
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
+      firstMediaObjectMs ??= nowMs;
       traceArrival(e, nowMs);
       lastArrivalMs[e.mediaType as 'video' | 'audio'] = nowMs;
     }
@@ -1716,6 +1721,17 @@ async function main(): Promise<void> {
     frozenSinceMs = freezeSince;
     const frozen = frozenSinceMs !== null;
 
+    const settling = firstMediaObjectMs === null || tickNowMs - firstMediaObjectMs < CHART_STARTUP_HOLD_MS;
+    if (settling) {
+      // Nothing from the hold reaches a window, the MAX dot or the drift fit.
+      latWindow.length = 0;
+      latHistory.length = 0;
+      audioLatWindow.length = 0;
+      screenWindow.length = 0;
+      tickWorstRawMs = -Infinity;
+      jitterEwma = 0;
+    }
+
     // Trimmed here, not on arrival, so an outage empties the window and leaves a gap.
     while (latWindow.length && tickNowMs - latWindow[0]![0] > LAT_WINDOW_MS) latWindow.shift();
     while (latHistory.length && tickNowMs - latHistory[0]![0] > CHART_SPAN_MS + LAT_WINDOW_MS) latHistory.shift();
@@ -1750,9 +1766,9 @@ async function main(): Promise<void> {
     latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
     latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
     latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) && !frozen ? tickWorstRawMs - driftCorrectionMs : NaN);
-    jitSamples.push(prevCaptureMs || expectedIntervalMs ? jitterEwma : NaN);
-    queuedASamples.push(queued ? (aMs ?? NaN) : NaN);
-    queuedVSamples.push(queued ? (vMs ?? NaN) : NaN);
+    jitSamples.push(!settling && (prevCaptureMs || expectedIntervalMs) ? jitterEwma : NaN);
+    queuedASamples.push(queued && !settling ? (aMs ?? NaN) : NaN);
+    queuedVSamples.push(queued && !settling ? (vMs ?? NaN) : NaN);
     tickWorstRawMs = -Infinity;
     trimSamples(tickNowMs);
 
