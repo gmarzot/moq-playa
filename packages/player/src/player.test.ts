@@ -10875,6 +10875,34 @@ describe('MoqtPlayer', () => {
           await player.destroy();
         });
 
+        it('two picks waiting on one switch: the later wins, with one subscription', async () => {
+          const { player, adapter } = await loadLive(500_000);
+          const subsBefore = (adapter.subscribe as any).mock.calls.length;
+          const abr = player.selectVideoTrack('video-0', 'bandwidth', 'upshift');
+          const first = player.selectVideoTrack('video-1', 'manual');
+          const second = player.selectVideoTrack('video-2', 'manual');
+          await Promise.all([abr, first, second]);
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-2');
+          const names = (adapter.subscribe as any).mock.calls.slice(subsBefore)
+            .map((c: any) => { try { return new TextDecoder().decode(c[1]); } catch { return ''; } });
+          const unsubscribed = (adapter.unsubscribe as any).mock.calls.length;
+          expect(names.filter((n: string) => n === 'video-2')).toHaveLength(1);
+          expect(unsubscribed).toBe(names.length - 1);
+          await player.destroy();
+        });
+
+        it('goes ahead when a switch is cleared without an outcome', async () => {
+          const { player } = await loadLive(500_000);
+          const p = player as any;
+          p.switchInProgress = true;
+          const manual = player.selectVideoTrack('video-2', 'manual');
+          await new Promise(r => setTimeout(r, 10));
+          p.switchInProgress = false;
+          await manual;
+          expect(p.pendingVideoSwitch?.newTrackName).toBe('video-2');
+          await player.destroy();
+        });
+
         it('still refuses an ABR switch while a manual one is pending', async () => {
           const { player } = await loadLive(500_000);
           await player.selectVideoTrack('video-2', 'manual');

@@ -2979,7 +2979,17 @@ export class MoqtPlayer {
       if (reason !== 'manual' || inFlight === 'view' || inFlight === 'program') {
         throw new Error('Cannot switch video track: a video track switch is already in progress');
       }
-      if (await this.supersedeVideoSwitch(trackName)) return;
+      // No await between the wait's end and the reservation below: one waiting pick goes at a time.
+      while ((this.videoSwitchStarting || this.switchInProgress) && !this._destroyed) {
+        await this.videoSwitchChange();
+      }
+      if (this._destroyed) return;
+      const sw = this.pendingVideoSwitch;
+      if (sw?.newTrackName === trackName) {
+        this.qualityController?.lockManual();
+        return;
+      }
+      if (sw) this.abortPendingVideoSwitch(sw, new Error(`superseded by a manual pick of "${trackName}"`), { quiet: true });
     }
     this.videoSwitchStarting = true;
     this.videoSwitchStartingTarget = trackName;
@@ -2997,32 +3007,20 @@ export class MoqtPlayer {
   }
 
   /**
-   * For a manual pick of `trackName`: wait out a video switch that is starting
-   * or committing, then cancel the one still pending. True when the switch
-   * left pending already goes to `trackName`.
+   * Settles when the video switch in flight may have moved on: it started,
+   * committed or failed, or VIDEO_SWITCH_RECHECK_MS passed, which covers paths
+   * that clear a switch without an outcome (a migration).
    */
-  private async supersedeVideoSwitch(trackName: string): Promise<boolean> {
-    while ((this.videoSwitchStarting || this.switchInProgress) && !this._destroyed) {
-      await (this.videoSwitchStarting && this.videoSwitchStart ? this.videoSwitchStart : this.nextVideoSwitchOutcome());
-    }
-    const sw = this.pendingVideoSwitch;
-    if (sw?.newTrackName === trackName) {
-      this.qualityController?.lockManual();
-      return true;
-    }
-    if (sw) this.abortPendingVideoSwitch(sw, new Error(`superseded by a manual pick of "${trackName}"`), { quiet: true });
-    return false;
-  }
-
-  /** Settles when the pending video switch commits or fails, or the player goes away. */
-  private nextVideoSwitchOutcome(): Promise<void> {
+  private videoSwitchChange(): Promise<void> {
     return new Promise((resolve) => {
       const offs: Array<() => void> = [];
-      const done = (): void => { for (const off of offs) off(); resolve(); };
-      offs.push(this.emitter.on('quality_switched', done), this.emitter.on('quality_switch_failed', done),
-        this.emitter.on('state_changed', () => { if (this._destroyed) done(); }));
+      const done = (): void => { clearTimeout(timer); for (const off of offs) off(); resolve(); };
+      const timer = setTimeout(done, MoqtPlayer.VIDEO_SWITCH_RECHECK_MS);
+      offs.push(this.emitter.on('quality_switched', done), this.emitter.on('quality_switch_failed', done));
+      void this.videoSwitchStart?.then(done);
     });
   }
+  private static readonly VIDEO_SWITCH_RECHECK_MS = 250;
 
   /** Body of `selectVideoTrack`, serialized by it. */
   private async startVideoSwitch(
