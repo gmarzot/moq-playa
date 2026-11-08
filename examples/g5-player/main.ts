@@ -1269,19 +1269,20 @@ async function main(): Promise<void> {
   };
   const holeSkipped = (startSec: number): boolean =>
     skippedHoleStartsSec.some((s) => Math.abs(startSec - s) < 0.05);
-  /** Starts of holes already counted as freezes. */
-  const countedHoleStartsSec: number[] = [];
+  /** Holes already counted as freezes, kept while the 1 s lookback still reaches them. */
+  let countedHoles: Array<[number, number]> = [];
   const noteVideoHoles = (ms: any): void => {
     const ranges: Array<[number, number]> | undefined = ms?.bufferedRanges?.('video');
     const video = playerContainer.querySelector('video');
     if (!ranges || !video) return;
     const t = video.currentTime;
+    countedHoles = countedHoles.filter(([, end]) => end >= t - 1);
     const holes = new Set<string>();
     for (let i = 1; i < ranges.length; i++) {
       const a = ranges[i - 1]![1];
       const b = ranges[i]![0];
       if (b < t - 1) continue;
-      if (holeSkipped(a) || countedHoleStartsSec.some((s) => Math.abs(a - s) < 0.05)) continue;
+      if (holeSkipped(a) || countedHoles.some(([s]) => Math.abs(a - s) < 0.05)) continue;
       const key = `${a.toFixed(2)}-${b.toFixed(2)}`;
       holes.add(key);
       if (videoHolesSeen.has(key)) continue;
@@ -1297,8 +1298,7 @@ async function main(): Promise<void> {
         if (!holeSkipped(a)) {
           videoFreezes++;
           videoFrozenSec += b - a;
-          countedHoleStartsSec.push(a);
-          if (countedHoleStartsSec.length > 8) countedHoleStartsSec.shift();
+          countedHoles.push([a, b]);
         }
         videoHolesSeen.delete(key);
       } else if (!holes.has(key)) {
