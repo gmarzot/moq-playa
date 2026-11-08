@@ -954,6 +954,9 @@ export class MoqtPlayer {
   private videoSwitchStarting = false;
   /** Target of the switch `videoSwitchStarting` guards (a repeat request for it is a no-op). */
   private videoSwitchStartingTarget: string | null = null;
+  private videoSwitchStartingReason: string | null = null;
+  /** Settles when the video switch now starting has started or failed. */
+  private videoSwitchStart: Promise<void> | null = null;
   /** Video tracks found not to decode here; never switched to again this session. */
   private readonly undecodableVideoTracks = new Set<string>();
   /** The video track played before the current one, for leaving an undecodable track. */
@@ -2967,18 +2970,57 @@ export class MoqtPlayer {
     // manual) racing the first through its awaits would overwrite the pending
     // switch and orphan a subscription.
     if (this.pendingVideoSwitch || this.switchInProgress || this.videoSwitchStarting) {
-      if (this.pendingVideoSwitch?.newTrackName === trackName || this.videoSwitchStartingTarget === trackName) return;
-      throw new Error('Cannot switch video track: a video track switch is already in progress');
+      if (this.pendingVideoSwitch?.newTrackName === trackName || this.videoSwitchStartingTarget === trackName) {
+        if (reason === 'manual') this.qualityController?.lockManual();
+        return;
+      }
+      // A manual pick wins over a quality switch in flight, not over a view or program change.
+      const inFlight = this.pendingVideoSwitch?.reason ?? this.videoSwitchStartingReason;
+      if (reason !== 'manual' || inFlight === 'view' || inFlight === 'program') {
+        throw new Error('Cannot switch video track: a video track switch is already in progress');
+      }
+      // No await between the wait's end and the reservation below: one waiting pick goes at a time.
+      while ((this.videoSwitchStarting || this.switchInProgress) && !this._destroyed) {
+        await this.videoSwitchChange();
+      }
+      if (this._destroyed) return;
+      const sw = this.pendingVideoSwitch;
+      if (sw?.newTrackName === trackName) {
+        this.qualityController?.lockManual();
+        return;
+      }
+      if (sw) this.abortPendingVideoSwitch(sw, new Error(`superseded by a manual pick of "${trackName}"`), { quiet: true });
     }
     this.videoSwitchStarting = true;
     this.videoSwitchStartingTarget = trackName;
+    this.videoSwitchStartingReason = reason;
+    const start = this.startVideoSwitch(trackName, reason, abrAction);
+    this.videoSwitchStart = start.then(() => undefined, () => undefined);
     try {
-      await this.startVideoSwitch(trackName, reason, abrAction);
+      await start;
     } finally {
       this.videoSwitchStarting = false;
       this.videoSwitchStartingTarget = null;
+      this.videoSwitchStartingReason = null;
+      this.videoSwitchStart = null;
     }
   }
+
+  /**
+   * Settles when the video switch in flight may have moved on: it started,
+   * committed or failed, or VIDEO_SWITCH_RECHECK_MS passed, which covers paths
+   * that clear a switch without an outcome (a migration).
+   */
+  private videoSwitchChange(): Promise<void> {
+    return new Promise((resolve) => {
+      const offs: Array<() => void> = [];
+      const done = (): void => { clearTimeout(timer); for (const off of offs) off(); resolve(); };
+      const timer = setTimeout(done, MoqtPlayer.VIDEO_SWITCH_RECHECK_MS);
+      offs.push(this.emitter.on('quality_switched', done), this.emitter.on('quality_switch_failed', done));
+      void this.videoSwitchStart?.then(done);
+    });
+  }
+  private static readonly VIDEO_SWITCH_RECHECK_MS = 250;
 
   /** Body of `selectVideoTrack`, serialized by it. */
   private async startVideoSwitch(
@@ -3449,9 +3491,11 @@ export class MoqtPlayer {
    * SourceBuffer; the new track is unsubscribed; staged bytes are
    * discarded; an error event surfaces to the application.
    */
+  /** `quiet`: superseded, not failed — reported as quality_switch_failed only, not as an error. */
   private abortPendingVideoSwitch(
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
     cause: Error,
+    { quiet = false }: { quiet?: boolean } = {},
   ): void {
     if (this.pendingVideoSwitch === sw) this.clearVideoSwitchTimers();
     if (this.connection && this.subscriptionManager) {
@@ -3474,13 +3518,15 @@ export class MoqtPlayer {
       reason: sw.reason,
       error: cause,
     });
-    this.emitError(createPlayerError(
-      'degraded',
-      'decoder',
-      PlayerErrorCode.VIDEO_DECODE_ERROR,
-      `Track switch to "${sw.newTrackName}" failed: ${cause.message}`,
-      { cause, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
-    ));
+    if (!quiet) {
+      this.emitError(createPlayerError(
+        'degraded',
+        'decoder',
+        PlayerErrorCode.VIDEO_DECODE_ERROR,
+        `Track switch to "${sw.newTrackName}" failed: ${cause.message}`,
+        { cause, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
+      ));
+    }
     if (sw.programLeg) this.settleProgramLeg('video', false);
   }
 

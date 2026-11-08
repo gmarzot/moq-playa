@@ -10821,6 +10821,97 @@ describe('MoqtPlayer', () => {
         await player.destroy();
       });
 
+      describe('a manual pick during a switch in flight', () => {
+        /** loadLive with an ABR upshift to video-0 pending. */
+        async function withAbrPending() {
+          const live = await loadLive(500_000);
+          clockUs = 6 * S;
+          timeObjects(live.player, 20_000);
+          live.player.tick();
+          await new Promise(r => setTimeout(r, 0));
+          expect((live.player as any).pendingVideoSwitch?.newTrackName).toBe('video-0');
+          return live;
+        }
+
+        it('replaces a pending ABR switch, reported as superseded, not as an error', async () => {
+          const { player, subscribedTo } = await withAbrPending();
+          const failed = vi.fn();
+          const errors = vi.fn();
+          player.on('quality_switch_failed', failed);
+          player.on('error', errors);
+          player.setAutoQuality(false);
+          await player.selectVideoTrack('video-2', 'manual');
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-2');
+          expect(subscribedTo('video-2')).toBe(true);
+          expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video-0' }));
+          expect(errors).not.toHaveBeenCalled();
+          await player.destroy();
+        });
+
+        it('keeps a pending switch that already goes to the pick, and locks manual', async () => {
+          const { player } = await withAbrPending();
+          const pending = (player as any).pendingVideoSwitch;
+          await player.selectVideoTrack('video-0', 'manual');
+          expect((player as any).pendingVideoSwitch).toBe(pending);
+          expect(player.autoQuality).toBe(false);
+          await player.destroy();
+        });
+
+        it('waits for a switch that is still starting, then replaces it', async () => {
+          const { player } = await loadLive(500_000);
+          const abr = player.selectVideoTrack('video-0', 'bandwidth', 'upshift');
+          const manual = player.selectVideoTrack('video-2', 'manual');
+          await abr;
+          await manual;
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-2');
+          await player.destroy();
+        });
+
+        it('replaces an earlier manual pick still pending', async () => {
+          const { player } = await loadLive(500_000);
+          await player.selectVideoTrack('video-0', 'manual');
+          await player.selectVideoTrack('video-2', 'manual');
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-2');
+          await player.destroy();
+        });
+
+        it('two picks waiting on one switch: the later wins, with one subscription', async () => {
+          const { player, adapter } = await loadLive(500_000);
+          const subsBefore = (adapter.subscribe as any).mock.calls.length;
+          const abr = player.selectVideoTrack('video-0', 'bandwidth', 'upshift');
+          const first = player.selectVideoTrack('video-1', 'manual');
+          const second = player.selectVideoTrack('video-2', 'manual');
+          await Promise.all([abr, first, second]);
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-2');
+          const names = (adapter.subscribe as any).mock.calls.slice(subsBefore)
+            .map((c: any) => { try { return new TextDecoder().decode(c[1]); } catch { return ''; } });
+          const unsubscribed = (adapter.unsubscribe as any).mock.calls.length;
+          expect(names.filter((n: string) => n === 'video-2')).toHaveLength(1);
+          expect(unsubscribed).toBe(names.length - 1);
+          await player.destroy();
+        });
+
+        it('goes ahead when a switch is cleared without an outcome', async () => {
+          const { player } = await loadLive(500_000);
+          const p = player as any;
+          p.switchInProgress = true;
+          const manual = player.selectVideoTrack('video-2', 'manual');
+          await new Promise(r => setTimeout(r, 10));
+          p.switchInProgress = false;
+          await manual;
+          expect(p.pendingVideoSwitch?.newTrackName).toBe('video-2');
+          await player.destroy();
+        });
+
+        it('still refuses an ABR switch while a manual one is pending', async () => {
+          const { player } = await loadLive(500_000);
+          await player.selectVideoTrack('video-2', 'manual');
+          await expect(player.selectVideoTrack('video-0', 'bandwidth', 'upshift')).rejects.toThrow('already in progress');
+          expect((player as any).pendingVideoSwitch?.newTrackName).toBe('video-2');
+          await player.destroy();
+        });
+      });
+
       it('a recovery step-down fails an upshift on trial', async () => {
         const { player } = await loadLive(500_000);
         const p = player as any;
