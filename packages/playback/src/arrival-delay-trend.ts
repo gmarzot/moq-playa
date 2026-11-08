@@ -42,11 +42,12 @@ export class ArrivalDelayTrend {
     }
 
     /**
-     * How far the delay rose across the window (µs), or 0 unless it rose
+     * How far `track`'s delay rose across the window (µs), or 0 unless it rose
      * through both halves of it: the last third's minimum above the middle's,
      * and the middle's above the first's, each by a quarter of the rise.
      */
-    riseUs(nowUs: number): number {
+    riseUs(track: string, nowUs: number): number {
+        if (track !== this.track) return 0;
         this.trim(nowUs);
         const b = this.buckets;
         if (b.length < 3 || b[b.length - 1]!.startUs - b[0]!.startUs < ArrivalDelayTrend.MIN_SPAN_US) return 0;

@@ -6986,7 +6986,7 @@ export class MoqtPlayer {
     } else {
       this.linkShort = null;
     }
-    const riseUs = this.videoArrivalDelay.riseUs(now);
+    const riseUs = this.videoArrivalDelay.riseUs(track.name, now);
     if (riseUs > MoqtPlayer.ABR_BACKLOG_RISE_US) {
       return `video arriving ${Math.round(riseUs / 1000)} ms later`;
     }
