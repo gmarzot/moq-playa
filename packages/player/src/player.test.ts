@@ -9576,7 +9576,7 @@ describe('MoqtPlayer', () => {
         );
       }
 
-      return { adapter, renderer, decoder, player, feedGroups, simulateRenderedFrames, hasSubscribeTo };
+      return { adapter, renderer, decoder, player, feedGroups, simulateRenderedFrames, hasSubscribeTo, videoAlias };
     }
 
     it('LOC: upshifts when healthy delivery + high bandwidth + stability elapsed + rendered frames', async () => {
@@ -9609,6 +9609,101 @@ describe('MoqtPlayer', () => {
       player.tick();
       expect(hasSubscribeTo('video-0', subsBefore)).toBe(true);
       await player.destroy();
+    });
+
+    describe('LOC: steps down when the link falls behind the rung', () => {
+      const T0 = 1_726_000_000_000_000n;
+
+      /** Ten video-1 objects a second, a group a second, each captured `delayAt(t, i)` µs before it arrives. */
+      function feedTimed(
+        { adapter, player, videoAlias }: { adapter: ReturnType<typeof createMockAdapter>; player: MoqtPlayer; videoAlias: ReturnType<typeof varint> },
+        seconds: number, delayAt: (t: number, i: number) => number,
+      ): void {
+        for (let i = 0; i < seconds * 10; i++) {
+          advanceClock(100_000);
+          const t = clockTimeUs;
+          adapter._triggerObject(BigInt(Math.floor(i / 10) + 1), {
+            kind: 'data', trackAlias: videoAlias,
+            groupId: varint(Math.floor(i / 10)), subgroupId: varint(0), objectId: varint(i % 10),
+            payload: new Uint8Array(1_000),
+            extensions: encodeLocHeaders({ captureTimestamp: T0 + BigInt(t - delayAt(t, i)) }, { wireProfile: 'd16-delta-varint' }),
+          } as MoqtObject);
+          player.tick();
+        }
+      }
+
+      /** Link-rate samples: objects that took the time `kbps` implies. */
+      function timeLink(player: MoqtPlayer, kbps: number): void {
+        for (let i = 0; i < 3; i++) {
+          (player as any).recordDeliverySpans({
+            kind: 'data', objectId: varint(5), payload: new Uint8Array(100_000),
+            socketFirstMs: 0, socketStartMs: 100, socketLastMs: 100 + 800_000 / kbps, assemblyBusyMs: 0,
+          });
+        }
+      }
+
+      it('steps down when video arrives ever later', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        feedTimed(t, 8, (us) => 200_000 + us * 0.15);
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(true);
+        await t.player.destroy();
+      });
+
+      it('holds when only each group\'s first object is late', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        feedTimed(t, 10, (_us, i) => 200_000 + (i % 10 === 0 ? 400_000 : 0));
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(false);
+        await t.player.destroy();
+      });
+
+      it('holds through a publisher clock step', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        const stepAt = clockTimeUs + 4_000_000;
+        feedTimed(t, 10, (us) => (us < stepAt ? 200_000 : 900_000));
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(false);
+        await t.player.destroy();
+      });
+
+      it('steps down on a link under the rung once arrivals lag', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        timeLink(t.player, 1_000);
+        const start = clockTimeUs;
+        feedTimed(t, 8, (us) => 200_000 + (us - start) * 0.03);
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(true);
+        await t.player.destroy();
+      });
+
+      it('holds on a link under the rung while arrivals keep pace', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        timeLink(t.player, 1_000);
+        feedTimed(t, 10, () => 200_000);
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(false);
+        await t.player.destroy();
+      });
+
+      it('steps down again on a link under the rung within 30 s of a lag, with no new rise', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        (t.player as any).lastLinkLagUs = clockTimeUs;
+        timeLink(t.player, 1_000);
+        feedTimed(t, 8, () => 200_000);
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(true);
+        await t.player.destroy();
+      });
+
+      it('never steps down a manual pick', async () => {
+        const t = await setupAbrTest();
+        t.player.setAutoQuality(false);
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        feedTimed(t, 8, (us) => 200_000 + us * 0.15);
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(false);
+        await t.player.destroy();
+      });
     });
 
     it('LOC: no upshift when recent stall within stability window (timestamp proves it)', async () => {
