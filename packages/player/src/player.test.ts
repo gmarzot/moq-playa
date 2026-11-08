@@ -9686,6 +9686,16 @@ describe('MoqtPlayer', () => {
         await t.player.destroy();
       });
 
+      it('steps down again on a link under the rung within 30 s of a lag, with no new rise', async () => {
+        const t = await setupAbrTest();
+        const subsBefore = (t.adapter.subscribe as any).mock.calls.length;
+        (t.player as any).lastLinkLagUs = clockTimeUs;
+        timeLink(t.player, 1_000);
+        feedTimed(t, 8, () => 200_000);
+        expect(t.hasSubscribeTo('video-2', subsBefore)).toBe(true);
+        await t.player.destroy();
+      });
+
       it('never steps down a manual pick', async () => {
         const t = await setupAbrTest();
         t.player.setAutoQuality(false);

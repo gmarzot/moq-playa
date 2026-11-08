@@ -6907,6 +6907,9 @@ export class MoqtPlayer {
   private readonly videoArrivalDelay = new ArrivalDelayTrend();
   /** Since when the link rate has been under the playing rung's bitrate. */
   private linkShort: { track: string; sinceUs: number } | null = null;
+  /** When the link was last found behind a rung: within ABR_LINK_LAG_MEMORY_US it corroborates a short link rate. */
+  private lastLinkLagUs = Number.NEGATIVE_INFINITY;
+  private static readonly ABR_LINK_LAG_MEMORY_US = 30_000_000;
   /** Timestamp (µs) of last MSE stall — gates live CMAF upshift. */
   private lastMseStallUs = 0;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
@@ -6976,7 +6979,7 @@ export class MoqtPlayer {
   /**
    * Live LOC: why the link falls behind the playing rung, or null. Video
    * arriving ever later behind capture, or a link rate under the rung's
-   * bitrate while arrivals start to lag.
+   * bitrate while arrivals start to lag or lagged within the last 30 s.
    */
   private locLinkShort(now: number, linkKbps: number): string | null {
     const track = this.bufferAbrController?.currentTrack;
@@ -6988,10 +6991,14 @@ export class MoqtPlayer {
     }
     const riseUs = this.videoArrivalDelay.riseUs(track.name, now);
     if (riseUs > MoqtPlayer.ABR_BACKLOG_RISE_US) {
+      this.lastLinkLagUs = now;
       return `video arriving ${Math.round(riseUs / 1000)} ms later`;
     }
-    if (this.linkShort && now - this.linkShort.sinceUs >= MoqtPlayer.ABR_LINK_SHORT_US
-        && riseUs > MoqtPlayer.ABR_LINK_SHORT_RISE_US) {
+    // A rung the link cannot drain leaves a flat backlog: a recent lag stands in for a rise.
+    const lagging = riseUs > MoqtPlayer.ABR_LINK_SHORT_RISE_US
+      || now - this.lastLinkLagUs < MoqtPlayer.ABR_LINK_LAG_MEMORY_US;
+    if (this.linkShort && now - this.linkShort.sinceUs >= MoqtPlayer.ABR_LINK_SHORT_US && lagging) {
+      this.lastLinkLagUs = now;
       return `link ${Math.round(linkKbps)} kbps under ${Math.round(track.bitrateKbps)} kbps`;
     }
     return null;
