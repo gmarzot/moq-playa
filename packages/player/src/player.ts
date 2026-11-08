@@ -32,7 +32,7 @@ import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import type { MoqtObjectData } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator, isKeyframePayload } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, ArrivalDelayTrend, isKeyframePayload } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
@@ -3664,6 +3664,10 @@ export class MoqtPlayer {
       }
 
       this.lastMediaArrivalUs = this.clock.now();
+      if (mediaType === 'video' && obj.kind === 'data' && headers.captureTimestamp !== undefined
+          && trackName === this.qualityController?.currentVideoTrack?.name) {
+        this.videoArrivalDelay.record(trackName, this.lastMediaArrivalUs, Number(headers.captureTimestamp));
+      }
       // Emit raw event (recording, analytics, custom processing)
       this.emitter.emit('media_object', {
         type: 'media_object',
@@ -6894,6 +6898,15 @@ export class MoqtPlayer {
   private lastAbrUpshiftUs = 0;
   /** Live upshift wait; doubles on each failed upshift, resets once an upshift holds 2 min. */
   private liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
+  /** Live LOC: video arriving this much later across the window steps down. */
+  private static readonly ABR_BACKLOG_RISE_US = 400_000;
+  /** Live LOC: a link rate under the rung's bitrate this long, with video arriving ABR_LINK_SHORT_RISE_US later, steps down. */
+  private static readonly ABR_LINK_SHORT_US = 3_000_000;
+  private static readonly ABR_LINK_SHORT_RISE_US = 100_000;
+  /** Arrival delay of the playing video track. */
+  private readonly videoArrivalDelay = new ArrivalDelayTrend();
+  /** Since when the link rate has been under the playing rung's bitrate. */
+  private linkShort: { track: string; sinceUs: number } | null = null;
   /** Timestamp (µs) of last MSE stall — gates live CMAF upshift. */
   private lastMseStallUs = 0;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
@@ -6960,6 +6973,30 @@ export class MoqtPlayer {
     return true;
   }
 
+  /**
+   * Live LOC: why the link falls behind the playing rung, or null. Video
+   * arriving ever later behind capture, or a link rate under the rung's
+   * bitrate while arrivals start to lag.
+   */
+  private locLinkShort(now: number, linkKbps: number): string | null {
+    const track = this.bufferAbrController?.currentTrack;
+    if (!track) return null;
+    if (linkKbps > 0 && linkKbps < track.bitrateKbps) {
+      if (this.linkShort?.track !== track.name) this.linkShort = { track: track.name, sinceUs: now };
+    } else {
+      this.linkShort = null;
+    }
+    const riseUs = this.videoArrivalDelay.riseUs(now);
+    if (riseUs > MoqtPlayer.ABR_BACKLOG_RISE_US) {
+      return `video arriving ${Math.round(riseUs / 1000)} ms later`;
+    }
+    if (this.linkShort && now - this.linkShort.sinceUs >= MoqtPlayer.ABR_LINK_SHORT_US
+        && riseUs > MoqtPlayer.ABR_LINK_SHORT_RISE_US) {
+      return `link ${Math.round(linkKbps)} kbps under ${Math.round(track.bitrateKbps)} kbps`;
+    }
+    return null;
+  }
+
   private checkBandwidthAdaptation(): void {
     if (!this.bufferAbrController || !this.qualityController) return;
     // Don't trigger ABR while a switch is in flight — give the current
@@ -6974,6 +7011,7 @@ export class MoqtPlayer {
     // On live the arrival rate is the publisher's pace; the link rate shows the headroom.
     const bandwidthKbps = Math.max(arrivalKbps, linkKbps);
     let effectiveBufferUs: number;
+    let shortReason: string | null = null;
 
     if (this.videoPipeline) {
       // LOC path: health gates all upshift decisions. When unhealthy,
@@ -6981,7 +7019,10 @@ export class MoqtPlayer {
       // after stalls, decode errors, or partial group abandonment.
       const bufferedGroups = this.videoPipeline.bufferedGroupCount;
       const healthy = this.isLocDeliveryHealthy(upshiftWaitUs);
-      if (!healthy) {
+      shortReason = live ? this.locLinkShort(now, linkKbps) : null;
+      if (shortReason) {
+        effectiveBufferUs = 0;
+      } else if (!healthy) {
         effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
       } else if (bufferedGroups === 0) {
         effectiveBufferUs = this.bufferAbrController.highThresholdUs;
@@ -7039,8 +7080,9 @@ export class MoqtPlayer {
     if (newTrack) {
       if (isDown) this.noteAbrDownshift(now);
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s',
-        effectiveBufferUs / 1_000_000, bandwidthKbps, arrivalKbps, verb, newTrack.name);
+      this.log.warn('Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s%s',
+        effectiveBufferUs / 1_000_000, bandwidthKbps, arrivalKbps, verb, newTrack.name,
+        shortReason ? ` (${shortReason})` : '');
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack(newTrack.name, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
