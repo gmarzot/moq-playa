@@ -27,6 +27,8 @@ import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.
 import type { BootstrapPhase } from './catalog-bootstrap.js';
 import { NamespaceFollower, type ReturnAction } from './namespace-follow.js';
 import { cmafChunkStartsWithSync } from './cmaf-sync.js';
+import { CmafCaptureMap } from './cmaf-capture-map.js';
+import { pickCaptureTime, type CaptureTimes } from './capture-time.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
@@ -584,6 +586,7 @@ export class MoqtPlayer {
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
+  private readonly cmafCaptures = new CmafCaptureMap();
 
   /**
    * Init segment bytes received from each subscribed init track, keyed
@@ -2164,6 +2167,8 @@ export class MoqtPlayer {
     } else {
       this._stats.recordGapObject();
     }
+    const captureFields = this.subscriptionManager?.captureTimeFields(obj, headers);
+    this.noteCmafCapture(mediaType, obj, captureFields?.captureTimes);
     this.emitter.emit('media_object', {
       type: 'media_object',
       mediaType,
@@ -2176,7 +2181,7 @@ export class MoqtPlayer {
       ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
       ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
       ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
-      ...this.subscriptionManager?.captureTimeFields(obj, headers),
+      ...captureFields,
     });
 
     if (this.stateMachine.state === PlayerState.PAUSED) return;
@@ -3788,6 +3793,8 @@ export class MoqtPlayer {
       // Emit media_object for CMAF too — arrival timing and capture
       // timestamps are packaging-independent, so latency and jitter are
       // measured the same way on both paths.
+      const captureFields = this.subscriptionManager?.captureTimeFields(obj, headers);
+      this.noteCmafCapture(mediaType, obj, captureFields?.captureTimes);
       this.emitter.emit('media_object', {
         type: 'media_object',
         mediaType,
@@ -3800,7 +3807,7 @@ export class MoqtPlayer {
         ...(headers.captureTimestamp !== undefined ? { captureTimestamp: headers.captureTimestamp } : {}),
         ...(headers.timestampIsWallClock !== undefined ? { timestampIsWallClock: headers.timestampIsWallClock } : {}),
         ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
-        ...this.subscriptionManager?.captureTimeFields(obj, headers),
+        ...captureFields,
       });
 
       if (obj.kind !== 'data' || !obj.payload) return;
@@ -9531,6 +9538,7 @@ export class MoqtPlayer {
     if (!this.cmafHoldingForAttach) return;
     this.cmafHoldingForAttach = false;
     this.cmafAssembler?.reset();
+    this.cmafCaptures.clear();
     if (this.cmafPendingInit) {
       for (const mt of ['video', 'audio'] as const) {
         const bytes = this.cmafPendingInit[mt]?.bytes;
@@ -9658,16 +9666,29 @@ export class MoqtPlayer {
     this.visibilityListener = null;
   }
 
+  /** Capture time (µs) of the CMAF video frame at `mediaTimeSec`, or null when unknown. */
+  cmafCaptureUsAt(mediaTimeSec: number): number | null {
+    return this.cmafCaptures.captureUsAt(mediaTimeSec);
+  }
+
+  private noteCmafCapture(mediaType: string, obj: MoqtObject, times: CaptureTimes | undefined): void {
+    if (mediaType !== 'video' || obj.kind !== 'data') return;
+    const picked = pickCaptureTime(times);
+    if (picked) this.cmafCaptures.noteCapture(BigInt(obj.groupId), picked.us);
+  }
+
   /** Create the moof+mdat assembler wired to the MediaSource (single site). */
   private buildCmafAssembler(): void {
     const ms = this.mediaSource!;
+    this.cmafCaptures.clear();
     const timestampOffsetSet = { video: false, audio: false };
     if (!this.config.createCmafAssembler) {
       throw new Error('CMAF tracks require createCmafAssembler in MoqtPlayerConfig');
     }
     this.cmafAssembler = this.config.createCmafAssembler({
-      onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
+      onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint, presentationStartSec?: number) => {
         if (mediaType === 'audio' && this.mseAudioDropped !== null) return;
+        if (mediaType === 'video' && presentationStartSec !== undefined) this.cmafCaptures.noteSegment(groupId, presentationStartSec);
         if (!timestampOffsetSet[mediaType]) {
           timestampOffsetSet[mediaType] = true;
           if ('setTimestampOffset' in ms) {
@@ -9678,6 +9699,7 @@ export class MoqtPlayer {
         this.renewCmafFirstFrameDeadline(mediaType);
       },
       onDiscontinuity: (mediaType, trackName) => {
+        if (mediaType === 'video') this.cmafCaptures.clear();
         if ('clearTimeline' in ms) {
           (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
         }

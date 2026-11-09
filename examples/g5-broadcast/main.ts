@@ -149,8 +149,8 @@ const catalogDelivery: 'both' | 'fetch' | 'subscribe' =
   catalogDeliveryParam === 'fetch' || catalogDeliveryParam === 'subscribe' ? catalogDeliveryParam : 'both';
 /** `?debug=1`: per-second ingest snapshots and catalog re-emissions. */
 const debug = params.get('debug') === '1';
-/** `?status=0` hides the state overlay, which is on by default on this page. */
-const showStatus = params.get('status') !== '0';
+/** `?status=1`: state, relay time and send stats over the preview. */
+const showStatus = params.get('status') === '1';
 /** Capture frame rate. One frame period is latency before encode starts:
  *  42ms at 24fps, 17ms at 60. */
 const captureFps = parseInt(params.get('fps') ?? '60', 10);
@@ -383,7 +383,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
       || (Number.isFinite(bitrateParam) && bitrateParam > 0) || captureFps !== 60 || targetLatencyMs !== 200
       || keyframeSec !== null || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
       || catalogIntervalMs !== null || catalogDelivery !== 'both' || params.get('hash') !== null || dynamicGroups || audioDatagrams
-      || selfDescribing || locTimescale || annexbParam || debug || !showStatus || voiceProcessing;
+      || selfDescribing || locTimescale || annexbParam || debug || showStatus || voiceProcessing;
     showApplicableFields();
   }
 
@@ -447,7 +447,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sTarget.value && sTarget.value !== '200') np.set('target', sTarget.value);
     if (sCatalogInterval.value) np.set('catalogInterval', sCatalogInterval.value);
     if (sCatalogDelivery.value !== 'both') np.set('catalogDelivery', sCatalogDelivery.value);
-    if (!sStatus.checked) np.set('status', '0');
+    if (sStatus.checked) np.set('status', '1');
     if (sDebug.checked) np.set('debug', '1');
     if (sAudioDatagram.checked && datagramsApply()) np.set('audioDatagram', '1');
     if (sAnnexb.checked && annexbApplies()) np.set('annexb', '1');
@@ -479,6 +479,8 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
 const preview = document.getElementById('preview') as HTMLVideoElement;
 const stateBadge = document.getElementById('state')!;
 stateBadge.hidden = !showStatus;
+document.getElementById('status-line')!.hidden = !showStatus;
+const statusStats = document.getElementById('status-stats')!;
 const shareBtn = document.getElementById('share-btn') as HTMLButtonElement;
 const shareBackdrop = document.getElementById('share-backdrop')!;
 const shareUrlInput = document.getElementById('share-url') as HTMLInputElement;
@@ -739,6 +741,45 @@ const u = (s: string): string => `<span class="u">${s}</span>`;
 let lastSample = { t: 0, frames: 0, chunks: 0, vBytes: 0, aBytes: 0 };
 let fpsEnc = 0, vKbps = 0, aKbps = 0;
 
+/** When frames went into the encoder, by capture stamp. */
+const encodeStartMs = new Map<number, number>();
+let encodeMsTotal = 0, encodeMsCount = 0, statusStatsAtMs = 0;
+
+function noteEncodeStart(stampUs: number): void {
+  // Frames the encoder drops never come back.
+  if (encodeStartMs.size >= 256) encodeStartMs.clear();
+  encodeStartMs.set(stampUs, performance.now());
+}
+
+function noteEncodeEnd(stampUs: number): void {
+  const startMs = encodeStartMs.get(stampUs);
+  if (startMs === undefined) return;
+  encodeStartMs.delete(stampUs);
+  encodeMsTotal += performance.now() - startMs;
+  encodeMsCount++;
+}
+
+/** Overlay figures the metrics strip does not show. */
+function renderStatusStats(): void {
+  if (!showStatus) return;
+  const nowMs = performance.now();
+  const elapsedSec = statusStatsAtMs > 0 ? (nowMs - statusStatsAtMs) / 1000 : 0;
+  if (!currentPublisher) {
+    statusStats.textContent = '';
+    statusStatsAtMs = 0;
+    return;
+  }
+  statusStatsAtMs = nowMs;
+  statusStats.textContent = [
+    ...(preview.videoHeight ? [`${preview.videoHeight}p`] : []),
+    // Counted at the encoder, so it reads true before anyone subscribes.
+    ...(elapsedSec > 0 ? [`${(encodeMsCount / elapsedSec).toFixed(0)} fps`] : []),
+    ...(encodeMsCount > 0 ? [`encode ${(encodeMsTotal / encodeMsCount).toFixed(0)} ms`] : []),
+  ].join(' · ');
+  encodeMsTotal = 0;
+  encodeMsCount = 0;
+}
+
 function renderMetrics(): void {
   const p = currentPublisher;
   const now = performance.now();
@@ -799,6 +840,7 @@ async function renderTransport(): Promise<void> {
 
 setInterval(() => {
   renderMetrics();
+  renderStatusStats();
   void renderTransport();
   logSnapshot();
 }, 1000);
@@ -904,6 +946,14 @@ const referenceClock = new ClockReference(clockUrl, {
     log(`Clock: no reference at ${clockUrl}; capture times use this machine's clock`);
   },
 });
+const statusClock = document.getElementById('status-clock')!;
+const paintStatusClock = (): void => {
+  statusClock.textContent = referenceClock.offset !== null
+    ? new Date(referenceClock.nowMs()).toISOString().slice(11, 23) : '';
+  // About 30 updates a second; the timer requests no frames between them.
+  setTimeout(() => requestAnimationFrame(paintStatusClock), 26);
+};
+if (showStatus) requestAnimationFrame(paintStatusClock);
 void referenceClock.calibrate();
 setInterval(() => { void referenceClock.calibrate(); }, 300_000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void referenceClock.calibrate(); });
@@ -1485,6 +1535,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       currentSession = session;
       const ve = videoEncoder!;
       ve.onChunk = (data, isKeyframe, timestamp, duration, description) => {
+        if (showStatus) noteEncodeEnd(timestamp);
         const videoConfig = description ?? ve.description;
         if (videoConfig) noteVideoDescription(videoConfig);
         mediaPublisher.publishVideo(data, {
@@ -1510,6 +1561,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       // 6. Wire capture → encoder
       capture!.onVideoFrame = (frame) => {
         noteCapture('video', frame.timestamp, ve.queueDepth);
+        if (showStatus) noteEncodeStart(frame.timestamp);
         ve.encode(frame);
         frame.close();
       };

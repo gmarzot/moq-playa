@@ -622,6 +622,15 @@
     .state-badge.playing { background: var(--overlay-playing-bg); color: var(--overlay-playing-fg); }
     .state-badge.loading { background: var(--overlay-loading-bg); color: var(--overlay-loading-fg); }
     .state-badge.error { background: var(--overlay-error-bg); color: var(--overlay-error-fg); }
+    .status-line {
+      position: absolute; top: 12px; right: 12px;
+      padding: 3px 10px; border-radius: 4px;
+      font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+      background: rgba(0, 0, 0, .72); color: #e6edf5;
+      contain: layout style paint;
+    }
+    #status-clock:not(:empty) + #status-stats:not(:empty)::before { content: ' · '; }
 
     /* Log */
     /* A copy control rides the top-right of the pane it belongs to, so the
@@ -723,6 +732,7 @@
     <div class="video-wrap">
       <div id="player-container"></div>
       <span class="state-badge" id="state">idle</span>
+      <span class="status-line" id="status-line" title="Time on the relay's clock, to compare with a clock burned into the video" hidden><span id="status-clock"></span><span id="status-stats"></span></span>
     </div>
 
     <div class="controls">

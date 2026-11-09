@@ -154,6 +154,9 @@ function applyTheme(): void {
 }
 const stateBadge = document.getElementById('state')!;
 stateBadge.hidden = !showStatus;
+const statusClock = document.getElementById('status-clock')!;
+const statusStats = document.getElementById('status-stats')!;
+document.getElementById('status-line')!.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
 const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
@@ -431,7 +434,7 @@ async function main(): Promise<void> {
   // ── Wire Events ───────────────────────────────────────────────────
 
   player.on('statechange', ({ state }) => {
-    stateBadge.textContent = state;
+    stateBadge.textContent = state === 'playing' ? latencyMode : state;
     stateBadge.className = `state-badge ${state}`;
     if (state === 'error') {
       setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
@@ -750,6 +753,7 @@ async function main(): Promise<void> {
     if (!video || video === watchedVideo) return video;
     watchedVideo = video;
     video.addEventListener('waiting', () => { stallStartSnap = describeVideo(video); });
+    measurePresentedFrames(video);
     if (debug) {
       // Element-side view of every playhead disturbance, timestamped like
       // the stall lines so the two can be correlated.
@@ -884,6 +888,12 @@ async function main(): Promise<void> {
       stallCount: s.stallCount ?? 0, stallDurationMs: s.stallDurationMs ?? 0,
       ongoingStallMs: s.ongoingStallMs ?? 0, freezes: videoFreezes, frozenSec: videoFrozenSec, locPath,
     });
+    if (showStatus) {
+      const video = playerContainer.querySelector('video');
+      const height = video?.videoHeight || playerContainer.querySelector('canvas')?.height;
+      statusStats.textContent = `E2E ${latScreen.textContent} · ${height ? `${height}p · ` : ''}`
+        + `stalls ${stallsNow.faults}${stallsNow.sec > 0 ? ` (${stallsNow.sec.toFixed(1)} s)` : ''}`;
+    }
     // TTFF runs from connection start; the connect share goes in its tooltip.
     const connectMs: number | null = (player as any).engine?.stats?.ttffBreakdown?.setupCompleteMs ?? null;
     noteAudioDatagrams();
@@ -1010,6 +1020,13 @@ async function main(): Promise<void> {
   const wallNowMs = (): number => referenceClock.nowMs();
   void calibrateClock();
   setInterval(() => { void calibrateClock(); }, 300_000);
+  const paintStatusClock = (): void => {
+    statusClock.textContent = referenceClock.offset !== null
+      ? new Date(referenceClock.nowMs()).toISOString().slice(11, 23) : '';
+    // About 30 updates a second; the timer requests no frames between them.
+    setTimeout(() => requestAnimationFrame(paintStatusClock), 26);
+  };
+  if (showStatus) requestAnimationFrame(paintStatusClock);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void calibrateClock(); });
   let clockDriftApplied = false;
   document.addEventListener('visibilitychange', () => {
@@ -1042,6 +1059,17 @@ async function main(): Promise<void> {
     // Drawn frames are still draining the queue's fill.
     if (Math.abs(ageMs) < 120_000 && !inStartupHold(nowMs, QUEUED_CHART_HOLD_MS)) screenWindow.push([nowMs, ageMs]);
   };
+  /** CMAF: feed each presented frame's capture-to-screen age to the E2E window. */
+  function measurePresentedFrames(video: HTMLVideoElement): void {
+    if (!('requestVideoFrameCallback' in video)) return;
+    const onFrame = (_now: number, meta: VideoFrameCallbackMetadata): void => {
+      if (watchedVideo !== video) return;
+      const captureUs = (player as any).engine?.cmafCaptureUsAt?.(meta.mediaTime) as number | null | undefined;
+      if (captureUs != null) noteFrameDrawn(captureUs, performance.timeOrigin + meta.presentationTime);
+      video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+  }
   /** Underruns since the last report: buffers late past their slot, buffers on
    *  time after missing audio, silence, and the worst lateness. */
   const UNDERRUN_REPORT_MS = 10_000;
