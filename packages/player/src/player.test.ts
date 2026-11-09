@@ -10347,6 +10347,55 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it.each([
+      ['visible', true],
+      ['hidden', false],
+    ] as const)('an MSE stall on a %s page: downshifts %s, still reports the stall', async (visibilityState, downshifts) => {
+      vi.stubGlobal('document', { visibilityState, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+      try {
+        const adapter = createMockAdapter();
+        const ms = createMockMediaSource(2_000_000);
+        const stallFn = vi.fn();
+        const player = new MoqtPlayer({
+          url: 'https://relay.example.com/moq',
+          namespace: 'live/broadcast',
+          createTransport: vi.fn(async () => ({}) as any),
+          createConnection: () => adapter as unknown as MoqtConnection,
+          catalogBootstrap: 'subscribe',
+          createMediaSource: () => ms as any,
+          createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
+          qualitySwitchCooldownMs: 1,
+        });
+        player.on('stall', stallFn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        ackCatalog(adapter);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: varint(1),
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CMAF_ABR_CATALOG),
+        } as MoqtObject);
+        await new Promise(r => setTimeout(r, 0));
+
+        const subsBefore = (adapter.subscribe as any).mock.calls.length;
+        (ms as any).onStall?.(500);
+        await new Promise(r => setTimeout(r, 0));
+
+        expect(stallFn).toHaveBeenCalledWith(expect.objectContaining({ type: 'stall', durationMs: 500 }));
+        expect((adapter.subscribe as any).mock.calls.length > subsBefore).toBe(downshifts);
+
+        await player.destroy();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
     it('holds quality when CMAF buffer is healthy', async () => {
       const adapter = createMockAdapter();
       const ms = createMockMediaSource(2_000_000); // 2s ahead — healthy

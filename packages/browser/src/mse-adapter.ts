@@ -245,6 +245,8 @@ export interface MseMediaSourceOptions {
   readonly smoothCeilingSec?: number;
   /** Floor of the smooth cushion target (s), where it starts. Default 1. */
   readonly smoothFloorSec?: number;
+  /** The page is hidden. Default: `document.hidden`. */
+  readonly isHidden?: () => boolean;
   /**
    * Buffered-hole gap-jump: when the playhead is frozen at the end of a
    * buffered range with a bounded hole (≤ 2 s) and more buffered media
@@ -743,6 +745,7 @@ export class MseMediaSource implements MediaSourceLike {
   /** Set by a resume: startup re-enters on media buffered after this time (s). */
   private reentryAfterSec: number | null = null;
   private readonly chase: SoftChase;
+  private readonly isHidden: () => boolean;
   private stallStartTime: number | null = null;
   /** True once this episode has been reported as detected. */
   private stallDetected = false;
@@ -781,6 +784,8 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly BEHIND_EXCESS_SEC = 3;
   /** How long it must last before the jump: a short burst drains by itself. */
   private static readonly BEHIND_HOLD_MS = 2_000;
+  /** Backlog (s) above the cushion that a returning page jumps instead of chasing. */
+  private static readonly RESUME_EXCESS_SEC = 0.25;
   /** Past a range end by more than this, a playhead in the following hole needs the frozen proof. */
   private static readonly GAP_PARKED_PAST_END_MAX_SEC = 1.0;
   /** Wait floor and per-hole-second scaling: small holes clear fast, wide
@@ -992,6 +997,8 @@ export class MseMediaSource implements MediaSourceLike {
       : null;
     if (this.latencyPolicy) this.targetAheadSec = this.latencyPolicy.heldUs / 1e6;
     this.chase = new SoftChase(videoElement, () => this.targetAheadSec);
+    this.isHidden = options.isHidden ?? (() => typeof document !== 'undefined' && document.hidden);
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this.onVisibilityChange);
     const gapJumpMs = options.gapJumpMs ?? 2_000;
     this.stallThresholdMs = validateStallThresholdMs(options.stallThresholdMs);
     if (!Number.isFinite(gapJumpMs) || gapJumpMs < 0) {
@@ -1639,6 +1646,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.onError = null;
     this.onStall = null;
     this.onStallRecovered = null;
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.onVisibilityChange);
   }
 
   // ─── EME / DRM ─────────────────────────────────────────────────
@@ -2895,19 +2903,37 @@ export class MseMediaSource implements MediaSourceLike {
       if (ahead > this.maxAheadSec || heldBehind) {
         this.behindSinceMs = null;
         const target = Math.max(start, end - this.chase.releaseSec);
-        if (target > ct) {
-          this.logWarn('[MSE] behind live by %ss — jumping %s -> %s', ahead.toFixed(1), ct.toFixed(2), target.toFixed(2));
-          this.resetPlaybackRate();
-          v.currentTime = target;
-          this.noteSelfSeek();
-          this.onLiveEdgeResync?.('behind-live');
-        }
+        if (target > ct) this.jumpBehindLive(ahead, ct, target);
+      } else if (this.isHidden()) {
+        this.chase.stop();
       } else {
         this.chase.onCushion(ahead);
       }
       return; // containing range handled (or within cap) — done either way
     }
   }
+
+  private jumpBehindLive(aheadSec: number, fromSec: number, targetSec: number): void {
+    this.logWarn('[MSE] behind live by %ss — jumping %s -> %s', aheadSec.toFixed(1), fromSec.toFixed(2), targetSec.toFixed(2));
+    this.resetPlaybackRate();
+    this.video.currentTime = targetSec;
+    this.noteSelfSeek();
+    this.onLiveEdgeResync?.('behind-live');
+  }
+
+  /** A hidden page plays at 1×; a returning one jumps a backlog rather than chase it. */
+  private readonly onVisibilityChange = (): void => {
+    if (this.isHidden()) {
+      this.resetPlaybackRate();
+      return;
+    }
+    if (!this.playTriggered || this.video.paused) return;
+    const ahead = this.cushionAheadSec();
+    const release = this.chase.releaseSec;
+    if (ahead === null || ahead <= release + MseMediaSource.RESUME_EXCESS_SEC) return;
+    const ct = this.video.currentTime;
+    this.jumpBehindLive(ahead, ct, ct + ahead - release);
+  };
 
   /** Cushion buffered ahead of the playhead in its containing range, or null. */
   private cushionAheadSec(): number | null {
