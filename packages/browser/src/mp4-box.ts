@@ -482,6 +482,35 @@ function computeTrunDuration(
   };
 }
 
+/** Composition offset of the first moof's first sample in track ticks; 0 when absent or unreadable. */
+export function readFirstCompositionOffset(segment: Uint8Array): number {
+  const child = (box: Uint8Array, name: string, from: number): Uint8Array | null => {
+    for (let pos = from; pos + 8 <= box.byteLength;) {
+      const size = boxSize(box, pos);
+      if (size < 8) return null;
+      if (boxType(box, pos) === name) return box.subarray(pos, pos + size);
+      pos += size;
+    }
+    return null;
+  };
+  const moof = child(segment, 'moof', 0);
+  const traf = moof && child(moof, 'traf', 8);
+  const trun = traf && child(traf, 'trun', 8);
+  if (!trun || trun.byteLength < 16) return 0;
+  const view = new DataView(trun.buffer, trun.byteOffset, trun.byteLength);
+  const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11);
+  if ((flags & TRUN_FLAG_SAMPLE_CTO) === 0 || view.getUint32(12) === 0) return 0;
+  let pos = 16;
+  for (const present of [
+    TRUN_FLAG_DATA_OFFSET, TRUN_FLAG_FIRST_SAMPLE_FLAGS,
+    TRUN_FLAG_SAMPLE_DURATION, TRUN_FLAG_SAMPLE_SIZE, TRUN_FLAG_SAMPLE_FLAGS,
+  ]) {
+    if ((flags & present) !== 0) pos += 4;
+  }
+  if (pos + 4 > trun.byteLength) return 0;
+  return view.getUint8(8) === 0 ? view.getUint32(pos) : view.getInt32(pos);
+}
+
 /**
  * Read ranges from every moof in the payload.
  *

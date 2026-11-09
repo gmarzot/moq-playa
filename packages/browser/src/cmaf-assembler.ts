@@ -26,6 +26,7 @@ import {
   firstHevcVclNalType,
   isHevcCraNalType,
   isHevcRaslNalType,
+  readFirstCompositionOffset,
   readMdhdTimescale,
   readTrexDefaults,
   readSegmentTimeRanges,
@@ -58,13 +59,15 @@ export interface CmafAssemblerOptions {
    * `trackName` identifies the source MoQ track. Downstream consumers
    * (e.g. MseMediaSource's overlap detector) keep per-track state and need
    * to distinguish between same-track duplicates and across-track
-   * splices (ABR switches).
+   * splices (ABR switches). `presentationStartSec` is the first video
+   * sample's presentation time on the MSE timeline, ignoring edit lists.
    */
   readonly onSegment: (
     mediaType: 'video' | 'audio',
     segment: Uint8Array,
     trackName: string,
     groupId: bigint,
+    presentationStartSec?: number,
   ) => void;
   /**
    * Called when a decode-time discontinuity is detected (bmd went
@@ -764,7 +767,11 @@ export class CmafAssembler {
     if (o.lastGroup === null || groupId > o.lastGroup) o.lastGroup = groupId;
     const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
     const ranges = readSegmentTimeRanges(output, trex ?? undefined);
-    this.onSegment(mediaType, output, trackName, groupId);
+    const firstStart = ranges?.[0]?.startTime;
+    const presentationStartSec = mediaType === 'video' && firstStart !== undefined && this.videoTimescale
+      ? (Number(firstStart) + readFirstCompositionOffset(output)) / this.videoTimescale
+      : undefined;
+    this.onSegment(mediaType, output, trackName, groupId, presentationStartSec);
     if (ranges !== null && ranges.length > 0) {
       const start = ranges.reduce(
         (min, range) => range.startTime < min ? range.startTime : min,
