@@ -434,7 +434,7 @@ async function main(): Promise<void> {
   // ── Wire Events ───────────────────────────────────────────────────
 
   player.on('statechange', ({ state }) => {
-    stateBadge.textContent = state;
+    stateBadge.textContent = state === 'playing' ? latencyMode : state;
     stateBadge.className = `state-badge ${state}`;
     if (state === 'error') {
       setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
@@ -1020,14 +1020,11 @@ async function main(): Promise<void> {
   const wallNowMs = (): number => referenceClock.nowMs();
   void calibrateClock();
   setInterval(() => { void calibrateClock(); }, 300_000);
-  let statusClockTicks = 0;
   const paintStatusClock = (): void => {
-    // Every other refresh keeps pace with video at half the repaints.
-    if (++statusClockTicks % 2 === 0) {
-      statusClock.textContent = referenceClock.offset !== null
-        ? new Date(referenceClock.nowMs()).toISOString().slice(11, 23) : '';
-    }
-    requestAnimationFrame(paintStatusClock);
+    statusClock.textContent = referenceClock.offset !== null
+      ? new Date(referenceClock.nowMs()).toISOString().slice(11, 23) : '';
+    // About 30 updates a second; the timer requests no frames between them.
+    setTimeout(() => requestAnimationFrame(paintStatusClock), 26);
   };
   if (showStatus) requestAnimationFrame(paintStatusClock);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void calibrateClock(); });

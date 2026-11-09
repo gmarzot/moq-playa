@@ -625,8 +625,9 @@
     .status-line {
       position: absolute; top: 12px; right: 12px;
       padding: 3px 10px; border-radius: 4px;
-      font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap;
-      background: var(--overlay-bg); color: var(--overlay-fg);
+      font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+      background: rgba(0, 0, 0, .72); color: #e6edf5;
       contain: layout style paint;
     }
     #status-clock:not(:empty) + #status-stats:not(:empty)::before { content: ' · '; }
