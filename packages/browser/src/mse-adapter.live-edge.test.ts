@@ -146,6 +146,86 @@ describe('MseMediaSource — soft chase', () => {
         (adapter as any).handleWaiting();
         expect(floors).toEqual([]);
     });
+
+    describe('hidden page', () => {
+        const setup = () => {
+            const video = new MockVideoElement();
+            (video as unknown as { playbackRate: number }).playbackRate = 1;
+            let hidden = false;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2, isHidden: () => hidden });
+            (adapter as any).playTriggered = true;
+            const rate = () => (video as unknown as { playbackRate: number }).playbackRate;
+            const place = (aheadSec: number) => {
+                video.currentTime = 10;
+                video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            };
+            const setHidden = (h: boolean) => { hidden = h; (adapter as any).onVisibilityChange(); };
+            return { video, adapter, rate, place, setHidden };
+        };
+
+        it('does not start a chase while hidden', () => {
+            const { adapter, rate, place, setHidden } = setup();
+            setHidden(true);
+            place(0.35);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(rate()).toBe(1);
+            expect(adapter.chaseStarts).toBe(0);
+        });
+
+        it('stops a running chase when the page hides', () => {
+            const { adapter, rate, place, setHidden } = setup();
+            place(0.35);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(rate()).toBe(1.05);
+            setHidden(true);
+            expect(rate()).toBe(1);
+        });
+
+        it('a stall while hidden does not raise the chase floor', () => {
+            const { adapter, place, setHidden } = setup();
+            setHidden(true);
+            place(0.3);
+            (adapter as any).maybeChaseLiveEdge();
+            (adapter as any).noteChaseStall();
+            expect(adapter.cushionTargetSec).toBe(0.2);
+        });
+
+        it('keeps the behind-live cap while hidden', () => {
+            const { adapter, video, place, setHidden } = setup();
+            setHidden(true);
+            (adapter as any).maxAheadSec = 5;
+            place(6);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(video.currentTime).toBeCloseTo(15.8);
+        });
+
+        it('jumps a large backlog on return', () => {
+            const { video, place, setHidden } = setup();
+            setHidden(true);
+            place(1.5);
+            setHidden(false);
+            expect(video.currentTime).toBeCloseTo(11.3);
+        });
+
+        it('leaves a small backlog to the chase on return', () => {
+            const { adapter, video, rate, place, setHidden } = setup();
+            setHidden(true);
+            place(0.4);
+            setHidden(false);
+            expect(video.currentTime).toBe(10);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(rate()).toBe(1.05);
+        });
+
+        it('leaves a paused element alone on return', () => {
+            const { video, place, setHidden } = setup();
+            setHidden(true);
+            place(3);
+            (video as unknown as { paused: boolean }).paused = true;
+            setHidden(false);
+            expect(video.currentTime).toBe(10);
+        });
+    });
 });
 
 describe('stale-group floor', () => {

@@ -9340,6 +9340,8 @@ export class MoqtPlayer {
         // A media-gap stall is missing SOURCE media the adapter already
         // skipped — not a bandwidth signal. Count it, never downshift on it.
         if (cause === 'media-gap') return;
+        // Nor is a hidden page's stall; the buffer check still acts on real starvation.
+        if (this.documentHidden()) return;
         this.lastMseStallUs = this.clock.now();
 
         // Don't cascade downshifts while a switch is already in flight.
