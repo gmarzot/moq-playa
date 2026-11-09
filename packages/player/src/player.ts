@@ -70,7 +70,8 @@ interface LocmafChunkDetails {
   readonly baseMediaDecodeTime: bigint;
 }
 import type { MediaSourceLike, VideoPresentation } from './interfaces.js';
-import type { LatencyPolicy } from './latency-policy.js';
+import { SMOOTH_FLOOR_MS, type LatencyPolicy } from './latency-policy.js';
+import { AudioRepair, type AudioRepairStats } from './audio-repair.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
@@ -802,6 +803,8 @@ export class MoqtPlayer {
   private _emptyMediaObjects = 0;
   private _staleVideoDrops: { count: number; group: bigint | null; floor: bigint | null } = { count: 0, group: null, floor: null };
   private readonly _datagramObjects = { audio: 0, video: 0 };
+  private audioRepair: AudioRepair | null = null;
+  private audioRepairAlias: bigint | null = null;
   /** Recovery REQUEST_UPDATE suppressed until this clock reading. */
   private recoveryUpdateBlockedUntilUs = 0;
   /** Clock time of the last recovery REQUEST_UPDATE, per media type. */
@@ -5041,6 +5044,8 @@ export class MoqtPlayer {
     // Clear fetch state (fetches are per-session) and reject any in-flight
     // fetchCatalog promises — their request IDs/stream IDs belong to the old
     // adapter and won't match new-session traffic.
+    this.audioRepair?.reset();
+    this.audioRepairAlias = null;
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
@@ -5162,7 +5167,7 @@ export class MoqtPlayer {
    */
   async fetch(
     trackName: string,
-    options: { startGroup: number; startObject: number; endGroup: number; endObject: number },
+    options: { startGroup: number | bigint; startObject: number | bigint; endGroup: number | bigint; endObject: number | bigint },
   ): Promise<bigint> {
     if (!this.connection) throw new Error('Player not loaded');
     const connAtCall = this.connection;
@@ -5293,9 +5298,12 @@ export class MoqtPlayer {
    * same SubscriptionManager path live objects use.
    */
   private routeFetchObject(streamId: bigint, alias: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: MoqtConnection): void {
-    if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
+    const manager = this.subscriptionManager;
+    const mediaType = manager?.getMediaType(alias);
+    if (!manager || mediaType === undefined) return;
+    if (mediaType === 'audio' && obj.kind === 'data') this.audioRepair?.noteFetched(BigInt(obj.groupId), BigInt(obj.objectId));
     const remapped: MoqtObject = { ...obj, trackAlias: varint(alias) };
-    this.subscriptionManager.routeObject(streamId, remapped, sourceDraft, sourceConnection);
+    manager.routeObject(streamId, remapped, sourceDraft, sourceConnection);
   }
 
   /**
@@ -6841,6 +6849,31 @@ export class MoqtPlayer {
     return { ...this._datagramObjects };
   }
 
+  /** Lost audio datagrams recovered by FETCH; null unless Smooth has seen one. */
+  get audioRepairStats(): AudioRepairStats | null {
+    return this.audioRepair?.stats ?? null;
+  }
+
+  /** In Smooth, track audio datagrams so a lost one can be fetched before its playout. */
+  private noteAudioDatagram(alias: bigint, group: bigint, object: bigint): void {
+    if (this.config.latencyMode !== 'smooth') return;
+    this.audioRepair ??= new AudioRepair({
+      deadlineMs: Math.min(AudioRepair.DEFAULT_DEADLINE_MS, (this.config.smoothFloorMs ?? SMOOTH_FLOOR_MS) / 2),
+      fetch: (range) => {
+        const track = this.activeTrackName('audio');
+        return track === undefined ? Promise.reject(new Error('no audio track')) : this.fetch(track, range);
+      },
+      cancel: (requestId) => { this.fetchCancel(requestId).catch(() => { /* session gone */ }); },
+      onGiveUp: () => this.log.warn('Audio repair paused: FETCH is failing for recent audio'),
+    });
+    if (alias !== this.audioRepairAlias) {
+      this.audioRepairAlias = alias;
+      this.audioRepair.reset();
+    }
+    this.audioPipeline?.setMinGapTimeoutUs(this.audioRepair.stats.active ? this.audioRepair.holdMs * 1000 : 0);
+    this.audioRepair.note(group, object);
+  }
+
   /**
    * Early stale-group drop on the MSE paths (video only): groups older than the
    * one before what MSE has committed are replay. The immediately previous
@@ -8215,6 +8248,9 @@ export class MoqtPlayer {
         const datagramMedia = this.subscriptionManager?.getMediaType(alias);
         if (datagramMedia === undefined || !this.subscriptionManager) return;
         if (datagramMedia === 'audio' || datagramMedia === 'video') this._datagramObjects[datagramMedia]++;
+        if (datagramMedia === 'audio' && datagram.status === undefined) {
+          this.noteAudioDatagram(alias, BigInt(datagram.groupId), BigInt(datagram.objectId));
+        }
         this.log.debug('Datagram alias=%s group=%s obj=%s', alias, datagram.groupId, datagram.objectId);
 
         const obj: MoqtObject = datagram.status !== undefined

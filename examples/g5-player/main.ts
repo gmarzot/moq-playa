@@ -208,7 +208,7 @@ const CELL_TIPS: Record<string, string> = {
   'underruns': 'Audio ran dry. Small: total silence.',
   'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
   'dropped': "Video frames the browser didn't draw.",
-  'obj lost a/v': 'Objects that never arrived, audio/video.',
+  'obj lost a/v': 'Objects that never arrived, audio/video. Filled: audio datagrams recovered with FETCH in Smooth.',
   'stalls': 'Time playback was interrupted.',
 };
 
@@ -945,7 +945,8 @@ async function main(): Promise<void> {
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.
       cell('obj lost a/v',
-        `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`, '',
+        `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`,
+        ((player as any).engine?.audioRepairStats?.filled ?? 0) > 0 ? `${fmtCount((player as any).engine.audioRepairStats.filled)} filled` : '',
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
       cell('stalls', stallsNow.sec.toFixed(1), 's', FAULT(stallsNow.faults), '',
         `${CELL_TIPS['stalls']} ${stallsNow.detail}`),
