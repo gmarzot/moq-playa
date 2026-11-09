@@ -904,6 +904,18 @@ const referenceClock = new ClockReference(clockUrl, {
     log(`Clock: no reference at ${clockUrl}; capture times use this machine's clock`);
   },
 });
+const statusClock = document.getElementById('status-clock')!;
+let statusClockTicks = 0;
+const paintStatusClock = (): void => {
+  const known = referenceClock.offset !== null;
+  statusClock.hidden = !known;
+  // Every other refresh keeps pace with video at half the repaints.
+  if (known && ++statusClockTicks % 2 === 0) {
+    statusClock.textContent = new Date(referenceClock.nowMs()).toISOString().slice(11, 23);
+  }
+  requestAnimationFrame(paintStatusClock);
+};
+if (showStatus) requestAnimationFrame(paintStatusClock);
 void referenceClock.calibrate();
 setInterval(() => { void referenceClock.calibrate(); }, 300_000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void referenceClock.calibrate(); });
