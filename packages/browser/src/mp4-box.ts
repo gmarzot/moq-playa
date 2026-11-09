@@ -495,7 +495,13 @@ export function readFirstCompositionOffset(segment: Uint8Array): number {
   };
   const moof = child(segment, 'moof', 0);
   const traf = moof && child(moof, 'traf', 8);
-  const trun = traf && child(traf, 'trun', 8);
+  if (!traf) return 0;
+  // Empty runs hold no first sample.
+  let trun = child(traf, 'trun', 8);
+  while (trun && trun.byteLength >= 16
+      && new DataView(trun.buffer, trun.byteOffset, trun.byteLength).getUint32(12) === 0) {
+    trun = child(traf, 'trun', trun.byteOffset - traf.byteOffset + trun.byteLength);
+  }
   if (!trun || trun.byteLength < 16) return 0;
   const view = new DataView(trun.buffer, trun.byteOffset, trun.byteLength);
   const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11);
