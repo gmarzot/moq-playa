@@ -423,17 +423,18 @@
     .diag-grid .cell b.na { color: var(--text-na); font-weight: 400; }
     /* A unit can warn while its value stays neutral. */
     .diag-grid .cell b .u.fault { color: var(--warn); }
-    /* Fixed counts, not auto-fit: the charts share one time axis, so a ragged
-       row would break the comparison. */
+    /* Three across while every label fits, latency and jitter giving up width first;
+       otherwise one full-width column, never a ragged 2 + 1. The threshold is the labels'
+       natural widths (about 1050 px with the gaps) plus room for longer numbers. */
+    .diag { container-type: inline-size; }
     .diag-charts {
       display: grid; gap: 16px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
     }
-    @media (max-width: 900px) {
-      .diag-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 520px) {
-      .diag-charts { grid-template-columns: 1fr; }
+    @container (min-width: 1150px) {
+      .diag-charts {
+        grid-template-columns: minmax(min-content, 1fr) minmax(min-content, .6fr) minmax(min-content, 1.2fr);
+      }
     }
     /* Block so the underline spans the graph rather than the text; nowrap
        keeps every label one line, so every canvas sits at the same y. */
