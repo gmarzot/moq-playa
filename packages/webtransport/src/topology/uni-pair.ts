@@ -41,6 +41,27 @@ import type { WebTransportLike, WebTransportBidirectionalStream } from '../types
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';
 import type { RequestStreamDraft } from '@openmoq/transport';
 
+/** Longest a graceful finish waits for the peer to act on our STOP_SENDING before it FINs. */
+const STOP_BEFORE_FIN_MS = 250;
+
+/**
+ * STOP_SENDING, then FIN once the peer answers (its STOP_SENDING errors our writable)
+ * or after STOP_BEFORE_FIN_MS. A peer may ignore a STOP_SENDING that reaches it after our FIN.
+ */
+async function stopThenFin(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+): Promise<void> {
+  try { await reader.cancel(); } catch { /* already closed */ }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    writer.closed.catch(() => { /* the peer stopped our writable */ }),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, STOP_BEFORE_FIN_MS); }),
+  ]);
+  clearTimeout(timer);
+  try { await writer.close(); } catch { /* already closed/aborted */ }
+}
+
 /**
  * Marks a request stream torn down by a LOCAL cancellation (e.g. draft-18 FETCH
  * cancel). The owner recognizes it and does NOT surface it as an error — unlike
@@ -980,7 +1001,7 @@ class RequestStreamContext {
 
   /**
    * Gracefully finish the stream: optionally write one final message (no response
-   * expected), then FIN our writable and STOP_SENDING the readable. Used for a
+   * expected), then STOP_SENDING the readable and FIN our writable. Used for a
    * local PUBLISH_DONE on an outbound PUBLISH (§10.11). Resolves `closed` cleanly;
    * the read loop is suppressed from reporting the teardown as a failure.
    */
@@ -990,8 +1011,7 @@ class RequestStreamContext {
     if (finalMessage) {
       try { await this.writer.write(this.codec.encode(finalMessage)); } catch { /* already closed */ }
     }
-    try { await this.writer.close(); } catch { /* already closed/aborted */ }
-    try { await this.reader.cancel(); } catch { /* already closed */ }
+    await stopThenFin(this.reader, this.writer);
     for (const d of this.queue.splice(0)) d.reject(new RequestCancelledError(StreamResetCode18.CANCELLED));
     this.closedDeferred.resolve();
   }
@@ -1286,12 +1306,11 @@ class ContinuingRequestStreamContext {
     return d.promise;
   }
 
-  /** Gracefully close: FIN our writable + STOP_SENDING the readable. */
+  /** Gracefully close: STOP_SENDING the readable, then FIN our writable. */
   async close(): Promise<void> {
     if (this.closing) return;
     this.closing = true;
-    try { await this.writer.close(); } catch { /* already closed/aborted */ }
-    try { await this.reader.cancel(); } catch { /* already closed */ }
+    await stopThenFin(this.reader, this.writer);
     this.closedDeferred.resolve();
   }
 

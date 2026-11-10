@@ -50,6 +50,33 @@ function reqMessage(r: RequestResult): ControlMessage {
 const ns = (s: string) => [new TextEncoder().encode(s)];
 const nm = (s: string) => new TextEncoder().encode(s);
 
+/**
+ * A transport whose next bidi stream records when close() is called, resolves it only when
+ * the test acknowledges the FIN, and can be stopped by the peer (STOP_SENDING on our writable).
+ */
+function heldFinTransport(): {
+  transport: TransportSim; stream: SimStream; finSent: () => boolean; ackFin: () => void; peerStop: () => void;
+} {
+  const transport = new TransportSim();
+  const stream = new SimStream();
+  let ack: (() => void) | undefined;
+  let ctrl!: WritableStreamDefaultController;
+  Object.defineProperty(stream, 'writable', {
+    value: new WritableStream<Uint8Array>({
+      start: (c) => { ctrl = c; },
+      write: (chunk) => { stream.written.push(chunk.slice()); },
+      close: () => new Promise<void>((res) => { ack = () => { stream.writeClosed = true; res(); }; }),
+    }),
+  });
+  transport.createBidirectionalStream = async () => { transport.bidi.push(stream); return stream; };
+  return {
+    transport, stream, finSent: () => ack !== undefined, ackFin: () => ack?.(),
+    peerStop: () => ctrl.error(new Error('STOP_SENDING')),
+  };
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 describe('UniPairTopology — control handshake', () => {
   it('sends SETUP on the uni control stream, reads peer SETUP, reaches ESTABLISHED', async () => {
     const client = new Session(EndpointRole.CLIENT, 18);
@@ -612,6 +639,42 @@ describe('UniPairTopology — request streams (FETCH)', () => {
     await flush();
     expect(errors.some((e) => /FETCH_OK\/REQUEST_ERROR/i.test(e.message))).toBe(true);
   });
+
+  it('finishRequest sends STOP_SENDING first and FINs after a grace period', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const { transport, stream, finSent, ackFin } = heldFinTransport();
+    const f = session.fetch(ns('a'), nm('1'), fetchRange);
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
+    stream.push(fetchOkBytes());
+    await handle.response;
+
+    const finished = topo.finishRequest(handle.requestId);
+    await flush();
+    expect(stream.readCancelled).toBe(true);
+    expect(finSent()).toBe(false);
+    await sleep(300);
+    expect(finSent()).toBe(true);
+    ackFin();
+    await finished;
+    expect(stream.writeClosed).toBe(true);
+  });
+
+  it('finishRequest stops waiting once the peer answers STOP_SENDING', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const { transport, stream, peerStop } = heldFinTransport();
+    const f = session.fetch(ns('a'), nm('1'), fetchRange);
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
+    stream.push(fetchOkBytes());
+    await handle.response;
+
+    const finished = topo.finishRequest(handle.requestId);
+    await flush();
+    expect(stream.readCancelled).toBe(true);
+    peerStop();
+    await expect(Promise.race([finished.then(() => 'done'), sleep(100).then(() => 'waiting')])).resolves.toBe('done');
+  });
 });
 
 describe('UniPairTopology — request streams (TRACK_STATUS, §10.14)', () => {
@@ -813,6 +876,24 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
     await topo.closeContinuingRequest(requestId);
     expect(transport.bidi[0]!.writeClosed).toBe(true);
     expect(topo.hasContinuingRequest(requestId)).toBe(false);
+  });
+
+  it('closeContinuingRequest sends STOP_SENDING first and FINs after a grace period', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const { transport, stream, finSent, ackFin } = heldFinTransport();
+    const sn = session.subscribeNamespace([new Uint8Array([1])]);
+    const { requestId } = await topo.openContinuingRequest(transport, nsRequestMessage(sn), () => {});
+
+    const closing = topo.closeContinuingRequest(requestId);
+    await flush();
+    expect(stream.readCancelled).toBe(true);
+    expect(finSent()).toBe(false);
+    await sleep(300);
+    expect(finSent()).toBe(true);
+    ackFin();
+    await closing;
+    expect(stream.writeClosed).toBe(true);
   });
 
   it('a §10.9.2 prefix REQUEST_UPDATE response is matched (not misrouted as a continuation)', async () => {

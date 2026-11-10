@@ -83,6 +83,8 @@ export class PlaybackPipeline {
 
     /** Highest group from which at least one object was consumed. -1n = nothing consumed yet. */
     private lastConsumedGroupId = -1n;
+    private minGapTimeoutUs = 0;
+    private readonly configuredGapTimeoutUs: number;
 
     /** Groups for which END_OF_GROUP has been observed. */
     private readonly endedGroups = new Set<bigint>();
@@ -190,6 +192,7 @@ export class PlaybackPipeline {
             : 0;
 
         this.buffer = new JitterBuffer(opts.config.maxBufferDepth);
+        this.configuredGapTimeoutUs = opts.config.gapTimeoutUs;
         this.gapDetector = new GapDetector({
             gapTimeoutUs: opts.config.gapTimeoutUs,
             clock: opts.clock,
@@ -224,6 +227,15 @@ export class PlaybackPipeline {
             return this.adaptiveTolerance.effectiveGapTimeoutMs * 1000;
         }
         return this.gapDetector.gapTimeoutUs;
+    }
+
+    /** Wait at least this long at a gap; 0 leaves the configured or adaptive timeout. */
+    setMinGapTimeoutUs(us: number): void {
+        this.minGapTimeoutUs = us;
+    }
+
+    private get effectiveGapTimeoutBaseUs(): number {
+        return this.adaptiveTolerance ? this.adaptiveTolerance.effectiveGapTimeoutMs * 1000 : this.configuredGapTimeoutUs;
     }
 
     /** Last consumed group ID — for track switch subscription filters. */
@@ -510,9 +522,9 @@ export class PlaybackPipeline {
         if (this.adaptiveTolerance) {
             const nowMs = this.clock.now() / 1000;
             this.adaptiveTolerance.tick(nowMs);
-            this.gapDetector.gapTimeoutUs = this.adaptiveTolerance.effectiveGapTimeoutMs * 1000;
             this.sync.driftThresholdUs = this.adaptiveTolerance.effectiveDriftThresholdMs * 1000;
         }
+        this.gapDetector.gapTimeoutUs = Math.max(this.effectiveGapTimeoutBaseUs, this.minGapTimeoutUs);
 
         // After reset (pause→resume, jump-to-live), sync up to the first
         // group that starts with a keyframe (objectId 0). Stale P-frames
