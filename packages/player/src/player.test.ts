@@ -10820,9 +10820,47 @@ describe('MoqtPlayer', () => {
         });
       });
 
-      it('no upshift without link-rate samples', async () => {
+      it('no upshift without link-rate samples inside the first 30 s', async () => {
         const { player, subscribedTo } = await loadLive(500_000);
         clockUs = 10 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        await player.destroy();
+      });
+
+      it('without link-rate samples, probes one rung up after 30 s', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        clockUs = 31 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(true);
+        await player.destroy();
+      });
+
+      it('a probe waits until the previous upshift has had its 30 s trial', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        (player as any).lastAbrUpshiftUs = 25 * S;
+        clockUs = 31 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        clockUs = 56 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(true);
+        await player.destroy();
+      });
+
+      it('no probe while delivery is unhealthy', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        (player as any).lastMseStallUs = 28 * S;
+        clockUs = 31 * S;
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        await player.destroy();
+      });
+
+      it('a measured link rate decides instead of a probe', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        clockUs = 31 * S;
+        timeObjects(player, 4_000);
         player.tick();
         expect(subscribedTo('video-0')).toBe(false);
         await player.destroy();
