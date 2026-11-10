@@ -218,7 +218,7 @@ const MAX_LOG_LINES = 2000;
 const CELL_TIPS: Record<string, string> = {
   'ttff': 'Connection start to first frame drawn.',
   'bitrate a/v': 'Received kbps, audio/video.',
-  'reorder a/v': 'Out-of-order arrivals, audio/video. Small: slowest to settle.',
+  'reorder a/v': 'Out-of-order arrivals, audio/video, not counting audio recovered by FETCH. Small: slowest to settle.',
   'lag': 'Worst page stall. Hundreds of ms: page blocked or throttled.',
   'clk drift': 'Publisher clock vs this browser, ms/min. Removed from the latency chart once steady.',
   'slowest t/a/d': 'Slowest object: transfer / assembly / dispatch ms. Small: its size.',
@@ -226,7 +226,7 @@ const CELL_TIPS: Record<string, string> = {
   'underruns': 'Audio ran dry. Small: total silence.',
   'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
   'dropped': "Video frames the browser didn't draw.",
-  'obj lost a/v': 'Objects that never arrived, audio/video. Filled: audio datagrams recovered with FETCH in Smooth.',
+  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH in Smooth; they are not counted as lost.',
   'stalls': 'Time playback was interrupted.',
 };
 
@@ -931,8 +931,9 @@ async function main(): Promise<void> {
       // them. The settle time is the one with a cliff in front of it — past the
       // adaptive gap timeout the object is discarded and costs a sync reset — so
       // it, not the count, is what goes amber.
+      // Audio filled by FETCH arrives after later datagrams; it is a repair, not a reorder.
       cell('reorder a/v',
-        `${fmtCount(seqStat('audio', 'reorders'))}/${fmtCount(seqStat('video', 'reorders'))}`,
+        `${fmtCount(Math.max(0, seqStat('audio', 'reorders') - fetchFilled()))}/${fmtCount(seqStat('video', 'reorders'))}`,
         `&le;${settleMs.toFixed(0)}ms`, NUM, settleTone),
       // Worst event-loop lag in the window. Tens of ms is ordinary scheduling;
       // hundreds means the thread is blocked or the tab is being throttled.
@@ -972,7 +973,7 @@ async function main(): Promise<void> {
       // nothing else on this panel can see.
       cell('obj lost a/v',
         `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`,
-        ((player as any).engine?.audioRepairStats?.filled ?? 0) > 0 ? `${fmtCount((player as any).engine.audioRepairStats.filled)} filled` : '',
+        fetchFilled() > 0 ? `${fmtCount(fetchFilled())} fixed by FETCH` : '',
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
       cell('stalls', stallsNow.sec.toFixed(1), 's', FAULT(stallsNow.faults), '',
         `${CELL_TIPS['stalls']} ${stallsNow.detail}`),
@@ -1096,6 +1097,8 @@ async function main(): Promise<void> {
   let audioOrderReported = '';
   let audioBypassesReported = 0;
   let chaseStartsReported = 0;
+  /** Audio repair counters at the last report. */
+  let repairReported = { filled: 0, failed: 0 };
   let staleDropsReported = 0;
   let staleDropsReportedAtMs = 0;
   const noteUnderrun = (gapSec: number, lateSec: number | null): void => {
@@ -1241,6 +1244,8 @@ async function main(): Promise<void> {
   // Per-track object continuity (counters.ts).
   const objSeq: Record<string, ObjSeq> = {};
   const seqStat = (t: string, k: 'reorders' | 'lost'): number => objSeq[t]?.[k] ?? 0;
+  /** Audio objects the player recovered with FETCH (Smooth, audio on datagrams). */
+  const fetchFilled = (): number => (player as any).engine?.audioRepairStats?.filled ?? 0;
   const settleMaxMs = (): number => {
     let worst = 0;
     for (const s of Object.values(objSeq)) {
@@ -1879,6 +1884,14 @@ async function main(): Promise<void> {
         log(`[MSE] catch-up (1.05x) started ${chaseStarts - chaseStartsReported}× in the last `
           + `${UNDERRUN_REPORT_MS / 1000}s · ${chaseStarts} in all`);
         chaseStartsReported = chaseStarts;
+      }
+      const rs = (player as any).engine?.audioRepairStats as { filled: number; failed: number } | undefined;
+      if (rs && (rs.filled !== repairReported.filled || rs.failed !== repairReported.failed)) {
+        const filled = rs.filled - repairReported.filled;
+        const failed = rs.failed - repairReported.failed;
+        log(`Audio repair in ${UNDERRUN_REPORT_MS / 1000}s: ${filled + failed} lost → ${filled} filled by FETCH, `
+          + `${failed} still lost`);
+        repairReported = { filled: rs.filled, failed: rs.failed };
       }
       const u = underrunWindow;
       if (u.count > 0) {
