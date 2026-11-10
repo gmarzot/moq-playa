@@ -398,6 +398,13 @@
       gap: 12px 18px;
       font-variant-numeric: tabular-nums;
     }
+    /* The playback metrics: whole rows of aligned columns as the row narrows
+       (12, 6, 4, 3, 2 across), from the cells' natural widths plus room for longer numbers. */
+    #diag-grid { display: grid; grid-template-columns: repeat(2, auto); justify-content: space-between; }
+    @container (min-width: 350px) { #diag-grid { grid-template-columns: repeat(3, auto); } }
+    @container (min-width: 450px) { #diag-grid { grid-template-columns: repeat(4, auto); } }
+    @container (min-width: 680px) { #diag-grid { grid-template-columns: repeat(6, auto); } }
+    @container (min-width: 1180px) { #diag-grid { grid-template-columns: repeat(12, auto); } }
     .diag-grid .cell {
       flex: 0 1 auto; white-space: nowrap;
       color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em;
@@ -424,16 +431,28 @@
     /* A unit can warn while its value stays neutral. */
     .diag-grid .cell b .u.fault { color: var(--warn); }
     /* Three across while every label fits, latency and jitter giving up width first;
-       otherwise one full-width column, never a ragged 2 + 1. The threshold is the labels'
-       natural widths (about 1050 px with the gaps) plus room for longer numbers. */
+       otherwise one full-width column, never a ragged 2 + 1. Under 1150 px the labels
+       shrink and the queued label packs its parts, so three across holds to 900 px. */
     .diag { container-type: inline-size; }
     .diag-charts {
       display: grid; gap: 16px;
       grid-template-columns: minmax(0, 1fr);
     }
-    @container (min-width: 1150px) {
+    .diag-charts > .chart { min-width: 120px; }
+    @container (min-width: 900px) {
       .diag-charts {
         grid-template-columns: minmax(min-content, 1fr) minmax(min-content, .6fr) minmax(min-content, 1.2fr);
+      }
+    }
+    @container (min-width: 900px) and (max-width: 1149.98px) {
+      .diag-charts .chart-label { font-size: .72rem; }
+      .diag-charts .chart-label.split3 { grid-template-columns: auto auto auto; justify-content: space-between; }
+    }
+    /* A phone-width column: labels wrap rather than clip. */
+    @container (max-width: 599.98px) {
+      .diag-charts .chart-label { white-space: normal; }
+      .diag-charts .chart-label.split2, .diag-charts .chart-label.split3 {
+        display: flex; flex-wrap: wrap; justify-content: space-between; column-gap: 12px;
       }
     }
     /* Block so the underline spans the graph rather than the text; nowrap
