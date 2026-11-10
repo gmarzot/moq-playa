@@ -204,6 +204,13 @@ describe('broadcast catalog subscription lifecycle', () => {
     expect(catalog.initDataList).toBeUndefined();
   });
 
+  it('publishes its clock reference at the root as g5Clock, which a parser ignores', () => {
+    const clock = { source: 'https://relay.example/time', offsetMs: 101, uncertaintyMs: 43 };
+    const bytes = buildCatalogPayload({ ...PARAMS, clock });
+    expect(JSON.parse(new TextDecoder().decode(bytes)).g5Clock).toEqual(clock);
+    expect(parseCatalog(bytes).tracks.map((t) => t.name)).toEqual(parseCatalog(buildCatalogPayload(PARAMS)).tracks.map((t) => t.name));
+  });
+
   it('the catalog version is "draft-01" with and without initialization data (MSF-01 §5.1.1)', () => {
     const version = (params: BroadcastCatalogParams) =>
       JSON.parse(new TextDecoder().decode(buildCatalogPayload(params))).version;

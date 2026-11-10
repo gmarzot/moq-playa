@@ -123,6 +123,19 @@ export interface BroadcastCatalogParams {
   locVideoConfig?: Uint8Array;
   /** LOC: the audio decoder configuration (OpusHead, AudioSpecificConfig). */
   locAudioConfig?: Uint8Array;
+  /** The clock capture times are on, published at the catalog root as `g5Clock`
+   *  (a producer may add fields, MSF-01 §5). */
+  clock?: CatalogClock;
+}
+
+/** The broadcaster's clock reference, so a viewer can tell whether its E2E compares like with like. */
+export interface CatalogClock {
+  /** URL of the reference clock; null when capture times use this machine's clock. */
+  readonly source: string | null;
+  /** Correction applied to this machine's clock, ms; positive when it was behind. */
+  readonly offsetMs?: number;
+  /** Half the measurement's round trip, ms. */
+  readonly uncertaintyMs?: number;
 }
 
 /**
@@ -260,7 +273,7 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
   }
   const audioInit = !params.audio ? undefined
     : cmaf ? cmaf.audioInit : packaging === 'loc' ? params.locAudioConfig : undefined;
-  return buildCatalog({
+  const bytes = buildCatalog({
     // MSF-01 §5.1.1: the draft release this catalog follows.
     version: 'draft-01',
     // Initialization data goes in the root initDataList, referenced by initRef:
@@ -303,6 +316,9 @@ export function buildCatalogPayload(params: BroadcastCatalogParams): Uint8Array 
       }] : []),
     ],
   });
+  if (!params.clock) return bytes;
+  const doc = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+  return new TextEncoder().encode(JSON.stringify({ ...doc, g5Clock: params.clock }));
 }
 
 function toBase64(bytes: Uint8Array): string {
