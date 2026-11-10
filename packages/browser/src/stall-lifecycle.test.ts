@@ -505,6 +505,32 @@ describe('Canvas stall clock across a hidden page', () => {
     tick();
     expect(recovered).toEqual([2_000]);
   });
+
+  it('keeps the frames still ahead, so a Smooth cushion plays on', () => {
+    for (let t = 1_100; t <= 1_900; t += 100) renderer.enqueue(frame(t), t * 1000);
+    setHidden(true);
+    now = 1_050;
+    setHidden(false);
+    expect(renderer.queueLength).toBe(9);
+
+    for (now = 1_100; now <= 1_900; now += 100) tick();
+    expect(detected).toEqual([]);
+    expect(renderer.droppedCount).toBe(0);
+    expect(renderer.queueLength).toBe(0);
+  });
+
+  it('drops a due backlog to its newest frame and keeps the rest', () => {
+    for (const t of [1_100, 1_200, 1_300, 2_000]) renderer.enqueue(frame(t), t * 1000);
+    setHidden(true);
+    now = 1_500;
+    setHidden(false);
+    expect(renderer.droppedCount).toBe(2);
+    expect(renderer.queueLength).toBe(2);
+
+    tick();                                   // paints the 1_300 frame; 2_000 waits
+    expect(renderer.queueLength).toBe(1);
+    expect(detected).toEqual([]);
+  });
 });
 
 describe('Canvas validates before acquiring browser state', () => {
