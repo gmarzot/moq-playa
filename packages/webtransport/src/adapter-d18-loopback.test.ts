@@ -1668,6 +1668,7 @@ describe('MoqtConnection(18) loopback — FETCH happy path + cancel (§10.12)', 
     await server.closeFetchStream(sid);
     await flush();
 
+    await new Promise((r) => setTimeout(r, 300)); // the requester FINs after its STOP_SENDING grace
     // Session reclaimed the fetch on both sides.
     expect(client.session.getFetch(requestId)).toBeUndefined();
     expect(server.session.getIncomingFetch(fetchReqId)).toBeUndefined();
@@ -1714,6 +1715,7 @@ describe('MoqtConnection(18) loopback — FETCH happy path + cancel (§10.12)', 
     });
     await flush(32);
 
+    await new Promise((r) => setTimeout(r, 300)); // the requester FINs after its STOP_SENDING grace
     expect(client.session.getFetch(requestId)).toBeUndefined();
     expect(server.session.getIncomingFetch(fetchReqId)).toBeUndefined();
 
@@ -2666,6 +2668,7 @@ describe('MoqtConnection(18) loopback — terminal-lifecycle interleavings', () 
     await client.subscribeNamespace(ns('x')).catch(() => undefined);
     await flush(32);
 
+    await new Promise((r) => setTimeout(r, 300)); // the requester FINs after its STOP_SENDING grace
     const rejected = a.bidiOut[1]!; // the second continuing stream
     expect(rejected.in.writeClosed).toBe(true);                                  // responder FINned
     expect(rejected.out.writeClosed || rejected.out.writeAborted).toBe(true);    // requester released its side
