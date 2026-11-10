@@ -890,7 +890,7 @@ async function main(): Promise<void> {
     if (showStatus) {
       const video = playerContainer.querySelector('video');
       const height = video?.videoHeight || playerContainer.querySelector('canvas')?.height;
-      statusStats.textContent = `E2E ${latScreen.textContent} · ${height ? `${height}p · ` : ''}`
+      statusStats.textContent = `E2E ${latScreen.textContent}${latScreen.dataset.clock === 'unshared' ? '*' : ''} · ${height ? `${height}p · ` : ''}`
         + `stalls ${stallsNow.faults}${stallsNow.sec > 0 ? ` (${stallsNow.sec.toFixed(1)} s)` : ''}`;
     }
     // TTFF runs from connection start; the connect share goes in its tooltip.
@@ -2086,12 +2086,36 @@ async function main(): Promise<void> {
   });
   // Size goes in the header; `?debug=1` also logs each object's head.
   let rawSeen = 0;
+  // The publisher's clock reference (catalog root `g5Clock`), checked against this page's.
+  let publisherClockKey = '';
+  const hostOf = (url: string): string | null => { try { return new URL(url).host; } catch { return null; } };
+  const notePublisherClock = (text: string): void => {
+    let clock: { source?: unknown; uncertaintyMs?: unknown } | undefined;
+    try { clock = (JSON.parse(text) as { g5Clock?: typeof clock }).g5Clock; } catch { return; }
+    const source = typeof clock?.source === 'string' ? hostOf(clock.source) : null;
+    const key = clock === undefined ? 'absent' : source ?? 'none';
+    if (key === publisherClockKey) return;
+    publisherClockKey = key;
+    const here = hostOf(clockUrl);
+    if (clock === undefined) {
+      log('Clock: the catalog names no publisher clock; E2E assumes it is right');
+    } else if (source === null) {
+      log("Clock: the publisher's clock is uncorrected; E2E includes its error");
+    } else if (source === here) {
+      const u = typeof clock.uncertaintyMs === 'number' ? ` (publisher ±${clock.uncertaintyMs} ms)` : '';
+      log(`Clock: publisher and this page both follow ${here}${u}`);
+    } else {
+      log(`Clock: the publisher follows ${source}, this page ${here}; E2E includes the difference between them`);
+    }
+    latScreen.dataset.clock = source !== null && source === here ? 'shared' : 'unshared';
+  };
   player.on('catalog_raw', ({ bytes, text }) => {
     rawSeen++;
     // Empty text: the bytes were not UTF-8.
     if (text) {
       noteReceivedCatalog(text, bytes);
       showCatalogJson();
+      notePublisherClock(text);
     }
     if (!debug) return;
     const head = text === null ? '(not UTF-8)' : text.slice(0, 120);

@@ -1377,6 +1377,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         ...(audio ? { audio: { ...audio, ...(activeAudioCodec === 'opus' ? { sampleRate: 48_000 } : {}),
           codec: activeAudioCodec, bitrate: audioBitrate } } : {}),
         ...(audio && packaging === 'loc' ? { locAudioConfig: audioConfigFor(activeAudioCodec, audio) } : {}),
+        clock: referenceClock.offset !== null
+          ? { source: clockUrl, offsetMs: Math.round(referenceClock.offset.offsetMs),
+            uncertaintyMs: Math.round(referenceClock.offset.rttMs / 2) }
+          : { source: null },
       };
       sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
