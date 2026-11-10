@@ -86,6 +86,7 @@
       }
     }
   ],
+  "mttLatencies": ["smooth"],
   "mttNamespace": "openmoq/aiomoqt/mtt_00/clock/{packaging}/h264/720/30/aac/2",
   "mttExpected": {
     "videoWidth": 1280,
