@@ -51,6 +51,22 @@ const latencyMode: 'live' | 'smooth' = (() => {
   }
   return v === 'smooth' ? 'smooth' : 'live';
 })();
+
+const VOLUME_KEY = 'g5-volume';
+const MUTED_KEY = 'g5-muted';
+/** The viewer's last volume and mute choice. */
+const storedAudio: { volume?: number; muted?: boolean } = (() => {
+  try {
+    const raw = localStorage.getItem(VOLUME_KEY);
+    const volume = raw === null ? NaN : Number(raw);
+    const muted = localStorage.getItem(MUTED_KEY);
+    return {
+      ...(Number.isFinite(volume) && volume >= 0 && volume <= 1 ? { volume } : {}),
+      ...(muted === '1' || muted === '0' ? { muted: muted === '1' } : {}),
+    };
+  } catch { return {}; }
+})();
+
 /** `?latencyMax=`: ceiling of the smooth playout delay (ms). */
 const smoothCeilingMs: number | undefined = (() => {
   const v = Number(new URLSearchParams(location.search).get('latencyMax'));
@@ -412,6 +428,7 @@ async function main(): Promise<void> {
     url: relayUrl,
     namespace,
     autoplay: true,
+    ...storedAudio,
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {}),
     ...(congestionControl ? { congestionControl } : {}),
@@ -2162,6 +2179,14 @@ async function main(): Promise<void> {
   };
   setPlayIcon(false);
   setMuteIcon(player.muted);
+  volumeBar.value = String(Math.round(player.volume * 100));
+  /** Saves the viewer's own choices; a mute the autoplay policy forces is not one. */
+  const saveAudioChoice = (): void => {
+    try {
+      localStorage.setItem(VOLUME_KEY, String(player.volume));
+      localStorage.setItem(MUTED_KEY, player.muted ? '1' : '0');
+    } catch { /* storage unavailable */ }
+  };
   phoneBar.addEventListener('change', labelSpeaker);
 
   playBtn.addEventListener('click', () => {
@@ -2186,12 +2211,15 @@ async function main(): Promise<void> {
   });
 
   seekBar.addEventListener('input', () => player.seek(Number(seekBar.value)));
-  volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
+  volumeBar.addEventListener('input', () => {
+    player.setVolume(Number(volumeBar.value) / 100);
+    saveAudioChoice();
+  });
   muteBtn.addEventListener('click', () => {
     if (phoneBar.matches) setVolumePopOpen(!volumeGroup.classList.contains('open'));
-    else void player.toggleMute();
+    else void player.toggleMute().then(saveAudioChoice);
   });
-  popMuteBtn.addEventListener('click', () => player.toggleMute());
+  popMuteBtn.addEventListener('click', () => { void player.toggleMute().then(saveAudioChoice); });
   player.on('volumechange', ({ muted }) => setMuteIcon(muted));
 
   // Gear menu: closes on a choice, a click outside or Escape.
