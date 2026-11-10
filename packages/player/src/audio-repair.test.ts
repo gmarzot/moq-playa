@@ -42,6 +42,14 @@ describe('AudioRepair', () => {
     expect(cancelled).toEqual([1n]);
   });
 
+  it('repairs a one-object gap deep inside a long group', async () => {
+    const { repair, ranges } = setup();
+    repair.note(10n, 60n);
+    repair.note(10n, 62n);
+    await vi.advanceTimersByTimeAsync(30);
+    expect(ranges).toEqual([{ startGroup: 10n, startObject: 61n, endGroup: 10n, endObject: 62n }]);
+  });
+
   it('does not fetch a datagram that was only reordered', async () => {
     const { repair, ranges } = setup();
     repair.note(10n, 0n);

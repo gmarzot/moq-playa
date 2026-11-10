@@ -142,7 +142,8 @@ export class AudioRepair {
   private openGap(last: { group: bigint; object: bigint }, group: bigint, object: bigint): void {
     const missing = new Set<string>();
     const sameGroup = group === last.group;
-    if (group - last.group > BigInt(this.maxGapObjects) || object > BigInt(this.maxGapObjects)) return;
+    const objectSpan = sameGroup ? object - last.object : object;
+    if (group - last.group > BigInt(this.maxGapObjects) || objectSpan > BigInt(this.maxGapObjects)) return;
     for (let g = last.group + 1n; g < group; g++) missing.add(key(g, 0n));
     for (let o = sameGroup ? last.object + 1n : 0n; o < object; o++) missing.add(key(group, o));
     if (missing.size === 0 || missing.size > this.maxGapObjects) return;
