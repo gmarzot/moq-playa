@@ -153,10 +153,9 @@ function applyTheme(): void {
   prefersLight.addEventListener('change', () => { if (!themeChoice) applyTheme(); });
 }
 const stateBadge = document.getElementById('state')!;
-stateBadge.hidden = !showStatus;
 const statusClock = document.getElementById('status-clock')!;
 const statusStats = document.getElementById('status-stats')!;
-document.getElementById('status-line')!.hidden = !showStatus;
+document.getElementById('status-overlay')!.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
 const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
@@ -434,7 +433,7 @@ async function main(): Promise<void> {
   // ── Wire Events ───────────────────────────────────────────────────
 
   player.on('statechange', ({ state }) => {
-    stateBadge.textContent = state === 'playing' ? latencyMode : state;
+    stateBadge.textContent = state === 'playing' ? (latencyMode === 'smooth' ? 'live/smooth' : 'live') : state;
     stateBadge.className = `state-badge ${state}`;
     if (state === 'error') {
       setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };

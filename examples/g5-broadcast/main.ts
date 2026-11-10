@@ -478,8 +478,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
 
 const preview = document.getElementById('preview') as HTMLVideoElement;
 const stateBadge = document.getElementById('state')!;
-stateBadge.hidden = !showStatus;
-document.getElementById('status-line')!.hidden = !showStatus;
+document.getElementById('status-overlay')!.hidden = !showStatus;
 const statusStats = document.getElementById('status-stats')!;
 const shareBtn = document.getElementById('share-btn') as HTMLButtonElement;
 const shareBackdrop = document.getElementById('share-backdrop')!;
