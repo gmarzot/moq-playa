@@ -7119,10 +7119,24 @@ export class MoqtPlayer {
       effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
     }
 
-    const decision = this.bufferAbrController.evaluate({
+    let decision = this.bufferAbrController.evaluate({
       bufferDepthUs: effectiveBufferUs,
       bandwidthEstimateKbps: bandwidthKbps,
     });
+    // Live without link-rate samples: arrival is the publisher's pace, so the headroom is
+    // unknown. Try one rung up on trial, once the previous upshift has had its trial.
+    let probing = false;
+    if (decision.action === 'hold' && live && linkKbps === 0 && !shortReason
+      && now - this.lastAbrUpshiftUs >= MoqtPlayer.ABR_UPSHIFT_TRIAL_US) {
+      const probe = this.bufferAbrController.evaluate({
+        bufferDepthUs: effectiveBufferUs,
+        bandwidthEstimateKbps: Number.POSITIVE_INFINITY,
+      });
+      if (probe.action === 'upshift') {
+        decision = probe;
+        probing = true;
+      }
+    }
 
     if (decision.action === 'hold') return;
 
@@ -7142,7 +7156,7 @@ export class MoqtPlayer {
       const verb = isDown ? 'downshift' : 'upshift';
       this.log.warn('Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s%s',
         effectiveBufferUs / 1_000_000, bandwidthKbps, arrivalKbps, verb, newTrack.name,
-        shortReason ? ` (${shortReason})` : '');
+        shortReason ? ` (${shortReason})` : probing ? ' (no link rate: probing)' : '');
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack(newTrack.name, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
