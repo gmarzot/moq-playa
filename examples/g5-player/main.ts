@@ -169,10 +169,9 @@ function applyTheme(): void {
   prefersLight.addEventListener('change', () => { if (!themeChoice) applyTheme(); });
 }
 const stateBadge = document.getElementById('state')!;
-stateBadge.hidden = !showStatus;
 const statusClock = document.getElementById('status-clock')!;
 const statusStats = document.getElementById('status-stats')!;
-document.getElementById('status-line')!.hidden = !showStatus;
+document.getElementById('status-overlay')!.hidden = !showStatus;
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
 const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
@@ -227,7 +226,7 @@ const CELL_TIPS: Record<string, string> = {
   'underruns': 'Audio ran dry. Small: total silence.',
   'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
   'dropped': "Video frames the browser didn't draw.",
-  'obj lost a/v': 'Objects that never arrived, audio/video.',
+  'obj lost a/v': 'Objects that never arrived, audio/video. Filled: audio datagrams recovered with FETCH in Smooth.',
   'stalls': 'Time playback was interrupted.',
 };
 
@@ -451,7 +450,7 @@ async function main(): Promise<void> {
   // ── Wire Events ───────────────────────────────────────────────────
 
   player.on('statechange', ({ state }) => {
-    stateBadge.textContent = state === 'playing' ? latencyMode : state;
+    stateBadge.textContent = state === 'playing' ? (latencyMode === 'smooth' ? 'live/smooth' : 'live') : state;
     stateBadge.className = `state-badge ${state}`;
     if (state === 'error') {
       setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
@@ -908,7 +907,7 @@ async function main(): Promise<void> {
     if (showStatus) {
       const video = playerContainer.querySelector('video');
       const height = video?.videoHeight || playerContainer.querySelector('canvas')?.height;
-      statusStats.textContent = `E2E ${latScreen.textContent} · ${height ? `${height}p · ` : ''}`
+      statusStats.textContent = `E2E ${latScreen.textContent}${latScreen.dataset.clock === 'unshared' ? '*' : ''} · ${height ? `${height}p · ` : ''}`
         + `stalls ${stallsNow.faults}${stallsNow.sec > 0 ? ` (${stallsNow.sec.toFixed(1)} s)` : ''}`;
     }
     // TTFF runs from connection start; the connect share goes in its tooltip.
@@ -972,7 +971,8 @@ async function main(): Promise<void> {
       // An id that never arrived: a frame missing inside a buffered range, which
       // nothing else on this panel can see.
       cell('obj lost a/v',
-        `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`, '',
+        `${fmtCount(seqStat('audio', 'lost'))}/${fmtCount(seqStat('video', 'lost'))}`,
+        ((player as any).engine?.audioRepairStats?.filled ?? 0) > 0 ? `${fmtCount((player as any).engine.audioRepairStats.filled)} filled` : '',
         FAULT(seqStat('video', 'lost') + seqStat('audio', 'lost'))),
       cell('stalls', stallsNow.sec.toFixed(1), 's', FAULT(stallsNow.faults), '',
         `${CELL_TIPS['stalls']} ${stallsNow.detail}`),
@@ -2103,12 +2103,36 @@ async function main(): Promise<void> {
   });
   // Size goes in the header; `?debug=1` also logs each object's head.
   let rawSeen = 0;
+  // The publisher's clock reference (catalog root `g5Clock`), checked against this page's.
+  let publisherClockKey = '';
+  const hostOf = (url: string): string | null => { try { return new URL(url).host; } catch { return null; } };
+  const notePublisherClock = (text: string): void => {
+    let clock: { source?: unknown; uncertaintyMs?: unknown } | undefined;
+    try { clock = (JSON.parse(text) as { g5Clock?: typeof clock }).g5Clock; } catch { return; }
+    const source = typeof clock?.source === 'string' ? hostOf(clock.source) : null;
+    const key = clock === undefined ? 'absent' : source ?? 'none';
+    if (key === publisherClockKey) return;
+    publisherClockKey = key;
+    const here = hostOf(clockUrl);
+    if (clock === undefined) {
+      log('Clock: the catalog names no publisher clock; E2E assumes it is right');
+    } else if (source === null) {
+      log("Clock: the publisher's clock is uncorrected; E2E includes its error");
+    } else if (source === here) {
+      const u = typeof clock.uncertaintyMs === 'number' ? ` (publisher ±${clock.uncertaintyMs} ms)` : '';
+      log(`Clock: publisher and this page both follow ${here}${u}`);
+    } else {
+      log(`Clock: the publisher follows ${source}, this page ${here}; E2E includes the difference between them`);
+    }
+    latScreen.dataset.clock = source !== null && source === here ? 'shared' : 'unshared';
+  };
   player.on('catalog_raw', ({ bytes, text }) => {
     rawSeen++;
     // Empty text: the bytes were not UTF-8.
     if (text) {
       noteReceivedCatalog(text, bytes);
       showCatalogJson();
+      notePublisherClock(text);
     }
     if (!debug) return;
     const head = text === null ? '(not UTF-8)' : text.slice(0, 120);

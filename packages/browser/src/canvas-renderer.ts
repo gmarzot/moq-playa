@@ -378,11 +378,10 @@ export class CanvasRenderer implements VideoRendererLike {
 
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;
-    // Becoming visible: the queue built while painting was throttled holds
-    // frames whose moment has passed. Keep only the newest so playback
-    // resumes at the live edge instead of replaying the backlog.
+    // Becoming visible: drop the frames that fell due while painting was
+    // throttled, but the newest; frames still ahead keep the cushion.
     if (!document.hidden) {
-      this.dropAllButNewest();
+      this.dropDueBacklog(this.clock.now());
       // Throttled painting while hidden is not a stall: time the next one from
       // now. A stall already detected before the page was hidden keeps running.
       if (this.lastRenderTimeMs > 0) this.lastRenderTimeMs = performance.now();
@@ -392,17 +391,14 @@ export class CanvasRenderer implements VideoRendererLike {
     this.scheduleLoop();
   };
 
-  /** Close and discard every queued frame but the last. */
-  private dropAllButNewest(): void {
-    if (this.queue.length <= 1) return;
-    const newest = this.queue[this.queue.length - 1]!;
-    for (const q of this.queue) {
-      if (q === newest) continue;
+  /** Close and discard the frames already due but the newest of them. */
+  private dropDueBacklog(nowUs: number): void {
+    let due = 0;
+    while (due < this.queue.length && this.queue[due]!.renderTimeUs <= nowUs) due++;
+    for (const q of this.queue.splice(0, Math.max(0, due - 1))) {
       this.framesDropped++;
       try { q.frame.close(); } catch { /* already closed */ }
     }
-    this.queue.length = 0;
-    this.queue.push(newest);
   }
 
   private scheduleLoop(): void {

@@ -251,6 +251,27 @@ describe('PlaybackPipeline', () => {
         expect(decodes.length).toBeGreaterThanOrEqual(1);
     });
 
+    it('a minimum gap timeout holds a skip, and 0 restores the configured one', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01])));
+        pipeline.tick();
+        pipeline.setMinGapTimeoutUs(450_000);
+        pipeline.pushObject(makeData(2, 0), videoHeaders(1_000_100_000n, true, new Uint8Array([0x01])));
+        pipeline.tick();
+
+        clock.advance(250_000);       // past the configured 200 ms
+        pipeline.tick();
+        expect(events.filter(e => e.type === 'skip_forward')).toHaveLength(0);
+
+        pipeline.setMinGapTimeoutUs(0);
+        pipeline.tick();
+        pipeline.tick();
+        expect(events.filter(e => e.type === 'skip_forward')).toHaveLength(1);
+    });
+
     it('missing group + timeout → skip_forward event + decoder reset (§10.2.1.1)', () => {
         const clock = new MockClock();
         clock.set(5_000_000);

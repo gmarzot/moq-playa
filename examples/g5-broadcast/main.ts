@@ -478,8 +478,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
 
 const preview = document.getElementById('preview') as HTMLVideoElement;
 const stateBadge = document.getElementById('state')!;
-stateBadge.hidden = !showStatus;
-document.getElementById('status-line')!.hidden = !showStatus;
+document.getElementById('status-overlay')!.hidden = !showStatus;
 const statusStats = document.getElementById('status-stats')!;
 const shareBtn = document.getElementById('share-btn') as HTMLButtonElement;
 const shareBackdrop = document.getElementById('share-backdrop')!;
@@ -1378,6 +1377,10 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         ...(audio ? { audio: { ...audio, ...(activeAudioCodec === 'opus' ? { sampleRate: 48_000 } : {}),
           codec: activeAudioCodec, bitrate: audioBitrate } } : {}),
         ...(audio && packaging === 'loc' ? { locAudioConfig: audioConfigFor(activeAudioCodec, audio) } : {}),
+        clock: referenceClock.offset !== null
+          ? { source: clockUrl, offsetMs: Math.round(referenceClock.offset.offsetMs),
+            uncertaintyMs: Math.round(referenceClock.offset.rttMs / 2) }
+          : { source: null },
       };
       sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
