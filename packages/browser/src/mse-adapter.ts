@@ -841,6 +841,10 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly STALL_NUDGE_MS = 500;
   /** Media buffered ahead of the playhead the nudge requires. */
   private static readonly STALL_NUDGE_MIN_AHEAD_SEC = 0.5;
+  /** No new video frame for this long, with the playhead moving and video buffered there: the renderer is stuck. */
+  private static readonly VIDEO_STUCK_MS = 1_000;
+  private static readonly VIDEO_STUCK_MIN_MOVE_SEC = 0.5;
+  private static readonly VIDEO_STUCK_COOLDOWN_MS = 5_000;
   /** After a stall, a cushion this far over target is shed by one seek (live only). */
   private static readonly STALL_SNAP_EXCESS_SEC = 1.0;
   /** Cap on the stall length the snap keeps above target. */
@@ -859,6 +863,9 @@ export class MseMediaSource implements MediaSourceLike {
   /** When the cushion first went past the behind-live excess; null when it isn't. */
   private behindSinceMs: number | null = null;
   private lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+  /** Frames presented and playhead when the frame count last changed. */
+  private videoFramesSeen: { frames: number; time: number; atMs: number } | null = null;
+  private lastVideoStuckNudgeMs = Number.NEGATIVE_INFINITY;
   /** Buffered end when the player resubscribed: the next hole after it cannot fill. */
   private discontinuityMark: { afterSec: number; atMs: number } | null = null;
   /** Suppresses ONE seek-generated waiting/timeupdate episode after a jump. */
@@ -1621,6 +1628,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.gapEpisodeTicks = 0;
     this.retireGapLanding();
     this.lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+    this.videoFramesSeen = null;
+    this.lastVideoStuckNudgeMs = Number.NEGATIVE_INFINITY;
     this.discontinuityMark = null;
     this.resetPlaybackRate();
   }
@@ -2534,6 +2543,7 @@ export class MseMediaSource implements MediaSourceLike {
         // range), so the two never race for the same playhead state.
         this.checkGapJump(nowMs);
         this.checkPlayheadWedge(nowMs);
+        this.checkVideoStuck(nowMs);
         // Also on the tick, not only per append: a element the UA paused
         // (power saving on a hidden/occluded tab) keeps buffering, and on
         // resume nothing may ever append again — a publisher that ended
@@ -3670,6 +3680,47 @@ export class MseMediaSource implements MediaSourceLike {
     this.noteSelfSeek();
     this.logWarn('[MSE] post-stall snap %s -> %s', ct.toFixed(2), to.toFixed(2));
     try { this.onPlayheadAdjust?.('snap', ct, to); } catch { /* listener bug */ }
+  }
+
+  /**
+   * Chrome's video renderer can stop presenting after a video hole while audio
+   * moves the playhead on, until a seek. A playhead that moved with video
+   * buffered at it but no new frame for VIDEO_STUCK_MS is nudged 0.1 s on.
+   */
+  private checkVideoStuck(nowMs: number): void {
+    const v = this.video;
+    const q = (v as { getVideoPlaybackQuality?: () => VideoPlaybackQuality }).getVideoPlaybackQuality?.();
+    if (!q || this.destroyed || !this.playTriggered || !this.playbackIntent || !this.videoBuffer
+        || v.paused || v.seeking || this.isHidden()) {
+      this.videoFramesSeen = null;
+      return;
+    }
+    const ct = v.currentTime;
+    const seen = this.videoFramesSeen;
+    // totalVideoFrames counts dropped frames too; only presented ones move the picture.
+    const shown = q.totalVideoFrames - q.droppedVideoFrames;
+    if (seen === null || shown !== seen.frames || ct < seen.time) {
+      this.videoFramesSeen = { frames: shown, time: ct, atMs: nowMs };
+      return;
+    }
+    if (nowMs - seen.atMs < MseMediaSource.VIDEO_STUCK_MS
+        || ct - seen.time < MseMediaSource.VIDEO_STUCK_MIN_MOVE_SEC
+        || nowMs - this.lastVideoStuckNudgeMs < MseMediaSource.VIDEO_STUCK_COOLDOWN_MS) return;
+    let videoAt = false;
+    try {
+      const b = this.videoBuffer.buffered;
+      for (let i = 0; i < b.length; i++) if (ct >= b.start(i) && b.end(i) - ct >= 0.2) videoAt = true;
+    } catch { return; /* buffer detached */ }
+    const end = this.containingRangeEnd(ct);
+    if (!videoAt || end === null || end - ct < MseMediaSource.STALL_NUDGE_MIN_AHEAD_SEC) return;
+    const to = Math.min(ct + 0.1, end - 0.05);
+    this.lastVideoStuckNudgeMs = nowMs;
+    this.videoFramesSeen = null;
+    v.currentTime = to;
+    this.noteSelfSeek();
+    this.logWarn('[MSE] video stuck: no frame presented for %dms while the playhead moved %ss; nudge %s -> %s',
+      Math.round(nowMs - seen.atMs), (ct - seen.time).toFixed(2), ct.toFixed(2), to.toFixed(2));
+    try { this.onPlayheadAdjust?.('nudge', ct, to); } catch { /* listener bug */ }
   }
 
   /** End of the buffered range containing `t`, or null. */

@@ -132,12 +132,15 @@ interface DecodeOrder {
   lastSubgroup: bigint | null;
   /** Latest decode end emitted on the current rendition: the reference for gaps and lateness. */
   end: bigint | null;
+  /** The held head the hold deadline belongs to (its decode start), and the deadline (Date.now()). */
+  holdHead: bigint | null;
+  holdUntilMs: number | null;
 }
 
 const newDecodeOrder = (): DecodeOrder => ({
   held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0, passed: 0, bypasses: 0 },
   unfilledRun: 0, bypassUntilMs: null, resumed: false, lastGroup: null, lastStart: null, lastSubgroup: null,
-  end: null,
+  end: null, holdHead: null, holdUntilMs: null,
 });
 
 /** Frames a decode gap stands for, at least one. */
@@ -322,6 +325,8 @@ export class CmafAssembler {
   private static readonly STARTUP_DIAG_COUNT = 5;
   /** Buffered depth at which a hold gives up: Chrome reports `waiting` with about 130 ms still ahead. */
   private static readonly HOLD_RELEASE_MARGIN_MS = 150;
+  /** Least wait for a previous group's tail before a newer video group is emitted over its gap. */
+  private static readonly VIDEO_TAIL_HOLD_MS = 300;
   /** Audio gap holds that expire unfilled in a row before gaps pass straight through. */
   private static readonly AUDIO_BYPASS_AFTER = 3;
   /** How long audio gaps pass through before holding is tried again. */
@@ -722,13 +727,22 @@ export class CmafAssembler {
     const head = o.held[0]!;
     const frameMs = (Number(head.end - head.start) * 1000) / timescale;
     const aheadMs = (mediaType === 'video' ? this.videoAheadMs : this.audioAheadMs)?.() ?? null;
-    const ms = aheadMs === null
-      ? frameMs
-      : Math.max(frameMs, aheadMs - CmafAssembler.HOLD_RELEASE_MARGIN_MS);
+    // A just-joined rendition's next group can overtake the previous group's tail;
+    // waiting briefly costs less than the hole, which Chrome may not play past.
+    const tailMs = mediaType === 'video' && o.lastGroup !== null && head.groupId > o.lastGroup
+      ? CmafAssembler.VIDEO_TAIL_HOLD_MS : 0;
+    const ms = Math.max(frameMs, tailMs,
+      aheadMs === null ? 0 : aheadMs - CmafAssembler.HOLD_RELEASE_MARGIN_MS);
+    // A partial fill keeps the head's deadline rather than restarting the hold.
+    const nowMs = Date.now();
+    if (o.holdHead !== head.start || o.holdUntilMs === null) {
+      o.holdHead = head.start;
+      o.holdUntilMs = nowMs + ms;
+    }
     o.timer = setTimeout(() => {
       o.timer = null;
       this.releaseHeld(mediaType, true);
-    }, ms);
+    }, Math.max(0, o.holdUntilMs - nowMs));
   }
 
   /** Emit everything held for one media type, skipping its gaps. */
@@ -742,6 +756,8 @@ export class CmafAssembler {
       if (o.timer !== null) clearTimeout(o.timer);
       o.timer = null;
       o.held.length = 0;
+      o.holdHead = null;
+      o.holdUntilMs = null;
     }
   }
 
