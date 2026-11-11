@@ -1440,6 +1440,78 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
     assembler.push('video', 'video0', 0n, concat(buildMoof(200 * VIDEO_TS), buildMdat(new Uint8Array([2]))));
     expect(outBmd(onSegment, 1)).toBe(0n);
   });
+
+  describe('rendition switch', () => {
+    const FRAME = VIDEO_TS / 10;
+    const frame = (rawBmd: number, sequence: number) =>
+      concat(buildMoof(rawBmd, sequence, FRAME), buildMdat(new Uint8Array([sequence & 0xff])));
+    /** Push `count` frames of one group, starting `first` frames into it (groups are 1 s from raw 10 s). */
+    const pushFrames = (
+      assembler: CmafAssembler, track: string, groupId: bigint, first: number, count: number,
+    ) => {
+      const groupStart = (10 + Number(groupId - 100n)) * VIDEO_TS;
+      for (let i = first; i < first + count; i++) {
+        assembler.push('video', track, groupId, frame(groupStart + i * FRAME, Number(groupId) * 10 + i));
+      }
+    };
+    const outs = (onSegment: ReturnType<typeof vi.fn>) =>
+      onSegment.mock.calls.map((_, i) => outBmd(onSegment, i));
+
+    it('keeps a rendition that starts inside the emitted tail on the shared timeline', () => {
+      const { assembler, onSegment } = assemblerWithInits();
+      assembler.push('audio', 'audio0', 0n, concat(buildMoof(10 * AUDIO_TS, 1, AUDIO_TS), buildMdat(new Uint8Array([1]))));
+      pushFrames(assembler, 'videoA', 100n, 0, 10);
+      pushFrames(assembler, 'videoA', 101n, 0, 2);
+      assembler.selectTrack('video', 'videoB');
+      pushFrames(assembler, 'videoB', 101n, 0, 3);
+
+      const video = outs(onSegment).slice(1);
+      expect(video.slice(12)).toEqual([BigInt(VIDEO_TS), BigInt(VIDEO_TS + FRAME), BigInt(VIDEO_TS + 2 * FRAME)]);
+      expect(outBmd(onSegment, 0)).toBe(0n);
+    });
+
+    it('does not accumulate an offset over alternating switches', () => {
+      const { assembler, onSegment } = assemblerWithInits();
+      pushFrames(assembler, 'videoA', 100n, 0, 10);
+      const firstOfSwitch: number[] = [];
+      for (let k = 0; k < 6; k++) {
+        const groupId = 101n + BigInt(k);
+        const [from, to] = k % 2 === 0 ? ['videoA', 'videoB'] : ['videoB', 'videoA'];
+        pushFrames(assembler, from, groupId, 0, 1);
+        assembler.selectTrack('video', to);
+        firstOfSwitch.push(onSegment.mock.calls.length);
+        pushFrames(assembler, to, groupId, 0, 10);
+      }
+
+      const out = outs(onSegment);
+      expect(firstOfSwitch.map((i) => out[i])).toEqual(
+        [1, 2, 3, 4, 5, 6].map((sec) => BigInt(sec * VIDEO_TS)));
+    });
+
+    it('holds a reordered subgroup of the new rendition inside the overlap until its gap fills', () => {
+      const { assembler, onSegment } = assemblerWithInits();
+      pushFrames(assembler, 'videoA', 100n, 0, 10);
+      pushFrames(assembler, 'videoA', 101n, 0, 3);
+      assembler.selectTrack('video', 'videoB');
+      const at = (i: number) => frame(11 * VIDEO_TS + i * FRAME, 1010 + i);
+      assembler.push('video', 'videoB', 101n, at(0), 0n);
+      assembler.push('video', 'videoB', 101n, at(2), 1n);
+      assembler.push('video', 'videoB', 101n, at(1), 0n);
+
+      expect(outs(onSegment).slice(13)).toEqual(
+        [0, 1, 2].map((i) => BigInt(VIDEO_TS + i * FRAME)));
+    });
+
+    it('moves a rendition past the emitted tail when the overlap exceeds the switch bound', () => {
+      const { assembler, onSegment } = assemblerWithInits();
+      pushFrames(assembler, 'videoA', 100n, 0, 10);
+      pushFrames(assembler, 'videoA', 101n, 0, 6);
+      assembler.selectTrack('video', 'videoB');
+      pushFrames(assembler, 'videoB', 101n, 0, 1);
+
+      expect(outs(onSegment).at(-1)).toBe(BigInt(VIDEO_TS + 6 * FRAME));
+    });
+  });
 });
 
 // ─── Diagnostic epoch-mode control ───────────────────────────────

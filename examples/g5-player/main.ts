@@ -1345,10 +1345,11 @@ async function main(): Promise<void> {
 
   // Arrival and CMAF video timeline trace, at most four lines a second: an
   // arrival gap over 150 ms; a video fragment starting before the previous one
-  // (dropped), ending inside video already received (overlap), or starting more
-  // than two frames after the previous one (MSE drops to the next keyframe).
+  // (another rendition's, or dropped), ending inside video already received
+  // (overlap), or starting more than two frames after the previous one (MSE
+  // drops to the next keyframe).
   let traceVideoInit: { timescale: number; trex?: TrexDefaults } | null = null;
-  let tracePrev: { start: bigint; end: bigint; group: bigint } | null = null;
+  let tracePrev: { start: bigint; end: bigint; group: bigint; track: string } | null = null;
   let traceMaxEnd: bigint | null = null;
   /** The last video group starting 5 s or more past the previous fragment, and when it arrived. */
   let traceTimelineJump: { group: bigint; atMs: number } | null = null;
@@ -1467,14 +1468,15 @@ async function main(): Promise<void> {
     const prev = tracePrev;
     const maxEnd = traceMaxEnd;
     const group = BigInt(e.groupId);
-    tracePrev = { start, end, group };
+    tracePrev = { start, end, group, track: e.trackName };
     if (maxEnd === null || end > maxEnd) traceMaxEnd = end;
     if (prev === null || maxEnd === null) return;
     const where = `group ${e.groupId}/${e.objectId}${group !== prev.group ? ' (new group)' : ''}`;
     const prevDur = `previous dur ${ms(prev.end - prev.start)}ms`;
     if (start < prev.start) {
       traceJumpAtMs = nowMs;
-      traceLog(`trace video: ${where} starts ${ms(prev.start - start)}ms before the previous fragment (out of order, dropped) · dur ${ms(end - start)}ms`);
+      const fate = e.trackName !== prev.track ? 'another rendition' : 'out of order, dropped';
+      traceLog(`trace video: ${where} starts ${ms(prev.start - start)}ms before the previous fragment (${fate}) · dur ${ms(end - start)}ms`);
     } else if (end <= maxEnd) {
       traceLog(`trace video: ${where} ends ${ms(maxEnd - end)}ms inside video already received (overlap, appended) · dur ${ms(end - start)}ms · ${prevDur}`);
     } else if (start - prev.start > 2n * (prev.end - prev.start)) {

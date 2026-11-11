@@ -21,6 +21,7 @@ import {
   filterInitSegment,
   describeBoxes,
   peekSegmentMetadata,
+  readFirstCompositionOffset,
   readMdhdTimescale,
   readSegmentTimeRanges,
   readTrexDefaults,
@@ -398,7 +399,7 @@ export interface MseStartupReport {
 }
 
 /** What app-initiated operation mutated a SourceBuffer. */
-type BufferOpCause = 'append' | 'init-append' | 'back-buffer-remove' | 'quota-remove' | 'quota-flush';
+type BufferOpCause = 'append' | 'init-append' | 'back-buffer-remove' | 'quota-remove' | 'quota-flush' | 'splice-remove';
 
 /** Render a TimeRanges as "a-b,c-d" for diagnostics; never throws. */
 function fmtRanges(ranges: TimeRanges | undefined | null): string {
@@ -666,6 +667,9 @@ export class MseMediaSource implements MediaSourceLike {
 
   /** Per-(mediaType:trackName) decode start of the latest sample committed. */
   private readonly latestSampleStart = new Map<string, bigint>();
+
+  /** Track of the last video append; a segment from another track starts a rendition splice. */
+  private lastVideoTrackName: string | null = null;
 
   private readonly video: HTMLVideoElement;
   private objectUrl: string | null = null;
@@ -1262,9 +1266,10 @@ export class MseMediaSource implements MediaSourceLike {
 
     if (this.changingType[mediaType] || buffer.updating || queue.length > 0) {
       queue.push(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
-    } else if (this.maybeEvictBackBuffer(mediaType, buffer)) {
-      // An eviction remove() is now in flight (it sets `updating`); park the
-      // chunk — its updateend re-enters drainQueue and dispatches it.
+    } else if (this.maybeEvictBackBuffer(mediaType, buffer)
+        || (mediaType === 'video' && this.removeSplicedAhead(buffer, data, trackName))) {
+      // A remove() is now in flight (it sets `updating`); park the chunk —
+      // its updateend re-enters drainQueue and dispatches it.
       queue.push(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
     } else {
       this.doAppend(mediaType, buffer, data, trackName, groupId);
@@ -1556,6 +1561,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoTimelines.clear();
     this.audioTimelines.clear();
     this.latestSampleStart.clear();
+    this.lastVideoTrackName = null;
     this.committedGroupFloor.clear();
     this.pendingVideoRanges = [];
     this.pendingAudioRanges = [];
@@ -1849,9 +1855,78 @@ export class MseMediaSource implements MediaSourceLike {
     // keepBehindSec exists, evict it first. The remove() sets `updating`; its
     // updateend re-enters this drain and dispatches the queued chunk.
     if (this.maybeEvictBackBuffer(mediaType, buffer)) return;
+    if (mediaType === 'video' && this.removeSplicedAhead(buffer, queue[0]!.data, queue[0]!.trackName)) return;
 
     const next = queue.shift()!;
     this.doAppend(mediaType, buffer, next.data, next.trackName, next.groupId);
+  }
+
+  /**
+   * Every range is inside the track's committed timeline and starts at or before
+   * its latest sample: a replay (relay group redelivery). A new frame inside the
+   * recorded range, under a long previous frame, starts after that sample.
+   */
+  private isContainedReplay(
+    mediaType: 'video' | 'audio',
+    trackName: string,
+    ranges: readonly { startTime: bigint; endTime: bigint }[],
+  ): boolean {
+    const timeline = (mediaType === 'video' ? this.videoTimelines : this.audioTimelines).get(trackName);
+    if (!timeline || ranges.length === 0) return false;
+    const latestStart = this.latestSampleStart.get(`${mediaType}:${trackName}`);
+    return ranges.every((r) => timeline.containsRange(r.startTime, r.endTime)
+      && (latestStart === undefined || r.startTime <= latestStart));
+  }
+
+  /**
+   * At a rendition splice, remove the old track's video buffered from the new
+   * segment's presentation start: a keyframe appended into the middle of the
+   * old GOP leaves a hole. The range behind the playhead stays, and a replay
+   * the append will drop removes nothing. Returns true when a remove() was
+   * started; its updateend re-enters drainQueue.
+   */
+  private removeSplicedAhead(buffer: SourceBuffer, data: Uint8Array, trackName: string): boolean {
+    const previous = this.lastVideoTrackName;
+    if (previous === null || previous === trackName) return false;
+    const timescale = this.videoTimescale;
+    const ranges = readSegmentTimeRanges(data, this.videoTrex);
+    if (ranges && this.isContainedReplay('video', trackName, ranges)) return false;
+    this.lastVideoTrackName = trackName;
+    if (!timescale || !ranges || ranges.length === 0) return false;
+    const first = ranges.reduce((min, r) => (r.startTime < min ? r.startTime : min), ranges[0]!.startTime);
+    let startSec: number;
+    let endSec: number;
+    try {
+      startSec = (Number(first) + readFirstCompositionOffset(data)) / timescale + buffer.timestampOffset;
+      if (buffer.buffered.length === 0) return false;
+      endSec = buffer.buffered.end(buffer.buffered.length - 1);
+    } catch { return false; /* buffer detached */ }
+    if (endSec <= startSec || startSec < this.video.currentTime) return false;
+    try {
+      this.runMutation('video', 'splice-remove', () => buffer.remove(startSec, endSec));
+    } catch (err) {
+      this.logWarn('[MSE] splice remove failed: %s', (err as Error).message);
+      return false;
+    }
+    this.clipTimelineFrom('video', previous, first);
+    this.logDebug('[MSE] video splice "%s" → "%s": removed the old rendition [%s, %s)',
+      previous, trackName, startSec.toFixed(3), endSec.toFixed(3));
+    return true;
+  }
+
+  /** Forget a track's committed coverage from decode tick `cut` on: it was removed. */
+  private clipTimelineFrom(mediaType: 'video' | 'audio', trackName: string, cut: bigint): void {
+    const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
+    const timeline = timelines.get(trackName);
+    if (!timeline) return;
+    const kept = new TimelineIndex();
+    for (const r of timeline.getRanges()) {
+      if (r.start < cut) kept.insert(r.start, r.end < cut ? r.end : cut);
+    }
+    timelines.set(trackName, kept);
+    const key = `${mediaType}:${trackName}`;
+    const latest = this.latestSampleStart.get(key);
+    if (latest !== undefined && latest >= cut) this.latestSampleStart.set(key, cut - 1n);
   }
 
   /**
@@ -3041,12 +3116,7 @@ export class MseMediaSource implements MediaSourceLike {
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
     const timeline = timelines.get(trackName);
     if (ranges !== null && ranges.length > 0 && timeline) {
-      // A replay starts at or before the latest sample committed; a new frame
-      // inside the recorded range (under a long previous frame) starts after it.
-      const latestStart = this.latestSampleStart.get(`${mediaType}:${trackName}`);
-      const allContained = ranges.every((r) => timeline.containsRange(r.startTime, r.endTime)
-        && (latestStart === undefined || r.startTime <= latestStart));
-      if (allContained) {
+      if (this.isContainedReplay(mediaType, trackName, ranges)) {
         // Logged with group id and the exact decode range so an eviction can be
         // correlated against a later drop of the SAME range — the evidence
         // needed before any residency/refill policy is designed.
@@ -3124,6 +3194,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.pendingVideoRanges = safeRanges;
       this.pendingVideoTrackName = trackName;
       this.pendingVideoGroupId = groupId;
+      this.lastVideoTrackName = trackName;
     } else {
       this.pendingAudioRanges = safeRanges;
       this.pendingAudioTrackName = trackName;
