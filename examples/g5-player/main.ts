@@ -78,6 +78,14 @@ let debug = initialPlayback.debug;
 /** Applies a query's playback settings to the running player, throwing if it rejects them; null until it exists. */
 let applyPlaybackQuery: ((query: URLSearchParams) => void) | null = null;
 
+/** Fatal media errors only a fresh tune-in recovers: wedged element, unrecoverable gap, dead pipeline. */
+const REJOIN_CODES = new Set([0x1102, 0x1104, 0x1105]);
+/** This tab's automatic rejoins, at most REJOIN_MAX in REJOIN_WINDOW_MS. */
+const REJOIN_KEY = 'g5-rejoins';
+const REJOIN_REASON_KEY = 'g5-rejoin-reason';
+const REJOIN_MAX = 3;
+const REJOIN_WINDOW_MS = 10 * 60_000;
+
 const VOLUME_KEY = 'g5-volume';
 const MUTED_KEY = 'g5-muted';
 /** This tab's last volume and mute choice; survives its reloads. */
@@ -425,6 +433,13 @@ function formatTime(ms: number): string {
 
 async function main(): Promise<void> {
   initBuildInfo(log);
+  try {
+    const reason = sessionStorage.getItem(REJOIN_REASON_KEY);
+    if (reason !== null) {
+      sessionStorage.removeItem(REJOIN_REASON_KEY);
+      log(`Rejoined live after a fatal playback error: ${reason}`);
+    }
+  } catch { /* storage unavailable */ }
   log('Discovering relay endpoint...');
   onDiscoveryAttempt((url, outcome) => log(`  probe ${url}: ${outcome}`));
   let relayUrl: string;
@@ -983,7 +998,24 @@ async function main(): Promise<void> {
     catalogWaitSinceMs = null;
     catalogWaitLogged = false;
   });
-  player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
+  player.on('error', ({ severity, code, message }) => {
+    log(`[${severity}] ${message}`);
+    if (severity !== 'fatal' || !REJOIN_CODES.has(code)) return;
+    const nowMs = Date.now();
+    let recent: number[] = [];
+    try {
+      const raw: unknown = JSON.parse(sessionStorage.getItem(REJOIN_KEY) ?? '[]');
+      if (Array.isArray(raw)) recent = raw.filter((t): t is number => typeof t === 'number' && nowMs - t < REJOIN_WINDOW_MS);
+      if (recent.length >= REJOIN_MAX) {
+        log(`Not rejoining: ${REJOIN_MAX} rejoins in the last ${REJOIN_WINDOW_MS / 60_000} min; reload to try again`);
+        return;
+      }
+      sessionStorage.setItem(REJOIN_KEY, JSON.stringify([...recent, nowMs]));
+      sessionStorage.setItem(REJOIN_REASON_KEY, message);
+    } catch { return; /* without storage the rejoin bound cannot hold */ }
+    log('Rejoining live in 1 s with a fresh session');
+    setTimeout(() => location.reload(), 1_000);
+  });
 
   const renderCushionMs = (): number | null =>
     (player as any).engine?.stats?.loc?.renderCushionMs ?? null;
@@ -1226,6 +1258,7 @@ async function main(): Promise<void> {
   let underrunReportAtMs = 0;
   let audioOrderReported = '';
   let audioBypassesReported = 0;
+  let audioBypassLoggedAtMs = Number.NEGATIVE_INFINITY;
   let chaseStartsReported = 0;
   /** Audio repair counters at the last report. */
   let repairReported = { filled: 0, failed: 0 };
@@ -1881,11 +1914,13 @@ async function main(): Promise<void> {
           + `catch-up now stops at ${Math.round(floorSec * 1000)}ms`);
     }
     if (ms && ms.debug === !debug) ms.debug = debug;
+    // At most one line per 30 s bypass window, however often it re-arms.
     const bypasses: number = (player as any).engine?.cmafAssembler?.audioOrderStats?.bypasses ?? 0;
-    if (bypasses > audioBypassesReported) {
-      audioBypassesReported = bypasses;
+    if (bypasses > audioBypassesReported && performance.now() - audioBypassLoggedAtMs >= 30_000) {
       log(`CMAF audio: gap holds keep expiring unfilled, so audio gaps pass through without a hold `
-        + `for 30 s (time ${bypasses})`);
+        + `for 30 s (${bypasses - audioBypassesReported} since the last report, ${bypasses} in all)`);
+      audioBypassesReported = bypasses;
+      audioBypassLoggedAtMs = performance.now();
     }
     // Per-track depth ahead of the playhead: MSE SourceBuffers on CMAF; on LOC
     // the render queue and the audio scheduled in WebAudio.
