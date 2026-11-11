@@ -469,6 +469,7 @@ export class MseMediaSource implements MediaSourceLike {
   setTargetAheadSec(sec: number): void {
     if (!Number.isFinite(sec) || sec <= 0) return;
     const target = Math.max(sec, MIN_TARGET_AHEAD_SEC);
+    this.baseTargetAheadSec = target;
     if (this.latencyPolicy) {
       this.latencyPolicy.setBase(target * 1e6);
       this.targetAheadSec = this.latencyPolicy.heldUs / 1e6;
@@ -476,6 +477,34 @@ export class MseMediaSource implements MediaSourceLike {
       this.targetAheadSec = target;
     }
     this.diag('target-ahead %ss', this.targetAheadSec.toFixed(2));
+  }
+
+  /**
+   * A new latency mode and smooth bounds (s). The base target stays; smooth
+   * re-bounds its policy or starts one, live drops it. Invalid bounds are ignored.
+   */
+  setLatency(latency: { readonly mode: LatencyMode; readonly floorSec: number; readonly ceilingSec: number }): void {
+    const { mode, floorSec, ceilingSec } = latency;
+    if (!(Number.isFinite(floorSec) && floorSec >= 0 && ceilingSec > 0)) return;
+    if (mode !== 'smooth') {
+      this.latencyPolicy = null;
+    } else if (this.latencyPolicy) {
+      this.latencyPolicy.setBounds({ floorUs: floorSec * 1e6, ceilingUs: ceilingSec * 1e6 });
+    } else {
+      this.latencyPolicy = this.newLatencyPolicy(floorSec, ceilingSec);
+    }
+    this.targetAheadSec = this.latencyPolicy ? this.latencyPolicy.heldUs / 1e6 : this.baseTargetAheadSec;
+    this.diag('latency %s target-ahead %ss', mode, this.targetAheadSec.toFixed(2));
+  }
+
+  private newLatencyPolicy(floorSec: number, ceilingSec: number): LatencyPolicy {
+    return new LatencyPolicy({
+      mode: 'smooth',
+      baseUs: this.baseTargetAheadSec * 1e6,
+      ceilingUs: ceilingSec * 1e6,
+      floorUs: floorSec * 1e6,
+      startupGraceUs: SMOOTH_STARTUP_GRACE_US,
+    }, { now: () => performance.now() * 1000 });
   }
 
   latencyStats(): LatencyStats | null {
@@ -856,8 +885,10 @@ export class MseMediaSource implements MediaSourceLike {
   private readonly maxAheadSec: number;
   /** Where a live-edge jump lands: rangeEnd - targetAheadSec. */
   private targetAheadSec: number;
+  /** The target without the latency policy's hold. */
+  private baseTargetAheadSec: number;
   /** Smooth latency: holds targetAheadSec above the base after stalls; null in live mode. */
-  private readonly latencyPolicy: LatencyPolicy | null;
+  private latencyPolicy: LatencyPolicy | null;
   /** One evict+retry is allowed per quota error before escalating to flush. */
   private readonly quotaRetried: { video: boolean; audio: boolean } = { video: false, audio: false };
   /** A quota flush happened; the next committed append jumps playback to it. */
@@ -986,18 +1017,14 @@ export class MseMediaSource implements MediaSourceLike {
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
     this.targetAheadSec = Math.max(options.targetAheadSec ?? 2, MIN_TARGET_AHEAD_SEC);
+    this.baseTargetAheadSec = this.targetAheadSec;
     if (options.smoothFloorSec !== undefined
         && !(Number.isFinite(options.smoothFloorSec) && options.smoothFloorSec >= 0)) {
       throw new Error(`smoothFloorSec must be finite and >= 0 (got ${String(options.smoothFloorSec)})`);
     }
     this.latencyPolicy = options.latencyMode === 'smooth'
-      ? new LatencyPolicy({
-        mode: 'smooth',
-        baseUs: this.targetAheadSec * 1e6,
-        ceilingUs: (options.smoothCeilingSec ?? SMOOTH_CEILING_MS / 1000) * 1e6,
-        floorUs: (options.smoothFloorSec ?? SMOOTH_FLOOR_MS / 1000) * 1e6,
-        startupGraceUs: SMOOTH_STARTUP_GRACE_US,
-      }, { now: () => performance.now() * 1000 })
+      ? this.newLatencyPolicy(options.smoothFloorSec ?? SMOOTH_FLOOR_MS / 1000,
+        options.smoothCeilingSec ?? SMOOTH_CEILING_MS / 1000)
       : null;
     if (this.latencyPolicy) this.targetAheadSec = this.latencyPolicy.heldUs / 1e6;
     this.chase = new SoftChase(videoElement, () => this.targetAheadSec);

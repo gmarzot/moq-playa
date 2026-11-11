@@ -72,7 +72,7 @@ interface LocmafChunkDetails {
   readonly baseMediaDecodeTime: bigint;
 }
 import type { MediaSourceLike, VideoPresentation } from './interfaces.js';
-import { SMOOTH_FLOOR_MS, type LatencyPolicy } from './latency-policy.js';
+import { SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, type LatencyPolicy } from './latency-policy.js';
 import { AudioRepair, type AudioRepairStats } from './audio-repair.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
@@ -85,6 +85,7 @@ import { computePlaybackDelayUs,
   handlePipelineCommand as doPipelineCommand,
   handlePipelineEvent as doPipelineEvent,
   handleRecoveryAction as doRecoveryAction,
+  type PipelineSet,
   type TrackInfo,
 } from './player-pipeline.js';
 import {
@@ -418,6 +419,32 @@ interface MigrationTxn {
 
 // ─── MoqtPlayer ──────────────────────────────────────────────────────
 
+/** Config keys {@link MoqtPlayer.updatePlayback} applies to a running session. */
+const PLAYBACK_KEYS = [
+  'targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs',
+  'renderCushionFloorMs', 'renderCushionMaxMs', 'maxCatchUpRate', 'logLevel',
+] as const;
+
+/** Playback settings for {@link MoqtPlayer.updatePlayback}; `undefined` restores a key's default. */
+export type PlaybackSettings = {
+  readonly [K in typeof PLAYBACK_KEYS[number]]?: MoqtPlayerConfig[K] | undefined;
+};
+
+/** The config's logger, and whether an info-level message can reach a sink. */
+function loggerFor(config: MoqtPlayerConfig): { log: LoggerLike; infoLoggingEnabled: boolean } {
+  return {
+    log: createLogger({
+      ...(config.logLevel !== undefined ? { logLevel: config.logLevel } : {}),
+      ...(config.logger !== undefined ? { logger: config.logger } : {}),
+    }),
+    // A custom logger does its own filtering, so it always can; otherwise
+    // `createLogger` returns NULL_LOGGER below 'info' and the message would be
+    // built and discarded. Diagnostics that serialize their payload check this first.
+    infoLoggingEnabled: config.logger !== undefined
+      || LOG_LEVELS[config.logLevel ?? 'none'] >= LOG_LEVELS.info,
+  };
+}
+
 /**
  * MOQT player — load()/play()/pause()/destroy().
  *
@@ -428,11 +455,11 @@ export class MoqtPlayer {
   /** Player version (set at build time). */
   static readonly version = '0.6.0';
 
-  private readonly config: MoqtPlayerConfig;
+  private config: MoqtPlayerConfig;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private readonly stateMachine = new PlayerStateMachine();
   private readonly _stats = new StatsAccumulator();
-  private readonly log: LoggerLike;
+  private log: LoggerLike;
   private readonly watchdog: WatchdogController;
 
   /** Hook chains for interception. */
@@ -529,6 +556,8 @@ export class MoqtPlayer {
   /** Smoothed LOC render cushion getter (slice A); null for CMAF sessions. */
   private getRenderCushionUs: (() => number) | null = null;
   private latencyPolicy: LatencyPolicy | null = null;
+  /** Applies latency settings to the LOC playout; null before pipelines exist. */
+  private applyLocPlayout: NonNullable<PipelineSet['apply']> | null = null;
 
   /** Whether mediaSource.initialize() has been called. */
   private cmafInitialized = false;
@@ -646,7 +675,7 @@ export class MoqtPlayer {
    * discarded candidate's state is collectable without explicit teardown.
    */
   /** True when an info-level message can reach a sink. @see constructor */
-  private readonly infoLoggingEnabled: boolean;
+  private infoLoggingEnabled: boolean;
 
   private readonly subgroupWitness = new WeakMap<MoqtConnection, Map<bigint, {
     groupId: bigint;
@@ -1278,16 +1307,9 @@ export class MoqtPlayer {
     // Must match the CanvasRenderer's rAF-driven renderTick(performance.now() * 1000)
     // to ensure render time domains are consistent.
     this.clock = this.config.clock ?? { now: () => performance.now() * 1000 };
-    this.log = createLogger({
-      ...(this.config.logLevel !== undefined ? { logLevel: this.config.logLevel } : {}),
-      ...(this.config.logger !== undefined ? { logger: this.config.logger } : {}),
-    });
-    // Whether an info-level message can reach anything. A custom logger does
-    // its own filtering, so it always can; otherwise `createLogger` returns
-    // NULL_LOGGER below 'info' and the message would be built and discarded.
-    // Diagnostics that serialize their payload check this first.
-    this.infoLoggingEnabled = this.config.logger !== undefined
-      || LOG_LEVELS[this.config.logLevel ?? 'none'] >= LOG_LEVELS.info;
+    const logging = loggerFor(this.config);
+    this.log = logging.log;
+    this.infoLoggingEnabled = logging.infoLoggingEnabled;
 
     // Watchdog: detect "nothing happened" scenarios.
     // Fires timeout/warning events when expected lifecycle events don't arrive.
@@ -1565,6 +1587,57 @@ export class MoqtPlayer {
       this.qualityController.unlockAuto();
     } else {
       this.qualityController.lockManual();
+    }
+  }
+
+  /**
+   * Apply playback settings to the running session in place: the LOC render
+   * cushion and smooth policy, catch-up, the MSE target and latency policy,
+   * and the log level. The merged config is validated as at construction; an
+   * invalid one throws and changes nothing. Before pipelines exist the config
+   * alone changes, and they are built from it.
+   */
+  updatePlayback(settings: PlaybackSettings): void {
+    const merged: Record<string, unknown> = { ...this.config };
+    for (const key of PLAYBACK_KEYS) {
+      if (!(key in settings)) continue;
+      const value = settings[key];
+      if (value === undefined) delete merged[key];
+      else merged[key] = value;
+    }
+    const next = { ...DEFAULT_PLAYER_CONFIG, ...merged } as MoqtPlayerConfig;
+    validateConfig(next);
+    const prev = this.config;
+    this.config = next;
+    const changed = (...keys: Array<typeof PLAYBACK_KEYS[number]>): boolean => keys.some((k) => prev[k] !== next[k]);
+
+    if (changed('logLevel')) {
+      const logging = loggerFor(next);
+      this.log = logging.log;
+      this.infoLoggingEnabled = logging.infoLoggingEnabled;
+    }
+    if (changed('targetLatencyMs', 'maxCatchUpRate')) {
+      this.syncController?.setCatchUp(next.targetLatencyMs, next.maxCatchUpRate);
+    }
+    const targetMs = next.targetLatencyMs ?? this.catalogTargetLatencyMs ?? undefined;
+    if (changed('targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs',
+      'renderCushionFloorMs', 'renderCushionMaxMs') && this.applyLocPlayout) {
+      this.latencyPolicy = this.applyLocPlayout(next, this.catalogTargetLatencyMs ?? undefined) ?? null;
+    }
+    if (changed('targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs')) {
+      this.mediaSource?.setLatency?.({
+        mode: next.latencyMode ?? 'live',
+        floorSec: (next.smoothFloorMs ?? SMOOTH_FLOOR_MS) / 1000,
+        ceilingSec: (next.smoothCeilingMs ?? SMOOTH_CEILING_MS) / 1000,
+      });
+      if (targetMs !== undefined) this.mediaSource?.setTargetAheadSec?.(targetMs / 1000);
+    }
+    // Audio repair runs in smooth only, with a deadline from the floor; a new one starts on the next datagram.
+    if ((changed('latencyMode') && next.latencyMode !== 'smooth') || changed('smoothFloorMs')) {
+      this.audioRepair?.reset();
+      this.audioRepair = null;
+      this.audioRepairAlias = null;
+      this.audioPipeline?.setMinGapTimeoutUs(0);
     }
   }
 
@@ -7376,6 +7449,7 @@ export class MoqtPlayer {
     this.audioPipeline = null;
     this.syncController = null;
     this.recoveryController = null;
+    this.applyLocPlayout = null;
     this.pipelinesCreated = false;
     this.subscriptionManager?.clear();
     this.subscriptionManager = null;
@@ -9474,6 +9548,7 @@ export class MoqtPlayer {
     }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
     this.latencyPolicy = pipelines.latencyPolicy ?? null;
+    this.applyLocPlayout = pipelines.apply ?? null;
 
     // Wire MSE stall detection to ABR emergency downshift.
     // CMAF has no pipeline-level stall handler — the MseMediaSource

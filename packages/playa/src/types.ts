@@ -123,6 +123,15 @@ export interface PlayerOptions {
   readonly moqtPlayerConfig?: Partial<MoqtPlayerConfig>;
 }
 
+/**
+ * Playback settings `Player.updatePlayback()` applies to a running session,
+ * named as in the engine config. A key set to `undefined` restores its default.
+ */
+export type PlaybackUpdate = {
+  readonly [K in 'targetLatencyMs' | 'latencyMode' | 'smoothFloorMs' | 'smoothCeilingMs'
+    | 'renderCushionFloorMs' | 'renderCushionMaxMs' | 'maxCatchUpRate' | 'logLevel']?: MoqtPlayerConfig[K] | undefined;
+};
+
 /** Quality level exposed to UI (e.g., for a quality selector menu). */
 export interface Level {
   /** Index in the levels array (0-based, sorted by bitrate descending). */

@@ -14256,3 +14256,63 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 });
+
+describe('updatePlayback', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('rejects an invalid merged config and changes nothing', () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer({ ...createConfig(adapter), renderCushionFloorMs: 300, smoothCeilingMs: 2000 });
+    const before = (player as any).config;
+    expect(() => player.updatePlayback({ renderCushionMaxMs: 200, latencyMode: 'smooth' })).toThrow(/renderCushionMaxMs/);
+    expect(() => player.updatePlayback({ smoothFloorMs: 3000 })).toThrow(/smoothCeilingMs/);
+    expect(() => player.updatePlayback({ maxCatchUpRate: 0.5 })).toThrow(/maxCatchUpRate/);
+    expect((player as any).config).toBe(before);
+    player.updatePlayback({ renderCushionMaxMs: 400, smoothCeilingMs: undefined });
+    expect((player as any).config).toMatchObject({ renderCushionFloorMs: 300, renderCushionMaxMs: 400 });
+    expect('smoothCeilingMs' in (player as any).config).toBe(false);
+  });
+
+  it('swaps the logger when the log level changes', async () => {
+    const spyInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    expect((player as any).infoLoggingEnabled).toBe(false);
+    player.updatePlayback({ logLevel: 'info' });
+    expect((player as any).infoLoggingEnabled).toBe(true);
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    expect(spyInfo.mock.calls.map((c) => c[0])).toContain('[moqt] Connecting to %s');
+    spyInfo.mockClear();
+    player.updatePlayback({ logLevel: undefined });
+    expect((player as any).infoLoggingEnabled).toBe(false);
+    (player as any).log.info('silent');
+    expect(spyInfo).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('applies latency and catch-up to running pipelines', async () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    ackCatalog(adapter);
+    adapter._triggerObject(1n, {
+      kind: 'data', trackAlias: varint(1n), groupId: varint(0n), subgroupId: varint(0n), objectId: varint(0n),
+      publisherPriority: 0, extensions: new Uint8Array(0), payload: new TextEncoder().encode(CATALOG_JSON),
+    });
+    await vi.waitFor(() => expect((player as any).pipelinesCreated).toBe(true));
+    expect(player.stats.latency).toBeNull();
+
+    player.updatePlayback({ latencyMode: 'smooth', smoothFloorMs: 1500, targetLatencyMs: 800, maxCatchUpRate: 1.2 });
+    expect(player.stats.latency).toMatchObject({ mode: 'smooth', heldMs: 1500, floorMs: 1500 });
+    expect((player as any).syncController).toMatchObject({ targetLatencyMs: 800, maxCatchUpRate: 1.2 });
+
+    player.updatePlayback({ latencyMode: undefined, maxCatchUpRate: undefined });
+    expect(player.stats.latency).toBeNull();
+    expect((player as any).syncController.maxCatchUpRate).toBe(1);
+    await player.destroy();
+  });
+});

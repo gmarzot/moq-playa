@@ -131,4 +131,18 @@ describe('LatencyPolicy', () => {
     expect(live.heldUs).toBe(200_000);
     expect(live.stats.floorMs).toBe(200);
   });
+
+  it('setBounds re-bounds the held delay: a lower ceiling clamps it, a higher floor lifts it', () => {
+    const p = new LatencyPolicy({ mode: 'smooth', baseUs: 200_000, ceilingUs: 2_000_000, floorUs: 500_000 }, makeClock());
+    p.noteArrival(-1_000_000, 500_000);                     // held 1550 ms
+    expect(p.heldUs).toBe(1_550_000);
+    p.setBounds({ floorUs: 500_000, ceilingUs: 1_000_000 });
+    expect(p.heldUs).toBe(1_000_000);
+    // A higher ceiling does not restore the clamped raise.
+    p.setBounds({ floorUs: 500_000, ceilingUs: 2_000_000 });
+    expect(p.heldUs).toBe(1_000_000);
+    p.setBounds({ floorUs: 1_200_000, ceilingUs: 2_000_000 });
+    expect(p.heldUs).toBe(1_200_000);
+    expect(p.stats).toMatchObject({ floorMs: 1200, ceilingMs: 2000 });
+  });
 });
