@@ -2972,8 +2972,8 @@ export class MoqtPlayer {
     reason: string = 'manual',
     abrAction?: 'downshift' | 'upshift',
   ): Promise<void> {
-    // A recovery step-down fails an upshift on trial, as an ABR downshift does.
-    if (reason === 'recovery') this.noteAbrDownshift(this.clock.now());
+    // A recovery switch fails an upshift on trial; a stall step-down does over the longer stall window.
+    if (reason === 'recovery') this.noteAbrDownshift(this.clock.now(), abrAction === 'downshift');
     // One video switch at a time: a second one (ABR, recovery, view, program,
     // manual) racing the first through its awaits would overwrite the pending
     // switch and orphan a subscription.
@@ -6978,6 +6978,18 @@ export class MoqtPlayer {
   private static readonly ABR_UPSHIFT_WAIT_MAX_US = 120_000_000;
   /** A downshift this soon after an ABR upshift fails the upshift. */
   private static readonly ABR_UPSHIFT_TRIAL_US = 30_000_000;
+  /** A stall this soon after an ABR upshift fails it: a rung the device cannot keep up with can take that long to stall. */
+  private static readonly ABR_UPSHIFT_STALL_TRIAL_US = 120_000_000;
+  /** MSE: a rung whose dropped share of video frames tops this over a window is beyond the device's decoder. */
+  private static readonly DECODE_DROP_SHARE = 0.05;
+  private static readonly DECODE_WINDOW_US = 5_000_000;
+  private static readonly DECODE_MIN_FRAMES = 60;
+  /** How long Auto stays below a rung the device could not decode. */
+  private static readonly DECODE_CAP_US = 300_000_000;
+  /** Frame counts at the start of the current decode window; null until sampled. */
+  private decodeWindow: { atUs: number; total: number; dropped: number; track: string } | null = null;
+  /** Auto stays below this bitrate (kbps) until `untilUs`. */
+  private decodeCap: { kbps: number; untilUs: number } | null = null;
   /** Timestamp of last ABR downshift — gates upshift for stability. */
   private lastAbrDownshiftUs = 0;
   /** Timestamp of the last ABR upshift still on trial; 0 when none. */
@@ -7035,9 +7047,29 @@ export class MoqtPlayer {
     return this.liveUpshiftWaitUs;
   }
 
-  private noteAbrDownshift(now: number): void {
+  /** MSE: whether the playing rung dropped more than its share of frames over the last window. A hidden page is not judged. */
+  private decodeOverloaded(now: number, track: string | undefined): boolean {
+    const q = this.mediaSource?.getPlaybackQuality?.();
+    if (!q || !track || this.documentHidden()) {
+      this.decodeWindow = null;
+      return false;
+    }
+    const w = this.decodeWindow;
+    if (!w || w.track !== track || q.totalFrames < w.total) {
+      this.decodeWindow = { atUs: now, total: q.totalFrames, dropped: q.droppedFrames, track };
+      return false;
+    }
+    if (now - w.atUs < MoqtPlayer.DECODE_WINDOW_US) return false;
+    const frames = q.totalFrames - w.total;
+    const dropped = q.droppedFrames - w.dropped;
+    this.decodeWindow = { atUs: now, total: q.totalFrames, dropped: q.droppedFrames, track };
+    return frames >= MoqtPlayer.DECODE_MIN_FRAMES && dropped / frames > MoqtPlayer.DECODE_DROP_SHARE;
+  }
+
+  private noteAbrDownshift(now: number, stall = false): void {
     this.lastAbrDownshiftUs = now;
-    if (this.lastAbrUpshiftUs > 0 && now - this.lastAbrUpshiftUs < MoqtPlayer.ABR_UPSHIFT_TRIAL_US) {
+    const trialUs = stall ? MoqtPlayer.ABR_UPSHIFT_STALL_TRIAL_US : MoqtPlayer.ABR_UPSHIFT_TRIAL_US;
+    if (this.lastAbrUpshiftUs > 0 && now - this.lastAbrUpshiftUs < trialUs) {
       this.liveUpshiftWaitUs = Math.min(this.liveUpshiftWaitUs * 2, MoqtPlayer.ABR_UPSHIFT_WAIT_MAX_US);
     }
     this.lastAbrUpshiftUs = 0;
@@ -7105,6 +7137,22 @@ export class MoqtPlayer {
     const bandwidthKbps = Math.max(arrivalKbps, linkKbps);
     let effectiveBufferUs: number;
     let shortReason: string | null = null;
+
+    if (this.decodeCap && now >= this.decodeCap.untilUs) this.decodeCap = null;
+    const playing = this.qualityController.currentVideoTrack;
+    if (!this.videoPipeline && this.decodeOverloaded(now, playing?.name)) {
+      const lower = this.qualityController.peekLowerVideoQuality(false);
+      if (lower && playing?.bitrate) {
+        this.decodeCap = { kbps: playing.bitrate / 1000, untilUs: now + MoqtPlayer.DECODE_CAP_US };
+        this.noteAbrDownshift(now, true);
+        this.log.warn('Over %d%% of %s frames dropped → downshift to %s; Auto stays below %s for %d min',
+          MoqtPlayer.DECODE_DROP_SHARE * 100, playing.name, lower.name, playing.name, MoqtPlayer.DECODE_CAP_US / 60_000_000);
+        this.selectVideoTrack(lower.name, 'bandwidth', 'downshift').catch((err) => {
+          this.log.warn('Decode downshift to "%s" failed: %s', lower.name, err);
+        });
+        return;
+      }
+    }
 
     if (this.videoPipeline) {
       // LOC path: health gates all upshift decisions. When unhealthy,
@@ -7183,6 +7231,7 @@ export class MoqtPlayer {
     const newTrack = isDown
       ? this.qualityController.peekLowerVideoQuality(isEmergency)
       : this.qualityController.peekHigherVideoQuality();
+    if (!isDown && newTrack && this.decodeCap && (newTrack.bitrate ?? 0) / 1000 >= this.decodeCap.kbps) return;
 
     if (newTrack) {
       if (isDown) this.noteAbrDownshift(now);
@@ -9412,7 +9461,7 @@ export class MoqtPlayer {
         if (this.qualityController && this.bufferAbrController) {
           const newTrack = this.qualityController.peekLowerVideoQuality(true);
           if (newTrack) {
-            this.noteAbrDownshift(this.clock.now());
+            this.noteAbrDownshift(this.clock.now(), true);
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
             this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
               this.log.warn('Stall downshift to "%s" failed: %s', newTrack.name, err);

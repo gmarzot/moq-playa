@@ -1437,6 +1437,11 @@ export class MseMediaSource implements MediaSourceLike {
     }
   }
 
+  getPlaybackQuality(): { totalFrames: number; droppedFrames: number } | null {
+    const q = (this.video as { getVideoPlaybackQuality?: () => VideoPlaybackQuality }).getVideoPlaybackQuality?.();
+    return q ? { totalFrames: q.totalVideoFrames, droppedFrames: q.droppedVideoFrames } : null;
+  }
+
   getBufferAheadUs(): number | null {
     const v = this.video;
     if (!v.buffered.length) {

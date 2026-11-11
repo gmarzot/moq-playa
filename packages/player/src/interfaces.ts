@@ -354,6 +354,9 @@ export interface MediaSourceLike {
    */
   getBufferAheadUs?(): number | null;
 
+  /** Video frames the element has handled and dropped since it started; null when not reported. */
+  getPlaybackQuality?(): { readonly totalFrames: number; readonly droppedFrames: number } | null;
+
   /**
    * Whether the media element has attached the MediaSource (MSE
    * `sourceopen`), i.e. SourceBuffers exist and appendChunk() can take

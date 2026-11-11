@@ -10258,6 +10258,7 @@ describe('MoqtPlayer', () => {
         onError: null,
         onStall: null,
         getBufferAheadUs: vi.fn(() => bufferAheadUs),
+        getPlaybackQuality: vi.fn((): { totalFrames: number; droppedFrames: number } | null => null),
       };
     }
 
@@ -10601,7 +10602,7 @@ describe('MoqtPlayer', () => {
         const subsBefore = (adapter.subscribe as any).mock.calls.length;
         const subscribedTo = (name: string): boolean => (adapter.subscribe as any).mock.calls.slice(subsBefore)
           .some((c: any) => { try { return new TextDecoder().decode(c[1]) === name; } catch { return false; } });
-        return { player, adapter, subscribedTo };
+        return { player, adapter, subscribedTo, ms };
       }
 
       /** The ABR catalog without the named tracks, plus any extra tracks and root fields. */
@@ -11007,6 +11008,69 @@ describe('MoqtPlayer', () => {
         void player.selectVideoTrack('video-2', 'recovery', 'downshift').catch(() => {});
         expect(p.lastAbrUpshiftUs).toBe(0);
         expect(p.lastAbrDownshiftUs).toBe(15 * S);
+        expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
+        await player.destroy();
+      });
+
+      it('dropping over 5% of frames on a rung steps down', async () => {
+        const { player, subscribedTo, ms } = await loadLive(500_000);
+        let q = { totalFrames: 1000, droppedFrames: 0 };
+        ms.getPlaybackQuality = vi.fn(() => q);
+        clockUs = 1 * S;
+        player.tick();
+        q = { totalFrames: 1300, droppedFrames: 30 };
+        clockUs = 7 * S;
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(true);
+        expect((player as any).decodeCap).toEqual({ kbps: 1500, untilUs: 7 * S + 300 * S });
+        await player.destroy();
+      });
+
+      it('a few dropped frames do not step down', async () => {
+        const { player, subscribedTo, ms } = await loadLive(500_000);
+        let q = { totalFrames: 1000, droppedFrames: 0 };
+        ms.getPlaybackQuality = vi.fn(() => q);
+        clockUs = 1 * S;
+        player.tick();
+        q = { totalFrames: 1300, droppedFrames: 10 };
+        clockUs = 7 * S;
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(false);
+        await player.destroy();
+      });
+
+      it('Auto stays below a rung it could not decode until the cap lifts', async () => {
+        const { player, subscribedTo } = await loadLive(500_000);
+        (player as any).decodeCap = { kbps: 3000, untilUs: 60 * S };
+        clockUs = 40 * S;
+        timeObjects(player, 20_000);
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(false);
+        clockUs = 61 * S;
+        timeObjects(player, 20_000);
+        player.tick();
+        expect(subscribedTo('video-0')).toBe(true);
+        await player.destroy();
+      });
+
+      it('a stall step-down within 2 min of an upshift fails it; a bandwidth one or a decoder fallback after 30 s does not', async () => {
+        const { player } = await loadLive(500_000);
+        const p = player as any;
+        p.lastAbrUpshiftUs = 10 * S;
+        clockUs = 70 * S;
+        p.noteAbrDownshift(clockUs);
+        expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(5 * S);
+        p.lastAbrUpshiftUs = 80 * S;
+        clockUs = 140 * S;
+        void player.selectVideoTrack('video-2', 'recovery', 'downshift').catch(() => {});
+        expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
+        p.lastAbrUpshiftUs = 150 * S;
+        clockUs = 280 * S;
+        p.noteAbrDownshift(clockUs, true);
+        expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
+        p.lastAbrUpshiftUs = 300 * S;
+        clockUs = 360 * S;
+        void player.selectVideoTrack('video-0', 'recovery').catch(() => {});
         expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
         await player.destroy();
       });
