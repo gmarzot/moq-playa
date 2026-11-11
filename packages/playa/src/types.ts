@@ -70,6 +70,13 @@ export interface PlayerOptions {
   readonly smoothCeilingMs?: number;
   /** Floor of the smooth playout delay in ms, where it starts. Default: 1000. */
   readonly smoothFloorMs?: number;
+  /**
+   * Pause delivery while the page is hidden and silent, and rejoin live when it
+   * is visible again. It pauses after 60 s hidden while muted, at volume 0 or
+   * with its audio context not running, or as soon as the hidden page's timers
+   * run 10 s late (the browser is throttling it). Default: false.
+   */
+  readonly pauseWhenHidden?: boolean;
 
   // ── Quality ──
 

@@ -122,6 +122,14 @@ export class Player {
   private frozenSinceMs: number | null = null;
   /** Frozen at least this long and the buffer is stale: re-join live rather than play it out. */
   private static readonly RESUME_JUMP_TO_LIVE_MS = 3_000;
+  /** pauseWhenHidden: why delivery is paused, until the page is visible again. */
+  private hiddenPause: 'silent' | 'throttled' | null = null;
+  /** pauseWhenHidden: a chained timer while hidden and playing. */
+  private hiddenProbe: ReturnType<typeof setTimeout> | null = null;
+  private static readonly HIDDEN_PROBE_MS = 1_000;
+  private static readonly HIDDEN_SILENT_PAUSE_MS = 60_000;
+  /** A probe this late means the browser runs the page's timers only in bursts. */
+  private static readonly HIDDEN_THROTTLED_LATE_MS = 10_000;
 
   /** The MSE autoplay ladder may mute the element itself; mirror it. */
   private readonly syncMutedFromElement = (): void => {
@@ -419,6 +427,7 @@ export class Player {
    * In 'gesture' mode, audio stays deferred until prepareAudio()/unmute().
    */
   play(): void {
+    this.hiddenPause = null;
     if (this.options.audioActivation !== 'gesture') {
       this.ensureAudioContext();
     }
@@ -432,6 +441,7 @@ export class Player {
 
   /** Pause playback (REQUEST_UPDATE forward:0). */
   pause(): void {
+    this.hiddenPause = null;
     this.engine.pause();
     this.renderer?.stop();
     this.timeCtrl?.stop();
@@ -602,15 +612,28 @@ export class Player {
       this.awaySinceMs ??= Date.now();
       if (kind === 'frozen') this.frozenSinceMs ??= Date.now();
       this.emitter.emit('lifecycle', { state: kind });
+      if (kind === 'hidden') this.startHiddenProbe();
       return;
+    }
+    this.stopHiddenProbe();
+    // A frozen page can resume while still hidden: it stays paused and is watched again.
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.startHiddenProbe();
+      if (this.hiddenPause !== null) return;
     }
     const now = Date.now();
     const awayMs = this.awaySinceMs === null ? 0 : now - this.awaySinceMs;
     const frozenMs = this.frozenSinceMs === null ? 0 : now - this.frozenSinceMs;
     this.awaySinceMs = null;
     this.frozenSinceMs = null;
-    this.emitter.emit('lifecycle', { state: kind, awayMs });
+    const rejoin = this.hiddenPause !== null;
+    this.emitter.emit('lifecycle', { state: kind, awayMs, ...(rejoin ? { rejoined: true } : {}) });
     this.engine.reconnectNow();
+    if (rejoin) {
+      // From paused, play() resets the pipelines and resumes forwarding at the live edge.
+      this.play();
+      return;
+    }
     // A frozen page comes back with its media element and audio context suspended.
     if (this.state === 'playing') {
       this.engine.resumeSuspendedPlayback();
@@ -622,6 +645,48 @@ export class Player {
       this.engine.jumpToLive(`resumed after ${(frozenMs / 1000).toFixed(1)}s frozen`);
     }
   };
+
+  /** pauseWhenHidden: once a second while hidden and playing, until it pauses. */
+  private startHiddenProbe(): void {
+    if (!this.options.pauseWhenHidden || this.hiddenProbe !== null || this._state !== 'playing') return;
+    const hiddenAtMs = Date.now();
+    let dueMs = hiddenAtMs + Player.HIDDEN_PROBE_MS;
+    const probe = (): void => {
+      this.hiddenProbe = null;
+      if (this._state !== 'playing' || typeof document === 'undefined' || !document.hidden) return;
+      const now = Date.now();
+      const lateMs = now - dueMs;
+      if (lateMs >= Player.HIDDEN_THROTTLED_LATE_MS) {
+        this.pauseForHidden('throttled', lateMs);
+      } else if (now - hiddenAtMs >= Player.HIDDEN_SILENT_PAUSE_MS && this.isSilent()) {
+        this.pauseForHidden('silent');
+      } else {
+        dueMs = now + Player.HIDDEN_PROBE_MS;
+        this.hiddenProbe = setTimeout(probe, Player.HIDDEN_PROBE_MS);
+      }
+    };
+    this.hiddenProbe = setTimeout(probe, Player.HIDDEN_PROBE_MS);
+  }
+
+  private stopHiddenProbe(): void {
+    if (this.hiddenProbe === null) return;
+    clearTimeout(this.hiddenProbe);
+    this.hiddenProbe = null;
+  }
+
+  /** Muted, at volume 0, or with its audio context not running. */
+  private isSilent(): boolean {
+    return this._muted || this._volume === 0
+      || (this.audioCtx !== null && this.audioCtx.state !== 'running');
+  }
+
+  private pauseForHidden(reason: 'silent' | 'throttled', lateMs?: number): void {
+    this.pause();
+    this.hiddenPause = reason;
+    this.emitter.emit('lifecycle', {
+      state: 'hidden', paused: reason, ...(lateMs !== undefined ? { lateMs: Math.round(lateMs) } : {}),
+    });
+  }
 
   private readonly onVisibilityChange = (): void =>
     this.onLifecycle(document.hidden ? 'hidden' : 'visible');
@@ -637,6 +702,7 @@ export class Player {
   }
 
   private removeLifecycleListeners(): void {
+    this.stopHiddenProbe();
     if (typeof document === 'undefined' || typeof document.removeEventListener !== 'function') return;
     document.removeEventListener('visibilitychange', this.onVisibilityChange);
     document.removeEventListener('freeze', this.onFreeze);
