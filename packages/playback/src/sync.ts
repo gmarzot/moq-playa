@@ -125,8 +125,8 @@ export class SyncController {
 
     // ── Catch-up state ─────────────────────────────────────────
     private readonly wallClock: WallClockSource;
-    private readonly targetLatencyMs: number | undefined;
-    private readonly maxCatchUpRate: number;
+    private targetLatencyMs: number | undefined;
+    private maxCatchUpRate: number;
     private readonly catchUpThresholdMs: number;
     private readonly catchUpRecoveryMs: number;
 
@@ -145,6 +145,12 @@ export class SyncController {
         this.maxCatchUpRate = config.maxCatchUpRate ?? 1.0;
         this.catchUpThresholdMs = config.catchUpThresholdMs ?? 500;
         this.catchUpRecoveryMs = config.catchUpRecoveryMs ?? 50;
+    }
+
+    /** New catch-up target (ms) and max rate; either unset disables catch-up. */
+    setCatchUp(targetLatencyMs: number | undefined, maxCatchUpRate: number | undefined): void {
+        this.targetLatencyMs = targetLatencyMs;
+        this.maxCatchUpRate = maxCatchUpRate ?? 1.0;
     }
 
     /** Whether a sync reference has been established. */
@@ -426,8 +432,15 @@ export class SyncController {
 
         this._lastLatencyUs = latencyUs;
 
-        // Catch-up disabled?
-        if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) return null;
+        // Catch-up disabled. Ending a chase reports rate 1 once.
+        if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) {
+            if (!this._catchUpActive && this._currentRate === 1.0) return null;
+            this._catchUpActive = false;
+            this._currentRate = 1.0;
+            return {
+                active: false, currentRate: 1.0, latencyMs: latencyUs / 1000, targetMs: this.targetLatencyMs ?? 0,
+            };
+        }
 
         const latencyMs = latencyUs / 1000;
         const targetMs = this.targetLatencyMs;

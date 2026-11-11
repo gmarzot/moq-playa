@@ -59,7 +59,7 @@ import { VolumeController } from './volume-controller.js';
 import { TimeController } from './time-controller.js';
 import type { CatalogState } from '@openmoq/msf';
 import { mapLevels, mapAudioTracks } from './level-mapper.js';
-import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
+import type { PlayerOptions, PlaybackUpdate, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 import type { PlayerEventMap } from './events.js';
 import type { AltGroup } from '@openmoq/msf';
 
@@ -71,6 +71,10 @@ const DEFAULTS = {
   autoQuality: true,
   startLevel: 'auto' as const,
 } satisfies Partial<PlayerOptions>;
+
+/** PlaybackUpdate keys that are also top-level PlayerOptions. */
+const PLAYER_PLAYBACK_KEYS = ['targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs'] as const satisfies
+  ReadonlyArray<keyof PlayerOptions & keyof PlaybackUpdate>;
 
 /**
  * Batteries-included MoQ media player.
@@ -101,7 +105,7 @@ export class Player {
   private presentationRetired = false;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private readonly container: HTMLElement | null;
-  private readonly options: PlayerOptions;
+  private options: PlayerOptions;
   private readonly strategy: DecoderStrategy;
   /** How the engine consumes LOCMAF tracks; decides the render sink for them. */
   private readonly locmafDecoding: LocmafDecoding | undefined;
@@ -147,6 +151,8 @@ export class Player {
   private volumeCtrl: VolumeController | null = null;
   /** Live-edge aim from the catalog target, applied to each audio output. */
   private liveEdgeTargetSec: number | null = null;
+  /** The largest catalog targetLatency (ms); 0 when none. */
+  private catalogTargetLatencyMs = 0;
   private timeCtrl: TimeController | null = null;
 
   // Adapter instances (held for lifecycle)
@@ -485,6 +491,26 @@ export class Player {
     await this.engine.selectVideoTrack(level.trackName, 'manual');
   }
 
+  /**
+   * Apply playback settings to the running session without a reload; video
+   * keeps playing. Throws on an invalid merged config, changing nothing.
+   */
+  updatePlayback(update: PlaybackUpdate): void {
+    this.engine.updatePlayback(update);
+    // Top-level keys stay top-level, the rest go in moqtPlayerConfig; either replaces a moqtPlayerConfig override.
+    const top: Record<string, unknown> = { ...this.options };
+    const engine: Record<string, unknown> = { ...this.options.moqtPlayerConfig };
+    for (const [key, value] of Object.entries(update)) {
+      delete engine[key];
+      const into = (PLAYER_PLAYBACK_KEYS as readonly string[]).includes(key) ? top : engine;
+      if (value === undefined) delete into[key];
+      else into[key] = value;
+    }
+    top['moqtPlayerConfig'] = engine;
+    this.options = top as unknown as PlayerOptions;
+    if ('targetLatencyMs' in update) this.aimLiveEdge();
+  }
+
   /** Set audio track by index. */
   setAudioTrack(index: number): void {
     if (index >= 0 && index < this._audioTracks.length) {
@@ -818,13 +844,17 @@ export class Player {
     }
 
     Object.assign(base, {
-      // Latency settings are read from base when the adapter is built, after moqtPlayerConfig overrides merge.
-      createMediaSource: () => new MseMediaSource(this.videoElement!, {
-        ...(opts.targetLatencyMs !== undefined ? { targetAheadSec: opts.targetLatencyMs / 1000 } : {}),
-        ...(base.latencyMode !== undefined ? { latencyMode: base.latencyMode } : {}),
-        ...(base.smoothCeilingMs !== undefined ? { smoothCeilingSec: base.smoothCeilingMs / 1000 } : {}),
-        ...(base.smoothFloorMs !== undefined ? { smoothFloorSec: base.smoothFloorMs / 1000 } : {}),
-      }),
+      // Latency settings are read when the adapter is built, moqtPlayerConfig overrides winning.
+      createMediaSource: () => {
+        const cur = { ...this.options, ...this.options.moqtPlayerConfig };
+        return new MseMediaSource(this.videoElement!, {
+          ...(this.options.targetLatencyMs !== undefined
+            ? { targetAheadSec: this.options.targetLatencyMs / 1000 } : {}),
+          ...(cur.latencyMode !== undefined ? { latencyMode: cur.latencyMode } : {}),
+          ...(cur.smoothCeilingMs !== undefined ? { smoothCeilingSec: cur.smoothCeilingMs / 1000 } : {}),
+          ...(cur.smoothFloorMs !== undefined ? { smoothFloorSec: cur.smoothFloorMs / 1000 } : {}),
+        });
+      },
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),
     });
@@ -925,14 +955,8 @@ export class Player {
       const sinkTrack = selected.video ?? selected.audio;
       const hasCmaf = sinkTrack !== undefined && usesMsePath(sinkTrack.packaging, this.locmafDecoding);
 
-      // Aim the live edge at the declared target. The audio output is built
-      // later, at pipeline creation, so the aim is stored for it too.
-      const targetMs = this.options.targetLatencyMs
-        ?? Math.max(0, ...e.catalog.tracks.map((t) => Number(t.targetLatency) || 0));
-      if (targetMs > 0) {
-        this.liveEdgeTargetSec = (targetMs / 1000) / 2;
-        this.audioOutput?.setTargetAheadSec(this.liveEdgeTargetSec);
-      }
+      this.catalogTargetLatencyMs = Math.max(0, ...e.catalog.tracks.map((t) => Number(t.targetLatency) || 0));
+      this.aimLiveEdge();
 
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';
@@ -1032,6 +1056,18 @@ export class Player {
         this.setState('error');
       }
     });
+  }
+
+  /**
+   * Aim the live edge at the declared target. The audio output is built
+   * later, at pipeline creation, so the aim is stored for it too.
+   */
+  private aimLiveEdge(): void {
+    const targetMs = this.options.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    if (targetMs > 0) {
+      this.liveEdgeTargetSec = (targetMs / 1000) / 2;
+      this.audioOutput?.setTargetAheadSec(this.liveEdgeTargetSec);
+    }
   }
 
   /** Rebuild the levels when a catalog update changes the ladder, keeping the current level by track name. */

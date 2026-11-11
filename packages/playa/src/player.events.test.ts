@@ -202,3 +202,56 @@ describe('Player — stats', () => {
     expect(p.stats.stallDurationMs).toBe(5_000);
   });
 });
+
+// ─── updatePlayback ──────────────────────────────────────────────────
+
+describe('Player — updatePlayback', () => {
+  it('forwards to the engine, keeps its options and aims the live edge at a new target', () => {
+    const player = createPlayer();
+    const engine = (player as any).engine;
+    const forward = vi.spyOn(engine, 'updatePlayback');
+    const update = { targetLatencyMs: 1500, latencyMode: 'smooth', renderCushionFloorMs: 300 } as const;
+    player.updatePlayback(update);
+    expect(forward).toHaveBeenCalledWith(update);
+    expect(engine.config).toMatchObject(update);
+    expect((player as any).options).toMatchObject({
+      targetLatencyMs: 1500, latencyMode: 'smooth', moqtPlayerConfig: { renderCushionFloorMs: 300 },
+    });
+    expect((player as any).liveEdgeTargetSec).toBe(0.75);
+
+    player.updatePlayback({ latencyMode: undefined, renderCushionFloorMs: undefined });
+    expect((player as any).options.latencyMode).toBeUndefined();
+    expect((player as any).options.moqtPlayerConfig.renderCushionFloorMs).toBeUndefined();
+  });
+
+  it('a media source built after the update starts from the updated latency', () => {
+    vi.stubGlobal('MediaSource', class {
+      readyState = 'closed';
+      addEventListener(): void { /* sourceopen never fires */ }
+      removeEventListener(): void { /* noop */ }
+    });
+    vi.stubGlobal('URL', { createObjectURL: () => 'blob:mock', revokeObjectURL: () => {} });
+    try {
+      const player = new Player(null, {
+        url: 'https://relay.example.com/moq', namespace: 'test',
+        video: Object.assign(mockElement(), { removeEventListener: vi.fn() }),
+        moqtPlayerConfig: { latencyMode: 'smooth' },
+      });
+      player.updatePlayback({ latencyMode: undefined, targetLatencyMs: 900 });
+      const ms = (player as any).engine.config.createMediaSource();
+      expect(ms.latencyStats()).toBeNull();
+      expect(ms.targetAheadSec).toBe(0.9);
+      ms.destroy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('an invalid update throws and changes nothing', () => {
+    const player = createPlayer();
+    const before = (player as any).options;
+    expect(() => player.updatePlayback({ smoothFloorMs: 3000, smoothCeilingMs: 2000 })).toThrow(/smoothCeilingMs/);
+    expect((player as any).options).toBe(before);
+    expect((player as any).engine.config.smoothFloorMs).toBeUndefined();
+  });
+});

@@ -410,6 +410,22 @@ describe('SyncController', () => {
             expect(sync.evaluateCatchUp(1_000_000_000n)).toBeNull();
         });
 
+        it('setCatchUp off mid-chase reports rate 1 once, then nothing; on again chases', () => {
+            const wallClock = new MockWallClock();
+            const sync = createCatchUpSync(wallClock);
+            wallClock.set(1_001_750_000);
+            expect(sync.evaluateCatchUp(1_000_000_000n)!.currentRate).toBe(MAX_RATE);
+
+            sync.setCatchUp(TARGET_MS, undefined);
+            expect(sync.evaluateCatchUp(1_000_000_000n)).toMatchObject({ active: false, currentRate: 1 });
+            expect(sync.catchUpActive).toBe(false);
+            expect(sync.currentRate).toBe(1);
+            expect(sync.evaluateCatchUp(1_000_000_000n)).toBeNull();
+
+            sync.setCatchUp(TARGET_MS, MAX_RATE);
+            expect(sync.evaluateCatchUp(1_000_000_000n)!.currentRate).toBe(MAX_RATE);
+        });
+
         it('activates when latency exceeds target + threshold (§5.1.16)', () => {
             const wallClock = new MockWallClock();
             const sync = createCatchUpSync(wallClock);

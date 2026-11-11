@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { RENDER_CUSHION_MAX_US } from './render-cushion.js';
+import { RENDER_CUSHION_MAX_US, RENDER_CUSHION_FALL_US_PER_SEC, RENDER_CUSHION_RISE_US_PER_SEC } from './render-cushion.js';
 import {
   computePlaybackDelayUs,
   createPipelines,
@@ -804,5 +804,83 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     };
     const result = createPipelines(minimalConfig({ createMediaSource: () => ({ initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null }) as any }), mockClock, cmaf, mockCallbacks());
     expect(result.getRenderCushionUs).toBeUndefined();
+  });
+});
+
+describe('createPipelines — apply to a running session', () => {
+  function locVideo(overrides: Partial<MoqtPlayerConfig> = {}) {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const audioOutput = { schedule: vi.fn(), flush: vi.fn(), destroy: vi.fn(), currentPlayoutTimeUs: 0, realign: vi.fn() };
+    const config = minimalConfig({
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
+      createAudioOutput: () => audioOutput as any,
+      ...overrides,
+    });
+    const result = createPipelines(config, clock,
+      { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
+    Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', { get: () => 0, configurable: true });
+    return {
+      config, result, videoDecoder, renderer, audioOutput,
+      at: (us: number) => { nowUs = us; },
+      schedule: () => (result.commandDispatcher as any)._getPlaybackDelayUs(),
+    };
+  }
+
+  it('live to smooth raises the next frame\'s slot to the smooth floor and realigns audio', () => {
+    const s = locVideo();
+    s.at(100_000);
+    s.result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
+    s.at(200_000);
+    s.videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);   // slot 0.2 + 0.2 cushion
+    expect(s.result.apply!({ ...s.config, latencyMode: 'smooth' }, undefined)?.mode).toBe('smooth');
+    expect(s.result.latencyPolicy?.stats).toMatchObject({ heldMs: 1000, floorMs: 1000 });
+    expect(s.result.getRenderCushionUs!()).toBe(1_000_000);
+    expect(s.audioOutput.realign).toHaveBeenCalledTimes(1);
+    s.at(233_333);
+    s.videoDecoder.onFrame?.({ timestamp: 1_133_333, close: vi.fn() } as any, 0);
+    expect(s.renderer.enqueue.mock.calls.map((c) => c[1])).toEqual([400_000, 233_333 + 1_000_000]);
+  });
+
+  it('smooth to live drops the policy and the cushion slews down to the live cap', () => {
+    const s = locVideo({ latencyMode: 'smooth' });
+    expect(s.result.getRenderCushionUs!()).toBe(1_000_000);
+    expect(s.result.apply!({ ...s.config, latencyMode: 'live' }, undefined)).toBeUndefined();
+    expect(s.result.latencyPolicy).toBeUndefined();
+    expect(s.audioOutput.realign).not.toHaveBeenCalled();
+    s.at(1_000_000);
+    s.schedule();
+    expect(s.result.getRenderCushionUs!()).toBe(1_000_000 - RENDER_CUSHION_FALL_US_PER_SEC);
+    s.at(60_000_000);
+    s.schedule();
+    expect(s.result.getRenderCushionUs!()).toBe(200_000);
+  });
+
+  it('a cushion floor change moves the cushion to the new floor at the slew rates', () => {
+    const s = locVideo();
+    s.schedule();
+    expect(s.result.getRenderCushionUs!()).toBe(200_000);
+    s.result.apply!({ ...s.config, renderCushionFloorMs: 500 }, undefined);
+    s.at(1_000_000);
+    s.schedule();
+    expect(s.result.getRenderCushionUs!()).toBe(200_000 + RENDER_CUSHION_RISE_US_PER_SEC);
+    s.at(4_000_000);
+    s.schedule();
+    expect(s.result.getRenderCushionUs!()).toBe(500_000);
+    s.result.apply!({ ...s.config, renderCushionFloorMs: 100 }, undefined);
+    s.at(5_000_000);
+    s.schedule();
+    expect(s.result.getRenderCushionUs!()).toBe(500_000 - RENDER_CUSHION_FALL_US_PER_SEC);
   });
 });

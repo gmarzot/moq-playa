@@ -15,7 +15,7 @@
  */
 
 import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
-import type { LatencyStats } from './latency-policy.js';
+import type { LatencyMode, LatencyStats } from './latency-policy.js';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -445,6 +445,13 @@ export interface MediaSourceLike {
    * `targetLatencyMs` or the catalog's targetLatency.
    */
   setTargetAheadSec?(sec: number): void;
+
+  /**
+   * OPTIONAL: a new latency mode and smooth bounds (s) for the running
+   * adapter. The base target stays; the latency policy is re-bounded, created
+   * or dropped.
+   */
+  setLatency?(latency: { readonly mode: LatencyMode; readonly floorSec: number; readonly ceilingSec: number }): void;
 
   /** The latency policy's state, or null when the adapter has none. Optional. */
   latencyStats?(): LatencyStats | null;
