@@ -987,6 +987,63 @@ describe('MseMediaSource — timeline-owned append integration', () => {
     });
 });
 
+describe('MseMediaSource — rendition splice', () => {
+    // Timescale 1000: a segment at bmd N ms with 5 × 100-tick samples spans [N, N + 500) ms.
+    const seg = (bmd: number) => makeSegment({ bmd, defaultDur: 100, sampleCount: 5 });
+
+    it('removes the old rendition buffered past the new track\'s first segment, then appends it', async () => {
+        const { adapter, vsb } = await makeReadyAdapter(1000);
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        vsb.buffered = makeTimeRanges([[0, 1.2]]);           // the old track runs ahead
+        const appends = vsb.appendedPayloads.length;
+
+        adapter.appendChunk('video', seg(1000), 'video_1080p');
+        expect(vsb.removeCalls).toEqual([[1, 1.2]]);
+        expect(vsb.appendedPayloads.length).toBe(appends);  // parked behind the remove
+        await flush();
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(appends + 1);
+
+        // Later segments of the new track append without another remove.
+        vsb.buffered = makeTimeRanges([[0, 1.5]]);
+        adapter.appendChunk('video', seg(1500), 'video_1080p');
+        await flush();
+        expect(vsb.removeCalls).toHaveLength(1);
+    });
+
+    it('removes nothing when the new track starts past the buffered end or behind the playhead', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter(1000);
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        vsb.buffered = makeTimeRanges([[0, 0.5]]);
+        adapter.appendChunk('video', seg(1000), 'video_1080p');
+        await flush();
+        video.currentTime = 1.6;
+        vsb.buffered = makeTimeRanges([[0, 2]]);
+        adapter.appendChunk('video', seg(1500), 'video');
+        await flush();
+        expect(vsb.removeCalls).toEqual([]);
+        expect(vsb.appendedPayloads.length).toBe(4);       // init + three segments
+    });
+
+    it('a queued first segment of the new track removes the old rendition when it drains', async () => {
+        const { adapter, vsb } = await makeReadyAdapter(1000);
+        vsb.autoComplete = false;
+        adapter.appendChunk('video', seg(0), 'video');      // held in flight
+        adapter.appendChunk('video', seg(1000), 'video_1080p');
+        expect(vsb.removeCalls).toEqual([]);
+        vsb.buffered = makeTimeRanges([[0, 1.2]]);
+        vsb.autoComplete = true;
+        vsb.updating = false;
+        vsb.fire('updateend');
+        expect(vsb.removeCalls).toEqual([[1, 1.2]]);
+        await flush();
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(3);
+    });
+});
+
 // ─── changeType (codec switch) ───────────────────────────────────
 
 describe('MseMediaSource — pipeline failure', () => {

@@ -325,6 +325,8 @@ export class CmafAssembler {
   private static readonly AUDIO_BYPASS_MS = 30_000;
   /** Backward decode-time jump after a resubscribe that is a publisher restart whatever its Group IDs. */
   private static readonly RESTART_JUMP_SEC = 10n;
+  /** Largest overlap of the emitted tail a rendition switch keeps on the shared timeline. */
+  private static readonly SWITCH_OVERLAP_MAX_MS = 500n;
   private diagVideoCount = 0;
   private diagAudioCount = 0;
 
@@ -928,11 +930,17 @@ export class CmafAssembler {
     this.sharedOutputOffsetTimescale = timescale;
   }
 
-  /** Resolve an offset that maps this fragment at or beyond committed media. */
+  /**
+   * Resolve an offset that maps this fragment at or beyond committed media.
+   * `switching`: variants of a switching set share media time, so a new
+   * rendition that overlaps the emitted tail by at most SWITCH_OVERLAP_MAX_MS
+   * keeps the shared offset and the sink replaces the overlap.
+   */
   private outputOffsetFor(
     mediaType: 'video' | 'audio',
     bmd: bigint,
     epoch: bigint,
+    switching = false,
   ): bigint {
     const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     const lastOutputBmd = mediaType === 'video' ? this.lastVideoOutputBmd : this.lastAudioOutputBmd;
@@ -944,8 +952,10 @@ export class CmafAssembler {
       ? scoredEnd
       : null;
     if (reliableEnd !== null) {
-      const mappedStart = offset + bmd - epoch;
-      if (mappedStart < reliableEnd) offset += reliableEnd - mappedStart;
+      const overlap = reliableEnd - (offset + bmd - epoch);
+      const aligned = switching && timescale !== null
+        && overlap * 1000n <= BigInt(timescale) * CmafAssembler.SWITCH_OVERLAP_MAX_MS;
+      if (overlap > 0n && !aligned) offset += overlap;
     }
     return offset;
   }
@@ -1094,6 +1104,11 @@ export class CmafAssembler {
       // aligned. Keep the shared raw/output epochs so a switch cannot jump
       // back to presentation time zero after a source restart.
       this.flushHeld(mediaType);
+      // The new rendition may start inside the emitted tail: order it on its own.
+      const order = this.order[mediaType];
+      order.lastGroup = null;
+      order.lastStart = null;
+      order.lastSubgroup = null;
       const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;
@@ -1101,7 +1116,7 @@ export class CmafAssembler {
         this.lastVideoBmd = null;
         this.videoEpochGen = this.sharedEpochGen;
         this.highestVideoGroupId = null;
-        this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
+        this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored, true);
         this.videoEpochGroupFloor = null;
       } else {
         this.audioEpoch = anchored;
@@ -1109,7 +1124,7 @@ export class CmafAssembler {
         this.lastAudioBmd = null;
         this.audioEpochGen = this.sharedEpochGen;
         this.highestAudioGroupId = null;
-        this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
+        this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored, true);
         this.audioEpochGroupFloor = null;
       }
     } else if (epoch === null) {
