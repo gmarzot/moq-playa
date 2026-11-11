@@ -11053,7 +11053,7 @@ describe('MoqtPlayer', () => {
         await player.destroy();
       });
 
-      it('a stall step-down within 2 min of an upshift fails it; a bandwidth one after 30 s does not', async () => {
+      it('a stall step-down within 2 min of an upshift fails it; a bandwidth one or a decoder fallback after 30 s does not', async () => {
         const { player } = await loadLive(500_000);
         const p = player as any;
         p.lastAbrUpshiftUs = 10 * S;
@@ -11067,6 +11067,10 @@ describe('MoqtPlayer', () => {
         p.lastAbrUpshiftUs = 150 * S;
         clockUs = 280 * S;
         p.noteAbrDownshift(clockUs, true);
+        expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
+        p.lastAbrUpshiftUs = 300 * S;
+        clockUs = 360 * S;
+        void player.selectVideoTrack('video-0', 'recovery').catch(() => {});
         expect(p.abrUpshiftWaitUs(true, clockUs)).toBe(10 * S);
         await player.destroy();
       });

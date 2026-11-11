@@ -2972,8 +2972,8 @@ export class MoqtPlayer {
     reason: string = 'manual',
     abrAction?: 'downshift' | 'upshift',
   ): Promise<void> {
-    // A recovery step-down fails an upshift on trial, as an ABR downshift does.
-    if (reason === 'recovery') this.noteAbrDownshift(this.clock.now(), true);
+    // A recovery switch fails an upshift on trial; a stall step-down does over the longer stall window.
+    if (reason === 'recovery') this.noteAbrDownshift(this.clock.now(), abrAction === 'downshift');
     // One video switch at a time: a second one (ABR, recovery, view, program,
     // manual) racing the first through its awaits would overwrite the pending
     // switch and orphan a subscription.
