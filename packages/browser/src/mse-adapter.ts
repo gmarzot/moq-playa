@@ -1889,7 +1889,7 @@ export class MseMediaSource implements MediaSourceLike {
     const previous = this.lastVideoTrackName;
     if (previous === null || previous === trackName) return false;
     const timescale = this.videoTimescale;
-    const ranges = timescale ? readSegmentTimeRanges(data, this.videoTrex) : null;
+    const ranges = readSegmentTimeRanges(data, this.videoTrex);
     if (ranges && this.isContainedReplay('video', trackName, ranges)) return false;
     this.lastVideoTrackName = trackName;
     if (!timescale || !ranges || ranges.length === 0) return false;

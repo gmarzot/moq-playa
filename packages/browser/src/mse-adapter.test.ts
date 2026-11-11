@@ -1043,6 +1043,20 @@ describe('MseMediaSource — rendition splice', () => {
         expect(vsb.appendedPayloads.length).toBe(appends);
     });
 
+    it('without a timescale, a replay from the previous track leaves the splice state alone', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        adapter.appendChunk('video', seg(500), 'video_1080p');
+        await flush();
+        const appends = vsb.appendedPayloads.length;
+
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(appends);
+        expect((adapter as any).lastVideoTrackName).toBe('video_1080p');
+    });
+
     it('a track that returns over its removed coverage appends', async () => {
         const { adapter, vsb } = await makeReadyAdapter(1000);
         adapter.appendChunk('video', seg(0), 'video');
