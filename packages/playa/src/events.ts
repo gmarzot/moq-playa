@@ -176,6 +176,11 @@ export interface LifecycleEvent {
   readonly state: 'hidden' | 'visible' | 'frozen' | 'resumed';
   /** How long the page spent away, on the transition back. */
   readonly awayMs?: number;
+  /** pauseWhenHidden paused delivery: the page was silent, or its timers ran `lateMs` late. */
+  readonly paused?: 'silent' | 'throttled';
+  readonly lateMs?: number;
+  /** The return resumes delivery that pauseWhenHidden paused, rejoining live. */
+  readonly rejoined?: boolean;
 }
 
 export interface SessionClosedEvent {

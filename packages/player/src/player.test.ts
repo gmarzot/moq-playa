@@ -2074,6 +2074,22 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it('a subscription that gets its SUBSCRIBE_OK while paused is paused too', async () => {
+      const adapter = createMockAdapter();
+      const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+      player.play();
+      player.pause();
+      (adapter.requestUpdate as any).mockClear();
+
+      await ackMedia(adapter);
+
+      const media = await Promise.all(vi.mocked(adapter.subscribe).mock.results.slice(1).map((r) => r.value));
+      const calls = vi.mocked(adapter.requestUpdate).mock.calls;
+      expect(media.length).toBeGreaterThan(0);
+      for (const id of media) expect(calls).toContainEqual([id, { forward: 0 }]);
+      await player.destroy();
+    });
+
     it('pause() sends REQUEST_UPDATE with forward:0 for active subscriptions', async () => {
       const adapter = createMockAdapter();
       const player = await loadCatalogAndSubscribe(adapter);

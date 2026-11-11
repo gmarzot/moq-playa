@@ -4630,17 +4630,22 @@ export class MoqtPlayer {
   private sendForwardUpdate(forward: 0 | 1): void {
     if (!this.connection) return;
     for (const [requestId] of this.activeSubscriptions) {
-      if (!this.isSubscriptionEstablished(requestId)) continue;
-      this.connection.requestUpdate(varint(requestId), { forward }).catch((err: unknown) => {
-        const cause = err instanceof Error ? err : new Error(String(err));
-        this.log.warn('REQUEST_UPDATE forward:%d failed for reqId=%s: %s', forward, requestId, cause.message);
-        this.emitError(createPlayerError(
-          'degraded', 'connection', PlayerErrorCode.REQUEST_UPDATE_FAILED,
-          `REQUEST_UPDATE forward:${forward} failed: ${cause.message}`,
-          { cause, context: { requestId, forward } },
-        ));
-      });
+      if (this.isSubscriptionEstablished(requestId)) this.requestForward(requestId, forward);
     }
+  }
+
+  /** REQUEST_UPDATE with FORWARD for one subscription; a failure is reported, not thrown. */
+  private requestForward(requestId: bigint, forward: 0 | 1): void {
+    if (!this.connection) return;
+    this.connection.requestUpdate(varint(requestId), { forward }).catch((err: unknown) => {
+      const cause = err instanceof Error ? err : new Error(String(err));
+      this.log.warn('REQUEST_UPDATE forward:%d failed for reqId=%s: %s', forward, requestId, cause.message);
+      this.emitError(createPlayerError(
+        'degraded', 'connection', PlayerErrorCode.REQUEST_UPDATE_FAILED,
+        `REQUEST_UPDATE forward:${forward} failed: ${cause.message}`,
+        { cause, context: { requestId, forward } },
+      ));
+    });
   }
 
   /**
@@ -8657,6 +8662,8 @@ export class MoqtPlayer {
         }
         this._mediaSubsOk++;
         this.mediaSubWire.delete(requestId);
+        // A subscription made while paused (a retry, a reconnect) starts paused too.
+        if (this.stateMachine.state === PlayerState.PAUSED) this.requestForward(requestId, 0);
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
         // Told to come back later, with nothing else playing this media type.

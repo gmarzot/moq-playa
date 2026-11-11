@@ -428,6 +428,7 @@ async function main(): Promise<void> {
     url: relayUrl,
     namespace,
     autoplay: true,
+    pauseWhenHidden: true,
     ...storedAudio,
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {}),
@@ -456,9 +457,15 @@ async function main(): Promise<void> {
   let lastFrameShownMs: number | null = null;
   let frameRunSinceMs = 0;
   let pictureFrozenSinceMs: number | null = null;
+  /** A return that resumed delivery paused while hidden, until its first frame. */
+  let rejoinAtMs: number | null = null;
   const noteFrameShown = (nowMs: number): void => {
     if (lastFrameShownMs === null || nowMs - lastFrameShownMs > FRAME_RUN_GAP_MS) frameRunSinceMs = nowMs;
     lastFrameShownMs = nowMs;
+    if (rejoinAtMs !== null) {
+      log(`Rejoined live: first frame ${((nowMs - rejoinAtMs) / 1000).toFixed(1)} s after return`);
+      rejoinAtMs = null;
+    }
   };
   const renderStateBadge = (): void => {
     const state = player.state;
@@ -866,10 +873,18 @@ async function main(): Promise<void> {
   if ((document as { wasDiscarded?: boolean }).wasDiscarded) {
     log('Page reloaded: the browser discarded this tab while it was in the background');
   }
-  player.on('lifecycle', ({ state, awayMs }) => {
-    log(awayMs === undefined
-      ? `Page ${state}`
-      : `Page ${state} after ${(awayMs / 1000).toFixed(1)}s away`);
+  player.on('lifecycle', ({ state, awayMs, paused, lateMs, rejoined }) => {
+    if (paused === 'silent') {
+      log('Page hidden 60 s while silent: delivery paused (Forward State 0) until visible');
+    } else if (paused === 'throttled') {
+      log(`Page hidden: timers ran ${((lateMs ?? 0) / 1000).toFixed(1)} s late (throttled): `
+        + 'delivery paused (Forward State 0) until visible');
+    } else {
+      log(awayMs === undefined
+        ? `Page ${state}`
+        : `Page ${state} after ${(awayMs / 1000).toFixed(1)}s away${rejoined ? ': rejoining live' : ''}`);
+    }
+    if (rejoined) rejoinAtMs = performance.now();
   });
   player.on('session_closed', ({ code, reason }) => {
     log(`Session closed${code !== undefined ? ` (code ${code})` : ''}${reason ? `: ${reason}` : ''}`);
