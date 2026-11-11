@@ -10,10 +10,7 @@
 import { Player, pickCaptureTime } from '@openmoq/playa';
 import type { CaptureTimeSource } from '@openmoq/playa';
 import { initBuildInfo } from '../shared/build-info.js';
-import {
-  namespace, certHash, draftVersion, catalogBootstrap,
-  renderCushionFloorMs, renderCushionMaxMs, targetLatencyMs as targetLatencyOverrideMs, debug,
-} from '../shared/cert.js';
+import { namespace, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import { parseCompat } from '../shared/compat.js';
 import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import {
@@ -36,15 +33,50 @@ const warmStart = new URLSearchParams(location.search).get('warmStart') !== '0';
 /** Media recovers in a background tab unless `?autoResume=0`. */
 const autoResume = new URLSearchParams(location.search).get('autoResume') !== '0';
 
+/** The playback settings a query sets; they apply to a running session without a reload. */
+function playbackParams(p: URLSearchParams) {
+  const positiveMs = (name: string): number | undefined => {
+    const v = Number(p.get(name));
+    return Number.isFinite(v) && v > 0 ? v : undefined;
+  };
+  const catchUp = Number(p.get('catchUp'));
+  const smoothCeilingMs = positiveMs('latencyMax');
+  const rawMin = p.get('latencyMin');
+  const min = rawMin === null || rawMin.trim() === '' ? NaN : Number(rawMin);
+  return {
+    latencyMode: (p.get('latency') === 'smooth' ? 'smooth' : 'live') as 'live' | 'smooth',
+    targetLatencyMs: positiveMs('targetLatency'),
+    smoothCeilingMs,
+    smoothFloorMs: Number.isFinite(min) && min >= 0 && (smoothCeilingMs === undefined || min <= smoothCeilingMs)
+      ? min : undefined,
+    renderCushionFloorMs: positiveMs('cushion'),
+    renderCushionMaxMs: positiveMs('cushionMax'),
+    catchUpRate: Number.isFinite(catchUp) && catchUp >= 1 ? catchUp : undefined,
+    debug: p.get('debug') === '1',
+  };
+}
+const initialPlayback = playbackParams(new URLSearchParams(location.search));
+
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
-const catchUpRate: number | undefined = (() => {
-  const v = Number(new URLSearchParams(location.search).get('catchUp'));
-  return Number.isFinite(v) && v >= 1 ? v : undefined;
-})();
+let catchUpRate = initialPlayback.catchUpRate;
 
 /** `?latency=live|smooth`; Live edge by default. */
-const latencyMode: 'live' | 'smooth' =
-  new URLSearchParams(location.search).get('latency') === 'smooth' ? 'smooth' : 'live';
+let latencyMode = initialPlayback.latencyMode;
+
+/** `?targetLatency=MS`: catch-up set point; on CMAF also where live-edge
+ *  and gap-jump seeks land. Overrides the catalog's targetLatency. */
+let targetLatencyOverrideMs = initialPlayback.targetLatencyMs;
+
+/** `?cushion=MS` / `?cushionMax=MS`: LOC render-cushion floor and cap. */
+let renderCushionFloorMs = initialPlayback.renderCushionFloorMs;
+let renderCushionMaxMs = initialPlayback.renderCushionMaxMs;
+
+/** `?debug=1`: engine debug logging, MSE adapter tracing, and media-element
+ *  events mirrored into the on-page log. */
+let debug = initialPlayback.debug;
+
+/** Applies a query's playback settings to the running player, throwing if it rejects them; null until it exists. */
+let applyPlaybackQuery: ((query: URLSearchParams) => void) | null = null;
 
 /** Fatal media errors only a fresh tune-in recovers: wedged element, unrecoverable gap, dead pipeline. */
 const REJOIN_CODES = new Set([0x1102, 0x1104, 0x1105]);
@@ -70,16 +102,9 @@ const storedAudio: { volume?: number; muted?: boolean } = (() => {
 })();
 
 /** `?latencyMax=`: ceiling of the smooth playout delay (ms). */
-const smoothCeilingMs: number | undefined = (() => {
-  const v = Number(new URLSearchParams(location.search).get('latencyMax'));
-  return Number.isFinite(v) && v > 0 ? v : undefined;
-})();
+let smoothCeilingMs = initialPlayback.smoothCeilingMs;
 /** `?latencyMin=`: floor of the smooth playout delay (ms), where it starts; 0 starts at the target. */
-const smoothFloorMs: number | undefined = (() => {
-  const raw = new URLSearchParams(location.search).get('latencyMin');
-  const v = raw === null || raw.trim() === '' ? NaN : Number(raw);
-  return Number.isFinite(v) && v >= 0 && (smoothCeilingMs === undefined || v <= smoothCeilingMs) ? v : undefined;
-})();
+let smoothFloorMs = initialPlayback.smoothFloorMs;
 
 /** `?congestionControl=low-latency|throughput`: a hint to the browser's QUIC
  *  congestion controller. Unset leaves the browser default. */
@@ -257,6 +282,8 @@ function log(msg: string): void {
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
   const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'latencyMin', 'latencyMax', 'cushion', 'cushionMax',
     'catchUp', 'catalogBootstrap', 'warmStart', 'autoResume', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
+  /** Applied to the running session without a reload. */
+  const LIVE_KEYS = ['targetLatency', 'latencyMin', 'latencyMax', 'cushion', 'cushionMax', 'catchUp', 'debug', 'status'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const backdrop = byId('settings-backdrop');
@@ -323,10 +350,10 @@ function log(msg: string): void {
     const tag = (e.target as HTMLElement).tagName;
     if (tag !== 'INPUT' && tag !== 'SELECT') return;
     e.preventDefault();
-    byId('set-apply').click();
+    byId('set-apply').dispatchEvent(new MouseEvent('click', { ctrlKey: e.ctrlKey, metaKey: e.metaKey }));
   });
 
-  byId('set-apply').addEventListener('click', () => {
+  byId('set-apply').addEventListener('click', (e) => {
     const next = new URLSearchParams(location.search);
     for (const k of MANAGED) next.delete(k);
     // A blank field means "use the default", and a default is never written —
@@ -354,11 +381,22 @@ function log(msg: string): void {
     const href = location.pathname + (qs ? `?${qs}` : '');
     const cur = new URLSearchParams(location.search);
     const changed = MANAGED.filter((k) => JSON.stringify(cur.getAll(k)) !== JSON.stringify(next.getAll(k)));
-    // The overlay applies live; any other change needs a new session.
-    if (changed.length === 1 && changed[0] === 'status') {
+    // The overlay and playback settings apply live; any other change needs a new session, as does Ctrl/⌘-Apply.
+    const reload = e.ctrlKey || e.metaKey;
+    const playback = changed.some((k) => k !== 'status');
+    if (changed.length && !reload && changed.every((k) => LIVE_KEYS.includes(k))
+        && (!playback || applyPlaybackQuery)) {
+      if (playback) {
+        try {
+          applyPlaybackQuery!(next);
+        } catch (err) {
+          log(`Settings not applied: ${(err as Error).message}`);
+          return;
+        }
+      }
       history.replaceState(history.state, '', href + location.hash);
-      setShowStatus(next.get('status') === '1');
-    } else if (changed.length) {
+      if (changed.includes('status')) setShowStatus(next.get('status') === '1');
+    } else if (changed.length || reload) {
       location.href = href;
       return;
     }
@@ -854,13 +892,11 @@ async function main(): Promise<void> {
     watchedVideo = video;
     video.addEventListener('waiting', () => { stallStartSnap = describeVideo(video); });
     measurePresentedFrames(video);
-    if (debug) {
-      // Element-side view of every playhead disturbance, timestamped like
-      // the stall lines so the two can be correlated.
-      for (const ev of ['play', 'playing', 'pause', 'waiting', 'stalled', 'suspend',
-                        'seeking', 'seeked', 'ratechange', 'ended', 'error']) {
-        video.addEventListener(ev, () => log(`[video] ${ev} ${describeVideo(video)}`));
-      }
+    // With debug on: an element-side view of every playhead disturbance,
+    // timestamped like the stall lines so the two can be correlated.
+    for (const ev of ['play', 'playing', 'pause', 'waiting', 'stalled', 'suspend',
+                      'seeking', 'seeked', 'ratechange', 'ended', 'error']) {
+      video.addEventListener(ev, () => { if (debug) log(`[video] ${ev} ${describeVideo(video)}`); });
     }
     return video;
   };
@@ -1269,6 +1305,8 @@ async function main(): Promise<void> {
   /** Stall detection times, drawn over the queue chart. */
   const stallMarks: number[] = [];
   let targetLatencyMs = 0;
+  /** The largest catalog targetLatency (ms); 0 when none. */
+  let catalogTargetLatencyMs = 0;
   let audioCodec: string | null = null;
   let videoFps: number | null = null;
   let prevArrivalMs = 0;
@@ -1875,7 +1913,7 @@ async function main(): Promise<void> {
         log(`[MSE] stalled with ${Math.round(aheadSec * 1000)}ms buffered while catching up; `
           + `catch-up now stops at ${Math.round(floorSec * 1000)}ms`);
     }
-    if (debug && ms && ms.debug === false) ms.debug = true;
+    if (ms && ms.debug === !debug) ms.debug = debug;
     // At most one line per 30 s bypass window, however often it re-arms.
     const bypasses: number = (player as any).engine?.cmafAssembler?.audioOrderStats?.bypasses ?? 0;
     if (bypasses > audioBypassesReported && performance.now() - audioBypassLoggedAtMs >= 30_000) {
@@ -2142,8 +2180,8 @@ async function main(): Promise<void> {
     noteCatalogViews(tracks);
     fillTrackPickers();
     // The engine runs at the URL override when one is given.
-    targetLatencyMs = targetLatencyOverrideMs ?? Math.max(0,
-      ...tracks.map((t) => Number(t.targetLatency) || 0));
+    catalogTargetLatencyMs = Math.max(0, ...tracks.map((t) => Number(t.targetLatency) || 0));
+    targetLatencyMs = targetLatencyOverrideMs ?? catalogTargetLatencyMs;
     // Same header as the broadcaster's catalog panel.
     catalogLabelText = catalogLabel(tracks.map((t) => t.packaging), cat?.version);
     renderCatalogStatus();
@@ -2380,14 +2418,49 @@ async function main(): Promise<void> {
     else document.getElementById('settings-btn')!.click();
   });
   menu.addEventListener('change', () => setMenuOpen(false));
-  // A latency choice applies from the start of a session: record it in the URL and reload.
+  applyPlaybackQuery = (query: URLSearchParams): void => {
+    const p = playbackParams(query);
+    player.updatePlayback({
+      latencyMode: p.latencyMode === 'smooth' ? 'smooth' : undefined,
+      targetLatencyMs: p.targetLatencyMs,
+      smoothFloorMs: p.smoothFloorMs,
+      smoothCeilingMs: p.smoothCeilingMs,
+      renderCushionFloorMs: p.renderCushionFloorMs,
+      renderCushionMaxMs: p.renderCushionMaxMs,
+      maxCatchUpRate: p.catchUpRate,
+      logLevel: p.debug ? 'debug' : undefined,
+    });
+    ({
+      latencyMode, smoothFloorMs, smoothCeilingMs, renderCushionFloorMs, renderCushionMaxMs, catchUpRate, debug,
+      targetLatencyMs: targetLatencyOverrideMs,
+    } = p);
+    targetLatencyMs = targetLatencyOverrideMs ?? catalogTargetLatencyMs;
+    latencySelect.value = latencyMode;
+    renderStateBadge();
+    const parts = [`latency ${latencyMode}`, `target ${targetLatencyMs > 0 ? `${targetLatencyMs} ms` : 'none'}`];
+    if (smoothFloorMs !== undefined) parts.push(`smooth floor ${smoothFloorMs} ms`);
+    if (smoothCeilingMs !== undefined) parts.push(`smooth ceiling ${smoothCeilingMs} ms`);
+    if (renderCushionFloorMs !== undefined) parts.push(`cushion ${renderCushionFloorMs} ms`);
+    if (renderCushionMaxMs !== undefined) parts.push(`cushion max ${renderCushionMaxMs} ms`);
+    if (catchUpRate !== undefined) parts.push(`catch-up ${catchUpRate}x`);
+    if (debug) parts.push('debug');
+    log(`Playback settings applied: ${parts.join(', ')}`);
+  };
+  // A latency choice applies to the running session and is recorded in the URL.
   const latencySelect = document.getElementById('latency') as HTMLSelectElement;
   latencySelect.value = latencyMode;
   latencySelect.addEventListener('change', () => {
     const url = new URL(location.href);
     if (latencySelect.value === 'live') url.searchParams.delete('latency');
     else url.searchParams.set('latency', latencySelect.value);
-    location.href = url.toString();
+    try {
+      applyPlaybackQuery!(url.searchParams);
+    } catch (err) {
+      log(`Latency not applied: ${(err as Error).message}`);
+      latencySelect.value = latencyMode;
+      return;
+    }
+    history.replaceState(history.state, '', url.pathname + url.search + url.hash);
   });
   document.addEventListener('click', (e) => {
     if (!menu.hidden && !menu.parentElement!.contains(e.target as Node)) setMenuOpen(false);

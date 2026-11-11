@@ -60,8 +60,8 @@ export interface LatencyStats {
 
 export class LatencyPolicy {
   readonly mode: LatencyMode;
-  private readonly configuredCeilingUs: number;
-  private readonly configuredFloorUs: number;
+  private configuredCeilingUs: number;
+  private configuredFloorUs: number;
   private baseUs: number;
   private readonly marginUs: number;
   private readonly cleanWindowUs: number;
@@ -120,6 +120,13 @@ export class LatencyPolicy {
   /** A new base (e.g. the catalog target); a raised delay above it stays. */
   setBase(baseUs: number): void {
     this.baseUs = baseUs;
+  }
+
+  /** New smooth floor and ceiling (µs); a raised delay above the ceiling drops to it. */
+  setBounds(bounds: { readonly floorUs: number; readonly ceilingUs: number }): void {
+    this.configuredFloorUs = bounds.floorUs;
+    this.configuredCeilingUs = bounds.ceilingUs;
+    this.raisedUs = Math.min(this.raisedUs, this.ceilingUs);
   }
 
   /**

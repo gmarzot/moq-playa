@@ -88,6 +88,22 @@ describe('MseMediaSource — soft chase', () => {
         adapter.destroy();
     });
 
+    it('setLatency: smooth to live lowers the target to the base; live to smooth raises it to the new floor', () => {
+        const video = new MockVideoElement() as unknown as HTMLVideoElement;
+        const adapter = new MseMediaSource(video, { targetAheadSec: 0.2, latencyMode: 'smooth' });
+        adapter.setTargetAheadSec(0.3);
+        expect((adapter as any).targetAheadSec).toBe(1);
+        adapter.setLatency({ mode: 'live', floorSec: 1, ceilingSec: 2 });
+        expect(adapter.latencyStats()).toBeNull();
+        expect((adapter as any).targetAheadSec).toBe(0.3);
+        adapter.setLatency({ mode: 'smooth', floorSec: 1.5, ceilingSec: 2 });
+        expect(adapter.latencyStats()).toMatchObject({ mode: 'smooth', heldMs: 1500, floorMs: 1500, ceilingMs: 2000 });
+        expect((adapter as any).targetAheadSec).toBe(1.5);
+        adapter.setLatency({ mode: 'smooth', floorSec: 0.5, ceilingSec: 2 });
+        expect((adapter as any).targetAheadSec).toBe(0.5);
+        adapter.destroy();
+    });
+
     it('a stall during a chase raises the cushion the chase stops at', () => {
         const video = new MockVideoElement();
         (video as unknown as { playbackRate: number }).playbackRate = 1;

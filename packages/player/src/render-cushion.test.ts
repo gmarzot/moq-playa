@@ -106,4 +106,20 @@ describe('RenderCushionSmoother', () => {
     const b = s.update(0); // audio + video both call within the same instant
     expect(b).toBe(a);
   });
+
+  it('setBounds keeps the current value and slews it into the new bounds at the usual rates', () => {
+    const clock = makeClock();
+    const s = new RenderCushionSmoother({ floorUs: 200_000, maxUs: 750_000 }, clock);
+    s.update(0);
+    s.setBounds(500_000, 1_000_000);
+    expect(s.currentUs).toBe(200_000);
+    clock.advance(1_000_000);
+    expect(s.update(0)).toBe(200_000 + RENDER_CUSHION_RISE_US_PER_SEC);
+    clock.advance(5_000_000);
+    expect(s.update(0)).toBe(500_000);
+    expect(s.raiseTo(5_000_000)).toBe(1_000_000);
+    s.setBounds(200_000, 400_000);
+    clock.advance(1_000_000);
+    expect(s.update(0)).toBe(1_000_000 - RENDER_CUSHION_FALL_US_PER_SEC);
+  });
 });
