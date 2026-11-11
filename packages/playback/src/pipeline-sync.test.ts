@@ -226,6 +226,98 @@ describe('PlaybackPipeline — audio lateness re-anchor', () => {
     });
 });
 
+describe('PlaybackPipeline — audio past its slot inside the drop threshold', () => {
+    // A 200 ms cushion with a 100 ms drop threshold: 200-300 ms late plays
+    // late (past its slot) instead of being dropped.
+    const FRAME_US = 21_333;
+    const C0 = 1_000_000_000n;
+
+    function setup(cushionUs: number) {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const sync = new SyncController({
+            driftThresholdUs: DEFAULT_CONFIG.driftThresholdUs, dropThresholdUs: 100_000, clock,
+        });
+        const ctx = createPipeline({ mediaType: 'audio', clock, sync, getPlaybackDelayUs: () => cushionUs });
+        ctx.pipeline.configure(new Uint8Array([0x01]));
+        ctx.pipeline.pushObject(makeData(0, 0), audioHeaders(C0));
+        ctx.pipeline.tick();
+        let group = 1;
+        const push = (lateUs: number) => {
+            clock.set(5_000_000 + group * FRAME_US + lateUs);
+            ctx.pipeline.pushObject(makeData(group, 0), audioHeaders(C0 + BigInt(group * FRAME_US)));
+            ctx.pipeline.tick();
+            group++;
+        };
+        const decodes = () => ctx.commands.filter(c => c.type === 'decode_audio').length;
+        const reanchors = () => ctx.events.filter(e => e.type === 'audio_reanchored');
+        return { ...ctx, clock, push, decodes, reanchors };
+    }
+
+    it('a sustained run re-anchors once, within 250 ms, and drops nothing', () => {
+        const s = setup(200_000);
+        const before = s.decodes();
+        for (let i = 0; i < 11; i++) s.push(260_000);
+        expect(s.reanchors()).toHaveLength(0);
+        for (let i = 0; i < 2; i++) s.push(260_000);
+        expect(s.reanchors()).toHaveLength(1);
+
+        for (let i = 0; i < 200; i++) s.push(260_000);   // on its slot after the step
+        expect(s.reanchors()).toHaveLength(1);
+        expect(s.decodes()).toBe(before + 213);
+        expect(s.pipeline.lateAudioDrops).toBe(0);
+    });
+
+    it('delivery that steps 250 ms later is back on its slot within 2.5 s', () => {
+        const s = setup(140_000);
+        for (let i = 0; i < 100; i++) s.push(0);
+        let firstLateUs = 0;
+        const reanchoredAt: number[] = [];
+        for (let i = 0; i < 140; i++) {
+            const n = s.reanchors().length;
+            s.push(250_000);
+            if (i === 0) firstLateUs = s.clock.now();
+            if (s.reanchors().length > n) reanchoredAt.push(s.clock.now() - firstLateUs);
+        }
+        // Past the drop threshold first, then inside it: one bounded step each.
+        expect(reanchoredAt).toHaveLength(2);
+        expect(reanchoredAt[1]!).toBeLessThan(2_500_000);
+        const drops = s.pipeline.lateAudioDrops;
+        for (let i = 0; i < 200; i++) s.push(250_000);
+        expect(s.pipeline.lateAudioDrops).toBe(drops);
+        expect(s.reanchors()).toHaveLength(2);
+    });
+
+    it('frames back on their slot end the run', () => {
+        const s = setup(200_000);
+        for (let i = 0; i < 60; i++) s.push(i % 2 === 0 ? 260_000 : 150_000);
+        expect(s.reanchors()).toHaveLength(0);
+    });
+
+    it('the step is what the slot was missed by plus the tolerance, and schedules on the new reference', () => {
+        const s = setup(200_000);
+        for (let i = 0; i < 13; i++) s.push(201_000);     // 1 ms past the slot
+        expect(s.reanchors()).toHaveLength(1);
+        expect(s.sync.baselineDebtUs).toBe(21_000);
+        const last = s.commands.filter(c => c.type === 'decode_audio').at(-1) as { renderTimeUs: number };
+        expect(last.renderTimeUs).toBe(s.sync.computeAudioRenderTime(C0 + BigInt(13 * FRAME_US))!.renderTimeUs);
+
+        for (let i = 0; i < 200; i++) s.push(201_000);    // on its slot from here
+        expect(s.reanchors()).toHaveLength(1);
+        expect(s.sync.baselineDebtUs).toBe(21_000);
+    });
+
+    it('the step is bounded and walked back by on-time frames', () => {
+        const s = setup(200_000);
+        for (let i = 0; i < 13; i++) s.push(290_000);
+        expect(s.reanchors()).toHaveLength(1);
+        expect(s.sync.baselineDebtUs).toBe(100_000);
+
+        for (let i = 0; i < 40; i++) s.push(0);
+        expect(s.sync.baselineDebtUs).toBe(20_000);
+    });
+});
+
 describe('sync reference fallback (advertised audio that never delivers)', () => {
     it('video anchors the reference itself once the bound elapses, and says so', () => {
         const clock = new MockClock();

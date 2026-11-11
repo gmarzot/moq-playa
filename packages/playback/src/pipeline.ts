@@ -952,14 +952,26 @@ export class PlaybackPipeline {
             } else if (timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
             } else {
-                if (this.mediaType === 'audio') {
+                renderTimeUs = timing.renderTimeUs;
+                // Audio past its slot (render time plus the playout cushion) but inside
+                // the drop threshold plays late; a sustained run re-anchors like a drop run,
+                // by what it missed the slot by plus the tolerance.
+                const pastSlotUs = this.mediaType === 'audio'
+                    ? -(timing.offsetUs + (this.getPlaybackDelayUs?.() ?? 0)) : 0;
+                if (pastSlotUs > 0) {
+                    if (this.shouldReanchorAudio()) {
+                        this.sync.reanchorAudioBounded(pastSlotUs + PlaybackPipeline.REFERENCE_TOLERANCE_US);
+                        this.onEvent({ type: 'audio_reanchored', lateByUs: -timing.offsetUs });
+                        renderTimeUs = this.sync.computeAudioRenderTime(headers.captureTimestamp)?.renderTimeUs
+                            ?? this.clock.now();
+                    }
+                } else if (this.mediaType === 'audio') {
                     this._lateAudioSinceUs = null;
                     // Only audio lowers the shared reference, so video cannot pull
                     // it past what audio sustains. The shift applies from the next frame.
                     this.sync.lowerReference(
                         timing.offsetUs, PlaybackPipeline.REFERENCE_TOLERANCE_US);
                 }
-                renderTimeUs = timing.renderTimeUs;
             }
         } else {
             renderTimeUs = this.clock.now();
