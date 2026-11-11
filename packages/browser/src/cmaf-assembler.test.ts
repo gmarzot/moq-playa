@@ -1502,6 +1502,29 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
         [0, 1, 2].map((i) => BigInt(VIDEO_TS + i * FRAME)));
     });
 
+    it('holds a newer group over a gap long enough for the previous group\'s late tail', () => {
+      vi.useFakeTimers();
+      try {
+        const onSegment = vi.fn();
+        const assembler = new CmafAssembler({ onSegment, videoAheadMs: () => 40 });
+        assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+        const F60 = VIDEO_TS / 60;
+        const push = (groupId: bigint, i: number) => assembler.push('video', 'videoA', groupId,
+          concat(buildMoof(Number(groupId - 100n) * 120 * F60 + i * F60, i + 1, F60), buildMdat(new Uint8Array([i & 0xff]))));
+        for (let i = 0; i < 114; i++) push(100n, i);
+        push(101n, 0);                                    // overtakes group 100's last 6 frames
+        vi.advanceTimersByTime(23);
+        for (let i = 114; i < 120; i++) push(100n, i);
+        vi.advanceTimersByTime(500);
+
+        const out = outs(onSegment);
+        expect(out).toHaveLength(121);
+        expect(out.every((t, i) => i === 0 || t > out[i - 1]!)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('moves a rendition past the emitted tail when the overlap exceeds the switch bound', () => {
       const { assembler, onSegment } = assemblerWithInits();
       pushFrames(assembler, 'videoA', 100n, 0, 10);

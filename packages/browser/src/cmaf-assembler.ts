@@ -322,6 +322,8 @@ export class CmafAssembler {
   private static readonly STARTUP_DIAG_COUNT = 5;
   /** Buffered depth at which a hold gives up: Chrome reports `waiting` with about 130 ms still ahead. */
   private static readonly HOLD_RELEASE_MARGIN_MS = 150;
+  /** Least wait for a previous group's tail before a newer video group is emitted over its gap. */
+  private static readonly VIDEO_TAIL_HOLD_MS = 150;
   /** Audio gap holds that expire unfilled in a row before gaps pass straight through. */
   private static readonly AUDIO_BYPASS_AFTER = 3;
   /** How long audio gaps pass through before holding is tried again. */
@@ -722,9 +724,12 @@ export class CmafAssembler {
     const head = o.held[0]!;
     const frameMs = (Number(head.end - head.start) * 1000) / timescale;
     const aheadMs = (mediaType === 'video' ? this.videoAheadMs : this.audioAheadMs)?.() ?? null;
-    const ms = aheadMs === null
-      ? frameMs
-      : Math.max(frameMs, aheadMs - CmafAssembler.HOLD_RELEASE_MARGIN_MS);
+    // A just-joined rendition's next group can overtake the previous group's tail;
+    // waiting briefly costs less than the hole, which Chrome may not play past.
+    const tailMs = mediaType === 'video' && o.lastGroup !== null && head.groupId > o.lastGroup
+      ? CmafAssembler.VIDEO_TAIL_HOLD_MS : 0;
+    const ms = Math.max(frameMs, tailMs,
+      aheadMs === null ? 0 : aheadMs - CmafAssembler.HOLD_RELEASE_MARGIN_MS);
     o.timer = setTimeout(() => {
       o.timer = null;
       this.releaseHeld(mediaType, true);

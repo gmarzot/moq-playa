@@ -170,7 +170,7 @@ describe('CmafAssembler — video decode order', () => {
       const { assembler, push, emitted } = setup(() => 200);
       push(0, 0); push(1, 0);
       push(3, 1);
-      vi.advanceTimersByTime(200 - 150 - 1);   // held until 150 ms remain buffered
+      vi.advanceTimersByTime(150 - 1);         // a newer group waits 150 ms for the tail
       expect(emitted()).toEqual([0, 1]);
       vi.advanceTimersByTime(2);
       expect(emitted()).toEqual([0, 1, 3]);

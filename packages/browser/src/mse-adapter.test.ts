@@ -1755,6 +1755,69 @@ describe('MseMediaSource — live-buffer management', () => {
 // live-edge seek → onError (app rebuilds). A nudge/seek WE perform must
 // not count as recovery — only the playhead advancing on its own does.
 
+describe('video stuck while the playhead moves', () => {
+    function setup() {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[5, 25]]);
+        video.currentTime = 10;
+        let frames = 100;
+        (video as any).getVideoPlaybackQuality = () => ({ totalVideoFrames: frames, droppedVideoFrames: 0 });
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        (adapter as any).playTriggered = true;
+        (adapter as any).videoBuffer = { buffered: makeTimeRanges([[5, 25]]) };
+        const adjusts: Array<[string, number, number]> = [];
+        adapter.onPlayheadAdjust = (kind, from, to) => adjusts.push([kind, from, to]);
+        const check = (nowMs: number) => (adapter as any).checkVideoStuck(nowMs);
+        return { video, adjusts, check, setFrames: (n: number) => { frames = n; } };
+    }
+
+    it('nudges 0.1 s on when no new frame shows for 1 s while the playhead moves', () => {
+        const s = setup();
+        s.check(0);
+        s.video.currentTime = 10.6;
+        s.check(750);
+        expect(s.adjusts).toHaveLength(0);
+        s.video.currentTime = 11.0;
+        s.check(1_000);
+        expect(s.adjusts).toEqual([['nudge', 11.0, 11.1]]);
+        expect(s.video.currentTime).toBeCloseTo(11.1, 5);
+    });
+
+    it('stays quiet while frames advance, the playhead holds, or no video is buffered there', () => {
+        const s = setup();
+        s.check(0);
+        s.setFrames(160); s.video.currentTime = 11; s.check(1_000);
+        s.setFrames(220); s.video.currentTime = 12; s.check(2_000);
+        expect(s.adjusts).toHaveLength(0);
+
+        s.check(3_500);                                   // frames and playhead both still
+        expect(s.adjusts).toHaveLength(0);
+
+        const t = setup();
+        (t as any).video.currentTime = 10;
+        t.check(0);
+        t.video.currentTime = 24.9;                       // past the video range's useful end
+        t.check(1_500);
+        expect(t.adjusts).toHaveLength(0);
+    });
+
+    it('stays quiet on a hidden page and nudges at most once per 5 s', () => {
+        const s = setup();
+        vi.stubGlobal('document', { hidden: true });
+        try {
+            s.check(0); s.video.currentTime = 11; s.check(1_500);
+            expect(s.adjusts).toHaveLength(0);
+        } finally { vi.unstubAllGlobals(); }
+
+        s.check(2_000); s.video.currentTime = 12; s.check(3_000);
+        expect(s.adjusts).toHaveLength(1);
+        s.check(3_500); s.video.currentTime = 13; s.check(4_600);
+        expect(s.adjusts).toHaveLength(1);
+        s.check(8_100);  s.video.currentTime = 14; s.check(9_200);
+        expect(s.adjusts).toHaveLength(2);
+    });
+});
+
 describe('playhead-wedge watchdog', () => {
     function wedgeSetup() {
         const video = new MockVideoElement();
