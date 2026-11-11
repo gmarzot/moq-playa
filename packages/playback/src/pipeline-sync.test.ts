@@ -294,6 +294,19 @@ describe('PlaybackPipeline — audio past its slot inside the drop threshold', (
         expect(s.reanchors()).toHaveLength(0);
     });
 
+    it('the step is what the slot was missed by plus the tolerance, and schedules on the new reference', () => {
+        const s = setup(200_000);
+        for (let i = 0; i < 13; i++) s.push(201_000);     // 1 ms past the slot
+        expect(s.reanchors()).toHaveLength(1);
+        expect(s.sync.baselineDebtUs).toBe(21_000);
+        const last = s.commands.filter(c => c.type === 'decode_audio').at(-1) as { renderTimeUs: number };
+        expect(last.renderTimeUs).toBe(s.sync.computeAudioRenderTime(C0 + BigInt(13 * FRAME_US))!.renderTimeUs);
+
+        for (let i = 0; i < 200; i++) s.push(201_000);    // on its slot from here
+        expect(s.reanchors()).toHaveLength(1);
+        expect(s.sync.baselineDebtUs).toBe(21_000);
+    });
+
     it('the step is bounded and walked back by on-time frames', () => {
         const s = setup(200_000);
         for (let i = 0; i < 13; i++) s.push(290_000);
