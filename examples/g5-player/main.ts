@@ -315,10 +315,10 @@ function log(msg: string): void {
     const tag = (e.target as HTMLElement).tagName;
     if (tag !== 'INPUT' && tag !== 'SELECT') return;
     e.preventDefault();
-    byId('set-apply').click();
+    byId('set-apply').dispatchEvent(new MouseEvent('click', { ctrlKey: e.ctrlKey, metaKey: e.metaKey }));
   });
 
-  byId('set-apply').addEventListener('click', () => {
+  byId('set-apply').addEventListener('click', (e) => {
     const next = new URLSearchParams(location.search);
     for (const k of MANAGED) next.delete(k);
     // A blank field means "use the default", and a default is never written —
@@ -346,11 +346,12 @@ function log(msg: string): void {
     const href = location.pathname + (qs ? `?${qs}` : '');
     const cur = new URLSearchParams(location.search);
     const changed = MANAGED.filter((k) => JSON.stringify(cur.getAll(k)) !== JSON.stringify(next.getAll(k)));
-    // The overlay applies live; any other change needs a new session.
-    if (changed.length === 1 && changed[0] === 'status') {
+    // The overlay applies live; any other change needs a new session, as does Ctrl/⌘-Apply.
+    const reload = e.ctrlKey || e.metaKey;
+    if (changed.length === 1 && changed[0] === 'status' && !reload) {
       history.replaceState(history.state, '', href + location.hash);
       setShowStatus(next.get('status') === '1');
-    } else if (changed.length) {
+    } else if (changed.length || reload) {
       location.href = href;
       return;
     }
