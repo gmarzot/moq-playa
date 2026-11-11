@@ -764,6 +764,15 @@ async function main(): Promise<void> {
   };
   let watchedVideo: HTMLVideoElement | null = null;
   let stallStartSnap = '';
+  /** Refused tracks until their next object; a repeat of the logged code is not logged again. */
+  const refusedTracks = new Map<string, { code: bigint; count: number; sinceMs: number }>();
+  const noteTrackBack = (trackName: string): void => {
+    const refused = refusedTracks.get(trackName);
+    if (!refused) return;
+    refusedTracks.delete(trackName);
+    log(`Track "${trackName}" back after ${refused.count} refused subscribe(s) over `
+      + `${((performance.now() - refused.sinceMs) / 1000).toFixed(0)} s`);
+  };
   const watchVideo = () => {
     const video = playerContainer.querySelector('video');
     if (!video || video === watchedVideo) return video;
@@ -841,6 +850,14 @@ async function main(): Promise<void> {
     log(`Track "${trackName}" ended: ${reason || '(no reason)'}`);
   });
   player.on('track_subscribe_failed', ({ trackName, mediaType, errorCode, reason }) => {
+    const prior = refusedTracks.get(trackName);
+    if (prior && prior.code === BigInt(errorCode)) {
+      prior.count++;
+      return;
+    }
+    refusedTracks.set(trackName, {
+      code: BigInt(errorCode), count: (prior?.count ?? 0) + 1, sinceMs: prior?.sinceMs ?? performance.now(),
+    });
     log(`Subscribe ${mediaType} "${trackName}" refused (0x${errorCode.toString(16)}): ${reason || '(no reason)'}`);
   });
   player.on('namespace_state', ({ state, detail }) => {
@@ -1499,6 +1516,7 @@ async function main(): Promise<void> {
     fillTrackPickers();
   });
   (player as any).on('media_object', (e: any) => {
+    if (refusedTracks.size > 0) noteTrackBack(e.trackName);
     if ((e.mediaType === 'video' || e.mediaType === 'audio') && e.kind === 'data') {
       const nowMs = performance.now();
       firstMediaObjectMs ??= nowMs;
