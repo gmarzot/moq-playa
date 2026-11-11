@@ -449,9 +449,48 @@ async function main(): Promise<void> {
 
   // ── Wire Events ───────────────────────────────────────────────────
 
+  // Playing with no new frame on screen for FROZEN_AFTER_MS reads "frozen", not live,
+  // until frames have kept coming for FROZEN_AFTER_MS.
+  const FROZEN_AFTER_MS = 1_000;
+  const FRAME_RUN_GAP_MS = 500;
+  let lastFrameShownMs: number | null = null;
+  let frameRunSinceMs = 0;
+  let pictureFrozenSinceMs: number | null = null;
+  const noteFrameShown = (nowMs: number): void => {
+    if (lastFrameShownMs === null || nowMs - lastFrameShownMs > FRAME_RUN_GAP_MS) frameRunSinceMs = nowMs;
+    lastFrameShownMs = nowMs;
+  };
+  const renderStateBadge = (): void => {
+    const state = player.state;
+    const frozen = state === 'playing' && pictureFrozenSinceMs !== null;
+    stateBadge.textContent = frozen ? 'frozen'
+      : state === 'playing' ? (latencyMode === 'smooth' ? 'live/smooth' : 'live') : state;
+    stateBadge.className = `state-badge ${frozen ? 'loading' : state}`;
+  };
+  /** Per UI tick. `stalledSinceMs`: the freeze watch's verdict (engine stall, MSE playhead). */
+  const updatePictureFrozen = (nowMs: number, hidden: boolean, stalledSinceMs: number | null): void => {
+    if (hidden) {
+      // A hidden page draws nothing; its return starts a fresh wait.
+      if (lastFrameShownMs !== null) lastFrameShownMs = frameRunSinceMs = nowMs;
+      if (pictureFrozenSinceMs === null) return;
+      pictureFrozenSinceMs = null;
+    } else if (pictureFrozenSinceMs === null) {
+      if (player.state !== 'playing' || lastFrameShownMs === null) return;
+      if (stalledSinceMs === null && nowMs - lastFrameShownMs <= FROZEN_AFTER_MS) return;
+      pictureFrozenSinceMs = Math.min(stalledSinceMs ?? Infinity, lastFrameShownMs);
+    } else {
+      const moving = stalledSinceMs === null && lastFrameShownMs !== null
+        && nowMs - lastFrameShownMs <= FRAME_RUN_GAP_MS && nowMs - frameRunSinceMs >= FROZEN_AFTER_MS;
+      if (player.state === 'playing' && !moving) return;
+      if (moving) log(`Picture was frozen for ${((nowMs - pictureFrozenSinceMs) / 1000).toFixed(1)} s`);
+      pictureFrozenSinceMs = null;
+    }
+    renderStateBadge();
+  };
+
   player.on('statechange', ({ state }) => {
-    stateBadge.textContent = state === 'playing' ? (latencyMode === 'smooth' ? 'live/smooth' : 'live') : state;
-    stateBadge.className = `state-badge ${state}`;
+    if (state !== 'playing') pictureFrozenSinceMs = null;
+    renderStateBadge();
     if (state === 'error') {
       setupBadgeState = { tone: 'bad', detail: 'Session ended in a fatal error' };
       nsBadgeState = { tone: 'idle', detail: 'No namespace subscription: the session ended' };
@@ -1099,6 +1138,7 @@ async function main(): Promise<void> {
     if (!('requestVideoFrameCallback' in video)) return;
     const onFrame = (_now: number, meta: VideoFrameCallbackMetadata): void => {
       if (watchedVideo !== video) return;
+      noteFrameShown(performance.now());
       const captureUs = (player as any).engine?.cmafCaptureUsAt?.(meta.mediaTime) as number | null | undefined;
       if (captureUs != null) noteFrameDrawn(captureUs, performance.timeOrigin + meta.presentationTime);
       video.requestVideoFrameCallback(onFrame);
@@ -1778,7 +1818,12 @@ async function main(): Promise<void> {
     noteVideoHoles(eng?.mediaSource);
     const byKind = eng?.mediaSource?.getBufferAheadMsByKind?.();
     const renderer = (player as any).renderer;
-    if (renderer && renderer.onFrameDrawn === null) renderer.onFrameDrawn = noteFrameDrawn;
+    if (renderer && renderer.onFrameDrawn === null) {
+      renderer.onFrameDrawn = (captureUs: number, drawnAtWallMs: number) => {
+        noteFrameShown(performance.now());
+        noteFrameDrawn(captureUs, drawnAtWallMs);
+      };
+    }
     // An empty render queue is 0 ms ahead, not a missing sample.
     const vMs = byKind ? byKind.video
       : renderer ? (renderer.queuedAheadMs ?? 0) : null;
@@ -1806,6 +1851,7 @@ async function main(): Promise<void> {
     }
     frozenSinceMs = freezeSince;
     const frozen = frozenSinceMs !== null;
+    updatePictureFrozen(tickNowMs, hidden, frozenSinceMs);
 
     const arrivalsSettling = inStartupHold(tickNowMs, ARRIVAL_CHARTS_HOLD_MS);
     const queueSettling = inStartupHold(tickNowMs, QUEUED_CHART_HOLD_MS);
