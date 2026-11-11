@@ -3663,16 +3663,17 @@ export class MseMediaSource implements MediaSourceLike {
   private checkVideoStuck(nowMs: number): void {
     const v = this.video;
     const q = (v as { getVideoPlaybackQuality?: () => VideoPlaybackQuality }).getVideoPlaybackQuality?.();
-    const hidden = typeof document !== 'undefined' && document.hidden === true;
     if (!q || this.destroyed || !this.playTriggered || !this.playbackIntent || !this.videoBuffer
-        || v.paused || v.seeking || hidden) {
+        || v.paused || v.seeking || this.isHidden()) {
       this.videoFramesSeen = null;
       return;
     }
     const ct = v.currentTime;
     const seen = this.videoFramesSeen;
-    if (seen === null || q.totalVideoFrames !== seen.frames || ct < seen.time) {
-      this.videoFramesSeen = { frames: q.totalVideoFrames, time: ct, atMs: nowMs };
+    // totalVideoFrames counts dropped frames too; only presented ones move the picture.
+    const shown = q.totalVideoFrames - q.droppedVideoFrames;
+    if (seen === null || shown !== seen.frames || ct < seen.time) {
+      this.videoFramesSeen = { frames: shown, time: ct, atMs: nowMs };
       return;
     }
     if (nowMs - seen.atMs < MseMediaSource.VIDEO_STUCK_MS

@@ -1783,6 +1783,16 @@ describe('video stuck while the playhead moves', () => {
         expect(s.video.currentTime).toBeCloseTo(11.1, 5);
     });
 
+    it('counts dropped frames as not shown', () => {
+        const s = setup();
+        let dropped = 0;
+        (s.video as any).getVideoPlaybackQuality = () => ({ totalVideoFrames: 100 + dropped, droppedVideoFrames: dropped });
+        s.check(0);
+        dropped = 15; s.video.currentTime = 10.5; s.check(500);
+        dropped = 30; s.video.currentTime = 11.0; s.check(1_000);
+        expect(s.adjusts).toEqual([['nudge', 11.0, 11.1]]);
+    });
+
     it('stays quiet while frames advance, the playhead holds, or no video is buffered there', () => {
         const s = setup();
         s.check(0);

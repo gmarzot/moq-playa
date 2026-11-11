@@ -1525,6 +1525,26 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
       }
     });
 
+    it('a partial tail keeps the newer group\'s hold deadline', () => {
+      vi.useFakeTimers();
+      try {
+        const onSegment = vi.fn();
+        const assembler = new CmafAssembler({ onSegment, videoAheadMs: () => 40 });
+        assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+        const F60 = VIDEO_TS / 60;
+        const push = (groupId: bigint, i: number) => assembler.push('video', 'videoA', groupId,
+          concat(buildMoof(Number(groupId - 100n) * 120 * F60 + i * F60, i + 1, F60), buildMdat(new Uint8Array([i & 0xff]))));
+        for (let i = 0; i < 114; i++) push(100n, i);
+        push(101n, 0);
+        vi.advanceTimersByTime(200);
+        push(100n, 114);                                  // fills part of the gap
+        vi.advanceTimersByTime(110);                      // 310 ms since the hold began
+        expect(outs(onSegment)).toHaveLength(116);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('moves a rendition past the emitted tail when the overlap exceeds the switch bound', () => {
       const { assembler, onSegment } = assemblerWithInits();
       pushFrames(assembler, 'videoA', 100n, 0, 10);
