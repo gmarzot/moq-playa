@@ -24,7 +24,7 @@ import {
 } from '../../packages/browser/src/mp4-box.js';
 
 /** `?status=1` shows the playback state over the picture (off by default). */
-const showStatus = new URLSearchParams(location.search).get('status') === '1';
+let showStatus = new URLSearchParams(location.search).get('status') === '1';
 
 /** `?compat=`: opt-in interop for a non-conformant relay (shared/compat.ts). */
 const compatParam = parseCompat(new URLSearchParams(location.search).get('compat'));
@@ -42,24 +42,18 @@ const catchUpRate: number | undefined = (() => {
   return Number.isFinite(v) && v >= 1 ? v : undefined;
 })();
 
-const LATENCY_KEY = 'g5-latency';
-/** `?latency=live|smooth`, else the viewer's last choice; Live edge by default. */
-const latencyMode: 'live' | 'smooth' = (() => {
-  let v = new URLSearchParams(location.search).get('latency');
-  if (v === null) {
-    try { v = localStorage.getItem(LATENCY_KEY); } catch { /* storage unavailable */ }
-  }
-  return v === 'smooth' ? 'smooth' : 'live';
-})();
+/** `?latency=live|smooth`; Live edge by default. */
+const latencyMode: 'live' | 'smooth' =
+  new URLSearchParams(location.search).get('latency') === 'smooth' ? 'smooth' : 'live';
 
 const VOLUME_KEY = 'g5-volume';
 const MUTED_KEY = 'g5-muted';
-/** The viewer's last volume and mute choice. */
+/** This tab's last volume and mute choice; survives its reloads. */
 const storedAudio: { volume?: number; muted?: boolean } = (() => {
   try {
-    const raw = localStorage.getItem(VOLUME_KEY);
+    const raw = sessionStorage.getItem(VOLUME_KEY);
     const volume = raw === null ? NaN : Number(raw);
-    const muted = localStorage.getItem(MUTED_KEY);
+    const muted = sessionStorage.getItem(MUTED_KEY);
     return {
       ...(Number.isFinite(volume) && volume >= 0 && volume <= 1 ? { volume } : {}),
       ...(muted === '1' || muted === '0' ? { muted: muted === '1' } : {}),
@@ -171,7 +165,16 @@ function applyTheme(): void {
 const stateBadge = document.getElementById('state')!;
 const statusClock = document.getElementById('status-clock')!;
 const statusStats = document.getElementById('status-stats')!;
-document.getElementById('status-overlay')!.hidden = !showStatus;
+const statusOverlay = document.getElementById('status-overlay')!;
+statusOverlay.hidden = !showStatus;
+/** Starts the overlay's clock loop; main() sets it once the reference clock exists. */
+let startStatusClock = (): void => {};
+/** Shows or hides the status overlay without a reload. */
+function setShowStatus(on: boolean): void {
+  showStatus = on;
+  statusOverlay.hidden = !on;
+  if (on) startStatusClock();
+}
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
 const advPanel = document.getElementById('adv-panel') as HTMLDetailsElement;
@@ -340,7 +343,18 @@ function log(msg: string): void {
     if (fStatus.checked) next.set('status', '1');
     if (fDebug.checked) next.set('debug', '1');
     const qs = next.toString();
-    location.href = location.pathname + (qs ? `?${qs}` : '');
+    const href = location.pathname + (qs ? `?${qs}` : '');
+    const cur = new URLSearchParams(location.search);
+    const changed = MANAGED.filter((k) => JSON.stringify(cur.getAll(k)) !== JSON.stringify(next.getAll(k)));
+    // The overlay applies live; any other change needs a new session.
+    if (changed.length === 1 && changed[0] === 'status') {
+      history.replaceState(history.state, '', href + location.hash);
+      setShowStatus(next.get('status') === '1');
+    } else if (changed.length) {
+      location.href = href;
+      return;
+    }
+    close();
   });
 }
 
@@ -1109,13 +1123,21 @@ async function main(): Promise<void> {
   const wallNowMs = (): number => referenceClock.nowMs();
   void calibrateClock();
   setInterval(() => { void calibrateClock(); }, 300_000);
+  let statusClockRunning = false;
   const paintStatusClock = (): void => {
+    if (!showStatus) { statusClockRunning = false; return; }
     statusClock.textContent = referenceClock.offset !== null
       ? new Date(referenceClock.nowMs()).toISOString().slice(11, 23) : '';
     // About 30 updates a second; the timer requests no frames between them.
     setTimeout(() => requestAnimationFrame(paintStatusClock), 26);
   };
-  if (showStatus) requestAnimationFrame(paintStatusClock);
+  // One loop at a time; it ends at its first tick with the overlay hidden.
+  startStatusClock = (): void => {
+    if (statusClockRunning) return;
+    statusClockRunning = true;
+    requestAnimationFrame(paintStatusClock);
+  };
+  if (showStatus) startStatusClock();
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void calibrateClock(); });
   let clockDriftApplied = false;
   document.addEventListener('visibilitychange', () => {
@@ -2274,11 +2296,11 @@ async function main(): Promise<void> {
   setPlayIcon(false);
   setMuteIcon(player.muted);
   volumeBar.value = String(Math.round(player.volume * 100));
-  /** Saves the viewer's own choices; a mute the autoplay policy forces is not one. */
+  /** Saves the viewer's own choices for this tab; a mute the autoplay policy forces is not one. */
   const saveAudioChoice = (): void => {
     try {
-      localStorage.setItem(VOLUME_KEY, String(player.volume));
-      localStorage.setItem(MUTED_KEY, player.muted ? '1' : '0');
+      sessionStorage.setItem(VOLUME_KEY, String(player.volume));
+      sessionStorage.setItem(MUTED_KEY, player.muted ? '1' : '0');
     } catch { /* storage unavailable */ }
   };
   phoneBar.addEventListener('change', labelSpeaker);
@@ -2323,14 +2345,12 @@ async function main(): Promise<void> {
     else document.getElementById('settings-btn')!.click();
   });
   menu.addEventListener('change', () => setMenuOpen(false));
-  // A latency choice applies from the start of a session: remember it and reload.
+  // A latency choice applies from the start of a session: record it in the URL and reload.
   const latencySelect = document.getElementById('latency') as HTMLSelectElement;
   latencySelect.value = latencyMode;
   latencySelect.addEventListener('change', () => {
-    let stored = true;
-    try { localStorage.setItem(LATENCY_KEY, latencySelect.value); } catch { stored = false; }
     const url = new URL(location.href);
-    if (stored) url.searchParams.delete('latency');
+    if (latencySelect.value === 'live') url.searchParams.delete('latency');
     else url.searchParams.set('latency', latencySelect.value);
     location.href = url.toString();
   });

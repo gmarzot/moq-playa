@@ -83,7 +83,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | `live` |
 | `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
 | `targetLatency=` | overrides the catalog target (ms); see below | catalog value |
-| `latency=` | `live` or `smooth`; overrides the choice the ⚙ menu remembers | the remembered choice, else live |
+| `latency=` | `live` or `smooth`; the ⚙ menu sets it for this tab | live |
 | `latencyMin=` | where Smooth starts and the lowest it steps back to (ms); 0 starts at the target | 1000 |
 | `latencyMax=` | Smooth's limit (ms) | 2000 |
 | `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
