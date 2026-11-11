@@ -11,6 +11,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { NamespaceFollower } from './namespace-follow.js';
 import { PlayerState } from './state.js';
+import { PlayerErrorCode } from './errors.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { NamespaceState } from './events.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
@@ -355,6 +356,150 @@ describe('followNamespace (SUBSCRIBE_NAMESPACE, §10.18)', () => {
       expect(errors.some((e) => e.severity === 'fatal' && /catalog bootstrap failed/.test(e.message))).toBe(true);
       await sleep(60);
       expect(migrate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a listed track refused as not existing', () => {
+    const td = new TextDecoder();
+    const names = (adapter: ReturnType<typeof createMockAdapter>): string[] =>
+      adapter.subscribe.mock.calls.map((c: unknown[]) => td.decode(c[1] as Uint8Array));
+    const lastRequestId = async (adapter: ReturnType<typeof createMockAdapter>, name: string): Promise<bigint> =>
+      BigInt(await adapter.subscribe.mock.results[names(adapter).lastIndexOf(name)]!.value);
+    const refuse = (adapter: ReturnType<typeof createMockAdapter>, requestId: bigint): void =>
+      adapter._triggerMessage({
+        type: 'REQUEST_ERROR', requestId: varint(requestId), errorCode: varint(0x10n),
+        retryInterval: varint(0n), errorReason: 'track does not exist',
+      } as unknown as ControlMessage);
+    const accept = (adapter: ReturnType<typeof createMockAdapter>, requestId: bigint, alias: bigint): void =>
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(requestId), trackAlias: varint(alias),
+        parameters: new Map(), trackExtensions: [],
+      } as unknown as ControlMessage);
+    const trackEnded = (adapter: ReturnType<typeof createMockAdapter>, requestId: bigint): void =>
+      adapter._triggerMessage({
+        type: 'PUBLISH_DONE', requestId: varint(requestId), statusCode: varint(0x2),
+        streamCount: varint(0), errorReason: 'track ended',
+      } as unknown as ControlMessage);
+
+    /** Playing with the namespace published; video then ends, and audio unless `audioPlays`. */
+    async function tracksEnded(opts: { followNamespace?: boolean; audioPlays?: boolean } = {}) {
+      const adapter = createMockAdapter();
+      const { player, nsReqId } = await startFollowing(adapter, opts);
+      if (nsReqId !== null) {
+        requestOk(adapter, nsReqId);
+        namespaceMsg(adapter, nsReqId, 'NAMESPACE');
+      }
+      const refusals: string[] = [];
+      player.on('error', (e) => {
+        if (e.error.code === PlayerErrorCode.SUBSCRIPTION_REFUSED) refusals.push(e.error.message);
+      });
+      trackEnded(adapter, await lastRequestId(adapter, 'video'));
+      if (!opts.audioPlays) trackEnded(adapter, await lastRequestId(adapter, 'audio'));
+      const p = player as unknown as {
+        replaceSubscription(name: string, cause: string): void;
+        cancelResubscribe(name: string): void;
+        publishDoneRetries: Map<string, { timer: unknown }>;
+        livenessRestarts: Map<string, { attempts: number; active: boolean; cancelled: boolean }>;
+      };
+      /** Subscribe to `name` now and refuse it, as the relay does while the track is missing. */
+      const subscribeRefused = async (name: string): Promise<void> => {
+        p.cancelResubscribe(name);
+        p.replaceSubscription(name, 'liveness');
+        await sleep(0);
+        refuse(adapter, await lastRequestId(adapter, name));
+      };
+      return { adapter, player, nsReqId, refusals, p, subscribeRefused };
+    }
+
+    it('is reported once until the track is subscribed again', async () => {
+      const { adapter, player, refusals, p, subscribeRefused } = await tracksEnded();
+      const failed: string[] = [];
+      player.on('track_subscribe_failed', (e) => failed.push(e.trackName));
+
+      await subscribeRefused('video');
+      await subscribeRefused('video');
+      expect(failed).toEqual(['video', 'video']);
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]).toMatch(/Track "video" refused: .*; retrying in 2 s, backing off to 60 s$/);
+      expect(p.publishDoneRetries.get('video')?.timer).not.toBeNull();
+
+      p.cancelResubscribe('video');
+      p.replaceSubscription('video', 'refused');
+      await sleep(0);
+      const videoReqId = await lastRequestId(adapter, 'video');
+      accept(adapter, videoReqId, 60n);
+      trackEnded(adapter, videoReqId);
+      await subscribeRefused('video');
+      expect(refusals).toHaveLength(2);
+    });
+
+    it('replaces a running liveness ladder', async () => {
+      const { refusals, p, subscribeRefused } = await tracksEnded();
+      const restart = { attempts: 1, active: true, cancelled: false };
+      p.livenessRestarts.set('video:video', restart);
+      await subscribeRefused('video');
+      expect(restart.cancelled).toBe(true);
+      expect(p.publishDoneRetries.get('video')?.timer).not.toBeNull();
+      expect(refusals).toHaveLength(1);
+    });
+
+    it('without followNamespace, leaves a running liveness ladder to retry', async () => {
+      // Audio still plays: the end of every track would reconnect.
+      const { refusals, p, subscribeRefused } = await tracksEnded({ followNamespace: false, audioPlays: true });
+      const restart = { attempts: 1, active: true, cancelled: false };
+      p.livenessRestarts.set('video:video', restart);
+      await subscribeRefused('video');
+      expect(restart.cancelled).toBe(false);
+      expect(p.publishDoneRetries.get('video')).toBeUndefined();
+      expect(refusals[0]).toMatch(/\(code=0x10\) reqId=\d+ retryIn=0$/);
+    });
+
+    it('waits for a withdrawn namespace to be published again, then re-subscribes at once', async () => {
+      const { adapter, player, nsReqId, refusals, p, subscribeRefused } = await tracksEnded();
+      vi.spyOn(player, 'migrate').mockResolvedValue();
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE_DONE');
+      await subscribeRefused('video');
+      await subscribeRefused('audio');
+      expect(refusals).toHaveLength(2);
+      expect(refusals.every((m) => m.endsWith('; waiting for the namespace to be published again'))).toBe(true);
+      expect(p.publishDoneRetries.get('video')?.timer ?? null).toBeNull();
+      expect(p.publishDoneRetries.get('audio')?.timer ?? null).toBeNull();
+
+      const before = names(adapter).length;
+      namespaceMsg(adapter, nsReqId!, 'NAMESPACE');
+      await sleep(0);
+      expect(names(adapter).slice(before)).toEqual(['video', 'audio']);
+    });
+  });
+
+  describe('refused-track backoff', () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('doubles from 2 s to 60 s and starts over on a new session', async () => {
+      vi.useFakeTimers();
+      const p = new MoqtPlayer({ url: 'https://relay.example.com/moq', namespace: 'live/broadcast' }) as unknown as {
+        connection: unknown;
+        replaceSubscription: (name: string) => void;
+        scheduleResubscribe: (name: string, cause: string) => void;
+        destroy: () => Promise<void>;
+      };
+      p.connection = {};
+      const replace = vi.fn();
+      p.replaceSubscription = replace;
+      /** Refused again: the wait until the next attempt. */
+      const nextGap = async (): Promise<number> => {
+        const start = Date.now();
+        const calls = replace.mock.calls.length;
+        p.scheduleResubscribe('video', 'refused');
+        while (replace.mock.calls.length === calls) await vi.advanceTimersByTimeAsync(1_000);
+        return Date.now() - start;
+      };
+      const gaps: number[] = [];
+      for (let i = 0; i < 7; i++) gaps.push(await nextGap());
+      expect(gaps).toEqual([2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000]);
+      p.connection = {};
+      expect(await nextGap()).toBe(2_000);
+      await p.destroy();
     });
   });
 });

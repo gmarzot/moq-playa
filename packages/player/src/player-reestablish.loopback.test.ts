@@ -328,11 +328,10 @@ describe('resuming when the followed namespace returns (d18 loopback)', () => {
     await sleep(200);
     expect(r.sessions[1]!.subs).toEqual(['catalog(DNE)']);
 
-    // The catalog returns before the media tracks do. Each refusal also retries once at once.
+    // The catalog returns before the media tracks do.
     await r.republish();
     await sleep(PROMPT_MS);
-    expect(r.sessions[1]!.subs).toEqual(
-      ['catalog(DNE)', 'catalog', 'video(DNE)', 'audio(DNE)', 'video(DNE)', 'audio(DNE)']);
+    expect(r.sessions[1]!.subs).toEqual(['catalog(DNE)', 'catalog', 'video(DNE)', 'audio(DNE)']);
     expect(r.sessions).toHaveLength(3);
     const reestablished = r.sessions[2]!;
     expect(reestablished.subs.slice(0, 3)).toEqual(['catalog', 'video(DNE)', 'audio(DNE)']);
@@ -340,7 +339,7 @@ describe('resuming when the followed namespace returns (d18 loopback)', () => {
     // The refused tracks are retried with backoff on the fresh session.
     r.published.media = true;
     const mediaAt = performance.now();
-    await sleep(1_500);
+    await sleep(2_500);
     expect(reestablished.subs.slice(-2)).toEqual(['video', 'audio']);
     expect(objectsSince(mediaAt)).toBeGreaterThan(0);
     expect(r.sessions).toHaveLength(3);

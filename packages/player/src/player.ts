@@ -135,6 +135,9 @@ const PUBLISH_DONE_RETRY_MAX_MS = 30_000;
 const PUBLISH_DONE_RETRY_RESET_MS = 60_000;
 /** Poll cadence for a retry parked while the document is hidden. */
 const HIDDEN_RETRY_POLL_MS = 1_000;
+/** Retry spacing for a listed track refused as not existing: doubles from the base to the cap. */
+const REFUSED_RETRY_BASE_MS = 2_000;
+const REFUSED_RETRY_MAX_MS = 60_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -1069,7 +1072,12 @@ export class MoqtPlayer {
     attempts: number;
     lastDoneAtMs: number;
     timer: ReturnType<typeof setTimeout> | null;
+    /** The session the pending retry was scheduled on. */
+    conn: MoqtConnection | null;
   }>();
+
+  /** Listed tracks refused as not existing since their last SUBSCRIBE_OK; reported once per session. */
+  private readonly refusedTracks = new Map<string, { conn: MoqtConnection | null; refusals: number; sinceMs: number }>();
 
   /**
    * Media subscriptions pending SUBSCRIBE_OK: requestId → track info.
@@ -7287,6 +7295,7 @@ export class MoqtPlayer {
       if (retry.timer !== null) clearTimeout(retry.timer);
     }
     this.publishDoneRetries.clear();
+    this.refusedTracks.clear();
     this.livenessMonitor?.clear();
     this.subgroupStreams.clear();
     this.pendingMediaSubs.clear();
@@ -8638,6 +8647,14 @@ export class MoqtPlayer {
       },
       onMediaSubscribeOk: (requestId, _trackName, _mediaType) => {
         this.clearMediaRefusal(_trackName);
+        const refused = this.refusedTracks.get(_trackName);
+        if (refused) {
+          this.refusedTracks.delete(_trackName);
+          const retry = this.publishDoneRetries.get(_trackName);
+          if (retry) retry.attempts = 0;
+          this.log.info('Track "%s" subscribed after %d refusal(s) over %d s', _trackName,
+            refused.refusals, Math.round((performance.now() - refused.sinceMs) / 1000));
+        }
         this._mediaSubsOk++;
         this.mediaSubWire.delete(requestId);
       },
@@ -8665,24 +8682,47 @@ export class MoqtPlayer {
         // another subscriber is receiving needs the exact bytes sent.
         const wire = this.mediaSubWire.get(requestId);
         this.mediaSubWire.delete(requestId);
-        this.emitError(createPlayerError(
-          'degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
-          `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`
-          + ` reqId=${requestId.toString()}`
-          + (retryInterval !== undefined ? ` retryIn=${retryInterval.toString()}` : '')
-          + (wire !== undefined ? ` ${wire}` : ''),
-        ));
+        // A listed track not published yet, with nothing else playing this media type.
+        const missing = BigInt(errorCode) === BigInt(RequestError.DOES_NOT_EXIST)
+          && this.activeTrackName(mediaType) === undefined
+          && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName) === true;
+        const restart = this.livenessRestarts.get(`${mediaType}:${trackName}`);
+        // Without followNamespace a running liveness ladder keeps the retry, and fails playback when exhausted.
+        const ladderRetries = !this.config.followNamespace && restart?.active === true && !restart.cancelled;
+        const waitForNamespace = missing && this.config.followNamespace === true
+          && this.follower.state === 'withdrawn';
+        const prior = missing ? this.refusedTracks.get(trackName) : undefined;
+        if (prior?.conn === conn) {
+          prior.refusals++;
+        } else {
+          if (missing) {
+            this.refusedTracks.set(trackName, {
+              conn, refusals: (prior?.refusals ?? 0) + 1, sinceMs: prior?.sinceMs ?? performance.now(),
+            });
+          }
+          const next = !missing || ladderRetries ? ''
+            : waitForNamespace ? '; waiting for the namespace to be published again'
+              : `; retrying in ${REFUSED_RETRY_BASE_MS / 1000} s, backing off to ${REFUSED_RETRY_MAX_MS / 1000} s`;
+          this.emitError(createPlayerError(
+            'degraded', 'subscription', PlayerErrorCode.SUBSCRIPTION_REFUSED,
+            `Track "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`
+            + ` reqId=${requestId.toString()}`
+            + (retryInterval !== undefined ? ` retryIn=${retryInterval.toString()}` : '')
+            + (wire !== undefined ? ` ${wire}` : '')
+            + next,
+          ));
+        }
         if (this._mediaSubsFailed === this._mediaSubsExpected && this._mediaSubsOk === 0 && this._mediaSubsExpected > 0) {
           this.emitError(createPlayerError(
             'fatal', 'subscription', PlayerErrorCode.ALL_TRACKS_REFUSED,
             'All media track subscriptions refused — no playable content',
           ));
         }
-        // A listed track not published yet: retry with backoff while nothing else plays this media type.
-        if (BigInt(errorCode) === BigInt(RequestError.DOES_NOT_EXIST)
-            && this.activeTrackName(mediaType) === undefined
-            && this._catalogState?.tracks.some((t: CatalogTrack) => t.name === trackName)) {
-          this.scheduleResubscribe(trackName, 'refused');
+        if (missing && !ladderRetries) {
+          // One retry owner per track: the refusal backoff replaces the liveness ladder.
+          if (restart) restart.cancelled = true;
+          if (waitForNamespace) this.cancelResubscribe(trackName);
+          else this.scheduleResubscribe(trackName, 'refused');
         }
       },
       onCatalogSubscribeOk: (largest) => {
@@ -11081,28 +11121,38 @@ export class MoqtPlayer {
   }
 
   /**
-   * Resubscribe a track at once, then with doubling backoff, one pending retry
-   * per track; parked while hidden when autoResume is off.
+   * Resubscribe a track at once (a refused one after REFUSED_RETRY_BASE_MS), then
+   * with doubling backoff, one pending retry per track; parked while hidden when
+   * autoResume is off.
    */
   private scheduleResubscribe(trackName: string, cause: ResubscribeCause): void {
     const nowMs = performance.now();
     let retry = this.publishDoneRetries.get(trackName);
     if (!retry) {
-      retry = { attempts: 0, lastDoneAtMs: nowMs, timer: null };
+      retry = { attempts: 0, lastDoneAtMs: nowMs, timer: null, conn: null };
       this.publishDoneRetries.set(trackName, retry);
-    } else if (nowMs - retry.lastDoneAtMs >= PUBLISH_DONE_RETRY_RESET_MS) {
+    } else if (cause !== 'refused' && nowMs - retry.lastDoneAtMs >= PUBLISH_DONE_RETRY_RESET_MS) {
       retry.attempts = 0;
     }
     retry.lastDoneAtMs = nowMs;
+    if (retry.conn !== this.connection) {
+      // A fresh session starts the backoff over; a retry pending on the replaced one would never fire.
+      if (retry.timer !== null) clearTimeout(retry.timer);
+      retry.timer = null;
+      retry.attempts = 0;
+    }
     if (retry.timer !== null) return;
     const spread = cause === 'too_far_behind' || cause === 'publish_done'
       ? Math.random() * MoqtPlayer.RESUBSCRIBE_SPREAD_MS : 0;
-    const delayMs = retry.attempts === 0
-      ? spread
-      : Math.min(PUBLISH_DONE_RETRY_BASE_MS * 2 ** (retry.attempts - 1), PUBLISH_DONE_RETRY_MAX_MS);
+    const delayMs = cause === 'refused'
+      ? Math.min(REFUSED_RETRY_BASE_MS * 2 ** retry.attempts, REFUSED_RETRY_MAX_MS)
+      : retry.attempts === 0
+        ? spread
+        : Math.min(PUBLISH_DONE_RETRY_BASE_MS * 2 ** (retry.attempts - 1), PUBLISH_DONE_RETRY_MAX_MS);
     retry.attempts++;
     const state = retry;
     const conn = this.connection;
+    state.conn = conn;
     const fire = (): void => {
       state.timer = null;
       // A migration re-subscribes the replaced session's tracks itself.
@@ -11126,9 +11176,18 @@ export class MoqtPlayer {
   private stopRecoveringTrack(mediaType: 'video' | 'audio', trackName: string): void {
     const restart = this.livenessRestarts.get(`${mediaType}:${trackName}`);
     if (restart) restart.cancelled = true;
-    const retry = this.publishDoneRetries.get(trackName);
-    if (retry?.timer != null) clearTimeout(retry.timer);
+    this.cancelResubscribe(trackName);
     this.publishDoneRetries.delete(trackName);
+    this.refusedTracks.delete(trackName);
+  }
+
+  /** Drop a pending re-subscribe of this track, keeping its backoff. */
+  private cancelResubscribe(trackName: string): void {
+    const retry = this.publishDoneRetries.get(trackName);
+    if (retry?.timer != null) {
+      clearTimeout(retry.timer);
+      retry.timer = null;
+    }
   }
 
   /** Whether a different media track of this type is subscribed; init tracks register as 'video' too. */
