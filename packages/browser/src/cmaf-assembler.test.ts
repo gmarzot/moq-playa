@@ -1513,7 +1513,7 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
           concat(buildMoof(Number(groupId - 100n) * 120 * F60 + i * F60, i + 1, F60), buildMdat(new Uint8Array([i & 0xff]))));
         for (let i = 0; i < 114; i++) push(100n, i);
         push(101n, 0);                                    // overtakes group 100's last 6 frames
-        vi.advanceTimersByTime(23);
+        vi.advanceTimersByTime(250);
         for (let i = 114; i < 120; i++) push(100n, i);
         vi.advanceTimersByTime(500);
 

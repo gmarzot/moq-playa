@@ -323,7 +323,7 @@ export class CmafAssembler {
   /** Buffered depth at which a hold gives up: Chrome reports `waiting` with about 130 ms still ahead. */
   private static readonly HOLD_RELEASE_MARGIN_MS = 150;
   /** Least wait for a previous group's tail before a newer video group is emitted over its gap. */
-  private static readonly VIDEO_TAIL_HOLD_MS = 150;
+  private static readonly VIDEO_TAIL_HOLD_MS = 300;
   /** Audio gap holds that expire unfilled in a row before gaps pass straight through. */
   private static readonly AUDIO_BYPASS_AFTER = 3;
   /** How long audio gaps pass through before holding is tried again. */
