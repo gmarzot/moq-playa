@@ -1305,7 +1305,7 @@ async function main(): Promise<void> {
 
   // Arrival and CMAF video timeline trace, at most four lines a second: an
   // arrival gap over 150 ms; a video fragment starting before the previous one
-  // (a rendition switch, or dropped), ending inside video already received
+  // (another rendition's, or dropped), ending inside video already received
   // (overlap), or starting more than two frames after the previous one (MSE
   // drops to the next keyframe).
   let traceVideoInit: { timescale: number; trex?: TrexDefaults } | null = null;
@@ -1435,7 +1435,7 @@ async function main(): Promise<void> {
     const prevDur = `previous dur ${ms(prev.end - prev.start)}ms`;
     if (start < prev.start) {
       traceJumpAtMs = nowMs;
-      const fate = e.trackName !== prev.track ? 'rendition switch' : 'out of order, dropped';
+      const fate = e.trackName !== prev.track ? 'another rendition' : 'out of order, dropped';
       traceLog(`trace video: ${where} starts ${ms(prev.start - start)}ms before the previous fragment (${fate}) · dur ${ms(end - start)}ms`);
     } else if (end <= maxEnd) {
       traceLog(`trace video: ${where} ends ${ms(maxEnd - end)}ms inside video already received (overlap, appended) · dur ${ms(end - start)}ms · ${prevDur}`);

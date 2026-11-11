@@ -1027,6 +1027,42 @@ describe('MseMediaSource — rendition splice', () => {
         expect(vsb.appendedPayloads.length).toBe(4);       // init + three segments
     });
 
+    it('a replay from the previous track removes nothing and is dropped', async () => {
+        const { adapter, vsb } = await makeReadyAdapter(1000);
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        vsb.buffered = makeTimeRanges([[0, 0.5]]);
+        adapter.appendChunk('video', seg(500), 'video_1080p');
+        await flush();
+        const appends = vsb.appendedPayloads.length;
+
+        vsb.buffered = makeTimeRanges([[0, 1]]);
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        expect(vsb.removeCalls).toEqual([]);
+        expect(vsb.appendedPayloads.length).toBe(appends);
+    });
+
+    it('a track that returns over its removed coverage appends', async () => {
+        const { adapter, vsb } = await makeReadyAdapter(1000);
+        adapter.appendChunk('video', seg(0), 'video');
+        await flush();
+        adapter.appendChunk('video', seg(500), 'video');
+        await flush();
+        vsb.buffered = makeTimeRanges([[0, 1]]);
+        adapter.appendChunk('video', seg(500), 'video_1080p');   // removes [0.5, 1) of "video"
+        await flush();
+        await flush();
+        const appends = vsb.appendedPayloads.length;
+
+        vsb.buffered = makeTimeRanges([[0, 1]]);
+        adapter.appendChunk('video', seg(500), 'video');
+        await flush();
+        await flush();
+        expect(vsb.removeCalls).toEqual([[0.5, 1], [0.5, 1]]);
+        expect(vsb.appendedPayloads.length).toBe(appends + 1);
+    });
+
     it('a queued first segment of the new track removes the old rendition when it drains', async () => {
         const { adapter, vsb } = await makeReadyAdapter(1000);
         vsb.autoComplete = false;

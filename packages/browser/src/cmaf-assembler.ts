@@ -130,11 +130,14 @@ interface DecodeOrder {
   /** Latest decode start emitted, and the subgroup it came from. */
   lastStart: bigint | null;
   lastSubgroup: bigint | null;
+  /** Latest decode end emitted on the current rendition: the reference for gaps and lateness. */
+  end: bigint | null;
 }
 
 const newDecodeOrder = (): DecodeOrder => ({
   held: [], timer: null, stats: { restored: 0, missing: 0, late: 0, worstLateMs: 0, passed: 0, bypasses: 0 },
   unfilledRun: 0, bypassUntilMs: null, resumed: false, lastGroup: null, lastStart: null, lastSubgroup: null,
+  end: null,
 });
 
 /** Frames a decode gap stands for, at least one. */
@@ -631,7 +634,7 @@ export class CmafAssembler {
     const o = this.order[mediaType];
     const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     const span = this.segmentSpan(mediaType, segment);
-    const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+    const emittedEnd = o.end;
     if (span === null || emittedEnd === null || !timescale || o.resumed) {
       o.resumed = false;
       this.emitSegment(mediaType, segment, trackName, groupId, subgroupId);
@@ -684,7 +687,7 @@ export class CmafAssembler {
     let skipGap = expired;
     while (o.held.length > 0) {
       const head = o.held[0]!;
-      const emittedEnd = mediaType === 'video' ? this.lastVideoOutputEnd : this.lastAudioOutputEnd;
+      const emittedEnd = o.end;
       const duration = head.end - head.start;
       const gap = emittedEnd === null ? 0n : head.start - emittedEnd;
       if (gap > duration / 2n) {
@@ -787,6 +790,7 @@ export class CmafAssembler {
         (max, range) => range.endTime > max ? range.endTime : max,
         ranges[0]!.endTime,
       );
+      if (o.end === null || end > o.end) o.end = end;
       if (mediaType === 'video') {
         if (this.lastVideoOutputEnd === null || end > this.lastVideoOutputEnd) {
           this.lastVideoOutputEnd = end;
@@ -853,6 +857,7 @@ export class CmafAssembler {
       o.lastGroup = null;
       o.lastStart = null;
       o.lastSubgroup = null;
+      o.end = null;
     }
     this.videoEpoch = null;
     this.audioEpoch = null;
@@ -1109,6 +1114,7 @@ export class CmafAssembler {
       order.lastGroup = null;
       order.lastStart = null;
       order.lastSubgroup = null;
+      order.end = null;
       const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;

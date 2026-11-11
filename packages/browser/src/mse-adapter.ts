@@ -1862,17 +1862,36 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
+   * Every range is inside the track's committed timeline and starts at or before
+   * its latest sample: a replay (relay group redelivery). A new frame inside the
+   * recorded range, under a long previous frame, starts after that sample.
+   */
+  private isContainedReplay(
+    mediaType: 'video' | 'audio',
+    trackName: string,
+    ranges: readonly { startTime: bigint; endTime: bigint }[],
+  ): boolean {
+    const timeline = (mediaType === 'video' ? this.videoTimelines : this.audioTimelines).get(trackName);
+    if (!timeline || ranges.length === 0) return false;
+    const latestStart = this.latestSampleStart.get(`${mediaType}:${trackName}`);
+    return ranges.every((r) => timeline.containsRange(r.startTime, r.endTime)
+      && (latestStart === undefined || r.startTime <= latestStart));
+  }
+
+  /**
    * At a rendition splice, remove the old track's video buffered from the new
    * segment's presentation start: a keyframe appended into the middle of the
-   * old GOP leaves a hole. The range behind the playhead stays. Returns true
-   * when a remove() was started; its updateend re-enters drainQueue.
+   * old GOP leaves a hole. The range behind the playhead stays, and a replay
+   * the append will drop removes nothing. Returns true when a remove() was
+   * started; its updateend re-enters drainQueue.
    */
   private removeSplicedAhead(buffer: SourceBuffer, data: Uint8Array, trackName: string): boolean {
     const previous = this.lastVideoTrackName;
     if (previous === null || previous === trackName) return false;
-    this.lastVideoTrackName = trackName;
     const timescale = this.videoTimescale;
     const ranges = timescale ? readSegmentTimeRanges(data, this.videoTrex) : null;
+    if (ranges && this.isContainedReplay('video', trackName, ranges)) return false;
+    this.lastVideoTrackName = trackName;
     if (!timescale || !ranges || ranges.length === 0) return false;
     const first = ranges.reduce((min, r) => (r.startTime < min ? r.startTime : min), ranges[0]!.startTime);
     let startSec: number;
@@ -1889,9 +1908,25 @@ export class MseMediaSource implements MediaSourceLike {
       this.logWarn('[MSE] splice remove failed: %s', (err as Error).message);
       return false;
     }
+    this.clipTimelineFrom('video', previous, first);
     this.logDebug('[MSE] video splice "%s" → "%s": removed the old rendition [%s, %s)',
       previous, trackName, startSec.toFixed(3), endSec.toFixed(3));
     return true;
+  }
+
+  /** Forget a track's committed coverage from decode tick `cut` on: it was removed. */
+  private clipTimelineFrom(mediaType: 'video' | 'audio', trackName: string, cut: bigint): void {
+    const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
+    const timeline = timelines.get(trackName);
+    if (!timeline) return;
+    const kept = new TimelineIndex();
+    for (const r of timeline.getRanges()) {
+      if (r.start < cut) kept.insert(r.start, r.end < cut ? r.end : cut);
+    }
+    timelines.set(trackName, kept);
+    const key = `${mediaType}:${trackName}`;
+    const latest = this.latestSampleStart.get(key);
+    if (latest !== undefined && latest >= cut) this.latestSampleStart.set(key, cut - 1n);
   }
 
   /**
@@ -3081,12 +3116,7 @@ export class MseMediaSource implements MediaSourceLike {
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
     const timeline = timelines.get(trackName);
     if (ranges !== null && ranges.length > 0 && timeline) {
-      // A replay starts at or before the latest sample committed; a new frame
-      // inside the recorded range (under a long previous frame) starts after it.
-      const latestStart = this.latestSampleStart.get(`${mediaType}:${trackName}`);
-      const allContained = ranges.every((r) => timeline.containsRange(r.startTime, r.endTime)
-        && (latestStart === undefined || r.startTime <= latestStart));
-      if (allContained) {
+      if (this.isContainedReplay(mediaType, trackName, ranges)) {
         // Logged with group id and the exact decode range so an eviction can be
         // correlated against a later drop of the SAME range — the evidence
         // needed before any residency/refill policy is designed.

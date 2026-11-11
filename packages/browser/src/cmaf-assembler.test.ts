@@ -1488,6 +1488,20 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
         [1, 2, 3, 4, 5, 6].map((sec) => BigInt(sec * VIDEO_TS)));
     });
 
+    it('holds a reordered subgroup of the new rendition inside the overlap until its gap fills', () => {
+      const { assembler, onSegment } = assemblerWithInits();
+      pushFrames(assembler, 'videoA', 100n, 0, 10);
+      pushFrames(assembler, 'videoA', 101n, 0, 3);
+      assembler.selectTrack('video', 'videoB');
+      const at = (i: number) => frame(11 * VIDEO_TS + i * FRAME, 1010 + i);
+      assembler.push('video', 'videoB', 101n, at(0), 0n);
+      assembler.push('video', 'videoB', 101n, at(2), 1n);
+      assembler.push('video', 'videoB', 101n, at(1), 0n);
+
+      expect(outs(onSegment).slice(13)).toEqual(
+        [0, 1, 2].map((i) => BigInt(VIDEO_TS + i * FRAME)));
+    });
+
     it('moves a rendition past the emitted tail when the overlap exceeds the switch bound', () => {
       const { assembler, onSegment } = assemblerWithInits();
       pushFrames(assembler, 'videoA', 100n, 0, 10);
