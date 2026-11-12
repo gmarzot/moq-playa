@@ -2129,7 +2129,8 @@ async function main(): Promise<void> {
         chaseStartsReported = chaseStarts;
       }
       const rs = repairStats();
-      if (rs && (rs.filled !== repairReported.filled || rs.failed !== repairReported.failed)) {
+      if (rs && (rs.filled !== repairReported.filled || rs.failed !== repairReported.failed
+          || rs.fetches !== repairReported.fetches)) {
         const filled = rs.filled - repairReported.filled;
         const failed = rs.failed - repairReported.failed;
         log(`Audio repair in ${UNDERRUN_REPORT_MS / 1000}s: ${filled + failed} lost → ${filled} filled by FETCH, `
