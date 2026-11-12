@@ -27,6 +27,15 @@ export interface AudioRepairStats {
   readonly failed: number;
   /** False while repeated failures have paused the repair. */
   readonly active: boolean;
+  /** FETCHes sent. */
+  readonly fetches: number;
+  /** FETCHes that recovered every object they asked for. */
+  readonly fetchesFilled: number;
+  /** FETCHes that hit the deadline or were refused. */
+  readonly fetchesFailed: number;
+  /** Send-to-fill time over the last filled FETCHes (ms); null before the first. */
+  readonly fillP50Ms: number | null;
+  readonly fillMaxMs: number | null;
 }
 
 export interface AudioRepairOptions {
@@ -41,6 +50,8 @@ export interface AudioRepairOptions {
   /** Consecutive failed gaps before the repair pauses. */
   readonly giveUpAfter?: number;
   readonly pauseMs?: number;
+  /** Clock for fill times (ms). */
+  readonly now?: () => number;
 }
 
 interface Gap {
@@ -48,6 +59,7 @@ interface Gap {
   readonly missing: Set<string>;
   timer: ReturnType<typeof setTimeout>;
   sent: boolean;
+  sentAtMs: number;
   closed: boolean;
   requestId: bigint | null;
 }
@@ -59,6 +71,8 @@ export class AudioRepair {
   static readonly DEFAULT_GRACE_MS = 30;
   /** Longest a gap stays open once its FETCH is sent. */
   static readonly DEFAULT_DEADLINE_MS = 370;
+  /** Filled FETCHes the fill times are taken over. */
+  static readonly FILL_WINDOW = 64;
 
   private readonly graceMs: number;
   private readonly deadlineMs: number;
@@ -75,6 +89,11 @@ export class AudioRepair {
   private failed = 0;
   private failedInARow = 0;
   private active = true;
+  private fetches = 0;
+  private fetchesFilled = 0;
+  private fetchesFailed = 0;
+  private readonly fillMs: number[] = [];
+  private readonly now: () => number;
 
   constructor(private readonly options: AudioRepairOptions) {
     this.graceMs = options.graceMs ?? AudioRepair.DEFAULT_GRACE_MS;
@@ -83,10 +102,17 @@ export class AudioRepair {
     this.maxGapObjects = options.maxGapObjects ?? 50;
     this.giveUpAfter = options.giveUpAfter ?? 8;
     this.pauseMs = options.pauseMs ?? 60_000;
+    this.now = options.now ?? (() => performance.now());
   }
 
   get stats(): AudioRepairStats {
-    return { gaps: this.gaps, filled: this.filled, failed: this.failed, active: this.active };
+    const fills = [...this.fillMs].sort((a, b) => a - b);
+    return {
+      gaps: this.gaps, filled: this.filled, failed: this.failed, active: this.active,
+      fetches: this.fetches, fetchesFilled: this.fetchesFilled, fetchesFailed: this.fetchesFailed,
+      fillP50Ms: fills.length ? fills[Math.floor((fills.length - 1) / 2)]! : null,
+      fillMaxMs: fills.length ? fills[fills.length - 1]! : null,
+    };
   }
 
   /** How long a gap can stay open, for a pipeline holding later objects behind it. */
@@ -111,7 +137,12 @@ export class AudioRepair {
       if (!gap.sent || !gap.missing.delete(k)) continue;
       this.filled++;
       this.failedInARow = 0;
-      if (gap.missing.size === 0) this.close(gap);
+      if (gap.missing.size === 0) {
+        this.fetchesFilled++;
+        this.fillMs.push(this.now() - gap.sentAtMs);
+        if (this.fillMs.length > AudioRepair.FILL_WINDOW) this.fillMs.shift();
+        this.close(gap);
+      }
       return;
     }
   }
@@ -155,7 +186,7 @@ export class AudioRepair {
       endObject: object > 0n ? object : 0n,
     };
     const gap: Gap = {
-      range, missing, sent: false, closed: false, requestId: null,
+      range, missing, sent: false, sentAtMs: 0, closed: false, requestId: null,
       timer: setTimeout(() => this.send(gap), this.graceMs),
     };
     this.open.add(gap);
@@ -168,6 +199,8 @@ export class AudioRepair {
       return;
     }
     gap.sent = true;
+    gap.sentAtMs = this.now();
+    this.fetches++;
     this.inFlight++;
     gap.timer = setTimeout(() => this.fail(gap), this.deadlineMs);
     this.options.fetch(gap.range).then((requestId) => {
@@ -178,6 +211,7 @@ export class AudioRepair {
 
   private fail(gap: Gap): void {
     this.failed += gap.missing.size;
+    this.fetchesFailed++;
     this.failedInARow++;
     this.close(gap);
     if (this.failedInARow < this.giveUpAfter) return;

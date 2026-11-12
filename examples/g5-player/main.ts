@@ -256,6 +256,17 @@ const setText = (id: string, value: string): void => {
 const MAX_LOG_LINES = 2000;
 
 /** Metrics-row hover text. */
+/** The fields of the engine's AudioRepairStats this page reads. */
+interface RepairStats {
+  readonly filled: number;
+  readonly failed: number;
+  readonly fetches: number;
+  readonly fetchesFilled: number;
+  readonly fetchesFailed: number;
+  readonly fillP50Ms: number | null;
+  readonly fillMaxMs: number | null;
+}
+
 const CELL_TIPS: Record<string, string> = {
   'ttff': 'Connection start to first frame drawn.',
   'bitrate a/v': 'Received kbps, audio/video.',
@@ -1105,6 +1116,11 @@ async function main(): Promise<void> {
       const height = video?.videoHeight || playerContainer.querySelector('canvas')?.height;
       statusStats.textContent = `E2E ${latScreen.textContent}${latScreen.dataset.clock === 'unshared' ? '*' : ''} · ${height ? `${height}p · ` : ''}`
         + `stalls ${stallsNow.faults}${stallsNow.sec > 0 ? ` (${stallsNow.sec.toFixed(1)} s)` : ''}`;
+      const r = repairStats();
+      if (r && r.fetches > 0) {
+        statusStats.textContent += ` · repairs ${r.fetchesFilled}/${r.fetches}`
+          + `${r.fillP50Ms === null ? '' : ` · fill ${fmtFillMs(r)}`}`;
+      }
     }
     // TTFF runs from connection start; the connect share goes in its tooltip.
     const connectMs: number | null = (player as any).engine?.stats?.ttffBreakdown?.setupCompleteMs ?? null;
@@ -1304,7 +1320,7 @@ async function main(): Promise<void> {
   let audioBypassLoggedAtMs = Number.NEGATIVE_INFINITY;
   let chaseStartsReported = 0;
   /** Audio repair counters at the last report. */
-  let repairReported = { filled: 0, failed: 0 };
+  let repairReported = { filled: 0, failed: 0, fetches: 0 };
   let staleDropsReported = 0;
   let staleDropsReportedAtMs = 0;
   const noteUnderrun = (gapSec: number, lateSec: number | null): void => {
@@ -1452,8 +1468,12 @@ async function main(): Promise<void> {
   // Per-track object continuity (counters.ts).
   const objSeq: Record<string, ObjSeq> = {};
   const seqStat = (t: string, k: 'reorders' | 'lost'): number => objSeq[t]?.[k] ?? 0;
-  /** Audio objects the player recovered with FETCH (Smooth, audio on datagrams). */
-  const fetchFilled = (): number => (player as any).engine?.audioRepairStats?.filled ?? 0;
+  /** The engine's audio FETCH repair; null when it is not running. */
+  const repairStats = (): RepairStats | null => (player as any).engine?.audioRepairStats ?? null;
+  /** Audio objects the player recovered with FETCH (playing behind live, audio on datagrams). */
+  const fetchFilled = (): number => repairStats()?.filled ?? 0;
+  const fmtFillMs = (r: RepairStats): string =>
+    r.fillP50Ms === null ? '—' : `${Math.round(r.fillP50Ms)}/${Math.round(r.fillMaxMs!)} ms`;
   const settleMaxMs = (): number => {
     let worst = 0;
     for (const s of Object.values(objSeq)) {
@@ -1896,9 +1916,12 @@ async function main(): Promise<void> {
     if (!advPanel.open) return;
     const conn = (player as any).engine?.connection;
     const st = await conn?.getTransportStats?.();
+    const r = repairStats();
+    const repairCell = r ? advCell('audio repair', `${r.fetches} sent · ${r.fetchesFilled} filled · `
+      + `${r.fetchesFailed} failed · fill p50/max ${fmtFillMs(r)}`) : '';
     if (!st) {
       advGrid.innerHTML = advCell('transport stats',
-        conn ? 'not reported by this transport' : 'not connected');
+        conn ? 'not reported by this transport' : 'not connected') + repairCell;
       return;
     }
     const num = (k: string): number | undefined => st[k];
@@ -1931,7 +1954,7 @@ async function main(): Promise<void> {
     for (const k of Object.keys(st)) {
       if (k.startsWith('datagrams.')) cells.push(advCell(k.slice(10), String(st[k])));
     }
-    advGrid.innerHTML = cells.join('');
+    advGrid.innerHTML = cells.join('') + repairCell;
   };
   advPanel.addEventListener('toggle', () => { void renderTransport(); });
 
@@ -2105,13 +2128,14 @@ async function main(): Promise<void> {
           + `${UNDERRUN_REPORT_MS / 1000}s · ${chaseStarts} in all`);
         chaseStartsReported = chaseStarts;
       }
-      const rs = (player as any).engine?.audioRepairStats as { filled: number; failed: number } | undefined;
+      const rs = repairStats();
       if (rs && (rs.filled !== repairReported.filled || rs.failed !== repairReported.failed)) {
         const filled = rs.filled - repairReported.filled;
         const failed = rs.failed - repairReported.failed;
         log(`Audio repair in ${UNDERRUN_REPORT_MS / 1000}s: ${filled + failed} lost → ${filled} filled by FETCH, `
-          + `${failed} still lost`);
-        repairReported = { filled: rs.filled, failed: rs.failed };
+          + `${failed} still lost · ${rs.fetches - repairReported.fetches} FETCHes · `
+          + `${rs.fetchesFilled}/${rs.fetches} filled in all, fill p50/max ${fmtFillMs(rs)}`);
+        repairReported = { filled: rs.filled, failed: rs.failed, fetches: rs.fetches };
       }
       const u = underrunWindow;
       if (u.count > 0) {
