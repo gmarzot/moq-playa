@@ -60,7 +60,7 @@ Forward State change, capture gaps, and the per-minute capture drift.
 Controls: play/pause, timeline, speaker (on phones it opens a volume slider
 with mute), ⚙ (View: every view of the catalog, grouped by program; Quality;
 Audio: the program's audio feeds; Language: the languages of the feed playing;
-Latency: Live edge or Smooth; Connection settings), catalog panel.
+Latency: Live, or 1 s / 2 s behind live; Connection settings), catalog panel.
 A view this browser cannot decode is listed as "not supported here" and
 cannot be chosen.
 
@@ -83,9 +83,9 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | `live` |
 | `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
 | `targetLatency=` | overrides the catalog target (ms); see below | catalog value |
-| `latency=` | `live` or `smooth`; the ⚙ menu sets it for this tab | live |
-| `latencyMin=` | where Smooth starts and the lowest it steps back to (ms); 0 starts at the target | 1000 |
-| `latencyMax=` | Smooth's limit (ms) | 2000 |
+| `latency=` | `live`, or `smooth` to play behind live (⚙ → Latency 1 s / 2 s sets it for this tab) | live |
+| `latencyMin=` | with `latency=smooth`: where the delay starts and the lowest it steps back to (ms); 0 starts at the target | 1000 |
+| `latencyMax=` | with `latency=smooth`: the most late media raises the delay to (ms) | 2000 |
 | `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
 | `catchUp=` | LOC max playback rate chasing the target | 1.0 (off) |
 | `catalogBootstrap=` | auto, joining-fetch, strict, subscribe, fetch | auto |
@@ -113,12 +113,13 @@ a reload.
 - LOC plays a render cushion between a floor and a cap, and the target only
   caps it. To run 2 s behind live on LOC, raise the floor too:
   `targetLatency=2000&cushion=2000`.
-- ⚙ → Latency: **Live edge** (default) keeps the target and skips media that
-  arrives late. **Smooth** starts 1 s behind live (`latencyMin=`), raises the
-  delay when media arrives late, by how late it was plus 50 ms, up to its
-  limit (2 s, `latencyMax=`), and steps back toward 1 s after 30 s with
-  nothing late. TARGET then shows the delay in force, and the log records
-  each raise and step-down. The choice applies after a reload.
+- ⚙ → Latency: **Live** (default) keeps the target and skips media that
+  arrives late. **1 s** and **2 s** start that far behind live
+  (`latency=smooth&latencyMin=`), raise the delay when media arrives late, by
+  how late it was plus 50 ms, up to 1 s more (`latencyMax=`), and step back
+  toward the start after 30 s with nothing late. The badge reads
+  `LIVE +1.0 s` with the delay in force, TARGET shows it too, and the log
+  records each raise and step-down. The choice applies without a reload.
 
 ## Samples to play
 

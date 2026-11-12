@@ -632,6 +632,7 @@
       padding: 3px 10px; border-radius: 4px 0 0 4px;
       background: var(--overlay-bg); color: var(--overlay-fg);
     }
+    .state-badge .delay { text-transform: none; }
     .state-badge.playing { background: var(--overlay-playing-bg); color: var(--overlay-playing-fg); }
     .state-badge.loading { background: var(--overlay-loading-bg); color: var(--overlay-loading-fg); }
     .state-badge.error { background: var(--overlay-error-bg); color: var(--overlay-error-fg); }
@@ -766,10 +767,10 @@
               <div class="sp-field"><label for="s-target">Target latency (ms)</label>
                 <input id="s-target" type="number" min="1" placeholder="from catalog">
                 <div class="sp-hint">Overrides the catalog's targetLatency.</div></div>
-              <div class="sp-field"><label for="s-latency-min">Smooth start / limit (ms)</label>
+              <div class="sp-field"><label for="s-latency-min">Delay start / limit (ms)</label>
                 <div class="sp-inline">
-                  <input id="s-latency-min" type="number" min="0" placeholder="1000" title="Where Smooth starts and the lowest it steps back to; 0 starts at the target">
-                  <input id="s-latency-max" type="number" min="1" placeholder="2000" title="How far Smooth may raise the delay; past it, late media is skipped as in Live">
+                  <input id="s-latency-min" type="number" min="0" placeholder="1000" title="Where the delay starts and the lowest it steps back to; 0 starts at the target">
+                  <input id="s-latency-max" type="number" min="1" placeholder="2000" title="How far late media may raise the delay; past it, late media is skipped as in Live">
                 </div></div>
               <div class="sp-field"><label for="s-cushion">Render cushion floor / max (ms)</label>
                 <div class="sp-inline">

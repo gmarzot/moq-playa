@@ -267,7 +267,7 @@ const CELL_TIPS: Record<string, string> = {
   'underruns': 'Audio ran dry. Small: total silence.',
   'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
   'dropped': "Video frames the browser didn't draw.",
-  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH in Smooth; they are not counted as lost.',
+  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH when playing behind live (Latency 1 s or 2 s); they are not counted as lost.',
   'stalls': 'Time playback was interrupted.',
 };
 
@@ -561,11 +561,27 @@ async function main(): Promise<void> {
       rejoinAtMs = null;
     }
   };
+  /** The delay the badge shows, in tenths of a second; null when it shows none. */
+  const badgeTenths = (held: { heldMs: number } | null): number | null =>
+    held && latencyMode === 'smooth' && player.state === 'playing' && pictureFrozenSinceMs === null
+      ? Math.round(held.heldMs / 100) : null;
+  let badgeDelayTenths: number | null = null;
   const renderStateBadge = (): void => {
     const state = player.state;
     const frozen = state === 'playing' && pictureFrozenSinceMs !== null;
-    stateBadge.textContent = frozen ? 'frozen'
-      : state === 'playing' ? (latencyMode === 'smooth' ? 'live/smooth' : 'live') : state;
+    const held = player.stats.latency;
+    badgeDelayTenths = badgeTenths(held);
+    if (held && badgeDelayTenths !== null) {
+      // "live +1.0 s": the delay in force; it rises when media arrives late.
+      const delay = document.createElement('span');
+      delay.className = 'delay';
+      delay.textContent = `+${(badgeDelayTenths / 10).toFixed(1)} s`;
+      stateBadge.replaceChildren('live ', delay);
+      stateBadge.title = `${Math.round(held.heldMs)} ms behind live; late media raises it up to ${held.ceilingMs} ms`;
+    } else {
+      stateBadge.textContent = frozen ? 'frozen' : state === 'playing' ? 'live' : state;
+      stateBadge.title = '';
+    }
     stateBadge.className = `state-badge ${frozen ? 'loading' : state}`;
   };
   /** Per UI tick. `stalledSinceMs`: the freeze watch's verdict (engine stall, MSE playhead). */
@@ -2047,11 +2063,12 @@ async function main(): Promise<void> {
     const targetNowMs = smooth ? Math.round(renderCushionMs() ?? smooth.heldMs)
       : cushionTargetSec !== undefined ? Math.round(cushionTargetSec * 1000) : targetLatencyMs;
     if (smooth && (smooth.raises !== latencyRaises || smooth.lowers !== latencyLowers)) {
-      log(`Smooth latency: delay ${smooth.raises !== latencyRaises ? 'raised' : 'lowered'} to `
+      log(`Latency: delay ${smooth.raises !== latencyRaises ? 'raised' : 'lowered'} to `
         + `${Math.round(smooth.heldMs)} ms (limit ${smooth.ceilingMs} ms; ${smooth.raises} raised, ${smooth.lowers} lowered)`);
       latencyRaises = smooth.raises;
       latencyLowers = smooth.lowers;
     }
+    if (badgeTenths(smooth) !== badgeDelayTenths) renderStateBadge();
     drawSpark2(cusSpark, tickNowMs, queuedASamples, chartColors.audio, queuedVSamples, chartColors.video,
                targetNowMs, stallMarks);
     cusAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
@@ -2059,7 +2076,7 @@ async function main(): Promise<void> {
     // a − v, following the order the pair is printed in.
     cusDVal.textContent = (vMs != null && aMs != null)
       ? `${aMs - vMs >= 0 ? '+' : ''}${(aMs - vMs).toFixed(0)}` : '—';
-    cusTarget.textContent = targetNowMs ? `${targetNowMs}${smooth ? ' smooth' : ''}` : '—';
+    cusTarget.textContent = targetNowMs ? `${targetNowMs}` : '—';
     // One measurement (queued) against one setting (target). The render
     // cushion is a third name for the same region and pub_media pins it equal
     // to the target anyway, so it is not shown; rate and chase state are.
@@ -2462,16 +2479,17 @@ async function main(): Promise<void> {
     targetLatencyMs = targetLatencyOverrideMs ?? catalogTargetLatencyMs;
     syncLatencySelect(query);
     renderStateBadge();
-    const parts = [`latency ${latencyMode}`, `target ${targetLatencyMs > 0 ? `${targetLatencyMs} ms` : 'none'}`];
-    if (smoothFloorMs !== undefined) parts.push(`smooth floor ${smoothFloorMs} ms`);
-    if (smoothCeilingMs !== undefined) parts.push(`smooth ceiling ${smoothCeilingMs} ms`);
+    const parts = [latencyMode === 'smooth' ? 'latency live + delay' : 'latency live',
+      `target ${targetLatencyMs > 0 ? `${targetLatencyMs} ms` : 'none'}`];
+    if (smoothFloorMs !== undefined) parts.push(`delay start ${smoothFloorMs} ms`);
+    if (smoothCeilingMs !== undefined) parts.push(`delay limit ${smoothCeilingMs} ms`);
     if (renderCushionFloorMs !== undefined) parts.push(`cushion ${renderCushionFloorMs} ms`);
     if (renderCushionMaxMs !== undefined) parts.push(`cushion max ${renderCushionMaxMs} ms`);
     if (catchUpRate !== undefined) parts.push(`catch-up ${catchUpRate}x`);
     if (debug) parts.push('debug');
     log(`Playback settings applied: ${parts.join(', ')}`);
   };
-  // Latency presets: Live, or Smooth starting at 1 s or 2 s with 1 s of headroom.
+  // Latency presets: Live, or a delay starting at 1 s or 2 s with 1 s of headroom.
   // They apply to the running session and are recorded in the URL.
   const latencySelect = document.getElementById('latency') as HTMLSelectElement;
   const customLatency = latencySelect.querySelector<HTMLOptionElement>('option[value="custom"]')!;
