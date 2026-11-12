@@ -38,7 +38,7 @@ describe('AudioRepair', () => {
     await vi.advanceTimersByTimeAsync(30);
     expect(ranges).toEqual([whole(11n, 11n)]);
     repair.noteFetched(11n, 0n);
-    expect(repair.stats).toEqual({ gaps: 1, filled: 1, failed: 0, active: true });
+    expect(repair.stats).toMatchObject({ gaps: 1, filled: 1, failed: 0, active: true });
     expect(cancelled).toEqual([1n]);
   });
 
@@ -167,5 +167,56 @@ describe('AudioRepair', () => {
     repair.note(500n, 0n);
     await vi.advanceTimersByTimeAsync(100);
     expect(ranges).toEqual([]);
+  });
+
+  describe('readout', () => {
+    it('counts FETCHes sent, filled and failed, with fill times', async () => {
+      let nowMs = 0;
+      const { repair } = setup({ now: () => nowMs });
+      expect(repair.stats).toMatchObject({ fetches: 0, fillP50Ms: null, fillMaxMs: null });
+      repair.note(10n, 0n);
+      repair.note(12n, 0n);
+      await vi.advanceTimersByTimeAsync(30);
+      nowMs = 40;
+      repair.noteFetched(11n, 0n);
+      repair.note(14n, 0n);
+      await vi.advanceTimersByTimeAsync(30);
+      nowMs = 140;
+      repair.noteFetched(13n, 0n);
+      repair.note(16n, 0n);
+      await vi.advanceTimersByTimeAsync(30 + 370);
+      expect(repair.stats).toMatchObject({
+        fetches: 3, fetchesFilled: 2, fetchesFailed: 1, filled: 2, failed: 1, fillP50Ms: 40, fillMaxMs: 100,
+      });
+    });
+
+    it('fills only when the whole range has arrived', async () => {
+      let nowMs = 0;
+      const { repair } = setup({ now: () => nowMs });
+      repair.note(10n, 0n);
+      repair.note(13n, 0n);
+      await vi.advanceTimersByTimeAsync(30);
+      nowMs = 20;
+      repair.noteFetched(11n, 0n);
+      expect(repair.stats).toMatchObject({ fetchesFilled: 0, fillP50Ms: null });
+      nowMs = 60;
+      repair.noteFetched(12n, 0n);
+      expect(repair.stats).toMatchObject({ fetches: 1, fetchesFilled: 1, fillP50Ms: 60, fillMaxMs: 60 });
+    });
+
+    it('keeps fill times for the last 64 filled FETCHes', async () => {
+      let nowMs = 0;
+      const { repair } = setup({ now: () => nowMs });
+      repair.note(0n, 0n);
+      for (let i = 0; i < 70; i++) {
+        const g = BigInt(2 * i + 2);
+        repair.note(g, 0n);
+        await vi.advanceTimersByTimeAsync(30);
+        const sentAt = nowMs;
+        nowMs = sentAt + (i < 6 ? 1000 : 10);
+        repair.noteFetched(g - 1n, 0n);
+      }
+      expect(repair.stats).toMatchObject({ fetchesFilled: 70, fillMaxMs: 10, fillP50Ms: 10 });
+    });
   });
 });
