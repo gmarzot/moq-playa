@@ -29,8 +29,9 @@ player (files, OBS over SRT, HLS/DASH) are in aiomoqt's
 **Start** opens the source menu (each camera, then the screen); one source
 starts at once. While a broadcast runs the same button shows a red square and
 stops it. **Viewer link** (chain icon) shows the player link, to copy or
-open; it carries the relay, namespace, draft and any `compat=`. Settings (⚙) are kept per tab
-across reloads and seed new tabs; a URL parameter overrides a saved value
+open; it carries the relay, namespace, draft and any `compat=`. Settings (⚙) and the camera
+pick are kept per tab across reloads; a new tab starts from the defaults and its URL. A URL
+parameter overrides a saved value
 (e.g. `packaging=cmaf`, `v=22`, `target=150`, `camera=back`).
 
 | Setting | Meaning |
