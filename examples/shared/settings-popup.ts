@@ -102,6 +102,8 @@ export function attachSettingsPopup(
   });
   o.popup.addEventListener('input', refresh);
   o.popup.addEventListener('change', refresh);
+  // Pickers and buttons that set a field from code fire no input event.
+  o.popup.addEventListener('click', refresh);
   o.popup.addEventListener('keydown', (e) => {
     const k = e as KeyboardEvent;
     if (k.key !== 'Enter' || k.isComposing) return;

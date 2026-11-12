@@ -88,6 +88,9 @@ describe('attachSettingsPopup', () => {
     s.state.pending = 'reload';
     s.popup.fire('change', { target: s.field });
     expect(s.applyButton.textContent).toBe('Apply · reloads');
+    s.state.pending = 'none';
+    s.popup.fire('click', { target: s.field });                 // a picker set the field back
+    expect(s.applyButton.hidden).toBe(true);
   });
 
   it('Apply and Enter in a field apply; Ctrl/⌘ asks for a reload', () => {

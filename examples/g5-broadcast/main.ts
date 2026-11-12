@@ -492,8 +492,6 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
       else popup.close();
     },
   });
-  // A known relay or New fills a field from code, which fires no input event.
-  settingsMenu.addEventListener('click', () => popup.refresh());
   // Discovery for the relay field ends with the popup, however it closes.
   new MutationObserver(() => { if (settingsMenu.hidden) abortModalDiscovery(); })
     .observe(settingsMenu, { attributes: true, attributeFilter: ['hidden'] });
