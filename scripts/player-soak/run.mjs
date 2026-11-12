@@ -149,7 +149,8 @@ async function playCase(browser, webUrl, c, impair = null) {
     followNamespace: '1', log: 'info' });
   if (c.packaging === 'loc') query.set('output', 'canvas');
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
-  if (c.profile?.latency) query.set('latency', c.profile.latency);
+  const latency = c.latency ?? c.profile?.latency;
+  if (latency) query.set('latency', latency);
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
   // The disruption in progress; cleared only once its stop() succeeds.
@@ -245,9 +246,12 @@ async function runMtt(browser, webUrl, cases) {
   const queue = [...groups];
   const worker = async () => {
     for (let g = queue.shift(); g; g = queue.shift()) {
-      const plays = g.relayInfo.playDrafts.map((draft) => ({
-        name: `mtt-${g.id ?? g.packaging}-${g.relay}-d${draft}`, url: g.relayInfo.url, draft,
-        packaging: g.packaging, expected: g.expected ?? cases.mttExpected,
+      // Every draft in Live, then each of `mttLatencies` on the first draft.
+      const modes = [...g.relayInfo.playDrafts.map((draft) => ({ draft })),
+        ...(cases.mttLatencies ?? []).map((latency) => ({ draft: g.relayInfo.playDrafts[0], latency }))];
+      const plays = modes.map(({ draft, latency }) => ({
+        name: `mtt-${g.id ?? g.packaging}-${g.relay}-d${draft}${latency ? `-${latency}` : ''}`, url: g.relayInfo.url, draft,
+        packaging: g.packaging, expected: g.expected ?? cases.mttExpected, latency,
       }));
       let job;
       try {
