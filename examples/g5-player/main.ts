@@ -114,6 +114,8 @@ const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
 })();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
+import { attachSettingsPopup, rememberOpen } from '../shared/settings-popup.js';
+import '../shared/settings-popup.css';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
@@ -275,7 +277,7 @@ function log(msg: string): void {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-// ─── Settings modal ──────────────────────────────────────────────────
+// ─── Settings popup ──────────────────────────────────────────────────
 
 {
   /** Rewritten on apply. Every other param in the URL is carried over, so
@@ -286,7 +288,6 @@ function log(msg: string): void {
   const LIVE_KEYS = ['targetLatency', 'latencyMin', 'latencyMax', 'cushion', 'cushionMax', 'catchUp', 'debug', 'status'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
-  const backdrop = byId('settings-backdrop');
   const fUrl = byId<HTMLInputElement>('s-url');
   const relayPicker = attachRelayPicker(fUrl);
   const fNs = byId<HTMLInputElement>('s-ns');
@@ -306,8 +307,6 @@ function log(msg: string): void {
   const fStatus = byId<HTMLInputElement>('s-status');
   const fDebug = byId<HTMLInputElement>('s-debug');
   const advSec = byId<HTMLDetailsElement>('s-adv');
-
-  const close = (): void => backdrop.classList.remove('visible');
 
   function populate(): void {
     const p = new URLSearchParams(location.search);
@@ -330,30 +329,11 @@ function log(msg: string): void {
     fStatus.checked = p.get('status') === '1';
     fDebug.checked = p.get('debug') === '1';
     // Open Advanced when anything in it is set, so a non-default is never hidden.
-    advSec.open = MANAGED.slice(3).some((k) => p.has(k));
+    if (MANAGED.slice(3).some((k) => p.has(k))) advSec.open = true;
   }
 
-  byId('settings-btn').addEventListener('click', () => {
-    setMenuOpen(false);
-    populate();
-    backdrop.classList.add('visible');
-  });
-  byId('set-cancel').addEventListener('click', close);
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && backdrop.classList.contains('visible')) close();
-  });
-  // Enter in a field applies, as a form submit would; buttons and the
-  // Advanced toggle keep their own Enter.
-  backdrop.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || e.isComposing) return;
-    const tag = (e.target as HTMLElement).tagName;
-    if (tag !== 'INPUT' && tag !== 'SELECT') return;
-    e.preventDefault();
-    byId('set-apply').dispatchEvent(new MouseEvent('click', { ctrlKey: e.ctrlKey, metaKey: e.metaKey }));
-  });
-
-  byId('set-apply').addEventListener('click', (e) => {
+  /** The query the fields describe; every unmanaged param carries over. */
+  function fieldsQuery(): URLSearchParams {
     const next = new URLSearchParams(location.search);
     for (const k of MANAGED) next.delete(k);
     // A blank field means "use the default", and a default is never written —
@@ -377,31 +357,65 @@ function log(msg: string): void {
     set('hash', fHash.value.trim());
     if (fStatus.checked) next.set('status', '1');
     if (fDebug.checked) next.set('debug', '1');
+    return next;
+  }
+  const changedKeys = (next: URLSearchParams): string[] => {
+    const cur = new URLSearchParams(location.search);
+    return MANAGED.filter((k) => JSON.stringify(cur.getAll(k)) !== JSON.stringify(next.getAll(k)));
+  };
+  /** Playback keys and the overlay apply in place; anything else needs a new session. */
+  const inPlace = (changed: string[]): boolean =>
+    changed.every((k) => LIVE_KEYS.includes(k)) && (changed.every((k) => k === 'status') || applyPlaybackQuery !== null);
+
+  /** Applies `next`, in place when it can; returns false when a rejected update leaves the popup open. */
+  function applyQuery(next: URLSearchParams, forceReload: boolean): boolean {
     const qs = next.toString();
     const href = location.pathname + (qs ? `?${qs}` : '');
-    const cur = new URLSearchParams(location.search);
-    const changed = MANAGED.filter((k) => JSON.stringify(cur.getAll(k)) !== JSON.stringify(next.getAll(k)));
-    // The overlay and playback settings apply live; any other change needs a new session, as does Ctrl/⌘-Apply.
-    const reload = e.ctrlKey || e.metaKey;
+    const changed = changedKeys(next);
+    const reload = forceReload;
     const playback = changed.some((k) => k !== 'status');
-    if (changed.length && !reload && changed.every((k) => LIVE_KEYS.includes(k))
-        && (!playback || applyPlaybackQuery)) {
+    if (changed.length && !reload && inPlace(changed)) {
       if (playback) {
         try {
           applyPlaybackQuery!(next);
         } catch (err) {
           log(`Settings not applied: ${(err as Error).message}`);
-          return;
+          return false;
         }
       }
       history.replaceState(history.state, '', href + location.hash);
       if (changed.includes('status')) setShowStatus(next.get('status') === '1');
     } else if (changed.length || reload) {
       location.href = href;
-      return;
     }
-    close();
+    return true;
+  }
+
+  const popup = attachSettingsPopup({
+    button: menuBtn,
+    popup: menu,
+    applyButton: byId<HTMLButtonElement>('set-apply'),
+    advanced: advSec,
+    storageKey: 'g5-settings',
+    pending: () => {
+      const changed = changedKeys(fieldsQuery());
+      return changed.length === 0 ? 'none' : inPlace(changed) ? 'live' : 'reload';
+    },
+    reloadLabel: 'Apply · reloads',
+    onOpen: populate,
+    onApply: (forceReload) => { if (applyQuery(fieldsQuery(), forceReload)) popup.close(); },
   });
+
+  // The overlay and verbose logging apply as soon as they are ticked.
+  for (const [box, key] of [[fStatus, 'status'], [fDebug, 'debug']] as const) {
+    box.addEventListener('change', () => {
+      const next = new URLSearchParams(location.search);
+      if (box.checked) next.set(key, '1');
+      else next.delete(key);
+      if (!applyQuery(next, false)) box.checked = !box.checked;
+      popup.refresh();
+    });
+  }
 }
 
 /** Copy to the clipboard, confirming in the button itself. */
@@ -693,7 +707,7 @@ async function main(): Promise<void> {
       qualitySelect.appendChild(opt);
     }
     qualitySelect.value = player.autoQuality || player.currentLevel < 0 ? 'auto' : String(player.currentLevel);
-    qualitySelect.closest<HTMLElement>('.menu-row')!.hidden = levels.length < 2;
+    qualitySelect.closest<HTMLElement>('.sp-row')!.hidden = levels.length < 2;
   }
   player.on('levelsloaded', ({ levels }) => fillQuality(levels));
   player.on('qualitychange', ({ level, auto }) => { if (!auto) qualitySelect.value = String(level.index); });
@@ -708,7 +722,7 @@ async function main(): Promise<void> {
     }));
     if (current !== undefined) sel.value = current;
     // Menu pickers hide their row; the view picker on the bar hides itself.
-    (sel.closest<HTMLElement>('.menu-row') ?? sel).hidden = options.length < 2;
+    (sel.closest<HTMLElement>('.sp-row') ?? sel).hidden = options.length < 2;
   }
   /** One video view of the catalog: an altGroup within a program (renderGroup). */
   interface CatalogView {
@@ -783,7 +797,7 @@ async function main(): Promise<void> {
     const current = catalogViews.find((v) => v.altGroup === player.currentView
       && (v.renderGroup === undefined || v.renderGroup === player.currentProgram));
     if (current) viewSelect.value = `${current.renderGroup ?? ''}:${current.altGroup}`;
-    viewSelect.closest<HTMLElement>('.menu-row')!.hidden = catalogViews.length < 2;
+    viewSelect.closest<HTMLElement>('.sp-row')!.hidden = catalogViews.length < 2;
   }
   type AudioTrack = (typeof player.availableAudioTracks)[number];
   /** The program's audio feeds: tracks sharing an altGroup are one feed in several languages. */
@@ -2334,6 +2348,8 @@ async function main(): Promise<void> {
     catToggle.title = hidden ? 'Show the catalog' : 'Hide the catalog';
   };
   wireCopy(logCopy, () => logEl.textContent ?? '');
+  logCopy.addEventListener('click', (e) => e.preventDefault());
+  rememberOpen(document.getElementById('log-panel') as HTMLDetailsElement, 'g5-log-open');
   wireCopy(catCopy, () => catJson.textContent ?? '');
   catToggle.addEventListener('click', () => {
     setCatalogHidden(!layoutEl.classList.contains('cat-hidden'));
@@ -2411,13 +2427,10 @@ async function main(): Promise<void> {
   popMuteBtn.addEventListener('click', () => { void player.toggleMute().then(saveAudioChoice); });
   player.on('volumechange', ({ muted }) => setMuteIcon(muted));
 
-  // Gear menu: closes on a choice, a click outside or Escape.
-  // With no choice to offer, the gear opens the settings dialog directly.
-  menuBtn.addEventListener('click', () => {
-    if (!menu.hidden || menu.querySelector('.menu-row:not([hidden])')) setMenuOpen(menu.hidden);
-    else document.getElementById('settings-btn')!.click();
-  });
-  menu.addEventListener('change', () => setMenuOpen(false));
+  // A quick choice closes the gear popup.
+  for (const sel of [viewSelect, qualitySelect, audioSelect, langSelect]) {
+    sel.addEventListener('change', () => setMenuOpen(false));
+  }
   applyPlaybackQuery = (query: URLSearchParams): void => {
     const p = playbackParams(query);
     player.updatePlayback({
@@ -2435,7 +2448,7 @@ async function main(): Promise<void> {
       targetLatencyMs: targetLatencyOverrideMs,
     } = p);
     targetLatencyMs = targetLatencyOverrideMs ?? catalogTargetLatencyMs;
-    latencySelect.value = latencyMode;
+    syncLatencySelect(query);
     renderStateBadge();
     const parts = [`latency ${latencyMode}`, `target ${targetLatencyMs > 0 ? `${targetLatencyMs} ms` : 'none'}`];
     if (smoothFloorMs !== undefined) parts.push(`smooth floor ${smoothFloorMs} ms`);
@@ -2446,29 +2459,49 @@ async function main(): Promise<void> {
     if (debug) parts.push('debug');
     log(`Playback settings applied: ${parts.join(', ')}`);
   };
-  // A latency choice applies to the running session and is recorded in the URL.
+  // Latency presets: Live, or Smooth starting at 1 s or 2 s with 1 s of headroom.
+  // They apply to the running session and are recorded in the URL.
   const latencySelect = document.getElementById('latency') as HTMLSelectElement;
-  latencySelect.value = latencyMode;
+  const customLatency = latencySelect.querySelector<HTMLOptionElement>('option[value="custom"]')!;
+  function syncLatencySelect(q: URLSearchParams): void {
+    let preset = 'custom';
+    if (q.get('latency') !== 'smooth') preset = 'live';
+    else {
+      const min = q.get('latencyMin') ?? '1000';
+      const max = q.get('latencyMax') ?? '2000';
+      if (min === '1000' && max === '2000') preset = '1000';
+      else if (min === '2000' && max === '3000') preset = '2000';
+    }
+    customLatency.hidden = preset !== 'custom';
+    latencySelect.value = preset;
+  }
+  syncLatencySelect(new URLSearchParams(location.search));
   latencySelect.addEventListener('change', () => {
     const url = new URL(location.href);
-    if (latencySelect.value === 'live') url.searchParams.delete('latency');
-    else url.searchParams.set('latency', latencySelect.value);
+    const q = url.searchParams;
+    q.delete('latencyMin');
+    q.delete('latencyMax');
+    if (latencySelect.value === 'live') q.delete('latency');
+    else q.set('latency', 'smooth');
+    if (latencySelect.value === '2000') {
+      q.set('latencyMin', '2000');
+      q.set('latencyMax', '3000');
+    }
     try {
-      applyPlaybackQuery!(url.searchParams);
+      applyPlaybackQuery!(q);
     } catch (err) {
       log(`Latency not applied: ${(err as Error).message}`);
-      latencySelect.value = latencyMode;
+      syncLatencySelect(new URLSearchParams(location.search));
       return;
     }
     history.replaceState(history.state, '', url.pathname + url.search + url.hash);
+    setMenuOpen(false);
   });
   document.addEventListener('click', (e) => {
-    if (!menu.hidden && !menu.parentElement!.contains(e.target as Node)) setMenuOpen(false);
     if (!volumeGroup.contains(e.target as Node)) setVolumePopOpen(false);
   });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    setMenuOpen(false);
     // Focus inside the closing popup returns to the speaker.
     const popFocused = volumeGroup.classList.contains('open')
       && popMuteBtn.parentElement!.contains(document.activeElement);

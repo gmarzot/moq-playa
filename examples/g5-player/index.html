@@ -375,16 +375,6 @@
       background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
       padding: 10px 12px; box-shadow: 0 6px 20px var(--shadow);
     }
-    .menu-row {
-      display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      font-size: .85rem; color: var(--text-label);
-    }
-    .menu-row select { max-width: 170px; }
-    .menu .menu-item {
-      text-align: left; background: none; border: none; border-top: 1px solid var(--divider);
-      border-radius: 0; padding: 8px 0 2px; color: var(--text-soft); font-size: .85rem;
-    }
-    .menu .menu-item:hover { background: none; color: var(--text-strong); }
 
     /* Diagnostics strip — always visible beneath the playback window */
     .diag { padding: 10px 0; display: flex; flex-direction: column; gap: 10px; }
@@ -609,7 +599,7 @@
       /* The menu anchors to the whole bar, so it stays on screen. */
       .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
       .menu-wrap { position: static; }
-      .menu { max-width: 100%; }
+      .menu { left: 0; right: 0; width: auto; max-width: none; top: calc(100% + 6px); bottom: auto; }
       .seek-bar { flex: 1 1 0; min-width: 60px; }
       .volume-group { position: relative; }
       .volume-pop {
@@ -659,7 +649,6 @@
     /* Log */
     /* A copy control rides the top-right of the pane it belongs to, so the
        pane keeps its full height and the button never moves with the content. */
-    .log-wrap { position: relative; }
     .copy {
       position: absolute; top: 10px; z-index: 1; opacity: .5;
       /* Clear of the pane's own scrollbar, and opaque so text scrolling
@@ -687,55 +676,6 @@
       margin-top: 12px;
     }
 
-    /* ─── Settings modal ─────────────────────────── */
-    .modal-backdrop {
-      display: none; position: fixed; inset: 0; background: var(--backdrop);
-      z-index: 100; backdrop-filter: blur(4px);
-    }
-    .modal-backdrop.visible { display: flex; align-items: center; justify-content: center; }
-    .modal {
-      background: var(--modal-bg); border: 1px solid var(--modal-border); border-radius: 8px;
-      padding: 20px; width: min(500px, 92vw); max-height: 86vh; overflow-y: auto;
-      box-shadow: 0 20px 60px var(--modal-shadow);
-    }
-    .modal h2 { font-size: 1rem; margin-bottom: 4px; }
-    .modal .lede { color: var(--text-faint); font-size: .8rem; margin-bottom: 8px; }
-    .modal label {
-      display: block; font-size: .7rem; color: var(--text-faint); margin: 12px 0 4px;
-      text-transform: uppercase; letter-spacing: .5px;
-    }
-    .modal input[type=text], .modal input[type=number], .modal select {
-      width: 100%; padding: 7px 9px; border-radius: 6px;
-      border: 1px solid var(--input-border); background: var(--input-bg); color: var(--text);
-      font-family: monospace; font-size: .85rem;
-    }
-    .modal input:focus, .modal select:focus { outline: none; border-color: var(--focus); }
-    .modal .hint { font-size: .68rem; color: var(--text-dim); margin-top: 3px; }
-    /* Relay field: any URL, plus a menu of the known relays. */
-    .relay-combo { position: relative; display: flex; gap: 6px; }
-    .modal .relay-combo input[type=text] { flex: 1; min-width: 0; }
-    .relay-combo-btn { flex: none; padding: 0 12px; }
-    .relay-combo-menu {
-      position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 10; padding: 4px;
-      background: var(--modal-bg); border: 1px solid var(--input-border); border-radius: 6px;
-      box-shadow: 0 8px 24px var(--modal-shadow);
-    }
-    .relay-combo-item {
-      display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text);
-      padding: 7px 9px; border-radius: 4px; font-family: monospace; font-size: .85rem;
-      overflow-wrap: anywhere;
-    }
-    .relay-combo-item:hover, .relay-combo-item:focus-visible { background: var(--control-hover); outline: none; }
-    .relay-combo-item[aria-selected=true] { font-weight: 700; }
-    .modal .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
-    .modal .check input { width: auto; }
-    .modal .check label { margin: 0; text-transform: none; letter-spacing: 0; font-size: .8rem; color: var(--text-soft); }
-    .modal .adv-sec { margin-top: 16px; border-top: 1px solid var(--modal-divider); padding-top: 4px; }
-    .modal .adv-sec summary { cursor: pointer; font-size: .8rem; color: var(--text-soft); padding: 8px 0; }
-    .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
-    .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
-    .modal #set-apply { background: var(--active); border-color: var(--active); color: var(--apply-fg); }
-    .modal #set-apply:hover { background: var(--active-hover); }
   </style>
 </head>
 <body>
@@ -800,14 +740,78 @@
             10.26L4.87 10.02A7.4 7.4 0 0 1 5.56 8.36L3.81 6.26A10 10 0 0 1 6.26 3.81L8.36 5.56A7.4 7.4 0 0 1 10.02 4.87Z"/><circle
             cx="12" cy="12" r="3"/></svg>
         </button>
-        <div id="menu" class="menu" hidden>
-          <label class="menu-row" hidden>View <select id="view"></select></label>
-          <label class="menu-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
-          <label class="menu-row" hidden>Audio <select id="audio"></select></label>
-          <label class="menu-row" hidden>Language <select id="lang"></select></label>
-          <label class="menu-row" title="Live edge skips late media to stay at the target; Smooth raises the delay instead, up to its limit">Latency
-            <select id="latency"><option value="live">Live edge</option><option value="smooth">Smooth</option></select></label>
-          <button id="settings-btn" class="menu-item" type="button">Connection settings…</button>
+        <div id="menu" class="menu settings-popup" role="dialog" aria-label="Playback and connection settings" hidden>
+          <label class="sp-row" hidden>View <select id="view"></select></label>
+          <label class="sp-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
+          <label class="sp-row" hidden>Audio <select id="audio"></select></label>
+          <label class="sp-row" hidden>Language <select id="lang"></select></label>
+          <label class="sp-row" title="Live holds the target and skips late media; 1 s and 2 s start the delay there and raise it up to 1 s more when media arrives late">Latency
+            <select id="latency"><option value="live">Live</option><option value="1000">1 s</option><option value="2000">2 s</option><option value="custom" disabled hidden>Custom</option></select></label>
+          <hr class="sp-sep">
+          <div class="sp-field"><label for="s-url">Relay</label>
+            <input id="s-url" type="text" placeholder="blank = discover on this host, else moqx-main"></div>
+          <div class="sp-field"><label for="s-ns">Namespace</label>
+            <input id="s-ns" type="text" placeholder="live"></div>
+          <div class="sp-field"><label for="s-v">Draft</label>
+            <select id="s-v">
+              <option value="">Auto (offers moqt-16)</option>
+              <option value="22">Draft 22</option>
+              <option value="18">Draft 18</option>
+              <option value="16">Draft 16</option>
+              <option value="14">Draft 14</option>
+            </select></div>
+          <details class="sp-adv" id="s-adv">
+            <summary>Advanced</summary>
+            <div class="sp-adv-body">
+              <div class="sp-field"><label for="s-target">Target latency (ms)</label>
+                <input id="s-target" type="number" min="1" placeholder="from catalog">
+                <div class="sp-hint">Overrides the catalog's targetLatency.</div></div>
+              <div class="sp-field"><label for="s-latency-min">Smooth start / limit (ms)</label>
+                <div class="sp-inline">
+                  <input id="s-latency-min" type="number" min="0" placeholder="1000" title="Where Smooth starts and the lowest it steps back to; 0 starts at the target">
+                  <input id="s-latency-max" type="number" min="1" placeholder="2000" title="How far Smooth may raise the delay; past it, late media is skipped as in Live">
+                </div></div>
+              <div class="sp-field"><label for="s-cushion">Render cushion floor / max (ms)</label>
+                <div class="sp-inline">
+                  <input id="s-cushion" type="number" min="1" placeholder="engine default">
+                  <input id="s-cushion-max" type="number" min="1" placeholder="cap">
+                </div></div>
+              <div class="sp-field"><label for="s-catchup">Catch-up rate</label>
+                <input id="s-catchup" type="number" min="1" step="0.01" placeholder="1 (off)">
+                <div class="sp-hint">Max playback rate while chasing the target.</div></div>
+              <div class="sp-field"><label for="s-bootstrap">Catalog bootstrap</label>
+                <select id="s-bootstrap">
+                  <option value="">Player default</option>
+                  <option value="subscribe">subscribe (publishers without FETCH)</option>
+                  <option value="auto">auto</option>
+                  <option value="joining-fetch">joining-fetch</option>
+                  <option value="strict">strict</option>
+                  <option value="fetch">fetch (relays that serve the catalog only by FETCH)</option>
+                </select></div>
+              <div class="sp-check" title="LOC: fetch the current group. CMAF/LOCMAF: ask for a new group (broadcaster needs dynamic groups).">
+                <input id="s-warm-start" type="checkbox"><label for="s-warm-start">warm start</label></div>
+              <div class="sp-check" title="Recover media in a background tab. Off: a hidden tab waits until it is viewed.">
+                <input id="s-auto-resume" type="checkbox"><label for="s-auto-resume">auto-resume</label></div>
+              <div class="sp-field"><label for="s-cc">Congestion control (hint)</label>
+                <select id="s-cc">
+                  <option value="">Browser default</option>
+                  <option value="low-latency">Low latency</option>
+                  <option value="throughput">Throughput</option>
+                </select>
+                <div class="sp-hint">The browser may ignore it; the log shows what it applied.</div></div>
+              <div class="sp-field"><label for="s-authority">Authority</label>
+                <input id="s-authority" type="text" placeholder="(none)"></div>
+              <div class="sp-field"><label for="s-hash">Certificate hash</label>
+                <input id="s-hash" type="text" placeholder="(none)"></div>
+              <div class="sp-check"><input id="s-status" type="checkbox"><label for="s-status">stats overlay</label></div>
+              <div class="sp-check"><input id="s-debug" type="checkbox"><label for="s-debug">verbose logging</label></div>
+            </div>
+          </details>
+          <div class="sp-actions">
+            <span class="sp-build">build <span data-build></span></span>
+            <button id="set-apply" class="sp-apply" type="button" hidden
+              title="Settings that need a new session reload the page; Ctrl-click (⌘-click) or Ctrl/⌘-Enter always reloads">Apply</button>
+          </div>
         </div>
       </div>
       <button id="cat-toggle" class="mini" type="button" title="Show the catalog" aria-label="Catalog" aria-pressed="false">
@@ -860,113 +864,16 @@
       </div>
     </div>
 
-    <div class="log-wrap">
-      <button id="log-copy" class="mini copy" type="button">copy</button>
+    <details class="adv log-panel" id="log-panel">
+      <summary>log<button id="log-copy" class="mini copy" type="button">copy</button></summary>
       <pre id="log"></pre>
-    </div>
+    </details>
     <details class="adv" id="adv-panel">
       <summary>transport (QUIC / WebTransport)</summary>
       <div class="diag-grid" id="adv-grid"></div>
     </details>
 
     <footer class="attrib-note">Built on <a href="https://github.com/openmoq/moq-playa" target="_blank" rel="noopener noreferrer">openmoq/moq-playa</a> · build <span data-build></span></footer>
-  </div>
-
-  <div id="settings-backdrop" class="modal-backdrop">
-    <div class="modal">
-      <h2>Connection settings</h2>
-      <div class="lede">Applying reloads the page with these as URL parameters.</div>
-
-      <label for="s-url">Relay WebTransport URL</label>
-      <input id="s-url" type="text" placeholder="blank = discover on this host, else moqx-main">
-
-      <label for="s-ns">Namespace</label>
-      <input id="s-ns" type="text" placeholder="live">
-
-      <label for="s-v">Draft version</label>
-      <select id="s-v">
-        <option value="">Auto (offers moqt-16)</option>
-        <option value="22">Draft 22</option>
-        <option value="18">Draft 18</option>
-        <option value="16">Draft 16</option>
-        <option value="14">Draft 14</option>
-      </select>
-
-      <details class="adv-sec" id="s-adv">
-        <summary>Advanced</summary>
-
-        <label for="s-target">Target latency (ms)</label>
-        <input id="s-target" type="number" min="1" placeholder="from catalog">
-        <div class="hint">Overrides the catalog's targetLatency.</div>
-
-        <label for="s-latency-min">Smooth latency start (ms)</label>
-        <input id="s-latency-min" type="number" min="0" placeholder="1000">
-        <div class="hint">Where Smooth starts and the lowest it steps back to; 0 starts at the target.</div>
-
-        <label for="s-latency-max">Smooth latency limit (ms)</label>
-        <input id="s-latency-max" type="number" min="1" placeholder="2000">
-        <div class="hint">How far Smooth may raise the delay; past it, late media is skipped as in Live edge.</div>
-
-        <label for="s-cushion">Render cushion floor / max (ms)</label>
-        <input id="s-cushion" type="number" min="1" placeholder="engine default">
-        <input id="s-cushion-max" type="number" min="1" placeholder="cap" style="margin-top:6px">
-
-        <label for="s-catchup">Catch-up rate</label>
-        <input id="s-catchup" type="number" min="1" step="0.01" placeholder="1 (off)">
-        <div class="hint">Max playback rate while chasing the target.</div>
-
-        <label for="s-bootstrap">Catalog bootstrap</label>
-        <select id="s-bootstrap">
-          <option value="">Player default</option>
-          <option value="subscribe">subscribe (publishers without FETCH)</option>
-          <option value="auto">auto</option>
-          <option value="joining-fetch">joining-fetch</option>
-          <option value="strict">strict</option>
-          <option value="fetch">fetch (relays that serve the catalog only by FETCH)</option>
-        </select>
-
-        <div class="check">
-          <input id="s-warm-start" type="checkbox">
-          <label for="s-warm-start">warm start</label>
-        </div>
-        <div class="hint">LOC: fetch the current group. CMAF/LOCMAF: ask for a new group (broadcaster needs dynamic groups).</div>
-
-        <div class="check">
-          <input id="s-auto-resume" type="checkbox">
-          <label for="s-auto-resume">auto-resume</label>
-        </div>
-        <div class="hint">Recover media in a background tab. Off: a hidden tab waits until it is viewed.</div>
-
-        <label for="s-cc">Congestion control (hint)</label>
-        <select id="s-cc">
-          <option value="">Browser default</option>
-          <option value="low-latency">Low latency</option>
-          <option value="throughput">Throughput</option>
-        </select>
-        <div class="hint">The browser may ignore it; the log shows what it applied.</div>
-
-        <label for="s-authority">Authority</label>
-        <input id="s-authority" type="text" placeholder="(none)">
-
-        <label for="s-hash">Certificate hash</label>
-        <input id="s-hash" type="text" placeholder="(none)">
-
-        <div class="check">
-          <input id="s-status" type="checkbox">
-          <label for="s-status">status overlay</label>
-        </div>
-        <div class="check">
-          <input id="s-debug" type="checkbox">
-          <label for="s-debug">verbose logging</label>
-        </div>
-      </details>
-
-      <div class="build-line">build <span data-build></span></div>
-      <div class="btn-row">
-        <button id="set-cancel" type="button">Cancel</button>
-        <button id="set-apply" type="button" title="Settings that need a new session reload the page; Ctrl-click (⌘-click) always reloads">Apply</button>
-      </div>
-    </div>
   </div>
 
   <script type="module" src="./main.ts"></script>
