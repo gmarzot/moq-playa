@@ -42,7 +42,6 @@
       color: #fb3; font-size: .75rem; font-weight: 600; text-decoration: none; vertical-align: middle;
     }
     .build-update[hidden] { display: none; }
-    .build-line { margin-top: 12px; color: #666; font-size: .75rem; }
     .attrib-note {
       color: #666; font-size: .75rem; margin-top: 18px;
       padding-top: 10px; border-top: 1px solid #222;
@@ -116,11 +115,21 @@
     .menu .menu-item:hover, .menu .menu-item:focus-visible { background: #333; outline: none; }
     .menu .menu-item[aria-checked=true] { color: #fff; font-weight: 700; }
 
-    /* Phones: the bar wraps instead of overrunning; the list anchors to the bar. */
+    /* Gear popup: above the bar at the gear's right edge. */
+    #settings-menu { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 20; }
+    #settings-menu .sp-row select {
+      background: #333; color: #eee; border: 1px solid #555;
+      padding: 6px 10px; border-radius: 6px; font-size: .85rem;
+    }
+    #s-ns-new { flex: none; padding: 0 12px; font-size: .82rem; }
+
+    /* Phones: the bar wraps instead of overrunning; the menus anchor to the bar,
+       the gear popup below it. */
     @media (max-width: 600px) {
       .wrapper { padding: 16px 12px; }
       .controls { flex-wrap: wrap; gap: 10px 8px; position: relative; }
       .menu-wrap { position: static; }
+      #settings-menu { top: calc(100% + 6px); bottom: auto; max-width: 100%; }
       .controls button { min-height: 40px; }
     }
 
@@ -241,7 +250,6 @@
     }
 
     /* A copy control rides the top-right of the pane it belongs to. */
-    .log-wrap { position: relative; margin-top: 12px; }
     .copy {
       position: absolute; top: 10px; right: 24px; z-index: 1; opacity: .5;
       background: #23233a; border-color: #3a3a52;
@@ -251,9 +259,8 @@
       background: #1a1a2e; color: rgba(255,255,255,0.6);
       padding: 12px 16px; border-radius: 8px;
       font-family: monospace; font-size: 0.8rem; line-height: 1.5;
-      /* A floating copy button over a one-line box reads as broken; the panel
-         keeps a consistent height from the first line. */
-      min-height: 140px; max-height: 220px;
+      /* Not a one-line sliver while the log is short. */
+      min-height: 140px; max-height: 220px; margin-top: 6px;
       overflow-y: auto; white-space: pre-wrap;
     }
 
@@ -270,7 +277,7 @@
       .cat-json { min-height: 220px; max-height: 45vh; }
     }
 
-    /* Settings / share modals */
+    /* Share modal */
     .modal-backdrop {
       display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65);
       z-index: 100; backdrop-filter: blur(4px);
@@ -283,38 +290,17 @@
     }
     .modal h2 { font-size: 1rem; margin-bottom: 4px; }
     .modal .lede { color: #888; font-size: .8rem; margin-bottom: 8px; }
-    .modal label {
-      display: block; font-size: .7rem; color: #888; margin: 12px 0 4px;
-      text-transform: uppercase; letter-spacing: .5px;
-    }
-    .modal [hidden] { display: none !important; }
-    .modal input[type=text], .modal input[type=number], .modal select {
+    .modal input[type=text] {
       width: 100%; padding: 7px 9px; border-radius: 6px;
       border: 1px solid #444; background: #222; color: #eee;
       font-family: monospace; font-size: .85rem;
     }
-    .modal input:focus, .modal select:focus { outline: none; border-color: #2a6; }
+    .modal input:focus { outline: none; border-color: #2a6; }
     .modal .hint { font-size: .68rem; color: #666; margin-top: 3px; }
-    /* Relay field: any URL, plus a menu of the known relays. */
-    .relay-combo { position: relative; display: flex; gap: 6px; }
-    .modal .relay-combo input[type=text] { flex: 1; min-width: 0; }
-    .relay-combo-btn { flex: none; padding: 0 12px; }
-    .relay-combo-menu {
-      position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 10; padding: 4px;
-      background: #1a1a1a; border: 1px solid #444; border-radius: 6px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.6);
-    }
-    .relay-combo-item {
-      display: block; width: 100%; text-align: left; border: 0; background: none; color: #eee;
-      padding: 7px 9px; border-radius: 4px; font-family: monospace; font-size: .85rem;
-      overflow-wrap: anywhere;
-    }
-    .relay-combo-item:hover, .relay-combo-item:focus-visible { background: #333; outline: none; }
-    .relay-combo-item[aria-selected=true] { font-weight: 700; }
     .modal .btn-row { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
     .modal .btn-row button { padding: 8px 18px; font-size: .85rem; }
-    .modal #settings-apply, .modal #share-open { background: #2a6; border-color: #2a6; color: #fff; }
-    .modal #settings-apply:hover, .modal #share-open:hover { background: #2b7; }
+    .modal #share-open { background: #2a6; border-color: #2a6; color: #fff; }
+    .modal #share-open:hover { background: #2b7; }
   </style>
 </head>
 <body>
@@ -342,15 +328,119 @@
             <div id="camera-menu" class="menu" role="menu" aria-label="Broadcast source" hidden></div>
           </div>
           <span class="spacer"></span>
-          <button id="settings-btn" class="icon" type="button" title="Broadcast settings" aria-label="Broadcast settings">
-            <svg class="stroked" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.02 4.87L10.26 2.15A10 10 0 0 1 13.74
-              2.15L13.98 4.87A7.4 7.4 0 0 1 15.64 5.56L17.74 3.81A10 10 0 0 1 20.19 6.26L18.44 8.36A7.4 7.4 0 0 1 19.13
-              10.02L21.85 10.26A10 10 0 0 1 21.85 13.74L19.13 13.98A7.4 7.4 0 0 1 18.44 15.64L20.19 17.74A10 10 0 0 1
-              17.74 20.19L15.64 18.44A7.4 7.4 0 0 1 13.98 19.13L13.74 21.85A10 10 0 0 1 10.26 21.85L10.02 19.13A7.4 7.4 0 0 1
-              8.36 18.44L6.26 20.19A10 10 0 0 1 3.81 17.74L5.56 15.64A7.4 7.4 0 0 1 4.87 13.98L2.15 13.74A10 10 0 0 1 2.15
-              10.26L4.87 10.02A7.4 7.4 0 0 1 5.56 8.36L3.81 6.26A10 10 0 0 1 6.26 3.81L8.36 5.56A7.4 7.4 0 0 1 10.02 4.87Z"/><circle
-              cx="12" cy="12" r="3"/></svg>
-          </button>
+          <div class="menu-wrap">
+            <button id="settings-btn" class="icon" type="button" title="Broadcast settings" aria-label="Broadcast settings"
+              aria-haspopup="dialog" aria-expanded="false">
+              <svg class="stroked" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.02 4.87L10.26 2.15A10 10 0 0 1 13.74
+                2.15L13.98 4.87A7.4 7.4 0 0 1 15.64 5.56L17.74 3.81A10 10 0 0 1 20.19 6.26L18.44 8.36A7.4 7.4 0 0 1 19.13
+                10.02L21.85 10.26A10 10 0 0 1 21.85 13.74L19.13 13.98A7.4 7.4 0 0 1 18.44 15.64L20.19 17.74A10 10 0 0 1
+                17.74 20.19L15.64 18.44A7.4 7.4 0 0 1 13.98 19.13L13.74 21.85A10 10 0 0 1 10.26 21.85L10.02 19.13A7.4 7.4 0 0 1
+                8.36 18.44L6.26 20.19A10 10 0 0 1 3.81 17.74L5.56 15.64A7.4 7.4 0 0 1 4.87 13.98L2.15 13.74A10 10 0 0 1 2.15
+                10.26L4.87 10.02A7.4 7.4 0 0 1 5.56 8.36L3.81 6.26A10 10 0 0 1 6.26 3.81L8.36 5.56A7.4 7.4 0 0 1 10.02 4.87Z"/><circle
+                cx="12" cy="12" r="3"/></svg>
+            </button>
+            <div id="settings-menu" class="settings-popup" role="dialog" aria-label="Broadcast settings" hidden>
+              <label class="sp-row" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">Packaging
+                <select id="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">
+                  <option value="loc">LOC/MSF (default)</option>
+                  <option value="cmaf">CMAF/CMSF</option>
+                  <option value="locmaf">LOCMAF/CMSF</option>
+                </select></label>
+              <label class="sp-row" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">Camera size
+                <select id="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">
+                  <option value="1080">1080p</option>
+                  <option value="720">720p (default)</option>
+                  <option value="480">480p</option>
+                </select></label>
+              <hr class="sp-sep">
+              <div class="sp-field"><label for="s-url" title="The MoQ relay to publish to. Blank uses moqx-main.">Relay</label>
+                <input id="s-url" type="text" placeholder="default: moqx-main" title="The MoQ relay to publish to. Blank uses moqx-main."></div>
+              <div class="sp-field"><label for="s-ns" title="The MoQ namespace viewers subscribe to. Automatic: a new one per broadcast.">Namespace</label>
+                <div class="sp-inline">
+                  <input id="s-ns" type="text" placeholder="auto (new per broadcast)" title="The MoQ namespace viewers subscribe to. Automatic: a new one per broadcast.">
+                  <button id="s-ns-new" type="button" title="Mint a new automatic namespace; the viewer link changes">New</button>
+                </div>
+                <div class="sp-hint">Blank or automatic: a new one each broadcast. A typed name is kept.</div></div>
+              <div class="sp-field"><label for="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">Draft</label>
+                <select id="s-version" title="MoQT draft offered to the relay. 18 is current; 22 for relays that speak it; 14 and 16 for older relays.">
+                  <option value="22">Draft 22</option>
+                  <option value="18">Draft 18 (default)</option>
+                  <option value="16">Draft 16</option>
+                  <option value="14">Draft 14</option>
+                </select></div>
+              <details class="sp-adv" id="s-advanced">
+                <summary>Advanced</summary>
+                <div class="sp-adv-body">
+                  <div class="sp-field"><label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
+                    <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
+                      <option value="avc1.42001f">H.264 Baseline</option>
+                      <option value="avc1.640028">H.264 High</option>
+                      <option value="av01.0.04M.08">AV1 Main</option>
+                      <option value="hvc1.1.6.L93.B0">HEVC Main</option>
+                      <option value="vp09.00.31.08">VP9 Profile 0</option>
+                    </select></div>
+                  <div class="sp-field"><label for="s-bitrate" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">Video bitrate (kbps)</label>
+                    <input id="s-bitrate" type="number" min="1" placeholder="by resolution" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p."></div>
+                  <div class="sp-field"><label for="s-fps" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">Capture frame rate</label>
+                    <input id="s-fps" type="number" min="1" placeholder="60" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding."></div>
+                  <div class="sp-field"><label for="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">Audio codec</label>
+                    <div class="sp-inline">
+                      <select id="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
+                        <option value="opus">Opus</option>
+                        <option value="aac">AAC-LC</option>
+                      </select>
+                      <div class="sp-check" id="s-audio-datagram-row" title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
+                        <input id="s-audio-datagram" type="checkbox"><label for="s-audio-datagram">audio over datagrams</label></div>
+                    </div></div>
+                  <div class="sp-field"><label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
+                    <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200)."></div>
+                  <div class="sp-field"><label for="s-keyframe" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">Keyframe interval (s)</label>
+                    <input id="s-keyframe" type="number" min="0.1" step="0.1" placeholder="2" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner."></div>
+                  <div class="sp-field"><label for="s-bitrate-mode" title="Constant holds output near the target; variable lets complex frames and keyframes burst. Default: the encoder decides.">Bitrate mode</label>
+                    <select id="s-bitrate-mode" title="Constant holds output near the target; variable lets complex frames and keyframes burst. Default: the encoder decides.">
+                      <option value="">Encoder default</option>
+                      <option value="constant">Constant</option>
+                      <option value="variable">Variable</option>
+                    </select></div>
+                  <div class="sp-field"><label for="s-cc" title="A hint to the browser QUIC congestion controller. Browsers may ignore it.">Congestion control (hint)</label>
+                    <select id="s-cc" title="A hint to the browser QUIC congestion controller. Browsers may ignore it.">
+                      <option value="">Browser default</option>
+                      <option value="low-latency">Low latency</option>
+                      <option value="throughput">Throughput</option>
+                    </select></div>
+                  <div class="sp-field"><label for="s-catalog-interval" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">Catalog refresh interval (ms)</label>
+                    <input id="s-catalog-interval" type="number" min="0" placeholder="0" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent."></div>
+                  <div class="sp-field"><label for="s-catalog-delivery" title="How viewers get the catalog. Both: sent on each catalog subscription and served by FETCH. FETCH only: nothing on the subscription (relays that only FETCH). Subscribe only: catalog FETCH refused.">Catalog delivery</label>
+                    <select id="s-catalog-delivery" title="How viewers get the catalog. Both: sent on each catalog subscription and served by FETCH. FETCH only: nothing on the subscription (relays that only FETCH). Subscribe only: catalog FETCH refused.">
+                      <option value="both">Subscribe + FETCH (default)</option>
+                      <option value="fetch">FETCH only</option>
+                      <option value="subscribe">Subscribe only</option>
+                    </select></div>
+                  <div class="sp-field"><label for="s-hash" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">Certificate hash</label>
+                    <input id="s-hash" type="text" placeholder="(none)" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate."></div>
+                  <div class="sp-check" id="s-dynamic-groups-row" title="A joining viewer can ask for a new group (NEW_GROUP_REQUEST), so it starts at once instead of waiting for the next keyframe. Draft 18 only.">
+                    <input id="s-dynamic-groups" type="checkbox"><label for="s-dynamic-groups">dynamic groups: a joining viewer may request a keyframe</label></div>
+                  <div class="sp-check" id="s-self-describing-row" title="For players that read no catalog. LOC: every object also carries the codec string and decoder config. CMAF: the CMAF header (init segment) rides the first object of a group, at most once a second per track.">
+                    <input id="s-self-describing" type="checkbox"><label for="s-self-describing">self-describing objects (catalog-less players)</label></div>
+                  <div class="sp-check" id="s-timescale-row" title="Adds Timescale 1000000 to every object. Timestamps then read as media time, so viewers lose end-to-end latency.">
+                    <input id="s-timescale" type="checkbox"><label for="s-timescale">Timescale on LOC objects (players that require one)</label></div>
+                  <div class="sp-check" id="s-voice-processing-row" title="Keeps the browser's call processing on camera audio: echo cancellation, noise suppression, automatic gain. For speech from a microphone; on music or film it pumps the level and gates sound out.">
+                    <input id="s-voice-processing" type="checkbox"><label for="s-voice-processing">voice processing (calls)</label></div>
+                  <div class="sp-check" id="s-annexb-row" title="Start codes instead of length prefixes, parameter sets in keyframes instead of the video config property. Only for relays that drop object properties with players that ignore catalog init data. Catalog codec avc3.">
+                    <input id="s-annexb" type="checkbox"><label for="s-annexb">H.264 Annex B (start codes, parameter sets in keyframes)</label></div>
+                  <div class="sp-check" title="State badge, relay time and send stats over the preview.">
+                    <input id="s-status" type="checkbox"><label for="s-status">stats overlay</label></div>
+                  <div class="sp-check" title="Per-second ingest snapshots and catalog re-emissions in the log.">
+                    <input id="s-debug" type="checkbox"><label for="s-debug">verbose logging</label></div>
+                </div>
+              </details>
+              <div class="sp-actions">
+                <span class="sp-build">build <span data-build></span></span>
+                <button id="settings-apply" class="sp-apply" type="button" hidden
+                  title="Reloads the page with these settings, which restarts a running broadcast; Ctrl/⌘-Enter in a field reloads even with nothing changed">Apply</button>
+              </div>
+            </div>
+          </div>
           <button id="share-btn" class="mini" type="button" title="Viewer link" aria-label="Viewer link" hidden>
             <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path
@@ -389,10 +479,10 @@
       <div class="diag-grid" id="diag-grid"></div>
     </div>
 
-    <div class="log-wrap">
-      <button id="log-copy" class="mini copy" type="button">copy</button>
+    <details class="adv log-panel" id="log-panel">
+      <summary>log<button id="log-copy" class="mini copy" type="button">copy</button></summary>
       <pre id="log"></pre>
-    </div>
+    </details>
 
     <details class="adv" id="adv-panel">
       <summary>transport (QUIC / WebTransport)</summary>
@@ -414,160 +504,6 @@
         <button id="share-copy" type="button">Copy</button>
         <button id="share-open" type="button"
           title="Ctrl- or Shift-click: new window, same size as this one">Open in new tab</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Settings modal -->
-  <div id="settings-backdrop" class="modal-backdrop">
-    <div class="modal">
-      <h2>Broadcast settings</h2>
-      <div class="lede">Persistent settings overridden by URL params. Hover a field for details.</div>
-
-      <label for="s-url" title="The MoQ relay to publish to. Blank uses moqx-main.">Relay WebTransport URL</label>
-      <input id="s-url" type="text" placeholder="default: moqx-main" title="The MoQ relay to publish to. Blank uses moqx-main.">
-
-      <label for="s-ns" title="The MoQ namespace viewers subscribe to. Automatic: a new one per broadcast.">Namespace</label>
-      <div style="display:flex;gap:8px;align-items:center">
-        <input id="s-ns" type="text" placeholder="auto (new per broadcast)" style="flex:1;min-width:0"
-               title="The MoQ namespace viewers subscribe to. Automatic: a new one per broadcast.">
-        <button id="s-ns-new" type="button" title="Mint a new automatic namespace; the viewer link changes">New</button>
-      </div>
-      <div class="hint">Blank or automatic: a new one each broadcast. A typed name is kept.</div>
-
-      <label for="s-version" title="MoQT draft offered to the relay. 18 is current; 14 and 16 for older relays.">Draft version</label>
-      <select id="s-version" title="MoQT draft offered to the relay. 18 is current; 22 for relays that speak it; 14 and 16 for older relays.">
-        <option value="22">Draft 22</option>
-        <option value="18">Draft 18 (default)</option>
-        <option value="16">Draft 16</option>
-        <option value="14">Draft 14</option>
-      </select>
-
-      <label for="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">Packaging</label>
-      <select id="s-packaging" title="How media rides each object. LOC: one encoded frame per object, WebCodecs playback. CMAF: fMP4 fragments, MSE playback. LOCMAF: CMAF with compact headers.">
-        <option value="loc">LOC/MSF (default)</option>
-        <option value="cmaf">CMAF/CMSF</option>
-        <option value="locmaf">LOCMAF/CMSF</option>
-      </select>
-
-      <label for="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">Camera resolution</label>
-      <select id="s-height" title="Requested camera size (16:9). The camera delivers its closest mode. Screen capture keeps the screen size.">
-        <option value="1080">1080p</option>
-        <option value="720">720p (default)</option>
-        <option value="480">480p</option>
-      </select>
-
-      <details class="adv" id="s-advanced" style="margin-top:14px">
-        <summary>Advanced</summary>
-
-      <label for="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">Video codec</label>
-      <select id="s-codec" title="H.264 Baseline plays everywhere. High: better quality per bit. AV1, HEVC, VP9 need encoder support; unsupported codecs fall back to H.264 Baseline.">
-        <option value="avc1.42001f">H.264 Baseline</option>
-        <option value="avc1.640028">H.264 High</option>
-        <option value="av01.0.04M.08">AV1 Main</option>
-        <option value="hvc1.1.6.L93.B0">HEVC Main</option>
-        <option value="vp09.00.31.08">VP9 Profile 0</option>
-      </select>
-
-      <label for="s-bitrate" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">Video bitrate (kbps)</label>
-      <input id="s-bitrate" type="number" min="1" placeholder="by resolution" title="Encoder target. Blank: 4500 at 1080p, 2000 at 720p, 1000 at 480p.">
-
-      <label for="s-fps" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">Capture frame rate</label>
-      <input id="s-fps" type="number" min="1" placeholder="60" title="Frames per second asked of the camera or screen (default 60). One frame period is latency before encoding.">
-
-      <label for="s-audio-codec" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">Audio codec</label>
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <select id="s-audio-codec" style="flex:1 1 10em;width:auto" title="Opus: default, low latency. AAC-LC: for players that need it; needs an OS encoder (Windows, macOS), else falls back to Opus.">
-          <option value="opus">Opus</option>
-          <option value="aac">AAC-LC</option>
-        </select>
-        <div class="check" id="s-audio-datagram-row" style="display:flex;align-items:center;gap:8px;margin:0"
-             title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
-          <input id="s-audio-datagram" type="checkbox" style="width:auto">
-          <label for="s-audio-datagram" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">audio over datagrams</label>
-        </div>
-      </div>
-
-      <label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
-      <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200).">
-
-      <label for="s-keyframe" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">Keyframe interval (s)</label>
-      <input id="s-keyframe" type="number" min="0.1" step="0.1" placeholder="2" title="Seconds between keyframes (default 2). Shorter: faster joins, more bits. Dynamic groups let a joining viewer ask for one sooner.">
-
-      <label for="s-bitrate-mode" title="Constant holds output near the target; variable lets complex frames and keyframes burst. Default: the encoder decides.">Bitrate mode</label>
-      <select id="s-bitrate-mode" title="Constant holds output near the target; variable lets complex frames and keyframes burst. Default: the encoder decides.">
-        <option value="">Encoder default</option>
-        <option value="constant">Constant</option>
-        <option value="variable">Variable</option>
-      </select>
-
-      <label for="s-cc" title="A hint to the browser QUIC congestion controller. Browsers may ignore it.">Congestion control (hint)</label>
-      <select id="s-cc" title="A hint to the browser QUIC congestion controller. Browsers may ignore it.">
-        <option value="">Browser default</option>
-        <option value="low-latency">Low latency</option>
-        <option value="throughput">Throughput</option>
-      </select>
-
-      <label for="s-catalog-interval" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">Catalog refresh interval (ms)</label>
-      <input id="s-catalog-interval" type="number" min="0" placeholder="0" title="Re-publish the catalog this often. Blank: the draft default (draft 18 viewers fetch it; 14/16 get it every second). 0: never re-sent.">
-
-      <label for="s-catalog-delivery" title="How viewers get the catalog. Both: sent on each catalog subscription and served by FETCH. FETCH only: nothing on the subscription (relays that only FETCH). Subscribe only: catalog FETCH refused.">Catalog delivery</label>
-      <select id="s-catalog-delivery" title="How viewers get the catalog. Both: sent on each catalog subscription and served by FETCH. FETCH only: nothing on the subscription (relays that only FETCH). Subscribe only: catalog FETCH refused.">
-        <option value="both">Subscribe + FETCH (default)</option>
-        <option value="fetch">FETCH only</option>
-        <option value="subscribe">Subscribe only</option>
-      </select>
-
-      <label for="s-hash" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">Certificate hash</label>
-      <input id="s-hash" type="text" placeholder="(none)" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">
-
-      <div class="check" id="s-dynamic-groups-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="A joining viewer can ask for a new group (NEW_GROUP_REQUEST), so it starts at once instead of waiting for the next keyframe. Draft 18 only.">
-        <input id="s-dynamic-groups" type="checkbox" style="width:auto">
-        <label for="s-dynamic-groups" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">dynamic groups: a joining viewer may request a keyframe</label>
-      </div>
-
-      <div class="check" id="s-self-describing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="For players that read no catalog. LOC: every object also carries the codec string and decoder config. CMAF: the CMAF header (init segment) rides the first object of a group, at most once a second per track.">
-        <input id="s-self-describing" type="checkbox" style="width:auto">
-        <label for="s-self-describing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">self-describing objects (catalog-less players)</label>
-      </div>
-
-      <div class="check" id="s-timescale-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Adds Timescale 1000000 to every object. Timestamps then read as media time, so viewers lose end-to-end latency.">
-        <input id="s-timescale" type="checkbox" style="width:auto">
-        <label for="s-timescale" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">Timescale on LOC objects (players that require one)</label>
-      </div>
-
-      <div class="check" id="s-voice-processing-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Keeps the browser's call processing on camera audio: echo cancellation, noise suppression, automatic gain. For speech from a microphone; on music or film it pumps the level and gates sound out.">
-        <input id="s-voice-processing" type="checkbox" style="width:auto">
-        <label for="s-voice-processing" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">voice processing (calls)</label>
-      </div>
-
-      <div class="check" id="s-annexb-row" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Start codes instead of length prefixes, parameter sets in keyframes instead of the video config property. Only for relays that drop object properties with players that ignore catalog init data. Catalog codec avc3.">
-        <input id="s-annexb" type="checkbox" style="width:auto">
-        <label for="s-annexb" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">H.264 Annex B (start codes, parameter sets in keyframes)</label>
-      </div>
-
-      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="State badge, relay time and send stats over the preview.">
-        <input id="s-status" type="checkbox" style="width:auto">
-        <label for="s-status" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">status overlay</label>
-      </div>
-
-      <div class="check" style="display:flex;align-items:center;gap:8px;margin-top:12px"
-           title="Per-second ingest snapshots and catalog re-emissions in the log.">
-        <input id="s-debug" type="checkbox" style="width:auto">
-        <label for="s-debug" style="margin:0;text-transform:none;letter-spacing:0;font-size:.8rem;color:#bbb">verbose logging</label>
-      </div>
-      </details>
-
-      <div class="build-line">build <span data-build></span></div>
-      <div class="btn-row">
-        <button id="settings-cancel" type="button">Cancel</button>
-        <button id="settings-apply" type="button">Apply &amp; reload</button>
       </div>
     </div>
   </div>

@@ -34,6 +34,8 @@ import { parseCompat } from '../shared/compat.js';
 import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
+import { attachSettingsPopup, rememberOpen } from '../shared/settings-popup.js';
+import '../shared/settings-popup.css';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
@@ -290,11 +292,11 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   }));
 }
 
-// ─── Settings modal ──────────────────────────────────────────────────
+// ─── Settings popup ──────────────────────────────────────────────────
 
 {
   const settingsBtn = document.getElementById('settings-btn')!;
-  const backdrop = document.getElementById('settings-backdrop')!;
+  const settingsMenu = document.getElementById('settings-menu')!;
   const sUrl = document.getElementById('s-url') as HTMLInputElement;
   const relayPicker = attachRelayPicker(sUrl);
   const sNs = document.getElementById('s-ns') as HTMLInputElement;
@@ -323,15 +325,16 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   const sVoiceProcessing = document.getElementById('s-voice-processing') as HTMLInputElement;
   const sPackaging = document.getElementById('s-packaging') as HTMLSelectElement;
   const applyBtn = document.getElementById('settings-apply')!;
-  const cancelBtn = document.getElementById('settings-cancel')!;
 
-  // Modal-scoped lazy discovery: opening settings with no relay URL set and
+  // Popup-scoped lazy discovery: opening settings with no relay URL set and
   // no cached result starts its own discovery consumer, aborted on
   // close/Apply. Independent of the Go Live flow's consumer — neither can
   // block the other (Stop never waits on this, and vice versa).
   let modalDiscovery: AbortController | undefined;
   /** The automatic namespace the field holds, if any; Apply keeps it unnamed. */
   let autoNamespace: string | null = null;
+  /** fieldsQuery() as populateFields() left the fields. */
+  let loadedQuery = '';
 
   function abortModalDiscovery() {
     modalDiscovery?.abort(new Error('settings closed'));
@@ -344,7 +347,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (!sUrl.value && !modalDiscovery) {
       modalDiscovery = new AbortController();
       void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
-        (url) => { if (!sUrl.value) { sUrl.value = url; relayPicker.sync(); } },
+        (url) => { if (!sUrl.value) { sUrl.value = url; relayPicker.sync(); popup.refresh(); } },
         () => { /* aborted or failed — the field stays editable */ },
       );
     }
@@ -379,11 +382,11 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sTimescale.checked = locTimescale;
     sVoiceProcessing.checked = voiceProcessing;
     // Advanced opens when anything in it is set, so no change is hidden.
-    sAdvanced.open = videoCodec !== 'avc1.42001f' || audioCodecParam !== 'opus'
+    if (videoCodec !== 'avc1.42001f' || audioCodecParam !== 'opus'
       || (Number.isFinite(bitrateParam) && bitrateParam > 0) || captureFps !== 60 || targetLatencyMs !== 200
       || keyframeSec !== null || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
       || catalogIntervalMs !== null || catalogDelivery !== 'both' || params.get('hash') !== null || dynamicGroups || audioDatagrams
-      || selfDescribing || locTimescale || annexbParam || debug || showStatus || voiceProcessing;
+      || selfDescribing || locTimescale || annexbParam || debug || showStatus || voiceProcessing) sAdvanced.open = true;
     showApplicableFields();
   }
 
@@ -407,33 +410,18 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
   }
   sVersion.addEventListener('change', showCatalogIntervalDefault);
 
-  settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
   sNsNew.addEventListener('click', () => {
     autoNamespace = mintNamespace();
     sNs.value = autoNamespace;
   });
-  cancelBtn.addEventListener('click', () => { abortModalDiscovery(); backdrop.classList.remove('visible'); });
-  backdrop.addEventListener('click', (e) => {
-    if (e.target === backdrop) { abortModalDiscovery(); backdrop.classList.remove('visible'); }
-  });
-  // Enter in a field applies, as a form submit would; buttons and the
-  // Advanced toggle keep their own Enter.
-  backdrop.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || e.isComposing) return;
-    const tag = (e.target as HTMLElement).tagName;
-    if (tag !== 'INPUT' && tag !== 'SELECT') return;
-    e.preventDefault();
-    applyBtn.click();
-  });
 
-  applyBtn.addEventListener('click', () => {
-    abortModalDiscovery();
+  /** The settings the fields describe, `ns` included even when automatic. */
+  function fieldsQuery(): URLSearchParams {
     const np = new URLSearchParams();
     const url = sUrl.value.trim();
     const ns = sNs.value.trim();
     if (url && url !== DEFAULT_RELAY) np.set('url', url);
-    if (ns && ns === autoNamespace) storageSet(() => sessionStorage, AUTO_NAMESPACE_KEY, ns);
-    else if (ns) np.set('ns', ns);
+    if (ns) np.set('ns', ns);
     if (sHash.value.trim()) np.set('hash', sHash.value.trim());
     if (sVersion.value && sVersion.value !== String(DEFAULT_DRAFT)) np.set('v', sVersion.value);
     if (sCc.value) np.set('congestionControl', sCc.value);
@@ -456,6 +444,18 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     if (sVoiceProcessing.checked) np.set('voiceProcessing', '1');
     if (sDynamicGroups.checked && Number(sVersion.value) >= 18) np.set('dynamicGroups', '1');
     if (sPackaging.value !== 'loc') np.set('packaging', sPackaging.value);
+    return np;
+  }
+
+  /** Saves the fields and reloads, which starts a new broadcast. */
+  function applySettings(): void {
+    abortModalDiscovery();
+    const np = fieldsQuery();
+    const ns = np.get('ns');
+    if (ns !== null && ns === autoNamespace) {
+      np.delete('ns');
+      storageSet(() => sessionStorage, AUTO_NAMESPACE_KEY, ns);
+    }
     // The dialog showed URL overrides too, so they are saved and the URL drops
     // them; where storage is refused, the URL carries them instead. URL-only
     // settings stay.
@@ -471,7 +471,32 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     }
     const query = next.toString();
     window.location.assign(window.location.pathname + (query ? '?' + query : ''));
+  }
+
+  /** The fields differ from what the popup opened with; any change needs a new broadcast. */
+  const changed = (): boolean => fieldsQuery().toString() !== loadedQuery;
+  const popup = attachSettingsPopup({
+    button: settingsBtn,
+    popup: settingsMenu,
+    applyButton: applyBtn,
+    advanced: sAdvanced,
+    storageKey: 'g5-broadcast-settings',
+    pending: () => (changed() ? 'reload' : 'none'),
+    reloadLabel: 'Apply · restarts broadcast',
+    onOpen: () => {
+      populateFields();
+      loadedQuery = fieldsQuery().toString();
+    },
+    onApply: (forceReload) => {
+      if (forceReload || changed()) applySettings();
+      else popup.close();
+    },
   });
+  // A known relay or New fills a field from code, which fires no input event.
+  settingsMenu.addEventListener('click', () => popup.refresh());
+  // Discovery for the relay field ends with the popup, however it closes.
+  new MutationObserver(() => { if (settingsMenu.hidden) abortModalDiscovery(); })
+    .observe(settingsMenu, { attributes: true, attributeFilter: ['hidden'] });
 }
 
 // ─── DOM ─────────────────────────────────────────────────────────────
@@ -891,6 +916,9 @@ const setCatalogHidden = (hidden: boolean): void => {
 catToggle.addEventListener('click', () => setCatalogHidden(!layoutEl.classList.contains('cat-hidden')));
 wireCopy(catCopy, () => catJson.textContent ?? '');
 wireCopy(logCopy, () => document.getElementById('log')?.textContent ?? '');
+// The copy button rides the log's summary without toggling it.
+logCopy.addEventListener('click', (e) => e.preventDefault());
+rememberOpen(document.getElementById('log-panel') as HTMLDetailsElement, 'g5-broadcast-log-open');
 
 // ─── Share modal ─────────────────────────────────────────────────────
 
