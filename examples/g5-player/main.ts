@@ -372,9 +372,8 @@ function log(msg: string): void {
     const qs = next.toString();
     const href = location.pathname + (qs ? `?${qs}` : '');
     const changed = changedKeys(next);
-    const reload = forceReload;
     const playback = changed.some((k) => k !== 'status');
-    if (changed.length && !reload && inPlace(changed)) {
+    if (changed.length && !forceReload && inPlace(changed)) {
       if (playback) {
         try {
           applyPlaybackQuery!(next);
@@ -385,7 +384,7 @@ function log(msg: string): void {
       }
       history.replaceState(history.state, '', href + location.hash);
       if (changed.includes('status')) setShowStatus(next.get('status') === '1');
-    } else if (changed.length || reload) {
+    } else if (changed.length || forceReload) {
       location.href = href;
     }
     return true;
