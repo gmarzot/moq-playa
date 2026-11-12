@@ -3884,4 +3884,3 @@ describe('MoqtConnection(18) loopback — onSubscribeClosed (§3.3.2 unsubscribe
     expect(String(server.session.state).toLowerCase()).toBe('established');
   });
 });
-
