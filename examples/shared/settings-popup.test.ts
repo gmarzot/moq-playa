@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { attachSettingsPopup, rememberOpen, type PendingChange } from './settings-popup.js';
+import { attachSettingsPopup, rememberOpen, rememberedOpen, type PendingChange } from './settings-popup.js';
 
 type Handler = (e: Event) => void;
 
@@ -103,6 +103,18 @@ describe('attachSettingsPopup', () => {
     expect(e.preventDefault).toHaveBeenCalled();
     s.popup.fire('keydown', { key: 'Enter', target: { tagName: 'BUTTON' } });
     expect(s.onApply).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('rememberedOpen', () => {
+  it('is null until the tab toggles the disclosure', () => {
+    const storage = fakeStorage();
+    expect(rememberedOpen('k', storage)).toBeNull();
+    const a = { open: true, ...fakeTarget() };
+    rememberOpen(a, 'k', storage);
+    a.open = false;
+    a.fire('toggle');
+    expect(rememberedOpen('k', storage)).toBe(false);
   });
 });
 

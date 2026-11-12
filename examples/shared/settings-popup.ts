@@ -55,12 +55,18 @@ export interface PopupDocument {
   addEventListener(type: string, fn: Handler): void;
 }
 
-/** Keeps a <details> open or closed across this tab's reloads. */
-export function rememberOpen(details: PopupDetails, key: string, storage: Storage | null = sessionStorageOrNull()): void {
+/** This tab's remembered open state for `key`, or null when it has none. */
+export function rememberedOpen(key: string, storage: Storage | null = sessionStorageOrNull()): boolean | null {
   try {
     const stored = storage?.getItem(key);
-    if (stored === '1' || stored === '0') details.open = stored === '1';
-  } catch { /* storage unavailable */ }
+    return stored === '1' ? true : stored === '0' ? false : null;
+  } catch { return null; }
+}
+
+/** Keeps a <details> open or closed across this tab's reloads. */
+export function rememberOpen(details: PopupDetails, key: string, storage: Storage | null = sessionStorageOrNull()): void {
+  const stored = rememberedOpen(key, storage);
+  if (stored !== null) details.open = stored;
   details.addEventListener('toggle', () => {
     try { storage?.setItem(key, details.open ? '1' : '0'); } catch { /* storage unavailable */ }
   });
@@ -96,6 +102,8 @@ export function attachSettingsPopup(
   };
 
   o.button.addEventListener('click', () => setOpen(o.popup.hidden));
+  o.advanced?.addEventListener('toggle', () => { if (popup.isOpen) fitViewport(o.popup); });
+  if (typeof window !== 'undefined') window.addEventListener('resize', () => { if (popup.isOpen) fitViewport(o.popup); });
   o.applyButton.addEventListener('click', (e) => {
     const m = e as MouseEvent;
     o.onApply(m.ctrlKey === true || m.metaKey === true);
@@ -123,15 +131,19 @@ export function attachSettingsPopup(
   return popup;
 }
 
-/** Shortens the popup so it stays inside the viewport whichever way it opens. */
+/**
+ * Shortens the popup to the viewport. Upward it must fit, since the page cannot
+ * scroll above its top; downward a page too short for 160 px scrolls to it instead.
+ */
 function fitViewport(popup: PopupElement): void {
   const el = popup as unknown as HTMLElement;
   if (typeof el.getBoundingClientRect !== 'function' || !el.style || typeof window === 'undefined') return;
   el.style.maxHeight = '';
   const r = el.getBoundingClientRect();
   const margin = 8;
-  const over = Math.max(margin - r.top, r.bottom - (window.innerHeight - margin));
-  if (over > 0) el.style.maxHeight = `${Math.max(160, r.height - over)}px`;
+  const below = window.innerHeight - margin - r.top;
+  if (r.top < margin) el.style.maxHeight = `${Math.max(0, r.height - (margin - r.top))}px`;
+  else if (r.bottom > window.innerHeight - margin && below >= 160) el.style.maxHeight = `${below}px`;
 }
 
 function sessionStorageOrNull(): Storage | null {

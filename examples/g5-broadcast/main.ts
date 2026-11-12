@@ -34,7 +34,7 @@ import { parseCompat } from '../shared/compat.js';
 import { orderCatalogForDisplay } from '../shared/msf-order.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
-import { attachSettingsPopup, rememberOpen } from '../shared/settings-popup.js';
+import { attachSettingsPopup, rememberOpen, rememberedOpen } from '../shared/settings-popup.js';
 import '../shared/settings-popup.css';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
@@ -381,12 +381,13 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sSelfDescribing.checked = selfDescribing;
     sTimescale.checked = locTimescale;
     sVoiceProcessing.checked = voiceProcessing;
-    // Advanced opens when anything in it is set, so no change is hidden.
-    if (videoCodec !== 'avc1.42001f' || audioCodecParam !== 'opus'
+    // Unless this tab chose otherwise, Advanced opens when anything in it is set.
+    const advancedSet = videoCodec !== 'avc1.42001f' || audioCodecParam !== 'opus'
       || (Number.isFinite(bitrateParam) && bitrateParam > 0) || captureFps !== 60 || targetLatencyMs !== 200
       || keyframeSec !== null || keyframeFrames !== null || bitrateMode !== undefined || congestionControl !== undefined
       || catalogIntervalMs !== null || catalogDelivery !== 'both' || params.get('hash') !== null || dynamicGroups || audioDatagrams
-      || selfDescribing || locTimescale || annexbParam || debug || showStatus || voiceProcessing) sAdvanced.open = true;
+      || selfDescribing || locTimescale || annexbParam || debug || showStatus || voiceProcessing;
+    if (advancedSet && rememberedOpen('g5-broadcast-settings:advanced') === null) sAdvanced.open = true;
     showApplicableFields();
   }
 

@@ -78,6 +78,9 @@ let debug = initialPlayback.debug;
 /** Applies a query's playback settings to the running player, throwing if it rejects them; null until it exists. */
 let applyPlaybackQuery: ((query: URLSearchParams) => void) | null = null;
 
+/** The gear popup's hooks for quick choices made outside its fields. */
+let gearPopup: { closeUnlessEditing(): void; syncLatencyFields(q: URLSearchParams): void } | null = null;
+
 /** Fatal media errors only a fresh tune-in recovers: wedged element, unrecoverable gap, dead pipeline. */
 const REJOIN_CODES = new Set([0x1102, 0x1104, 0x1105]);
 /** This tab's automatic rejoins, at most REJOIN_MAX in REJOIN_WINDOW_MS. */
@@ -114,7 +117,7 @@ const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
 })();
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
-import { attachSettingsPopup, rememberOpen } from '../shared/settings-popup.js';
+import { attachSettingsPopup, rememberOpen, rememberedOpen } from '../shared/settings-popup.js';
 import '../shared/settings-popup.css';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
@@ -328,8 +331,8 @@ function log(msg: string): void {
     fHash.value = p.get('hash') ?? '';
     fStatus.checked = p.get('status') === '1';
     fDebug.checked = p.get('debug') === '1';
-    // Open Advanced when anything in it is set, so a non-default is never hidden.
-    if (MANAGED.slice(3).some((k) => p.has(k))) advSec.open = true;
+    // Unless this tab chose otherwise, Advanced opens when anything in it is set.
+    if (rememberedOpen('g5-settings:advanced') === null && MANAGED.slice(3).some((k) => p.has(k))) advSec.open = true;
   }
 
   /** The query the fields describe; every unmanaged param carries over. */
@@ -404,6 +407,17 @@ function log(msg: string): void {
     onOpen: populate,
     onApply: (forceReload) => { if (applyQuery(fieldsQuery(), forceReload)) popup.close(); },
   });
+  gearPopup = {
+    // A quick choice closes the popup unless other edits are still pending in it.
+    closeUnlessEditing: () => {
+      if (changedKeys(fieldsQuery()).length === 0) popup.close();
+      else popup.refresh();
+    },
+    syncLatencyFields: (q) => {
+      fLatencyMin.value = q.get('latencyMin') ?? '';
+      fLatencyMax.value = q.get('latencyMax') ?? '';
+    },
+  };
 
   // The overlay and verbose logging apply as soon as they are ticked.
   for (const [box, key] of [[fStatus, 'status'], [fDebug, 'debug']] as const) {
@@ -2426,9 +2440,8 @@ async function main(): Promise<void> {
   popMuteBtn.addEventListener('click', () => { void player.toggleMute().then(saveAudioChoice); });
   player.on('volumechange', ({ muted }) => setMuteIcon(muted));
 
-  // A quick choice closes the gear popup.
   for (const sel of [viewSelect, qualitySelect, audioSelect, langSelect]) {
-    sel.addEventListener('change', () => setMenuOpen(false));
+    sel.addEventListener('change', () => gearPopup?.closeUnlessEditing());
   }
   applyPlaybackQuery = (query: URLSearchParams): void => {
     const p = playbackParams(query);
@@ -2494,7 +2507,8 @@ async function main(): Promise<void> {
       return;
     }
     history.replaceState(history.state, '', url.pathname + url.search + url.hash);
-    setMenuOpen(false);
+    gearPopup?.syncLatencyFields(q);
+    gearPopup?.closeUnlessEditing();
   });
   document.addEventListener('click', (e) => {
     if (!volumeGroup.contains(e.target as Node)) setVolumePopOpen(false);
