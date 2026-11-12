@@ -8,6 +8,7 @@ import { parseLocmafTrackContext } from './track-context.js';
 import { serializeLocmafObject } from './serializer.js';
 import type { LocmafEffectiveSamples } from './effective.js';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, audioInit, buildChunk, buildInit, cencVideoInit, videoInit } from '../test-support/cmaf.js';
+import { ascii, concat, fullBox, isoBox, u16, u32, u8 } from '../test-support/bytes.js';
 
 function effective(over: Partial<LocmafEffectiveSamples> = {}): LocmafEffectiveSamples {
     return {
@@ -135,6 +136,46 @@ describe('codecDescriptionFromInit (section 16, codec configuration from the CMA
 
     it('returns null for a Header without a sample entry', () => {
         expect(codecDescriptionFromInit(buildInit({ trackId: 1, timescale: 90000, handler: 'vide', emptyStsd: true }))).toBeNull();
+    });
+
+    /** A CMAF Header whose only track is a sound track with this sample entry. */
+    const audioHeader = (entry: Uint8Array) => concat(
+        isoBox('ftyp', ascii('iso6'), u32(0), ascii('cmfc')),
+        isoBox('moov', isoBox('trak', isoBox('mdia',
+            fullBox('hdlr', 0, 0, u32(0), ascii('soun'), new Uint8Array(12), u8(0)),
+            isoBox('minf', isoBox('stbl', fullBox('stsd', 0, 0, u32(1), entry)))))));
+    const audioFields = (channels: number) =>
+        concat(new Uint8Array(6), u16(1), new Uint8Array(8), u16(channels), u16(16), u16(0), u16(0), u32(48000 << 16));
+    const opusHeader = (dops: number[]) =>
+        audioHeader(isoBox('Opus', audioFields(dops[1]!), isoBox('dOps', Uint8Array.from(dops))));
+    const OPUS_HEAD = [0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64];
+
+    it('rebuilds an OpusHead from dOps: magic, version 1, fields little-endian', () => {
+        // dOps: version 0, 2 channels, pre-skip 312, 48 kHz, gain 0, family 0.
+        const head = codecDescriptionFromInit(opusHeader([0, 2, 0x01, 0x38, 0, 0, 0xbb, 0x80, 0, 0, 0]))!;
+        expect(Array.from(head)).toEqual([...OPUS_HEAD, 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0]);
+    });
+
+    it('carries a dOps channel mapping table and a negative output gain into the OpusHead', () => {
+        // 6 channels, gain -256 (Q7.8), family 1: 4 streams, 2 coupled, mapping 0 4 1 2 3 5.
+        const head = codecDescriptionFromInit(opusHeader(
+            [0, 6, 0x01, 0x38, 0, 0, 0xbb, 0x80, 0xff, 0x00, 1, 4, 2, 0, 4, 1, 2, 3, 5]))!;
+        expect(Array.from(head)).toEqual(
+            [...OPUS_HEAD, 1, 6, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0x00, 0xff, 1, 4, 2, 0, 4, 1, 2, 3, 5]);
+    });
+
+    it('rejects a truncated dOps', () => {
+        expect(() => codecDescriptionFromInit(opusHeader([0, 2, 0x01, 0x38, 0, 0, 0xbb, 0x80, 0, 0])))
+            .toThrow(LocmafFormatError);
+        expect(() => codecDescriptionFromInit(opusHeader([0, 2, 0x01, 0x38, 0, 0, 0xbb, 0x80, 0, 0, 1, 1])))
+            .toThrow(LocmafFormatError);
+    });
+
+    it('prefixes the dfLa metadata blocks with "fLaC"', () => {
+        const streamInfo = concat(Uint8Array.of(0x80, 0, 0, 34), new Uint8Array(34).fill(7));
+        const description = codecDescriptionFromInit(
+            audioHeader(isoBox('fLaC', audioFields(2), fullBox('dfLa', 0, 0, streamInfo))))!;
+        expect(Array.from(description)).toEqual([0x66, 0x4c, 0x61, 0x43, ...streamInfo]);
     });
 });
 

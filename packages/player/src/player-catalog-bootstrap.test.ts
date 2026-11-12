@@ -19,6 +19,9 @@ import type { ControlMessage, MoqtObject, DataStreamHeader } from '@openmoq/tran
 import { varint } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
+
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const CATALOG = {
     version: 'draft-01',
@@ -672,6 +675,44 @@ describe('catalog retry with Joining FETCH', () => {
 });
 
 describe('catalog bootstrap wiring — subscribe + join', () => {
+    it.each(['auto', 'joining-fetch', 'strict', 'subscribe'] as const)(
+        '%s: a live update reaches the video ladder', async (mode) => {
+            const adapter = createMockAdapter(18);
+            const twoRungs = { ...CATALOG, tracks: [...CATALOG.tracks, { ...CATALOG.tracks[0]!, name: 'hd', bitrate: 4_000_000 }] };
+            const { player, events, errors } = await loadPlayer(adapter, { catalogBootstrap: mode });
+            await flush();
+            ackCatalog(adapter);
+            if (mode === 'subscribe') {
+                adapter._triggerObject(200n, {
+                    kind: 'data', trackAlias: varint(1n), groupId: varint(5n), subgroupId: varint(0n),
+                    objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+                } as unknown as MoqtObject);
+            } else {
+                const fetchId = BigInt((adapter.joiningFetch.mock.results[0]!.value as { requestId?: bigint })?.requestId ?? 3n);
+                await deliverFetchObject(adapter, fetchId, 100n, 5n, 0n, enc(CATALOG));
+                adapter._triggerMessage({
+                    type: 'FETCH_OK', requestId: varint(fetchId), endOfTrack: 0,
+                    endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+                } as unknown as ControlMessage);
+                adapter._triggerStreamClosed(100n);
+            }
+            await flush();
+            await flush();
+            expect(events).toEqual(['catalog_received']);
+            expect(player.availableVideoTracks.map(t => t.name)).toEqual(['video']);
+
+            adapter._triggerObject(200n, {
+                kind: 'data', trackAlias: varint(1n), groupId: varint(6n), subgroupId: varint(0n),
+                objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: enc(twoRungs),
+            } as unknown as MoqtObject);
+            await flush();
+            expect(events).toEqual(['catalog_received', 'catalog_updated']);
+            expect(player.availableVideoTracks.map(t => t.name)).toEqual(['hd', 'video']);
+            expect(player.currentVideoTrack).toBe('video');
+            expect(errors).toEqual([]);
+            await player.destroy();
+        });
+
     it('#2/#22: default auto on d16 → catalog subscribe LargestObject + relative join offset 0 referencing it, chosen atomically', async () => {
         const adapter = createMockAdapter(16);
         await loadPlayer(adapter);
@@ -4153,5 +4194,475 @@ describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', (
         await flush();
 
         expect(kinds).toEqual(['fin']);
+    });
+});
+
+describe('fetch-only catalog (catalogBootstrap: fetch)', () => {
+    it('TRACK_STATUS names the latest group and a standalone FETCH of it brings the catalog — no catalog SUBSCRIBE', async () => {
+        const adapter = createMockAdapter(16);
+        const { player, events, errors } = await loadPlayer(adapter, { catalogBootstrap: 'fetch' });
+        await flush();
+        expect(adapter.subscribe).not.toHaveBeenCalled();
+        expect(adapter.trackStatus).toHaveBeenCalledTimes(1);
+
+        // Draft-16 LARGEST_OBJECT: a raw Location (group 7, object 0).
+        adapter._triggerMessage({
+            type: 'REQUEST_OK', requestId: varint(99n), parameters: new Map([[0x09n, [new Uint8Array([7, 0])]]]),
+        } as unknown as ControlMessage);
+        await flush();
+        const opts = adapter.fetch.mock.calls[0]![2];
+        expect([opts.startGroup, opts.endGroup, opts.groupOrder]).toEqual([7n, 7n, undefined]);
+
+        await deliverFetchObject(adapter, 1n, 100n, 7n, 0n, enc(CATALOG));
+        await flush();
+        expect(events).toEqual(['catalog_received']);
+        expect(errors).toEqual([]);
+        expect(adapter.fetchCancel).not.toHaveBeenCalled();
+        expect(adapter.subscribe).toHaveBeenCalled();
+        await player.destroy();
+    });
+
+    it('without a TRACK_STATUS answer, one FETCH of every group newest first; the rest is cancelled', async () => {
+        const adapter = createMockAdapter(16);
+        const { player, events } = await loadPlayer(adapter, { catalogBootstrap: 'fetch' });
+        await flush();
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: varint(99n), errorCode: varint(4n), errorReason: 'Track not found',
+        } as unknown as ControlMessage);
+        await flush();
+        const opts = adapter.fetch.mock.calls[0]![2];
+        expect([opts.startGroup, opts.endGroup, opts.groupOrder]).toEqual([0n, (1n << 62n) - 1n, 2n]);
+
+        await deliverFetchObject(adapter, 1n, 100n, 9n, 0n, enc(CATALOG));
+        await flush();
+        expect(events).toEqual(['catalog_received']);
+        expect(adapter.fetchCancel).toHaveBeenCalledWith(1n);
+        await player.destroy();
+    });
+
+    it('is a valid catalogBootstrap value', () => {
+        expect(() => makePlayer(createMockAdapter(16), { catalogBootstrap: 'fetch' })).not.toThrow();
+    });
+});
+
+describe('catalog SUBSCRIBE refused with a Retry Interval', () => {
+    const LIMIT_MS = 300_000;
+    const players: MoqtPlayer[] = [];
+    type Adapter = ReturnType<typeof createMockAdapter>;
+
+    /** A document whose visibility the test sets. */
+    class FakeDocument extends EventTarget {
+        visibilityState: 'visible' | 'hidden' = 'visible';
+        setHidden(hidden: boolean): void {
+            this.visibilityState = hidden ? 'hidden' : 'visible';
+            this.dispatchEvent(new Event('visibilitychange'));
+        }
+    }
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(async () => {
+        for (const player of players.splice(0)) await player.destroy();
+        vi.useRealTimers();
+        delete (globalThis as { document?: unknown }).document;
+    });
+
+    function hiddenDocument(): FakeDocument {
+        const doc = new FakeDocument();
+        (globalThis as { document?: unknown }).document = doc;
+        doc.setHidden(true);
+        return doc;
+    }
+
+    /** Refuse the latest catalog SUBSCRIBE. */
+    async function refuse(adapter: Adapter, retryInterval: bigint, errorCode = 0x9n): Promise<void> {
+        const requestId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId, errorCode, retryInterval, errorReason: 'relay overloaded',
+        } as ControlMessage);
+    }
+
+    /** Admit the latest catalog SUBSCRIBE and complete its Joining FETCH. */
+    async function admit(adapter: Adapter, alias: bigint): Promise<void> {
+        const subscribeId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const fetchId = BigInt(await adapter.joiningFetch.mock.results.at(-1)!.value);
+        ackCatalog(adapter, subscribeId, alias);
+        adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: fetchId } } as DataStreamHeader);
+        adapter._triggerObject(100n, {
+            kind: 'data', trackAlias: varint(0), groupId: varint(10), subgroupId: varint(0),
+            objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+        } as MoqtObject);
+        adapter._triggerMessage({
+            type: 'FETCH_OK', requestId: fetchId, endOfTrack: 0,
+            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+        adapter._triggerStreamClosed(100n);
+        await vi.advanceTimersByTimeAsync(0);
+    }
+
+    async function loaded(cfg?: Partial<MoqtPlayerConfig>, draft: 16 | 18 = 18) {
+        const adapter = createMockAdapter(draft);
+        const result = await loadPlayer(adapter, cfg);
+        players.push(result.player);
+        return { adapter, ...result };
+    }
+
+    it.each([[0x9n, 18], [0x1n, 16]] as const)('code 0x%s on draft %i waits out the interval and retries', async (code, draft) => {
+        const { adapter, player, errors } = await loaded(undefined, draft);
+        await refuse(adapter, 8001n, code);
+        expect(player.state).not.toBe('error');
+        expect(errors).toEqual([expect.objectContaining({
+            severity: 'degraded', source: 'catalog', message: expect.stringMatching(/relay overloaded.*retrying in 8 s/),
+        })]);
+        expect(player.catalogRetry).toMatchObject({ code, reason: 'relay overloaded', retryAtMs: Date.now() + 8000 });
+
+        await vi.advanceTimersByTimeAsync(7999);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('a later refusal uses its own interval and does not report again', async () => {
+        const { adapter, errors } = await loaded();
+        await refuse(adapter, 2001n);
+        await vi.advanceTimersByTimeAsync(2000);
+        await refuse(adapter, 5001n);
+        expect(errors).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(4999);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('being admitted delivers the catalog with no reload', async () => {
+        const { adapter, player, events, errors } = await loaded();
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        await admit(adapter, 40n);
+        expect(player.catalogRetry).toBeNull();
+        expect(events).toEqual(['catalog_received']);
+        expect(errors.filter((e) => (e as { severity: string }).severity === 'fatal')).toEqual([]);
+    });
+
+    it('a track that does not exist once admitted leaves the refusal behind', async () => {
+        const { adapter, player } = await loaded();
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        await refuse(adapter, 2001n, 0x10n);
+        expect(player.catalogRetry).toBeNull();
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('gives up at the limit and closes the session', async () => {
+        const { adapter, player, errors } = await loaded();
+        for (let waited = 0; waited < LIMIT_MS; waited += 15_000) {
+            await refuse(adapter, 15_001n);
+            expect(player.state).not.toBe('error');
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        const sent = adapter.subscribe.mock.calls.length;
+        expect(adapter.close).not.toHaveBeenCalled();
+        await refuse(adapter, 15_001n);
+        expect(player.state).toBe('error');
+        expect(player.catalogRetry).toBeNull();
+        expect(errors.at(-1)).toMatchObject({
+            severity: 'fatal', message: expect.stringMatching(/relay overloaded.*gave up after 300 s, reload/),
+        });
+        expect(adapter.close).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(sent);
+    });
+
+    it('a zero interval ends playback at once and closes the session', async () => {
+        const { adapter, player, errors } = await loaded();
+        await refuse(adapter, 0n);
+        expect(player.state).toBe('error');
+        expect(errors).toEqual([expect.objectContaining({ severity: 'fatal' })]);
+        expect(adapter.close).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('a refusal does not close a session the application owns', async () => {
+        const adapter = createMockAdapter(18);
+        const player = new MoqtPlayer({
+            url: 'https://relay.example.com/moq', namespace: 'live/broadcast',
+            connection: adapter as unknown as MoqtConnection,
+        });
+        players.push(player);
+        await player.load();
+        await refuse(adapter, 0n);
+        expect(player.state).toBe('error');
+        expect(adapter.close).not.toHaveBeenCalled();
+    });
+
+    it('a hidden page keeps retrying by default', async () => {
+        hiddenDocument();
+        const { adapter } = await loaded();
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('autoResume off: a hidden page sends nothing until viewed, and the wait is not held against it', async () => {
+        const doc = hiddenDocument();
+        const { adapter, player } = await loaded({ autoResume: false });
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(LIMIT_MS * 2);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+
+        doc.setHidden(false);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        await refuse(adapter, 5001n);
+        expect(player.state).not.toBe('error');
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(3);
+    });
+
+    it('autoResume off: a hold excludes its own time from the limit and keeps the refusal', async () => {
+        const doc = new FakeDocument();
+        (globalThis as { document?: unknown }).document = doc;
+        const { adapter, player, errors } = await loaded({ autoResume: false });
+        for (let waited = 0; waited < 210_000; waited += 15_000) {
+            await refuse(adapter, 15_001n);
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        doc.setHidden(true);
+        await refuse(adapter, 15_001n);
+        const sent = adapter.subscribe.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(15_000 + LIMIT_MS * 2);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(sent);
+        expect(player.catalogRetry).not.toBeNull();
+
+        doc.setHidden(false);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(sent + 1);
+        for (let waited = 0; waited < 75_000; waited += 15_000) {
+            await refuse(adapter, 15_001n);
+            expect(player.state).not.toBe('error');
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        expect(errors).toHaveLength(1);
+        await refuse(adapter, 15_001n);
+        expect(player.state).toBe('error');
+        expect(errors.at(-1)).toMatchObject({ message: expect.stringMatching(/gave up after 300 s/) });
+    });
+
+    it('autoResume off: a visible page retries as usual', async () => {
+        const { adapter } = await loaded({ autoResume: false });
+        await refuse(adapter, 5001n);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('autoResume off: a track that does not exist is still retried while hidden', async () => {
+        hiddenDocument();
+        const { adapter } = await loaded({ autoResume: false });
+        await refuse(adapter, 2001n, 0x10n);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it('a playing viewer refused on reconnect waits, then resumes its media', async () => {
+        const a1 = createMockAdapter(18);
+        const a2 = createMockAdapter(18);
+        const adapters = [a1, a2];
+        const player = makePlayer(a1, { createConnection: () => adapters.shift() as unknown as MoqtConnection });
+        players.push(player);
+        const errors: { severity: string }[] = [];
+        player.on('error', (e) => errors.push(e.error));
+        const load = player.load();
+        await vi.waitFor(() => expect(a1.connect).toHaveBeenCalled());
+        a1._connectResolve?.();
+        await load;
+        player.play();
+        await admit(a1, 40n);
+        const selected = a1.subscribe.mock.calls.length;
+        expect(selected).toBeGreaterThan(1);
+        expect(player.state).toBe('playing');
+
+        a1._triggerClose(0x1, 'connection lost');
+        await vi.waitFor(() => expect(a2.connect).toHaveBeenCalled());
+        a2._connectResolve?.();
+        await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalledTimes(1));
+        await vi.advanceTimersByTimeAsync(0);
+
+        await refuse(a2, 6001n);
+        expect(player.state).toBe('playing');
+        expect(player.catalogRetry).not.toBeNull();
+        await vi.advanceTimersByTimeAsync(6000);
+        expect(a2.subscribe).toHaveBeenCalledTimes(2);
+
+        await admit(a2, 41n);
+        expect(player.catalogRetry).toBeNull();
+        expect(a2.subscribe.mock.calls.length).toBeGreaterThan(2);
+        expect(player.state).toBe('playing');
+        expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]);
+    });
+});
+
+describe('media SUBSCRIBE refused with a Retry Interval', () => {
+    const LIMIT_MS = 300_000;
+    const players: MoqtPlayer[] = [];
+    type Adapter = ReturnType<typeof createMockAdapter>;
+    const td = new TextDecoder();
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(async () => {
+        for (const player of players.splice(0)) await player.destroy();
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+    });
+
+    const subscribesOf = (adapter: Adapter, track: string): number =>
+        adapter.subscribe.mock.calls.filter((c: unknown[]) => td.decode(c[1] as Uint8Array) === track).length;
+
+    async function lastRequestId(adapter: Adapter, track: string): Promise<bigint> {
+        for (let i = adapter.subscribe.mock.calls.length - 1; i >= 0; i--) {
+            if (td.decode(adapter.subscribe.mock.calls[i]![1] as Uint8Array) === track) {
+                return BigInt(await adapter.subscribe.mock.results[i]!.value);
+            }
+        }
+        throw new Error(`no SUBSCRIBE for ${track}`);
+    }
+
+    async function refuse(adapter: Adapter, track: string, retryInterval: bigint, errorCode = 0x9n): Promise<void> {
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: await lastRequestId(adapter, track), errorCode, retryInterval,
+            errorReason: 'relay overloaded',
+        } as ControlMessage);
+        await vi.advanceTimersByTimeAsync(0);
+    }
+
+    /** A player past its catalog, with its media SUBSCRIBEs sent and unanswered. */
+    async function subscribing(cfg?: Partial<MoqtPlayerConfig>) {
+        const adapter = createMockAdapter(18);
+        const loaded = await loadPlayer(adapter, cfg);
+        players.push(loaded.player);
+        loaded.player.play();
+        const subscribeId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const fetchId = BigInt(await adapter.joiningFetch.mock.results.at(-1)!.value);
+        ackCatalog(adapter, subscribeId, 40n);
+        adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: fetchId } } as DataStreamHeader);
+        adapter._triggerObject(100n, {
+            kind: 'data', trackAlias: varint(0), groupId: varint(10), subgroupId: varint(0),
+            objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+        } as MoqtObject);
+        adapter._triggerMessage({
+            type: 'FETCH_OK', requestId: fetchId, endOfTrack: 0,
+            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+        adapter._triggerStreamClosed(100n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+        return { adapter, ...loaded };
+    }
+
+    const fatal = (errors: unknown[]): unknown[] =>
+        errors.filter((e) => (e as { severity: string }).severity === 'fatal');
+
+    it('every track refused waits out the interval and retries, with no fatal error', async () => {
+        const { adapter, player, errors } = await subscribing();
+        await refuse(adapter, 'video', 5001n);
+        await refuse(adapter, 'audio', 5001n);
+        expect(fatal(errors)).toEqual([]);
+        expect(player.state).not.toBe('error');
+        await vi.advanceTimersByTimeAsync(4999);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(subscribesOf(adapter, 'video')).toBe(2);
+        expect(subscribesOf(adapter, 'audio')).toBe(2);
+    });
+
+    it('reports a run of refusals once', async () => {
+        const { adapter, errors } = await subscribing();
+        await refuse(adapter, 'video', 2001n);
+        await vi.advanceTimersByTimeAsync(2000);
+        await refuse(adapter, 'video', 2001n);
+        expect(errors.filter((e) => /Track "video" refused/.test((e as Error).message))).toHaveLength(1);
+    });
+
+    it('stops at the limit, and then counts as a refusal', async () => {
+        const { adapter, errors } = await subscribing();
+        await refuse(adapter, 'audio', 0n, 0x1n);
+        for (let waited = 0; waited < LIMIT_MS; waited += 15_000) {
+            await refuse(adapter, 'video', 15_001n);
+            expect(fatal(errors)).toEqual([]);
+            await vi.advanceTimersByTimeAsync(15_000);
+        }
+        await refuse(adapter, 'video', 15_001n);
+        expect(fatal(errors)).toEqual([expect.objectContaining({ message: expect.stringMatching(/All media track/) })]);
+        const sent = subscribesOf(adapter, 'video');
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(subscribesOf(adapter, 'video')).toBe(sent);
+    });
+
+    it('a zero interval stays a refusal', async () => {
+        const { adapter, errors } = await subscribing();
+        await refuse(adapter, 'video', 0n);
+        await refuse(adapter, 'audio', 0n);
+        expect(fatal(errors)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+    });
+
+    it('a resubscribe after TOO_FAR_BEHIND that is refused also retries', async () => {
+        const { adapter, errors } = await subscribing();
+        const id = await lastRequestId(adapter, 'video');
+        adapter._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(41n), parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        adapter._triggerMessage({
+            type: 'PUBLISH_DONE', requestId: varint(id), statusCode: 0x5n, streamCount: 0n, errorReason: 'behind',
+        } as unknown as ControlMessage);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(subscribesOf(adapter, 'video')).toBe(2);
+        await refuse(adapter, 'video', 3001n);
+        await vi.advanceTimersByTimeAsync(3000);
+        expect(subscribesOf(adapter, 'video')).toBe(3);
+        expect(fatal(errors)).toEqual([]);
+    });
+
+    it('reports a skip only from a reset group followed by a newer one', async () => {
+        const { player } = await subscribing();
+        const skips: { fromGroupId: bigint; toGroupId: bigint; trackName: string }[] = [];
+        player.on('group_skip', (e) => skips.push(e));
+        const internal = player as unknown as {
+            noteGroupSequence(m: string, t: string, a: bigint, g: bigint): void;
+            abandonedMediaGroup: Map<bigint, bigint>;
+        };
+        const note = (alias: bigint, group: bigint): void => internal.noteGroupSequence('video', 'video', alias, group);
+        // Streams reorder: a forward gap with no reset says nothing.
+        for (const group of [5n, 6n, 9n, 8n, 10n]) note(7n, group);
+        expect(skips).toEqual([]);
+
+        // Reset, then late objects of that group, then the very next group.
+        internal.abandonedMediaGroup.set(7n, 10n);
+        note(7n, 10n);
+        expect(skips).toEqual([]);
+        note(7n, 11n);
+        expect(skips).toEqual([expect.objectContaining({ trackName: 'video', fromGroupId: 10n, toGroupId: 11n })]);
+        expect(player.stats.groupSkipCount).toBe(1);
+
+        note(7n, 12n);
+        note(8n, 100n);
+        expect(player.stats.groupSkipCount).toBe(1);
+    });
+
+    it('spreads a first resubscribe over the spread window', async () => {
+        const statics = MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number };
+        statics.RESUBSCRIBE_SPREAD_MS = 1_000;
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        const { adapter } = await subscribing();
+        const id = await lastRequestId(adapter, 'video');
+        adapter._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(41n), parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        adapter._triggerMessage({
+            type: 'PUBLISH_DONE', requestId: varint(id), statusCode: 0x5n, streamCount: 0n, errorReason: 'behind',
+        } as unknown as ControlMessage);
+        await vi.advanceTimersByTimeAsync(499);
+        expect(subscribesOf(adapter, 'video')).toBe(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(subscribesOf(adapter, 'video')).toBe(2);
     });
 });

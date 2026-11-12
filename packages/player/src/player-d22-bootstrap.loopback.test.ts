@@ -8,11 +8,16 @@
  * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-22 §3.4
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
+import { createLoopback } from '../../webtransport/src/testkit/loopback.js';
+import { MoqtConnection as Connection } from '../../webtransport/src/adapter.js';
 import { MoqtPlayer } from './player.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import { varint } from '@openmoq/transport';
+
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
 
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const td = new TextDecoder();
@@ -102,8 +107,8 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         await player.load();
         await settle();
 
-        // FILL_PARAMETERS = LOCATION_FILTER [1]: the current group.
-        expect(state.catalogFill && Array.from(state.catalogFill)).toEqual([0x21, 0x01, 0x01]);
+        // FILL_PARAMETERS = one parameter, LOCATION_FILTER [1]: the current group.
+        expect(state.catalogFill && Array.from(state.catalogFill)).toEqual([0x01, 0x21, 0x01, 0x01]);
         expect(state.fetches).toBe(0);
         expect(events).toEqual(['received']);
         expect(received[0]).toEqual(['video', 'audio']);
@@ -218,6 +223,40 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         expect(state.mediaSubs.map((m) => m.name)).toContain('video');
         expect(playerErrors).toEqual([]);
         expect(errors).toEqual([]);
+        await player.destroy();
+    });
+});
+
+describe('d22 loopback — migration', () => {
+    it.each([false, true])('the new session asks for the catalog fill and re-subscribes the media played (warm start %s)', async (warmStart) => {
+        const first = await connectedPair(22);
+        const state1 = wireServer(first.server as unknown as MoqtConnection);
+        const { a, b } = createLoopback({});
+        const client2 = new Connection(22);
+        const server2 = new Connection(22, { role: 'server' });
+        const state2 = wireServer(server2 as unknown as MoqtConnection);
+        const player = new MoqtPlayer({
+            url: 'https://unused.example/moq',
+            namespace: 'live/broadcast',
+            connection: first.client as unknown as MoqtConnection,
+            createTransport: async () => a as never,
+            draftVersion: 22,
+            ...(warmStart ? { warmStartCurrentGroup: true } : {}),
+        });
+        const playerErrors: unknown[] = [];
+        player.on('error', (e) => playerErrors.push(e.error));
+        await player.load();
+        await settle();
+        expect(state1.mediaSubs.map((m) => m.name).sort()).toEqual(['audio', 'video']);
+
+        await Promise.all([player.migrate(client2 as unknown as MoqtConnection), server2.connect(b, {})]);
+        await settle();
+
+        expect(state2.catalogFill && Array.from(state2.catalogFill)).toEqual([0x01, 0x21, 0x01, 0x01]);
+        expect(state2.fetches).toBe(0);
+        expect(state2.mediaSubs.map((m) => [m.name, m.fill]).sort())
+            .toEqual([['audio', warmStart], ['video', warmStart]]);
+        expect(playerErrors).toEqual([]);
         await player.destroy();
     });
 });

@@ -87,7 +87,7 @@ import { encodeFetchHeader18, encodeFetchObject18, encodeFetchEndOfRange18 } fro
 
 describe('End-of-Range draft isolation', () => {
   it.each([18, 22] as const)('pins the draft-%s marker bytes', (draft) => {
-    const expected = draft === 18 ? [0x80, 0x8c, 5, 10, 0] : [0x80, 0x8c, 5, 10];
+    const expected = [0x80, 0x8c, 5, 10];
     const { bytes } = encodeFetchEndOfRange18(true, 5n, 10n, undefined, draft);
     expect(bytes).toEqual(new Uint8Array(expected));
     const wire = new Uint8Array([...expected, 0x1c, 1, 0, 7, 1, 0xa3]);

@@ -15,6 +15,7 @@
  */
 
 import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
+import type { LatencyMode, LatencyStats } from './latency-policy.js';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -114,8 +115,12 @@ export interface AudioDecoderLike {
   /** Current decode queue depth. */
   readonly queueDepth: number;
 
-  /** Callback: decoded audio data ready for playout. */
-  onData: ((data: unknown, renderTimeUs: number) => void) | null;
+  /**
+   * Callback: decoded audio data ready for playout. `captureUs` is the
+   * submitted chunk's timestamp: decoders may rebase the output timestamp
+   * (Chrome's AAC decoder emits first-chunk time plus decoded samples).
+   */
+  onData: ((data: unknown, renderTimeUs: number, captureUs?: number) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -180,8 +185,11 @@ export interface VideoRendererLike {
  * Implementations: WebAudio AudioContext, MediaRecorder, NullOutput.
  */
 export interface AudioOutputLike {
-  /** Schedule an audio chunk for playout. */
-  schedule(data: unknown, renderTimeUs: number): void;
+  /**
+   * Schedule an audio chunk for playout. `captureUs`, when given, is the
+   * chunk's capture timestamp; prefer it over the decoded data's own.
+   */
+  schedule(data: unknown, renderTimeUs: number, captureUs?: number): void;
 
   /** Cancel all scheduled audio. */
   flush(): void;
@@ -209,6 +217,15 @@ export interface AudioOutputLike {
    * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
    */
   playheadCaptureUs?(): number | null;
+
+  /**
+   * The playout delay grew: a running chain ahead of its new slot waits for
+   * it once, so audio stays with video. Optional.
+   */
+  realign?(): void;
+
+  /** Video re-anchored: drain any lag the chain now has against its slot, below the target too. Optional. */
+  drainLag?(): void;
 
   /** Release resources. */
   destroy(): void;
@@ -294,6 +311,9 @@ export interface MediaSourceLike {
    * @param codec Codec string for the new mime type
    *              (e.g. `"hvc1.1.6.L93.90"`).
    * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
+   *
+   * The SourceBuffer keeps its timestampOffset: the player's CMAF assembler
+   * already places the new track's fragments on the running timeline.
    */
   changeType?(
     mediaType: 'video' | 'audio',
@@ -313,6 +333,12 @@ export interface MediaSourceLike {
   reset(): void;
 
   /**
+   * Replace a failed MediaSource with a new one on the same element, keeping
+   * callbacks and playback intent. initialize() must be called again.
+   */
+  rebuild?(): void;
+
+  /**
    * The underlying media element. Used by the player for integration
    * (e.g., reading currentTime, attaching to DOM).
    */
@@ -327,6 +353,9 @@ export interface MediaSourceLike {
    * currentTime now outside all buffered ranges).
    */
   getBufferAheadUs?(): number | null;
+
+  /** Video frames the element has handled and dropped since it started; null when not reported. */
+  getPlaybackQuality?(): { readonly totalFrames: number; readonly droppedFrames: number } | null;
 
   /**
    * Whether the media element has attached the MediaSource (MSE
@@ -369,7 +398,21 @@ export interface MediaSourceLike {
   onGapJump?: ((info: {
     from: number; to: number; holeSec: number; waitedMs: number;
     bufferedRanges: string;
+    holeStart: number;
+    reason: 'hole' | 'resubscribe' | 'timeline';
   }) => void) | null;
+
+  /**
+   * OPTIONAL: the player resubscribed past what is buffered, so the next
+   * hole after the current buffered end cannot fill and needs no infill wait.
+   */
+  expectDiscontinuity?(): void;
+
+  /**
+   * OPTIONAL: forget one track's committed group floor; a new subscription
+   * may number groups from zero.
+   */
+  clearGroupFloor?(mediaType: 'video' | 'audio', trackName: string): void;
 
   /**
    * OPTIONAL playback-intent contract.
@@ -384,12 +427,34 @@ export interface MediaSourceLike {
    * must not begin its startup positioning/play sequence until intent is true;
    * withdrawing intent pauses playback that has already started.
    *
-   * Optional for backward compatibility: an adapter that does not implement it
-   * keeps its previous behavior. The player only states an intent it has
-   * actually been given — a player whose play()/pause() was never called leaves
-   * the adapter's own default untouched.
+   * Optional: an adapter that does not implement it keeps its own behavior.
+   * The player always states its current intent on a new adapter; undeclared
+   * means not playing.
    */
   setPlaybackIntent?(intent: boolean): void;
+
+  /**
+   * OPTIONAL: restart playback the browser paused on its own (a frozen or
+   * backgrounded page) while playback intent holds. No-op without intent.
+   */
+  resumePlayback?(): void;
+
+  /**
+   * Playout cushion target in seconds: where live-edge and gap-jump seeks
+   * land, and the set point of the soft rate chase. Derived from
+   * `targetLatencyMs` or the catalog's targetLatency.
+   */
+  setTargetAheadSec?(sec: number): void;
+
+  /**
+   * OPTIONAL: a new latency mode and smooth bounds (s) for the running
+   * adapter. The base target stays; the latency policy is re-bounded, created
+   * or dropped.
+   */
+  setLatency?(latency: { readonly mode: LatencyMode; readonly floorSec: number; readonly ceilingSec: number }): void;
+
+  /** The latency policy's state, or null when the adapter has none. Optional. */
+  latencyStats?(): LatencyStats | null;
 
   /** Release all resources (MediaSource, SourceBuffers, object URLs). */
   destroy(): void;
@@ -407,11 +472,13 @@ export interface MediaSourceLike {
  * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
 export interface CmafAssemblerLike {
+  /** `subgroupId`, when known, lets a gap wait for another subgroup's stream. */
   push(
     mediaType: 'video' | 'audio',
     trackName: string,
     groupId: bigint,
     payload: Uint8Array,
+    subgroupId?: bigint,
   ): void;
   /**
    * Hand the assembler an init segment so it can extract trex defaults
@@ -441,6 +508,17 @@ export interface CmafAssemblerLike {
    * state may ignore the call.
    */
   clearPending?(mediaType: 'video' | 'audio'): void;
+  /**
+   * A new subscription starts a fresh Group ID sequence for one media type:
+   * forget its group order so a restarted publisher's lower groups are not
+   * taken for late data. Optional; assemblers without group state may ignore it.
+   */
+  resetGroupOrder?(mediaType: 'video' | 'audio'): void;
+  /**
+   * Delivery resumes after a pause: the paused interval is not missing media.
+   * Optional; assemblers without ordering state may ignore it.
+   */
+  resumeAfterPause?(): void;
   reset(): void;
   destroy(): void;
 }

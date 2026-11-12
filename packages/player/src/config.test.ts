@@ -328,6 +328,31 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ targetLatencyMs: 1000 }))).not.toThrow();
   });
 
+  // ── renderCushionFloorMs / renderCushionMaxMs ──
+
+  it('rejects renderCushionFloorMs <= 0 and renderCushionMaxMs <= 0', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 0 }))).toThrow(RangeError);
+    expect(() => validateConfig(minConfig({ renderCushionMaxMs: -1 }))).toThrow(RangeError);
+  });
+
+  it('rejects renderCushionMaxMs below renderCushionFloorMs', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 300, renderCushionMaxMs: 200 }))).toThrow(RangeError);
+  });
+
+  it('accepts a render cushion floor at or below its max', () => {
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 50 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 400 }))).not.toThrow();
+  });
+
+  // ── smoothFloorMs ──
+
+  it('accepts a smooth floor of 0 or at most the ceiling, rejects a negative one or one above the ceiling', () => {
+    expect(() => validateConfig(minConfig({ smoothFloorMs: 0 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ smoothFloorMs: 1000, smoothCeilingMs: 1000 }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ smoothFloorMs: -1 }))).toThrow(RangeError);
+    expect(() => validateConfig(minConfig({ smoothFloorMs: 1500, smoothCeilingMs: 1000 }))).toThrow(RangeError);
+  });
+
   // ── deliveryTimeoutMs ──
 
   it('rejects deliveryTimeoutMs <= 0', () => {

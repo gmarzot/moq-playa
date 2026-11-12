@@ -50,15 +50,23 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   /** Whether the codec is AAC (needs ADTS wrapping). */
   private isAAC = false;
 
-  /** FIFO queue: renderTimeUs values awaiting output data. */
-  private readonly renderTimeQueue: number[] = [];
+  /**
+   * FIFO of submitted chunks awaiting output: render time and the chunk's
+   * capture timestamp. The capture timestamp is carried here because the
+   * output's own is not it — Chrome's AAC decoder rebases outputs to
+   * first-chunk time plus decoded samples, so any chunk that never reaches
+   * the decoder leaves every later output timestamp behind.
+   */
+  private readonly renderTimeQueue: Array<{ renderTimeUs: number; captureUs: number }> = [];
 
   /** Error count — limit logging. */
   private errorCount = 0;
+  /** The browser rejected the current configuration; configure() clears it. */
+  private unsupported = false;
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
-  onData: ((data: unknown, renderTimeUs: number) => void) | null = null;
+  onData: ((data: unknown, renderTimeUs: number, captureUs?: number) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
 
   // ─── AudioDecoderLike ───────────────────────────────────────────
@@ -81,7 +89,8 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
    */
   configure(config: Uint8Array, codec: string, sampleRate?: number, channels?: number): void {
     this.lastCodec = codec;
-    this.lastSampleRate = sampleRate ?? 48000;
+    // Opus decodes at 48 kHz whatever rate the catalog names (RFC 7845 §5.1).
+    this.lastSampleRate = codec === 'opus' ? 48000 : sampleRate ?? 48000;
     this.lastChannels = channels ?? 2;
     this.lastDescription = config.length > 0 ? config.slice() : null;
     // AAC without a description runs in ADTS mode (client-side framing).
@@ -90,6 +99,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
     // @see W3C AAC WebCodecs Registration §2
     this.isAAC = codec.startsWith('mp4a.') && this.lastDescription === null;
     this.errorCount = 0;
+    this.unsupported = false;
 
     this.createDecoder();
   }
@@ -126,7 +136,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
       data = wrapInADTS(data, this.lastSampleRate, this.lastChannels);
     }
 
-    this.renderTimeQueue.push(renderTimeUs);
+    this.renderTimeQueue.push({ renderTimeUs, captureUs: chunk.timestamp });
 
     const chunkInit: EncodedAudioChunkInit = {
       type: chunk.type,
@@ -146,7 +156,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   /** Reset the decoder — recreate and reconfigure. No-op if never configured. */
   reset(): void {
     this.renderTimeQueue.length = 0;
-    if (!this.lastCodec) return; // Not yet configured — nothing to reset
+    if (!this.lastCodec || this.unsupported) return; // Not yet configured, or nothing to retry
     this.createDecoder();
   }
 
@@ -180,12 +190,23 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
           audioData.close();
           return;
         }
-        const renderTimeUs = this.renderTimeQueue.shift() ?? 0;
-        this.onData(audioData, renderTimeUs);
+        const queued = this.renderTimeQueue.shift();
+        this.onData(audioData, queued?.renderTimeUs ?? 0, queued?.captureUs);
       },
       error: (err: DOMException) => {
         if (this.decoder !== decoder) return;
         this.errorCount++;
+        // The browser rejected this configuration: a new decoder would fail the same way.
+        if (err.name === 'NotSupportedError') {
+          this.unsupported = true;
+          this.decoder = null;
+          this.renderTimeQueue.length = 0;
+          const error = new Error(`audio decoder does not support ${this.lastCodec} at ${this.lastSampleRate} Hz, `
+            + `${this.lastChannels} ch: ${err.message}`);
+          error.name = 'NotSupportedError';
+          this.onError?.(error);
+          return;
+        }
 
         // Chunks in flight died with the failed decoder — discard their
         // queued render times. Leaving them would pair every later output

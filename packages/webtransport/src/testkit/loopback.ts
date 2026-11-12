@@ -64,6 +64,14 @@ class StreamResetError extends Error {
   }
 }
 
+/** Error shape a writable takes when the peer stops reading it (STOP_SENDING). */
+class StreamStoppedError extends Error {
+  constructor(readonly streamErrorCode = 0) {
+    super(`simulated STOP_SENDING (code ${streamErrorCode})`);
+    this.name = 'StreamStoppedError';
+  }
+}
+
 /**
  * A one-directional byte channel: writes to `writable` are recorded and
  * enqueued to `readable`. Mirrors a single QUIC stream direction.
@@ -80,6 +88,10 @@ export class LoopPipe {
   writeClosed = false;
   writeAborted = false;
   readCancelled = false;
+  /** The reading side stopped this direction ({@link stopWrites}). */
+  writeStopped = false;
+  /** Called when the readable is cancelled, with the cancel reason. */
+  onReadCancel: ((reason: unknown) => void) | null = null;
 
   /** Deterministic fault config (all fields off by default). Mutable: arm late. */
   readonly faults: PipeFaults;
@@ -92,15 +104,17 @@ export class LoopPipe {
   private heldClose = false;
 
   private ctrl!: ReadableStreamDefaultController<Uint8Array>;
+  private writeCtrl!: WritableStreamDefaultController;
   private readClosed = false;
 
   constructor(faults: PipeFaults = {}) {
     this.faults = faults;
     this.readable = new ReadableStream<Uint8Array>({
       start: (c) => { this.ctrl = c; },
-      cancel: () => { this.readCancelled = true; this.readClosed = true; },
+      cancel: (reason) => { this.readCancelled = true; this.readClosed = true; this.onReadCancel?.(reason); },
     });
     this.writable = new WritableStream<Uint8Array>({
+      start: (c) => { this.writeCtrl = c; },
       write: (chunk) => {
         this.written.push(chunk.slice());
         if (!this.readClosed) this.deliver(chunk);
@@ -210,6 +224,20 @@ export class LoopPipe {
     try { this.ctrl.error(new StreamResetError(code)); } catch { /* already closed */ }
   }
 
+  /**
+   * The reader stops this direction: the writable errors as on a received
+   * STOP_SENDING, and the readable ends as it does for a reader that cancelled.
+   */
+  stopWrites(): void {
+    if (this.writeStopped) return;
+    this.writeStopped = true;
+    try { this.writeCtrl.error(new StreamStoppedError()); } catch { /* already closed */ }
+    if (!this.readClosed) {
+      this.readClosed = true;
+      try { this.ctrl.close(); } catch { /* already closed */ }
+    }
+  }
+
   /** Concatenate all written chunks (for assertions). */
   writtenBytes(): Uint8Array {
     const total = this.written.reduce((n, c) => n + c.length, 0);
@@ -263,9 +291,11 @@ export class LoopbackTransport implements WebTransportLike {
 
   /** Default fault config stamped onto every stream pipe this transport opens. */
   private readonly streamFaults: PipeFaults;
+  private readonly answerStopSending: boolean;
 
-  constructor(streamFaults: PipeFaults = {}) {
+  constructor(streamFaults: PipeFaults = {}, options: LoopbackOptions = {}) {
     this.streamFaults = streamFaults;
+    this.answerStopSending = options.answerStopSending ?? false;
     this.incomingUnidirectionalStreams = new ReadableStream<ReadableStream<Uint8Array>>({
       start: (c) => { this.incomingUniCtrl = c; },
     });
@@ -301,6 +331,11 @@ export class LoopbackTransport implements WebTransportLike {
     const inn = new LoopPipe({ ...this.streamFaults }); // peer writes → we read
     const ourView: WebTransportBidirectionalStream = { writable: out.writable, readable: inn.readable };
     const peerView: WebTransportBidirectionalStream = { writable: inn.writable, readable: out.readable };
+    if (this.answerStopSending) {
+      // A STOP_SENDING with a reason comes with a RESET the other side must still see.
+      inn.onReadCancel = (reason) => { if (reason === undefined) out.stopWrites(); };
+      out.onReadCancel = (reason) => { if (reason === undefined) inn.stopWrites(); };
+    }
     this.bidiOut.push({ view: ourView, out, in: inn });
     this.peer.incomingBidiCtrl.enqueue(peerView);
     return ourView;
@@ -314,6 +349,15 @@ export class LoopbackTransport implements WebTransportLike {
   }
 }
 
+export interface LoopbackOptions {
+  /**
+   * On a bidi stream, a plain STOP_SENDING (cancel with no reason) is answered
+   * the way a peer finishing the stream does: it stops reading the other
+   * direction. Off by default: the peer stays half-open.
+   */
+  readonly answerStopSending?: boolean;
+}
+
 /**
  * Create a wired loopback pair: streams `a` opens surface on `b`, and vice versa.
  *
@@ -324,9 +368,10 @@ export class LoopbackTransport implements WebTransportLike {
  */
 export function createLoopback(
   faults: { a?: PipeFaults; b?: PipeFaults } = {},
+  options: LoopbackOptions = {},
 ): { a: LoopbackTransport; b: LoopbackTransport } {
-  const a = new LoopbackTransport(faults.a ?? {});
-  const b = new LoopbackTransport(faults.b ?? {});
+  const a = new LoopbackTransport(faults.a ?? {}, options);
+  const b = new LoopbackTransport(faults.b ?? {}, options);
   a.peer = b;
   b.peer = a;
   return { a, b };

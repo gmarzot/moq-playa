@@ -105,7 +105,8 @@ jobs:
     # Main pushes build this exact image in publish-interop-client.yml. Running
     # both jobs concurrently duplicates a cold Node build and starves each of
     # cache produced by the other; PRs still get the native gate before merge.
-    if: github.event_name == 'pull_request'
+    # Upstream only: forks skip the ~2 h cold Node build.
+    if: github.event_name == 'pull_request' && github.repository == 'openmoq/moq-playa'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

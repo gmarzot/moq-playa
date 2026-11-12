@@ -1,0 +1,538 @@
+/**
+ * MseMediaSource live-edge behaviour: the soft chase and its floor, the
+ * stale-group floor, and the stall nudge / post-stall snap.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { MseMediaSource } from './mse-adapter.js';
+import { MockVideoElement, flush, installMseStubs, makeInit, makeSegment, makeTimeRanges } from './testkit/mse.js';
+
+const stubs = installMseStubs();
+
+describe('MseMediaSource — soft chase', () => {
+    it('soft chase engages two-thirds of the target above it and releases at the target', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2 });
+        (adapter as any).playTriggered = true;
+        const rateAt = (aheadSec: number): number => {
+            video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            video.currentTime = 10;
+            (adapter as any).maybeChaseLiveEdge();
+            return (video as unknown as { playbackRate: number }).playbackRate;
+        };
+        expect(rateAt(0.30)).toBe(1);     // inside the band
+        expect(rateAt(0.35)).toBe(1.05);  // past 0.2 + 0.132
+        expect(rateAt(0.25)).toBe(1.05);  // still above target: keeps chasing
+        expect(rateAt(0.20)).toBe(1);     // back at target: released
+        expect(adapter.chaseStarts).toBe(1);
+        rateAt(0.35);
+        expect(adapter.chaseStarts).toBe(2);
+    });
+
+    it('soft chase ends at the target measured before new media lands', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2 });
+        (adapter as any).playTriggered = true;
+        const rate = () => (video as unknown as { playbackRate: number }).playbackRate;
+        video.currentTime = 10;
+        video.buffered = makeTimeRanges([[0, 10.35]]);
+        (adapter as any).maybeChaseLiveEdge();
+        expect(rate()).toBe(1.05);
+
+        video.buffered = makeTimeRanges([[0, 10.21]]);    // low point, before an append
+        (adapter as any).chase.onLowPoint((adapter as any).cushionAheadSec());
+        expect(rate()).toBe(1.05);
+        video.buffered = makeTimeRanges([[0, 10.2]]);
+        (adapter as any).chase.onLowPoint((adapter as any).cushionAheadSec());
+        expect(rate()).toBe(1);
+
+        video.buffered = makeTimeRanges([[0, 10.25]]);    // the append's peak does not re-engage
+        (adapter as any).maybeChaseLiveEdge();
+        expect(rate()).toBe(1);
+    });
+
+    it('holds a target below 140 ms at 140 ms: the chase stops and live-edge seeks land there', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.06, maxAheadSec: 5 });
+        (adapter as any).playTriggered = true;
+        expect(adapter.cushionTargetSec).toBe(0.14);
+        expect(adapter.minTargetAheadSec).toBe(0.14);
+        adapter.setTargetAheadSec(0.1);
+        expect(adapter.cushionTargetSec).toBe(0.14);
+        const rateAt = (aheadSec: number): number => {
+            video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            video.currentTime = 10;
+            (adapter as any).maybeChaseLiveEdge();
+            return (video as unknown as { playbackRate: number }).playbackRate;
+        };
+        expect(rateAt(0.23)).toBe(1);     // inside the band
+        expect(rateAt(0.24)).toBe(1.05);  // past 0.14 + 0.0924
+        expect(rateAt(0.15)).toBe(1.05);
+        expect(rateAt(0.139)).toBe(1);    // released at the minimum
+
+        rateAt(6);                        // past maxAheadSec
+        expect(video.currentTime).toBeCloseTo(15.86, 5);
+        adapter.setTargetAheadSec(0.25);
+        expect(adapter.cushionTargetSec).toBe(0.25);
+        adapter.destroy();
+    });
+
+    it('smooth: a base below 140 ms is held at 140 ms', () => {
+        const video = new MockVideoElement() as unknown as HTMLVideoElement;
+        const adapter = new MseMediaSource(video, { targetAheadSec: 0.06, latencyMode: 'smooth', smoothFloorSec: 0 });
+        expect(adapter.latencyStats()!.heldMs).toBeCloseTo(140, 5);
+        adapter.setTargetAheadSec(0.1);
+        expect(adapter.latencyStats()!.heldMs).toBeCloseTo(140, 5);
+        adapter.destroy();
+    });
+
+    it('setLatency: smooth to live lowers the target to the base; live to smooth raises it to the new floor', () => {
+        const video = new MockVideoElement() as unknown as HTMLVideoElement;
+        const adapter = new MseMediaSource(video, { targetAheadSec: 0.2, latencyMode: 'smooth' });
+        adapter.setTargetAheadSec(0.3);
+        expect((adapter as any).targetAheadSec).toBe(1);
+        adapter.setLatency({ mode: 'live', floorSec: 1, ceilingSec: 2 });
+        expect(adapter.latencyStats()).toBeNull();
+        expect((adapter as any).targetAheadSec).toBe(0.3);
+        adapter.setLatency({ mode: 'smooth', floorSec: 1.5, ceilingSec: 2 });
+        expect(adapter.latencyStats()).toMatchObject({ mode: 'smooth', heldMs: 1500, floorMs: 1500, ceilingMs: 2000 });
+        expect((adapter as any).targetAheadSec).toBe(1.5);
+        adapter.setLatency({ mode: 'smooth', floorSec: 0.5, ceilingSec: 2 });
+        expect((adapter as any).targetAheadSec).toBe(0.5);
+        adapter.destroy();
+    });
+
+    it('a stall during a chase raises the cushion the chase stops at', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.14 });
+        (adapter as any).playTriggered = true;
+        (adapter as any).chase.noteSampleDuration(0.04);
+        const floors: number[] = [];
+        adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
+        const rate = () => (video as unknown as { playbackRate: number }).playbackRate;
+        const chaseAt = (aheadSec: number) => {
+            video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            (adapter as any).maybeChaseLiveEdge();
+            return rate();
+        };
+        video.currentTime = 10;
+        expect(chaseAt(0.4)).toBe(1.05);
+
+        video.buffered = makeTimeRanges([[0, 10.13]]);
+        (adapter as any).handleWaiting();                  // stalled with 130 ms still buffered
+        expect(floors).toHaveLength(1);
+        expect(floors[0]).toBeCloseTo(0.17, 5);
+        expect(rate()).toBe(1);
+        (adapter as any).cancelStallEpisode();
+
+        expect(chaseAt(0.4)).toBe(1.05);                   // past 0.17 + 0.0924
+        expect(chaseAt(0.18)).toBe(1.05);
+        expect(chaseAt(0.17)).toBe(1);                     // released at the floor, not the target
+    });
+
+    it('a stall during a chase but above its band leaves the floor alone', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2 });
+        (adapter as any).playTriggered = true;
+        const floors: number[] = [];
+        adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
+        video.currentTime = 10;
+        video.buffered = makeTimeRanges([[0, 10.6]]);
+        (adapter as any).maybeChaseLiveEdge();
+        expect((video as unknown as { playbackRate: number }).playbackRate).toBe(1.05);
+
+        video.buffered = makeTimeRanges([[0, 10.55]]);    // 550 ms: above 0.2 + 0.132
+        (adapter as any).handleWaiting();
+        expect(floors).toEqual([]);
+    });
+
+    it('a stall outside a chase leaves the chase floor alone', () => {
+        const video = new MockVideoElement();
+        (video as unknown as { playbackRate: number }).playbackRate = 1;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.1 });
+        (adapter as any).playTriggered = true;
+        const floors: number[] = [];
+        adapter.onChaseFloor = (floorSec) => floors.push(floorSec);
+        video.currentTime = 10;
+        video.buffered = makeTimeRanges([[0, 10.13]]);
+        (adapter as any).handleWaiting();
+        expect(floors).toEqual([]);
+    });
+
+    describe('hidden page', () => {
+        const setup = () => {
+            const video = new MockVideoElement();
+            (video as unknown as { playbackRate: number }).playbackRate = 1;
+            let hidden = false;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { targetAheadSec: 0.2, isHidden: () => hidden });
+            (adapter as any).playTriggered = true;
+            const rate = () => (video as unknown as { playbackRate: number }).playbackRate;
+            const place = (aheadSec: number) => {
+                video.currentTime = 10;
+                video.buffered = makeTimeRanges([[0, 10 + aheadSec]]);
+            };
+            const setHidden = (h: boolean) => { hidden = h; (adapter as any).onVisibilityChange(); };
+            return { video, adapter, rate, place, setHidden };
+        };
+
+        it('does not start a chase while hidden', () => {
+            const { adapter, rate, place, setHidden } = setup();
+            setHidden(true);
+            place(0.35);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(rate()).toBe(1);
+            expect(adapter.chaseStarts).toBe(0);
+        });
+
+        it('stops a running chase when the page hides', () => {
+            const { adapter, rate, place, setHidden } = setup();
+            place(0.35);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(rate()).toBe(1.05);
+            setHidden(true);
+            expect(rate()).toBe(1);
+        });
+
+        it('a stall while hidden does not raise the chase floor', () => {
+            const { adapter, place, setHidden } = setup();
+            setHidden(true);
+            place(0.3);
+            (adapter as any).maybeChaseLiveEdge();
+            (adapter as any).noteChaseStall();
+            expect(adapter.cushionTargetSec).toBe(0.2);
+        });
+
+        it('keeps the behind-live cap while hidden', () => {
+            const { adapter, video, place, setHidden } = setup();
+            setHidden(true);
+            (adapter as any).maxAheadSec = 5;
+            place(6);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(video.currentTime).toBeCloseTo(15.8);
+        });
+
+        it('jumps a large backlog on return', () => {
+            const { video, place, setHidden } = setup();
+            setHidden(true);
+            place(1.5);
+            setHidden(false);
+            expect(video.currentTime).toBeCloseTo(11.3);
+        });
+
+        it('leaves a small backlog to the chase on return', () => {
+            const { adapter, video, rate, place, setHidden } = setup();
+            setHidden(true);
+            place(0.4);
+            setHidden(false);
+            expect(video.currentTime).toBe(10);
+            (adapter as any).maybeChaseLiveEdge();
+            expect(rate()).toBe(1.05);
+        });
+
+        it('leaves a paused element alone on return', () => {
+            const { video, place, setHidden } = setup();
+            setHidden(true);
+            place(3);
+            (video as unknown as { paused: boolean }).paused = true;
+            setHidden(false);
+            expect(video.currentTime).toBe(10);
+        });
+    });
+});
+
+describe('stale-group floor', () => {
+    it('video drops two groups behind the floor, appends one behind; audio is exempt', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const initData = makeInit(1, 100);
+        adapter.initialize({
+            video: { codec: 'avc1.42c01e', initData },
+            audio: { codec: 'mp4a.40.2', initData },
+        });
+        stubs.ms().open();
+        await flush();
+        await flush();
+        const vsb = stubs.ms().videoBuffer;
+        const asb = stubs.ms().audioBuffer;
+        const seg = (bmd: number) => makeSegment({ bmd, defaultDur: 100, sampleCount: 1 });
+
+        adapter.appendChunk('video', seg(1000), 'v', 10n);                 // floor → 10
+        await flush(); await flush();
+        const vBase = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', seg(800), 'v', 8n);                   // two behind: dropped
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(vBase);
+        adapter.appendChunk('video', seg(900), 'v', 9n);                   // previous group: late tail, appends
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(vBase + 1);
+
+        adapter.appendChunk('audio', seg(1000), 'a', 100n);                // audio floor → 100
+        await flush(); await flush();
+        const aBase = asb.appendedPayloads.length;
+        adapter.appendChunk('audio', seg(840), 'a', 92n);                  // 8 groups (~170ms) late: appends
+        await flush(); await flush();
+        expect(asb.appendedPayloads.length).toBe(aBase + 1);
+        adapter.destroy();
+    });
+
+    it('clearTimeline drops the floor so a renumbered epoch is not stale', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        stubs.ms().open();
+        await flush();
+        await flush();
+        const vsb = stubs.ms().videoBuffer;
+        const seg = (bmd: number) => makeSegment({ bmd, defaultDur: 100, sampleCount: 1 });
+
+        adapter.appendChunk('video', seg(5000), 'v', 50n);                 // floor → 50
+        await flush(); await flush();
+        expect(adapter.getCommittedGroupFloor('video', 'v')).toBe(50n);
+
+        // Source restart renumbers groups downward; without the floor clear
+        // every chunk of the new epoch reads as stale and is dropped forever.
+        adapter.clearTimeline('video', 'v');
+        expect(adapter.getCommittedGroupFloor('video', 'v')).toBeUndefined();
+
+        const base = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', seg(100), 'v', 1n);
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.destroy();
+    });
+});
+
+describe('replay containment', () => {
+    it('appends a new frame inside a long previous frame; drops a true redelivery', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        stubs.ms().open();
+        await flush();
+        await flush();
+        const vsb = stubs.ms().videoBuffer;
+        const frame = (bmd: number, dur: number) => makeSegment({ bmd, defaultDur: dur, sampleCount: 1 });
+
+        adapter.appendChunk('video', frame(1000, 81), 'v', 1n);     // after a skipped frame: [1000, 1081)
+        await flush(); await flush();
+        const base = vsb.appendedPayloads.length;
+        adapter.appendChunk('video', frame(1004, 4), 'v', 1n);      // burst, 4 later: inside, but new
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.appendChunk('video', frame(1000, 81), 'v', 1n);     // redelivered: dropped
+        await flush(); await flush();
+        expect(vsb.appendedPayloads.length).toBe(base + 1);
+        adapter.destroy();
+    });
+});
+
+describe('stall nudge and post-stall live-edge snap', () => {
+    function stallSetup(opts: { maxAheadSec?: number; latencyMode?: 'live' | 'smooth'; smoothFloorSec?: number } = {}) {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[5, 25]]);
+        video.currentTime = 10;
+        video.readyState = 2;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+            targetAheadSec: 0.2,
+            ...(opts.maxAheadSec !== undefined ? { maxAheadSec: opts.maxAheadSec } : {}),
+            ...(opts.latencyMode !== undefined ? { latencyMode: opts.latencyMode } : {}),
+            ...(opts.smoothFloorSec !== undefined ? { smoothFloorSec: opts.smoothFloorSec } : {}),
+        });
+        (adapter as any).playTriggered = true;
+        const adjusts: Array<[string, number, number]> = [];
+        adapter.onPlayheadAdjust = (kind, from, to) => adjusts.push([kind, from, to]);
+        return { adapter, video, adjusts };
+    }
+
+    it('nudges a playhead frozen with media ahead once, after 500 ms', () => {
+        vi.useFakeTimers();
+        try {
+            const { adapter, video, adjusts } = stallSetup();
+            (adapter as any).handleWaiting();
+            vi.advanceTimersByTime(400);
+            expect(video.currentTime).toBe(10);
+            vi.advanceTimersByTime(200);
+            expect(video.currentTime).toBeCloseTo(10.1, 5);
+            expect(adjusts).toEqual([['nudge', 10, expect.closeTo(10.1, 5)]]);
+            // The nudge's own seek-generated waiting does not nudge again.
+            (adapter as any).handleWaiting();
+            vi.advanceTimersByTime(1_000);
+            expect(adjusts).toHaveLength(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('does not nudge without media ahead, while paused, or after the stall ended', () => {
+        vi.useFakeTimers();
+        try {
+            const thin = stallSetup();
+            thin.video.currentTime = 24.7;              // 0.3 s ahead
+            (thin.adapter as any).handleWaiting();
+            vi.advanceTimersByTime(600);
+            expect(thin.adjusts).toEqual([]);
+
+            const paused = stallSetup();
+            (paused.adapter as any).handleWaiting();
+            paused.video.paused = true;
+            vi.advanceTimersByTime(600);
+            expect(paused.adjusts).toEqual([]);
+
+            const ended = stallSetup();
+            (ended.adapter as any).handleWaiting();
+            (ended.adapter as any).handlePlaying();    // resumed before the nudge
+            vi.advanceTimersByTime(600);
+            expect(ended.adjusts).toEqual([]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('after a detected stall, snaps a live cushion more than 1 s over target, keeping the stall\'s length above target', () => {
+        vi.useFakeTimers();
+        try {
+            const { adapter, video, adjusts } = stallSetup();
+            let outageSec: number | null = null;
+            adapter.onStallRecovered = (ms) => { outageSec = ms / 1000; };
+            video.currentTime = 20;                     // 5 s ahead, target 0.2 s
+            (adapter as any).handleWaiting();
+            vi.advanceTimersByTime(300);                // detected (default threshold)
+            video.currentTime = 20;                     // undo the nudge for a clean read
+            adjusts.length = 0;
+            (adapter as any).handlePlaying();
+            expect(outageSec).toBeCloseTo(0.3, 2);
+            const to = 25 - 0.2 - Math.min(outageSec!, 1);   // 24.5
+            expect(video.currentTime).toBeCloseTo(to, 5);
+            expect(adjusts).toEqual([['snap', 20, expect.closeTo(to, 5)]]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('smooth: a detected stall raises the target by its length, keeping the backlog live sheds', () => {
+        vi.useFakeTimers();
+        try {
+            const live = stallSetup();
+            const smooth = stallSetup({ latencyMode: 'smooth', smoothFloorSec: 0 });
+            // Past Smooth's startup grace.
+            (smooth.adapter as any).noteLatencySlack(1);
+            vi.advanceTimersByTime(3_000);
+            for (const { adapter, video } of [live, smooth]) {
+                video.currentTime = 23.2;               // 1.8 s ahead, target 0.2 s
+                (adapter as any).handleWaiting();
+                vi.advanceTimersByTime(300);            // detected
+                (adapter as any).handlePlaying();
+            }
+            // Live: 25 - 0.2 - 0.3 = 24.5 is 1.3 s ahead of the playhead, so it snaps.
+            expect(live.adjusts.filter(([k]) => k === 'snap')).toHaveLength(1);
+            expect(live.adapter.latencyStats()).toBeNull();
+            // Smooth: the target rose to 0.2 + 0.3 + 0.05, inside the snap's excess.
+            expect(smooth.adjusts).toEqual([]);
+            expect(smooth.adapter.latencyStats()).toMatchObject({ mode: 'smooth', raises: 1 });
+            expect(smooth.adapter.latencyStats()!.heldMs).toBeCloseTo(550, 0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('smooth: the target starts at the 1 s floor, above a 0.2 s live target', () => {
+        const smooth = stallSetup({ latencyMode: 'smooth' });
+        expect((smooth.adapter as any).targetAheadSec).toBe(1);
+        expect(smooth.adapter.latencyStats()).toMatchObject({ mode: 'smooth', heldMs: 1000, floorMs: 1000 });
+        smooth.adapter.destroy();
+    });
+
+    it('smooth: playback starts once the held delay is buffered; live starts on the first range', async () => {
+        const start = (latencyMode?: 'smooth') => {
+            const video = new MockVideoElement();
+            video.buffered = makeTimeRanges([[10, 10.3]]);
+            video.currentTime = 10;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+                targetAheadSec: 0.2,
+                ...(latencyMode ? { latencyMode } : {}),
+            });
+            return { video, adapter };
+        };
+        const live = start();
+        const smooth = start('smooth');
+        await (live.adapter as any).requestStartup();
+        await (smooth.adapter as any).requestStartup();
+        await flush();
+        expect(live.video.playCalls).toBe(1);
+        expect(smooth.video.playCalls).toBe(0);
+        smooth.video.buffered = makeTimeRanges([[10, 10.97]]);   // within 50 ms of 1 s
+        await (smooth.adapter as any).requestStartup();
+        await flush();
+        expect(smooth.video.playCalls).toBe(1);
+        live.adapter.destroy();
+        smooth.adapter.destroy();
+    });
+
+    it('smooth: a held delay that never fills starts playback after it would have filled plus 1 s', async () => {
+        vi.useFakeTimers();
+        try {
+            const video = new MockVideoElement();
+            video.buffered = makeTimeRanges([[10, 10.3]]);
+            video.currentTime = 10;
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+                targetAheadSec: 0.2, latencyMode: 'smooth',
+            });
+            await (adapter as any).requestStartup();
+            await vi.advanceTimersByTimeAsync(1_900);
+            expect(video.playCalls).toBe(0);
+            await vi.advanceTimersByTimeAsync(200);
+            expect(video.playCalls).toBe(1);
+            adapter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('rejects a non-finite or negative smoothFloorSec', () => {
+        const video = new MockVideoElement() as unknown as HTMLVideoElement;
+        expect(() => new MseMediaSource(video, { latencyMode: 'smooth', smoothFloorSec: Number.NaN })).toThrow(/smoothFloorSec/);
+        expect(() => new MseMediaSource(video, { latencyMode: 'smooth', smoothFloorSec: -1 })).toThrow(/smoothFloorSec/);
+    });
+
+    it('does not snap after an undetected wait, near target, or on a non-live stream', () => {
+        vi.useFakeTimers();
+        try {
+            const brief = stallSetup();
+            brief.video.currentTime = 20;
+            (brief.adapter as any).handleWaiting();
+            (brief.adapter as any).handlePlaying();    // below the detection threshold
+            expect(brief.adjusts).toEqual([]);
+
+            const near = stallSetup();
+            near.video.currentTime = 24;                // 1 s ahead: 0.8 s over target
+            (near.adapter as any).handleWaiting();
+            vi.advanceTimersByTime(300);
+            (near.adapter as any).handlePlaying();
+            expect(near.adjusts.filter(([k]) => k === 'snap')).toEqual([]);
+
+            const vod = stallSetup({ maxAheadSec: Infinity });
+            vod.video.currentTime = 20;
+            (vod.adapter as any).handleWaiting();
+            vi.advanceTimersByTime(300);
+            (vod.adapter as any).handlePlaying();
+            expect(vod.adjusts.filter(([k]) => k === 'snap')).toEqual([]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('describes each SourceBuffer and the frame counters', () => {
+        const { adapter } = stallSetup();
+        (adapter as any).videoBuffer = { buffered: makeTimeRanges([[5, 25]]) };
+        (adapter as any).audioBuffer = { buffered: makeTimeRanges([[5, 12], [12.04, 25]]) };
+        expect(adapter.describeBuffers())
+            .toBe('video=[5.00–25.00] audio=[5.00–12.00][12.04–25.00] frames=100 dropped=2');
+        expect(adapter.bufferedRanges('audio')).toEqual([[5, 12], [12.04, 25]]);
+        (adapter as any).videoBuffer = null;
+        expect(adapter.bufferedRanges('video')).toEqual([]);
+    });
+});

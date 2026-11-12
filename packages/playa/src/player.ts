@@ -37,6 +37,9 @@ import {
   MoqtPlayer, QualityController, TypedEmitter, checkSupport, usesMsePath,
 } from '@openmoq/player';
 import type { LocmafDecoding, MoqtPlayerConfig, SupportReport, VideoPresentation } from '@openmoq/player';
+import type { BootstrapPhase, NamespaceState, SubscriptionStatus } from '@openmoq/player';
+import type { AudioTrackInfo, ProgramInfo, VideoViewInfo } from '@openmoq/player';
+import { forwardSelectionEvents } from './selection.js';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
@@ -54,20 +57,24 @@ import { detectStrategy } from './auto-detect.js';
 import type { DecoderStrategy } from './auto-detect.js';
 import { VolumeController } from './volume-controller.js';
 import { TimeController } from './time-controller.js';
+import type { CatalogState } from '@openmoq/msf';
 import { mapLevels, mapAudioTracks } from './level-mapper.js';
-import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
+import type { PlayerOptions, PlaybackUpdate, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 import type { PlayerEventMap } from './events.js';
 import type { AltGroup } from '@openmoq/msf';
 
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
-  draftVersion: 16 as const,
   autoplay: false,
   volume: 1,
   muted: false,
   autoQuality: true,
   startLevel: 'auto' as const,
 } satisfies Partial<PlayerOptions>;
+
+/** PlaybackUpdate keys that are also top-level PlayerOptions. */
+const PLAYER_PLAYBACK_KEYS = ['targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs'] as const satisfies
+  ReadonlyArray<keyof PlayerOptions & keyof PlaybackUpdate>;
 
 /**
  * Batteries-included MoQ media player.
@@ -98,7 +105,7 @@ export class Player {
   private presentationRetired = false;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private readonly container: HTMLElement | null;
-  private readonly options: PlayerOptions;
+  private options: PlayerOptions;
   private readonly strategy: DecoderStrategy;
   /** How the engine consumes LOCMAF tracks; decides the render sink for them. */
   private readonly locmafDecoding: LocmafDecoding | undefined;
@@ -113,18 +120,48 @@ export class Player {
   private ownsCanvas = false;
   private ownsVideo = false;
 
+  /** When the page went away, for the duration reported on the way back. */
+  private awaySinceMs: number | null = null;
+  /** When the page was frozen. Only a frozen page stops draining; a hidden one keeps up. */
+  private frozenSinceMs: number | null = null;
+  /** Frozen at least this long and the buffer is stale: re-join live rather than play it out. */
+  private static readonly RESUME_JUMP_TO_LIVE_MS = 3_000;
+  /** pauseWhenHidden: why delivery is paused, until the page is visible again. */
+  private hiddenPause: 'silent' | 'throttled' | null = null;
+  /** pauseWhenHidden: a chained timer while hidden and playing. */
+  private hiddenProbe: ReturnType<typeof setTimeout> | null = null;
+  private static readonly HIDDEN_PROBE_MS = 1_000;
+  private static readonly HIDDEN_SILENT_PAUSE_MS = 60_000;
+  /** A probe this late means the browser runs the page's timers only in bursts. */
+  private static readonly HIDDEN_THROTTLED_LATE_MS = 10_000;
+
+  /** The MSE autoplay ladder may mute the element itself; mirror it. */
+  private readonly syncMutedFromElement = (): void => {
+    const el = this.videoElement;
+    if (!el || el.muted === this._muted) return;
+    this._muted = el.muted;
+    this.emitter.emit('volumechange', { volume: this.volume, muted: this.muted });
+  };
+
   // Resolved after catalog_received — 'canvas' for LOC/WebCodecs, 'video' for CMAF/MSE.
   private _activeMediaType: 'canvas' | 'video' | null = null;
   private webAudioRequired = false;
 
   // Controllers
   private volumeCtrl: VolumeController | null = null;
+  /** Live-edge aim from the catalog target, applied to each audio output. */
+  private liveEdgeTargetSec: number | null = null;
+  /** The largest catalog targetLatency (ms); 0 when none. */
+  private catalogTargetLatencyMs = 0;
   private timeCtrl: TimeController | null = null;
 
   // Adapter instances (held for lifecycle)
   private readonly audioClock = new AudioAlignedClock();
   private readonly deferredAudio = new DeferredAudioOutput();
   private renderer: CanvasRenderer | null = null;
+  /** Congestion-control class the browser reported for the latest transport. */
+  private _congestionControl: string | undefined;
+  private audioOutput: WebAudioOutput | null = null;
   private audioCtx: AudioContext | null = null;
   private _prepareAudioPromise: Promise<void> | null = null;
 
@@ -160,6 +197,7 @@ export class Player {
     this._autoQuality = options.autoQuality ?? DEFAULTS.autoQuality;
     this._volume = this.clampVolume(options.volume ?? DEFAULTS.volume);
     this._muted = options.muted ?? DEFAULTS.muted;
+    this.installLifecycleListeners();
 
     // Detect decode strategy
     this.strategy = detectStrategy();
@@ -186,6 +224,7 @@ export class Player {
       this.videoElement = options.video;
       this.videoElement.volume = this._volume;
       this.videoElement.muted = this._muted;
+      this.videoElement.addEventListener?.('volumechange', this.syncMutedFromElement);
       this.ownsVideo = false;
     } else if (container) {
       // Classic mode: create the element and append it to the container.
@@ -197,6 +236,7 @@ export class Player {
       this.videoElement.hidden = this.strategy === 'webcodecs';
       this.videoElement.volume = this._volume;
       this.videoElement.muted = this._muted;
+      this.videoElement.addEventListener?.('volumechange', this.syncMutedFromElement);
       container.appendChild(this.videoElement);
       this.ownsVideo = true;
     }
@@ -236,6 +276,19 @@ export class Player {
 
   /** Current player state. */
   get state(): PlayerState { return this._state; }
+
+  /** Congestion-control class the browser applied to the current transport,
+   *  or undefined where it does not report one. */
+  get congestionControl(): string | undefined { return this._congestionControl; }
+
+  /** The SUBSCRIBEs this player holds, with their MoQT state. */
+  get subscriptions(): readonly SubscriptionStatus[] { return this.engine.subscriptions; }
+
+  /** The followed namespace's state at the relay, or null when not following. */
+  get namespaceState(): NamespaceState | null { return this.engine.namespaceState; }
+
+  /** The catalog retrieval step; null in subscribe-only mode. */
+  get catalogBootstrapPhase(): BootstrapPhase | null { return this.engine.catalogBootstrapPhase; }
 
   /**
    * Which media element is currently used as the render sink.
@@ -288,22 +341,80 @@ export class Player {
   /** Current audio track index. */
   get currentAudioTrack(): number { return this._currentAudioTrack; }
 
+  // ─── Programs, views and audio languages ────────────────────────
+
+  /** Catalog programs (renderGroups). */
+  get availablePrograms(): readonly ProgramInfo[] { return this.engine.availablePrograms; }
+
+  /** renderGroup of the program playing. */
+  get currentProgram(): number | undefined { return this.engine.currentProgram; }
+
+  /** Video views (altGroups) of the current program. */
+  get availableViews(): readonly VideoViewInfo[] { return this.engine.availableViews; }
+
+  /** altGroup of the view playing. */
+  get currentView(): number | undefined { return this.engine.currentView; }
+
+  /** Audio tracks of the current program, e.g. one per language. */
+  get availableAudioTracks(): readonly AudioTrackInfo[] { return this.engine.availableAudioTracks; }
+
+  /** Name of the audio track playing. */
+  get currentAudioTrackName(): string | undefined { return this.engine.currentAudioTrack; }
+
+  /** Switch program live: video and audio together, keeping the language when it can. */
+  selectProgram(renderGroup: number): Promise<void> { return this.engine.selectProgram(renderGroup); }
+
+  /** Switch to another view of the current program live; audio is untouched. */
+  selectView(altGroup: number): Promise<void> { return this.engine.selectView(altGroup); }
+
+  /** Switch audio track live (e.g. another language); video is untouched. */
+  selectAudioTrack(trackName: string): Promise<void> { return this.engine.selectAudioTrack(trackName); }
+
   /** Simplified stats for UI display. */
   get stats(): PlayerStats {
     const s = this.engine.stats;
+    // MSE path: the engine counts only WebCodecs frames; the element knows.
+    const q = this._activeMediaType === 'video' && this.videoElement?.getVideoPlaybackQuality
+      ? this.videoElement.getVideoPlaybackQuality() : null;
     return {
-      framesDecoded: s.framesDecoded,
-      framesRendered: s.framesRendered,
-      framesDropped: s.framesDropped,
+      framesDecoded: q ? q.totalVideoFrames : s.framesDecoded,
+      framesRendered: q ? q.totalVideoFrames - q.droppedVideoFrames : s.framesRendered,
+      framesDropped: q ? q.droppedVideoFrames : s.framesDropped,
       bitrate: s.currentBitrate,
-      latencyMs: 0, // TODO: derive from sync controller
+      latencyMs: s.currentLatencyMs,
       stallCount: s.stallCount,
       timeToFirstFrameMs: s.timeToFirstFrameMs,
+      ttffBreakdown: s.ttffBreakdown,
       resolution: s.currentResolution ?? null,
       videoCodec: s.currentVideoCodec ?? null,
       audioCodec: s.currentAudioCodec ?? null,
       sessionAgeMs: s.sessionAgeMs,
+      stallDurationMs: s.totalStallDurationMs,
+      ongoingStallMs: s.ongoingStallMs,
+      gapCount: s.gapCount,
+      avSkewMs: s.avSkewEwmaMs ?? null,
+      cushionMs: this.cushionMs(),
+      audioUnderruns: this.audioOutput?.underrunCount ?? 0,
+      latency: s.latency,
     };
+  }
+
+  /** Playable media ahead of the playhead, per active path. */
+  private cushionMs(): number | null {
+    const v = this.videoElement;
+    if (this._activeMediaType === 'video' && v) {
+      let buffered: TimeRanges;
+      try { buffered = v.buffered; } catch { return null; }
+      const t = v.currentTime;
+      for (let i = 0; i < buffered.length; i++) {
+        if (buffered.start(i) <= t + 0.05 && t < buffered.end(i)) {
+          return (buffered.end(i) - t) * 1000;
+        }
+      }
+      return buffered.length ? 0 : null;
+    }
+    if (this.audioOutput) return this.audioOutput.scheduledAheadSec * 1000;
+    return this.engine.stats.loc?.renderCushionMs ?? null;
   }
 
   // ─── Lifecycle Methods ───────────────────────────────────────────
@@ -322,6 +433,7 @@ export class Player {
    * In 'gesture' mode, audio stays deferred until prepareAudio()/unmute().
    */
   play(): void {
+    this.hiddenPause = null;
     if (this.options.audioActivation !== 'gesture') {
       this.ensureAudioContext();
     }
@@ -335,6 +447,7 @@ export class Player {
 
   /** Pause playback (REQUEST_UPDATE forward:0). */
   pause(): void {
+    this.hiddenPause = null;
     this.engine.pause();
     this.renderer?.stop();
     this.timeCtrl?.stop();
@@ -376,6 +489,26 @@ export class Player {
     this.engine.setAutoQuality(false);
     const level = this._levels[levelIndex]!;
     await this.engine.selectVideoTrack(level.trackName, 'manual');
+  }
+
+  /**
+   * Apply playback settings to the running session without a reload; video
+   * keeps playing. Throws on an invalid merged config, changing nothing.
+   */
+  updatePlayback(update: PlaybackUpdate): void {
+    this.engine.updatePlayback(update);
+    // Top-level keys stay top-level, the rest go in moqtPlayerConfig; either replaces a moqtPlayerConfig override.
+    const top: Record<string, unknown> = { ...this.options };
+    const engine: Record<string, unknown> = { ...this.options.moqtPlayerConfig };
+    for (const [key, value] of Object.entries(update)) {
+      delete engine[key];
+      const into = (PLAYER_PLAYBACK_KEYS as readonly string[]).includes(key) ? top : engine;
+      if (value === undefined) delete into[key];
+      else into[key] = value;
+    }
+    top['moqtPlayerConfig'] = engine;
+    this.options = top as unknown as PlayerOptions;
+    if ('targetLatencyMs' in update) this.aimLiveEdge();
   }
 
   /** Set audio track by index. */
@@ -427,8 +560,8 @@ export class Player {
 
   /**
    * Prepare audio for playback. Creates AudioContext (WebCodecs path only),
-   * attaches the audio-aligned clock, creates VolumeController, and activates
-   * the deferred audio output.
+   * attaches the audio-aligned clock, creates VolumeController, and — under
+   * `audioActivation: 'gesture'` — activates the deferred audio output.
    *
    * When the selected audio uses MSE, the HTMLVideoElement owns audio and
    * no AudioContext is created. Safe to call either way.
@@ -447,17 +580,17 @@ export class Player {
       this.ensureAudioContext();
       await this.audioCtx!.resume();
 
-      // Activate deferred audio output — real WebAudioOutput starts receiving data.
-      // The deferred output may or may not have been wired into the pipeline yet
-      // (depends on whether createAudioOutput factory has fired). Either way,
-      // activating it now means any subsequent or queued schedule() calls forward
-      // to the real output.
-      if (!this.deferredAudio.isActive) {
+      // Only the deferred proxy needs a real output installed here. Eager mode
+      // wires one at pipeline creation; replacing it would orphan the output the
+      // decoder feeds, leaving every audio gauge reading a dead instance.
+      if (this.options.audioActivation === 'gesture' && !this.deferredAudio.isActive) {
         const dest = this.volumeCtrl?.destinationNode;
         // Delay unification: the shared playout cushion arrives inside
         // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
         // output must not add a second, divergent delay of its own.
         const real = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+        if (this.liveEdgeTargetSec !== null) real.setTargetAheadSec(this.liveEdgeTargetSec);
+        this.audioOutput = real;
         this.deferredAudio.activate(real);
       }
     })();
@@ -499,8 +632,112 @@ export class Player {
 
   // ─── Cleanup ─────────────────────────────────────────────────────
 
+  /** Report page-lifecycle transitions; re-join live after RESUME_JUMP_TO_LIVE_MS frozen. */
+  private readonly onLifecycle = (kind: 'hidden' | 'visible' | 'frozen' | 'resumed'): void => {
+    if (kind === 'hidden' || kind === 'frozen') {
+      this.awaySinceMs ??= Date.now();
+      if (kind === 'frozen') this.frozenSinceMs ??= Date.now();
+      this.emitter.emit('lifecycle', { state: kind });
+      if (kind === 'hidden') this.startHiddenProbe();
+      return;
+    }
+    this.stopHiddenProbe();
+    // A frozen page can resume while still hidden: it stays paused and is watched again.
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.startHiddenProbe();
+      if (this.hiddenPause !== null) return;
+    }
+    const now = Date.now();
+    const awayMs = this.awaySinceMs === null ? 0 : now - this.awaySinceMs;
+    const frozenMs = this.frozenSinceMs === null ? 0 : now - this.frozenSinceMs;
+    this.awaySinceMs = null;
+    this.frozenSinceMs = null;
+    const rejoin = this.hiddenPause !== null;
+    this.emitter.emit('lifecycle', { state: kind, awayMs, ...(rejoin ? { rejoined: true } : {}) });
+    this.engine.reconnectNow();
+    if (rejoin) {
+      // From paused, play() resets the pipelines and resumes forwarding at the live edge.
+      this.play();
+      return;
+    }
+    // A frozen page comes back with its media element and audio context suspended.
+    if (this.state === 'playing') {
+      this.engine.resumeSuspendedPlayback();
+      if (this.audioCtx && this.audioCtx.state !== 'running' && this.audioCtx.state !== 'closed') {
+        void this.audioCtx.resume().catch(() => { /* needs a gesture */ });
+      }
+    }
+    if (frozenMs >= Player.RESUME_JUMP_TO_LIVE_MS && this.state === 'playing') {
+      this.engine.jumpToLive(`resumed after ${(frozenMs / 1000).toFixed(1)}s frozen`);
+    }
+  };
+
+  /** pauseWhenHidden: once a second while hidden and playing, until it pauses. */
+  private startHiddenProbe(): void {
+    if (!this.options.pauseWhenHidden || this.hiddenProbe !== null || this._state !== 'playing') return;
+    const hiddenAtMs = Date.now();
+    let dueMs = hiddenAtMs + Player.HIDDEN_PROBE_MS;
+    const probe = (): void => {
+      this.hiddenProbe = null;
+      if (this._state !== 'playing' || typeof document === 'undefined' || !document.hidden) return;
+      const now = Date.now();
+      const lateMs = now - dueMs;
+      if (lateMs >= Player.HIDDEN_THROTTLED_LATE_MS) {
+        this.pauseForHidden('throttled', lateMs);
+      } else if (now - hiddenAtMs >= Player.HIDDEN_SILENT_PAUSE_MS && this.isSilent()) {
+        this.pauseForHidden('silent');
+      } else {
+        dueMs = now + Player.HIDDEN_PROBE_MS;
+        this.hiddenProbe = setTimeout(probe, Player.HIDDEN_PROBE_MS);
+      }
+    };
+    this.hiddenProbe = setTimeout(probe, Player.HIDDEN_PROBE_MS);
+  }
+
+  private stopHiddenProbe(): void {
+    if (this.hiddenProbe === null) return;
+    clearTimeout(this.hiddenProbe);
+    this.hiddenProbe = null;
+  }
+
+  /** Muted, at volume 0, or with its audio context not running. */
+  private isSilent(): boolean {
+    return this._muted || this._volume === 0
+      || (this.audioCtx !== null && this.audioCtx.state !== 'running');
+  }
+
+  private pauseForHidden(reason: 'silent' | 'throttled', lateMs?: number): void {
+    this.pause();
+    this.hiddenPause = reason;
+    this.emitter.emit('lifecycle', {
+      state: 'hidden', paused: reason, ...(lateMs !== undefined ? { lateMs: Math.round(lateMs) } : {}),
+    });
+  }
+
+  private readonly onVisibilityChange = (): void =>
+    this.onLifecycle(document.hidden ? 'hidden' : 'visible');
+  private readonly onFreeze = (): void => this.onLifecycle('frozen');
+  private readonly onResume = (): void => this.onLifecycle('resumed');
+
+  /** No-op without a DOM (tests, Node). */
+  private installLifecycleListeners(): void {
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    document.addEventListener('freeze', this.onFreeze);
+    document.addEventListener('resume', this.onResume);
+  }
+
+  private removeLifecycleListeners(): void {
+    this.stopHiddenProbe();
+    if (typeof document === 'undefined' || typeof document.removeEventListener !== 'function') return;
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    document.removeEventListener('freeze', this.onFreeze);
+    document.removeEventListener('resume', this.onResume);
+  }
+
   /** Destroy the player and release all resources. */
   async destroy(): Promise<void> {
+    this.removeLifecycleListeners();
     this.presentationRetired = true;
     this.timeCtrl?.stop();
     this.stopStatsTimer();
@@ -510,6 +747,7 @@ export class Player {
     }
     this.audioClock.detachAudioContext();
     await this.engine.destroy();
+    this.videoElement?.removeEventListener?.('volumechange', this.syncMutedFromElement);
 
     // Remove owned DOM elements (never touch caller-provided elements).
     // ownsCanvas/ownsVideo are only true when container was non-null (invariant),
@@ -528,20 +766,48 @@ export class Player {
 
   private buildMoqtPlayerConfig(): MoqtPlayerConfig {
     const opts = this.options;
-    const draftVersion = opts.draftVersion ?? DEFAULTS.draftVersion;
+    // Unset: offer every draft and play the one the relay picks.
+    const draftVersion = opts.draftVersion;
+    const transportFactory = createWebTransport({
+      ...(opts.certHash ? { certHash: opts.certHash } : {}),
+      ...(opts.congestionControl ? { congestionControl: opts.congestionControl } : {}),
+      ...(draftVersion !== undefined ? { draftVersion } : {}),
+    });
 
     const base: MoqtPlayerConfig = {
       url: opts.url,
       namespace: opts.namespace,
-      draftVersion,
+      ...(draftVersion !== undefined ? { draftVersion } : {}),
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,
-      createTransport: createWebTransport({
-        ...(opts.certHash ? { certHash: opts.certHash } : {}),
+      // Every transport, a reconnect's included, records what the browser applied.
+      createTransport: async (url: string) => {
+        const transport = await transportFactory(url);
+        this._congestionControl = transport.congestionControl;
+        return transport;
+      },
+      createConnection: () => new MoqtConnection(
         draftVersion,
-      }),
-      createConnection: () => new MoqtConnection(draftVersion),
+        opts.maxPendingStreams === undefined ? {} : { maxPendingUniStreams: opts.maxPendingStreams },
+      ),
+      // Asks the decoder the track would use (MSE or WebCodecs); without that API, or on error, the track is tried.
+      canDecodeVideo: async (track): Promise<boolean> => {
+        const codec = track.codec;
+        if (!codec) return true;
+        try {
+          if (usesMsePath(track.packaging, this.locmafDecoding)) {
+            return typeof MediaSource === 'undefined' || MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`);
+          }
+          if (typeof VideoDecoder === 'undefined') return true;
+          const { supported } = await VideoDecoder.isConfigSupported({
+            codec, ...(track.width && track.height ? { codedWidth: track.width, codedHeight: track.height } : {}),
+          });
+          return supported === true;
+        } catch {
+          return true;
+        }
+      },
     };
 
     if (this.strategy === 'webcodecs') {
@@ -549,7 +815,9 @@ export class Player {
         createVideoDecoder: () => new WebCodecsVideoDecoder(),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
-          this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock });
+          // A caller-owned canvas keeps its size (no DOM mutations); our own
+          // follows the frame size and is letterboxed by object-fit.
+          this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock, followFrameSize: this.ownsCanvas });
           // Catalog discovery can create the pipeline after play() has returned.
           if (this._state === 'playing') this.renderer.start();
           return this.renderer;
@@ -566,13 +834,27 @@ export class Player {
           // Delay unification: the shared playout cushion arrives inside
           // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
           // output must not add a second, divergent delay of its own.
-          return new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+          this.audioOutput = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
+          if (this.liveEdgeTargetSec !== null) {
+            this.audioOutput.setTargetAheadSec(this.liveEdgeTargetSec);
+          }
+          return this.audioOutput;
         },
       });
     }
 
     Object.assign(base, {
-      createMediaSource: () => new MseMediaSource(this.videoElement!),
+      // Latency settings are read when the adapter is built, moqtPlayerConfig overrides winning.
+      createMediaSource: () => {
+        const cur = { ...this.options, ...this.options.moqtPlayerConfig };
+        return new MseMediaSource(this.videoElement!, {
+          ...(this.options.targetLatencyMs !== undefined
+            ? { targetAheadSec: this.options.targetLatencyMs / 1000 } : {}),
+          ...(cur.latencyMode !== undefined ? { latencyMode: cur.latencyMode } : {}),
+          ...(cur.smoothCeilingMs !== undefined ? { smoothCeilingSec: cur.smoothCeilingMs / 1000 } : {}),
+          ...(cur.smoothFloorMs !== undefined ? { smoothFloorSec: cur.smoothFloorMs / 1000 } : {}),
+        });
+      },
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),
     });
@@ -586,6 +868,9 @@ export class Player {
     if (opts.targetLatencyMs !== undefined) {
       (base as unknown as Record<string, unknown>).targetLatencyMs = opts.targetLatencyMs;
     }
+    if (opts.latencyMode !== undefined) Object.assign(base, { latencyMode: opts.latencyMode });
+    if (opts.smoothCeilingMs !== undefined) Object.assign(base, { smoothCeilingMs: opts.smoothCeilingMs });
+    if (opts.smoothFloorMs !== undefined) Object.assign(base, { smoothFloorMs: opts.smoothFloorMs });
     if (opts.authTokens) {
       (base as unknown as Record<string, unknown>).authTokens = opts.authTokens;
     }
@@ -604,7 +889,39 @@ export class Player {
   // ─── Private: Event Bridging ─────────────────────────────────────
 
   private wireEngineEvents(): void {
+    // Pass-through: catalog state and per-object arrivals carry no UI
+    // semantics of their own, but diagnostics and measurement need them
+    // and the engine is not public.
+    this.engine.on('catalog_updated', (e) => {
+      this.emitter.emit('catalog_updated', { catalog: e.catalog });
+      this.followCatalogLevels(e.catalog);
+    });
+    // Size and text only: the payload itself stays inside the engine.
+    this.engine.on('catalog_raw', (e) => {
+      this.emitter.emit('catalog_raw', {
+        bytes: e.payload?.byteLength ?? 0,
+        text: e.text ?? null,
+      });
+    });
+    this.engine.on('media_object', (e) => {
+      this.emitter.emit('media_object', {
+        mediaType: e.mediaType,
+        trackName: e.trackName,
+        groupId: e.groupId,
+        objectId: e.objectId,
+        kind: e.kind,
+        // Size only: the payload itself stays inside the engine.
+        bytes: e.payload?.byteLength ?? 0,
+        captureTimestamp: e.captureTimestamp,
+        timestampIsWallClock: e.timestampIsWallClock,
+        isKeyframe: e.isKeyframe,
+        captureTimes: e.captureTimes,
+        timingError: e.timingError,
+      });
+    });
+
     this.engine.on('catalog_received', (e) => {
+      this.emitter.emit('catalog_received', { catalog: e.catalog });
       // Catalog events precede subscription selection. A missing requested
       // group is reported by the engine, not thrown from an event listener.
       const config = this.selectionConfig;
@@ -638,6 +955,9 @@ export class Player {
       const sinkTrack = selected.video ?? selected.audio;
       const hasCmaf = sinkTrack !== undefined && usesMsePath(sinkTrack.packaging, this.locmafDecoding);
 
+      this.catalogTargetLatencyMs = Math.max(0, ...e.catalog.tracks.map((t) => Number(t.targetLatency) || 0));
+      this.aimLiveEdge();
+
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';
       this.webAudioRequired = selected.audio !== undefined && !usesMsePath(selected.audio.packaging, this.locmafDecoding);
@@ -653,7 +973,8 @@ export class Player {
         duration: this._duration,
       });
       this.emitter.emit('levelsloaded', { levels: this._levels });
-      if (this.options.autoplay ?? DEFAULTS.autoplay) this.play();
+      // A reconnect's catalog finds playback already running.
+      if ((this.options.autoplay ?? DEFAULTS.autoplay) && this._state !== 'playing') this.play();
     });
 
     this.engine.on('first_frame', () => {
@@ -662,6 +983,43 @@ export class Player {
 
     this.engine.on('stall', (e) => {
       this.emitter.emit('stall', { durationMs: e.durationMs });
+    });
+
+    this.engine.on('stall_recovered', (e) => {
+      this.emitter.emit('stall_recovered', { durationMs: e.durationMs });
+    });
+
+    this.engine.on('session_closed', (e) => {
+      this.emitter.emit('session_closed', {
+        ...(e.error !== undefined ? { code: e.error } : {}),
+        ...(e.reason !== undefined ? { reason: e.reason } : {}),
+      });
+    });
+
+    this.engine.on('session_reconnecting', (e) => {
+      this.emitter.emit('session_reconnecting', { attempt: e.attempt, delayMs: e.delayMs });
+    });
+
+    this.engine.on('session_established', () => {
+      this.emitter.emit('session_established', {});
+    });
+
+    this.engine.on('session_migrated', () => {
+      this.emitter.emit('session_migrated', {});
+    });
+
+    this.engine.on('namespace_state', (e) => {
+      this.emitter.emit('namespace_state', { state: e.state, detail: e.detail });
+    });
+
+    this.engine.on('track_unsubscribed', (e) => {
+      this.emitter.emit('track_unsubscribed', { trackName: e.trackName, reason: e.reason });
+    });
+
+    this.engine.on('track_subscribe_failed', (e) => {
+      this.emitter.emit('track_subscribe_failed', {
+        trackName: e.trackName, mediaType: e.mediaType, errorCode: e.errorCode, reason: e.reason,
+      });
     });
 
     this.engine.on('state_changed', (e) => {
@@ -680,6 +1038,7 @@ export class Player {
         this.emitter.emit('qualitychange', { level, auto: this._autoQuality });
       }
     });
+    forwardSelectionEvents(this.engine, this.emitter, (levels, current) => this.applyViewLevels(levels, current));
 
     this.engine.on('duration_changed', (e) => {
       this._duration = e.durationMs;
@@ -699,6 +1058,39 @@ export class Player {
     });
   }
 
+  /**
+   * Aim the live edge at the declared target. The audio output is built
+   * later, at pipeline creation, so the aim is stored for it too.
+   */
+  private aimLiveEdge(): void {
+    const targetMs = this.options.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    if (targetMs > 0) {
+      this.liveEdgeTargetSec = (targetMs / 1000) / 2;
+      this.audioOutput?.setTargetAheadSec(this.liveEdgeTargetSec);
+    }
+  }
+
+  /** Rebuild the levels when a catalog update changes the ladder, keeping the current level by track name. */
+  private followCatalogLevels(catalog: CatalogState): void {
+    const ladder = new Set(this.engine.availableVideoTracks.map(t => t.name));
+    if (ladder.size === 0) return;
+    const levels = mapLevels({ ...catalog, tracks: catalog.tracks.filter(t => t.role === 'video' && ladder.has(t.name)) });
+    if (JSON.stringify(levels) === JSON.stringify(this._levels)) return;
+    this._levels = levels;
+    const current = this.engine.currentVideoTrack;
+    this._currentLevel = levels.findIndex(l => l.trackName === current);
+    this.emitter.emit('levelsloaded', { levels });
+  }
+
+  /** A view switch replaced the quality ladder. */
+  private applyViewLevels(levels: Level[], current: number): void {
+    this._levels = levels;
+    this._currentLevel = current;
+    this.emitter.emit('levelsloaded', { levels });
+    const level = levels[current];
+    if (level) this.emitter.emit('qualitychange', { level, auto: this._autoQuality });
+  }
+
   // ─── Private: State ──────────────────────────────────────────────
 
   private setState(state: PlayerState): void {
@@ -716,6 +1108,14 @@ export class Player {
   private ensureAudioContext(): void {
     if (this.audioCtx) return;
     this.audioCtx = new AudioContext();
+    // Created without a gesture the context stays suspended; resume it on
+    // the first one so autoplay gets audio without a pause/play round trip.
+    if (this.audioCtx.state === 'suspended' && typeof document !== 'undefined') {
+      const resume = () => { void this.audioCtx?.resume(); };
+      for (const ev of ['pointerdown', 'keydown']) {
+        document.addEventListener(ev, resume, { once: true, passive: true });
+      }
+    }
     this.audioClock.attachAudioContext(this.audioCtx);
     this.volumeCtrl = new VolumeController(this.audioCtx, {
       initialVolume: this._volume,

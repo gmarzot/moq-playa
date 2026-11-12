@@ -16,7 +16,8 @@ import type { ControlMessage, Parameters } from '@openmoq/transport';
 import { varint, readLocation, MessageParam } from '@openmoq/transport';
 import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LoggerLike } from './logger.js';
-import type { TrackPackaging } from './subscription-manager.js';
+import type { TrackContext, TrackPackaging } from './subscription-manager.js';
+import { parseTimestampTrack } from './capture-time.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -32,6 +33,8 @@ export interface PendingMediaSub {
   trackName: string;
   mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
   packaging?: TrackPackaging;
+  /** LOC decoder configuration from the catalog's initialization data. */
+  initConfig?: Uint8Array;
 }
 
 /** Pending track status promise handles. */
@@ -48,7 +51,10 @@ export interface MessageAdapter {
 /** Minimal subscription manager interface. */
 export interface MessageSubscriptionManager {
   unregisterTrack(trackAlias: bigint): void;
-  registerTrack(trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline', packaging?: TrackPackaging): void;
+  registerTrack(
+    trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline',
+    packaging?: TrackPackaging, context?: TrackContext,
+  ): void;
   /** Check if a track alias is already registered. */
   getMediaType(trackAlias: bigint): 'video' | 'audio' | 'mediatimeline' | 'eventtimeline' | undefined;
 }
@@ -60,7 +66,7 @@ export interface MessageSubscriptionManager {
  * decodes location-kind parameters into a typed {group, object}. Absent or
  * malformed = null (track empty at subscribe time).
  */
-function extractLargestLocation(parameters: Parameters | undefined): { group: bigint; object: bigint } | null {
+export function extractLargestLocation(parameters: Parameters | undefined): { group: bigint; object: bigint } | null {
   const raw = parameters?.get(MessageParam.LARGEST_OBJECT)?.[0];
   if (raw instanceof Uint8Array) {
     try {
@@ -112,7 +118,7 @@ export interface ControlMessageContext {
   /** Called when SUBSCRIBE_OK matches a pending media subscription. @see §9.10 */
   onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio') => void;
   /** Called when REQUEST_ERROR matches a pending media subscription. @see §9.8 */
-  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
+  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint, retryInterval?: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
   onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint | null, statusCode: bigint, errorReason: string) => void;
   /**
@@ -230,7 +236,20 @@ export function handleControlMessage(
       if (pending && active) {
         ctx.pendingMediaSubs.delete(okReqId);
         active.trackAlias = alias;
-        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
+        const props = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties;
+        // Draft-18 TIMESCALE track property (0x08): the units of the track's object Timestamps.
+        const timescale = props?.get(0x08n)?.[0];
+        // Timestamp properties: Track Properties, or Track Extensions on draft-16.
+        const ext = (msg as { trackExtensions?: unknown }).trackExtensions;
+        const timestamps = parseTimestampTrack(
+          props ?? (ext instanceof Map ? ext as Map<bigint, unknown[]> : undefined));
+        const context: TrackContext = {
+          ...(typeof timescale === 'bigint' && timescale > 0n ? { timescale } : {}),
+          ...(timestamps ? { timestamps } : {}),
+          ...(pending.initConfig ? { initConfig: pending.initConfig } : {}),
+        };
+        const declared: [] | [TrackContext] = Object.keys(context).length > 0 ? [context] : [];
+        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging, ...declared);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
           ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);
         }
@@ -341,8 +360,15 @@ export function handleControlMessage(
         ctx.removeSubscription(errReqId);
         if (pendingMedia.mediaType === 'video' || pendingMedia.mediaType === 'audio') {
           ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
-            msg.errorReason ?? '', BigInt(msg.errorCode));
+            msg.errorReason ?? '', BigInt(msg.errorCode),
+            msg.retryInterval !== undefined ? BigInt(msg.retryInterval) : undefined);
         }
+      } else if (!pendingErr) {
+        // A refusal for a request nobody is waiting on: the id may belong to
+        // a fetch or a switch candidate handled below, but an unmatched one
+        // would otherwise vanish.
+        ctx.log.warn('REQUEST_ERROR reqId=%s code=0x%s reason="%s" — no pending media subscription',
+          errReqId.toString(), BigInt(msg.errorCode).toString(16), msg.errorReason ?? '');
       }
 
       // Catalog-bootstrap fetch: INVALID_RANGE (empty track) vs any other

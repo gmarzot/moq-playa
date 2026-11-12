@@ -7,7 +7,7 @@
 
 import { MSF_VERSION } from './types.js';
 import type {
-    Catalog, CatalogDelta, CatalogObject, CatalogTrack, Packaging,
+    Catalog, CatalogDelta, CatalogObject, CatalogTrack, IgnoredTrack, Packaging,
     MsfMediaTemplate, MsfInitDataEntry, CmsfContentProtection, CmsfDrmSystem, CmsfUrlRef,
 } from './types.js';
 import { assertFiniteCatalogNumbers } from './catalog-validate.js';
@@ -100,9 +100,12 @@ export function parseMsfCatalog(
     // spelling the corpus oracle accepts.
     const legacyMsf00 = typeof obj['version'] === 'number';
 
-    const tracks = (obj['tracks'] as unknown[]).map(
-        (raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00),
-    );
+    const ignoredTracks: IgnoredTrack[] = [];
+    const tracks = (obj['tracks'] as unknown[]).flatMap((raw, i) => {
+        const ignored = unknownPackaging(raw);
+        if (ignored) { ignoredTracks.push(ignored); return []; }
+        return [parseTrack(raw, i, catalogNamespace, legacyMsf00)];
+    });
 
     // §5.1.11: Track names must be unique per namespace
     validateTrackUniqueness(tracks);
@@ -117,7 +120,11 @@ export function parseMsfCatalog(
 
     // MSF-01 §5.1.5: publishTracks — an array of track objects (reverse direction).
     const publishTracks = Array.isArray(obj['publishTracks'])
-        ? (obj['publishTracks'] as unknown[]).map((raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00))
+        ? (obj['publishTracks'] as unknown[]).flatMap((raw, i) => {
+            const ignored = unknownPackaging(raw);
+            if (ignored) { ignoredTracks.push(ignored); return []; }
+            return [parseTrack(raw, i, catalogNamespace, legacyMsf00)];
+        })
         : undefined;
 
     // MSF-01 §5.1.7: root Initialization Data List (ids unique within the catalog).
@@ -134,6 +141,7 @@ export function parseMsfCatalog(
         ...(initDataList !== undefined ? { initDataList } : {}),
         ...(contentProtections !== undefined ? { contentProtections } : {}),
         ...(publishTracks !== undefined ? { publishTracks } : {}),
+        ...(ignoredTracks.length > 0 ? { ignoredTracks } : {}),
     };
 
     // MSF-01 §5.2.13 / CMSF-01 §4.1.2: reference topology — initRef and
@@ -287,6 +295,14 @@ export function validateLocmafVersion(track: {
  * Parse and validate a single track object.
  * Strips unknown fields per §5.1.
  */
+/** A track whose packaging this parser does not know: left out so the others still play. */
+function unknownPackaging(raw: unknown): IgnoredTrack | null {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const { name, packaging } = raw as Record<string, unknown>;
+    return typeof name === 'string' && typeof packaging === 'string' && !VALID_PACKAGING.has(packaging)
+        ? { name, packaging } : null;
+}
+
 function parseTrack(
     raw: unknown,
     index: number,

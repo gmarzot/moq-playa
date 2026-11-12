@@ -16,6 +16,8 @@
  * @module
  */
 
+import type { LatencyStats } from './latency-policy.js';
+
 // ─── TTFF Breakdown ──────────────────────────────────────────────────
 
 /**
@@ -112,6 +114,8 @@ export interface PlayerStats {
   // ── Errors ──────────────────────────────────────────────────
   /** Number of gap events detected by the pipeline. */
   readonly gapCount: number;
+  /** Times the relay skipped this subscriber ahead: a reset group's stream, then a newer group. */
+  readonly groupSkipCount: number;
   /** Number of playback stalls. */
   readonly stallCount: number;
   /** Bounded buffered-hole gap-jumps performed by the MSE adapter (source
@@ -131,6 +135,11 @@ export interface PlayerStats {
    * once.
    */
   readonly totalStallDurationMs: number;
+  /**
+   * Elapsed time of a detected stall still in progress (ms); 0 when none.
+   * Not included in `totalStallDurationMs` until the episode completes.
+   */
+  readonly ongoingStallMs: number;
   /** Number of decode errors. */
   readonly decodeErrorCount: number;
   /** Number of recovery actions taken. */
@@ -159,6 +168,9 @@ export interface PlayerStats {
    * skew steps with sync resets. Observability only — nothing acts on these.
    */
   readonly loc: LocDiagnostics;
+
+  /** The smooth latency policy's state; null in live mode. */
+  readonly latency: LatencyStats | null;
 }
 
 /** Kinds of LOC pipeline diagnostic events counted in {@link LocDiagnostics}. */
@@ -185,8 +197,10 @@ export interface LocDiagnostics {
   readonly backlogShedCount: number;
   /** Recovery actions that passed the player's recovery hook. */
   readonly recoveryActionCount: number;
-  /** A/V sync baseline resets actually performed (skip-triggered). */
+  /** A/V sync baseline resets actually performed (skip or sustained late audio). */
   readonly syncResetCount: number;
+  /** Audio frames dropped before decode as late past the playout cushion. null without a LOC audio pipeline. */
+  readonly audioLateDrops: number | null;
   /** Live adaptive gap-timeout of the video pipeline (ms). null without a LOC video pipeline. */
   readonly videoEffectiveGapTimeoutMs: number | null;
   /**
@@ -204,6 +218,7 @@ export interface LocDiagnostics {
 export interface LocTimingGauges {
   readonly videoEffectiveGapTimeoutMs: number | null;
   readonly renderCushionMs: number | null;
+  readonly audioLateDrops?: number | null;
 }
 
 // ─── StatsAccumulator ────────────────────────────────────────────────
@@ -247,10 +262,13 @@ export class StatsAccumulator {
 
   // ── Errors ──────────────────────────────────────────────────
   private _gapCount = 0;
+  private _groupSkipCount = 0;
   private _stallCount = 0;
   private _gapJumpCount = 0;
   private _locmafObjectsRejected = 0;
   private _totalStallDurationMs = 0;
+  /** Onset (Date.now()) of the detected, not yet ended stall episode. */
+  private _stallOnsetMs: number | null = null;
   private _decodeErrorCount = 0;
   private _recoveryActionCount = 0;
 
@@ -383,6 +401,11 @@ export class StatsAccumulator {
 
   // ── Errors ──────────────────────────────────────────────────
 
+  /** The relay skipped this subscriber ahead. */
+  recordGroupSkip(): void {
+    this._groupSkipCount++;
+  }
+
   /** Record a gap detected by the pipeline. */
   recordGapDetected(): void {
     this._gapCount++;
@@ -398,10 +421,10 @@ export class StatsAccumulator {
     this._locmafObjectsRejected++;
   }
 
-  /** Record a playback stall. */
+  /** Record a playback stall detected `durationMs` after its onset. */
   recordStall(durationMs: number): void {
-    void durationMs; // elapsed at detection, not the outage length
     this._stallCount++;
+    this._stallOnsetMs ??= Date.now() - Math.max(0, durationMs);
   }
 
   /**
@@ -415,6 +438,12 @@ export class StatsAccumulator {
    */
   recordStallRecovered(durationMs: number): void {
     this._totalStallDurationMs += durationMs;
+    this._stallOnsetMs = null;
+  }
+
+  /** End a detected episode without completing it (pause, seek, rebuild, teardown). */
+  cancelStall(): void {
+    this._stallOnsetMs = null;
   }
 
   /**
@@ -423,14 +452,15 @@ export class StatsAccumulator {
    * The gap-jump path reports the span from stall onset to the seek attempt,
    * which has genuinely elapsed — unlike ordinary detection, whose value is a
    * fixed latency into an outage that is still running. It counts and
-   * contributes in one call, preserving the aggregate this path had before
-   * detection and completion were separated.
+   * contributes in one call. When it ends an episode already counted at
+   * detection, it only completes that episode: one outage counts once.
    *
    * It is NOT proof that the landing recovered; the gap-attempt lifecycle is
    * deliberately unmodelled here, so no completion event is published.
    */
   recordResolvedStall(durationMs: number): void {
-    this._stallCount++;
+    if (this._stallOnsetMs === null) this._stallCount++;
+    this._stallOnsetMs = null;
     this._totalStallDurationMs += durationMs;
   }
 
@@ -500,6 +530,7 @@ export class StatsAccumulator {
 
   /** Mark end of active playback segment. */
   recordPlayStop(): void {
+    this._stallOnsetMs = null;
     if (this._playing && this._playSegmentStartMs !== null) {
       this._accumulatedPlayMs += Date.now() - this._playSegmentStartMs;
       this._playSegmentStartMs = null;
@@ -515,7 +546,7 @@ export class StatsAccumulator {
    * Computes relative TTFF, in-progress playback duration, session age,
    * and dropRatio. Returns a plain object (no class instance).
    */
-  snapshot(locGauges?: LocTimingGauges): PlayerStats {
+  snapshot(locGauges?: LocTimingGauges, latency?: LatencyStats | null): PlayerStats {
     const now = Date.now();
     const loadStart = this._loadStartMs;
 
@@ -582,10 +613,12 @@ export class StatsAccumulator {
 
       // Errors
       gapCount: this._gapCount,
+      groupSkipCount: this._groupSkipCount,
       stallCount: this._stallCount,
       gapJumpCount: this._gapJumpCount,
       locmafObjectsRejected: this._locmafObjectsRejected,
       totalStallDurationMs: this._totalStallDurationMs,
+      ongoingStallMs: this._stallOnsetMs === null ? 0 : Math.max(0, now - this._stallOnsetMs),
       decodeErrorCount: this._decodeErrorCount,
       recoveryActionCount: this._recoveryActionCount,
 
@@ -607,7 +640,9 @@ export class StatsAccumulator {
         syncResetCount: this._locCounts.sync_reset,
         videoEffectiveGapTimeoutMs: locGauges?.videoEffectiveGapTimeoutMs ?? null,
         renderCushionMs: locGauges?.renderCushionMs ?? null,
+        audioLateDrops: locGauges?.audioLateDrops ?? null,
       },
+      latency: latency ?? null,
     };
   }
 }

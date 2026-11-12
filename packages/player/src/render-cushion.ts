@@ -62,8 +62,8 @@ export interface RenderCushionOptions {
  * scheduling (audio adoption remains anchor/underrun-only downstream).
  */
 export class RenderCushionSmoother {
-  private readonly floorUs: number;
-  private readonly maxUs: number;
+  private floorUs: number;
+  private maxUs: number;
   private readonly riseUsPerSec: number;
   private readonly fallUsPerSec: number;
   private readonly clock: ClockSource;
@@ -82,6 +82,19 @@ export class RenderCushionSmoother {
   /** The smoothed cushion (µs); floor before the first update. */
   get currentUs(): number {
     return this._currentUs ?? this.floorUs;
+  }
+
+  /** New floor and cap (µs); the cushion slews into them at the usual rates. */
+  setBounds(floorUs: number, maxUs: number): void {
+    this.floorUs = floorUs;
+    this.maxUs = maxUs;
+  }
+
+  /** Step up to `us` (clamped) at once; a late arrival already cost the time. */
+  raiseTo(us: number): number {
+    this._currentUs = Math.max(this.currentUs, Math.min(us, this.maxUs));
+    this.lastUpdateUs = this.clock.now();
+    return this._currentUs;
   }
 
   /**

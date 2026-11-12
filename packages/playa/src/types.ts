@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig } from '@openmoq/player';
+import type { MoqtPlayerConfig, TTFFBreakdown, LatencyMode, LatencyStats } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -34,6 +34,13 @@ export interface PlayerOptions {
   readonly authTokens?: Uint8Array[];
   /** Issuer-supplied credentials for SETUP and subsequent requests. */
   readonly authorization?: MoqtPlayerConfig['authorization'];
+  /** WebTransport congestion-control hint, which the browser may ignore;
+   *  `Player.congestionControl` reports what it applied. */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
+  /** Draft-18: incoming streams allowed to await classification or SETUP at
+   *  once; at the bound, intake waits. Default: no bound beyond QUIC's
+   *  stream limit. */
+  readonly maxPendingStreams?: number;
 
   // ── Playback ──
 
@@ -53,6 +60,23 @@ export interface PlayerOptions {
   readonly audioActivation?: 'auto' | 'gesture';
   /** Target latency in ms for live edge. */
   readonly targetLatencyMs?: number;
+  /**
+   * `'live'` (default) holds the target and skips late media; `'smooth'`
+   * starts the playout delay at `smoothFloorMs` and raises it when media
+   * arrives late, up to `smoothCeilingMs`.
+   */
+  readonly latencyMode?: LatencyMode;
+  /** Ceiling of the smooth playout delay in ms. Default: 2000. */
+  readonly smoothCeilingMs?: number;
+  /** Floor of the smooth playout delay in ms, where it starts. Default: 1000. */
+  readonly smoothFloorMs?: number;
+  /**
+   * Pause delivery while the page is hidden and silent, and rejoin live when it
+   * is visible again. It pauses after 60 s hidden while muted, at volume 0 or
+   * with its audio context not running, or as soon as the hidden page's timers
+   * run 10 s late (the browser is throttling it). Default: false.
+   */
+  readonly pauseWhenHidden?: boolean;
 
   // ── Quality ──
 
@@ -99,6 +123,15 @@ export interface PlayerOptions {
   readonly moqtPlayerConfig?: Partial<MoqtPlayerConfig>;
 }
 
+/**
+ * Playback settings `Player.updatePlayback()` applies to a running session,
+ * named as in the engine config. A key set to `undefined` restores its default.
+ */
+export type PlaybackUpdate = {
+  readonly [K in 'targetLatencyMs' | 'latencyMode' | 'smoothFloorMs' | 'smoothCeilingMs'
+    | 'renderCushionFloorMs' | 'renderCushionMaxMs' | 'maxCatchUpRate' | 'logLevel']?: MoqtPlayerConfig[K] | undefined;
+};
+
 /** Quality level exposed to UI (e.g., for a quality selector menu). */
 export interface Level {
   /** Index in the levels array (0-based, sorted by bitrate descending). */
@@ -138,8 +171,24 @@ export interface PlayerStats {
   readonly latencyMs: number;
   readonly stallCount: number;
   readonly timeToFirstFrameMs: number | null;
+  /** Startup milestones, ms after load(); null before load(). */
+  readonly ttffBreakdown: TTFFBreakdown | null;
   readonly resolution: { readonly width: number; readonly height: number } | null;
   readonly videoCodec: string | null;
   readonly audioCodec: string | null;
   readonly sessionAgeMs: number;
+  /** Total time of completed stalls. */
+  readonly stallDurationMs: number;
+  /** Elapsed time of a stall still in progress; 0 when none. */
+  readonly ongoingStallMs: number;
+  readonly gapCount: number;
+  /** A/V skew EWMA (LOC path), null when unknown. */
+  readonly avSkewMs: number | null;
+  /** Media playable ahead of the playhead: contiguous buffered range on
+   *  the MSE path, scheduled audio on the WebCodecs path. */
+  readonly cushionMs: number | null;
+  /** WebCodecs audio buffers that arrived after the chain ran dry. */
+  readonly audioUnderruns: number;
+  /** The smooth latency policy's state; null in live mode. */
+  readonly latency: LatencyStats | null;
 }

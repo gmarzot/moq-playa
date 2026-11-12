@@ -41,6 +41,27 @@ import type { WebTransportLike, WebTransportBidirectionalStream } from '../types
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';
 import type { RequestStreamDraft } from '@openmoq/transport';
 
+/** Longest a graceful finish waits for the peer to act on our STOP_SENDING before it FINs. */
+const STOP_BEFORE_FIN_MS = 250;
+
+/**
+ * STOP_SENDING, then FIN once the peer answers (its STOP_SENDING errors our writable)
+ * or after STOP_BEFORE_FIN_MS. A peer may ignore a STOP_SENDING that reaches it after our FIN.
+ */
+async function stopThenFin(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+): Promise<void> {
+  try { await reader.cancel(); } catch { /* already closed */ }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    writer.closed.catch(() => { /* the peer stopped our writable */ }),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, STOP_BEFORE_FIN_MS); }),
+  ]);
+  clearTimeout(timer);
+  try { await writer.close(); } catch { /* already closed/aborted */ }
+}
+
 /**
  * Marks a request stream torn down by a LOCAL cancellation (e.g. draft-18 FETCH
  * cancel). The owner recognizes it and does NOT surface it as an error — unlike
@@ -119,6 +140,8 @@ export class UniPairTopology {
   private controlReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   /** Invalidates a control-stream open that settles after terminal shutdown. */
   private controlEpoch = 0;
+  /** First terminal owner also governs control streams whose creation resolves late. */
+  private controlShutdown: 'reset' | 'release' | undefined;
   /** Owns the shared incoming-unidirectional-stream accept loop after setup. */
   private incomingUniRouter: IncomingUniRouter | null = null;
 
@@ -165,6 +188,10 @@ export class UniPairTopology {
    *  GOAWAY, §10.4). The owner records the offending message raw, then closes with
    *  PROTOCOL_VIOLATION. */
   onRequestGoawayViolation?: (reason: string, message: DecodedControlMessage) => void;
+
+  /** Called when a PUBLISH_DONE ended a subscription with `count` REQUEST_UPDATEs
+   *  still unanswered (§10.9 owes each a response); those updates were rejected. */
+  onUnansweredUpdates?: (requestId: bigint, count: number) => void;
 
   /** Called when an open OUTBOUND request stream ends by PEER action — NOT a local
    *  cancel/finish (those are driven by the owner). `disposition` distinguishes:
@@ -292,7 +319,10 @@ export class UniPairTopology {
     } catch (error) {
       if (this.controlWriter === writer) this.controlWriter = null;
       if (writer) {
-        try { void writer.abort(error).catch(() => {}); } catch { /* stream already closed */ }
+        try {
+          if (this.controlShutdown === 'release') writer.releaseLock();
+          else void writer.abort(error).catch(() => {});
+        } catch { /* stream already closed or released */ }
       }
       throw error;
     }
@@ -447,6 +477,7 @@ export class UniPairTopology {
     ctx.onGoaway = (err) => this.onRequestGoaway?.(err);
     // A session-fatal violation seen on this request stream closes the session.
     ctx.onFatalViolation = (reason, message) => this.onRequestGoawayViolation?.(reason, message);
+    ctx.onUnansweredUpdates = (count) => this.onUnansweredUpdates?.(requestId, count);
     // Surface a stream failure (unsolicited/wrong-typed response, early end)
     // immediately, even if no operation is awaiting a response at the time, and
     // ALWAYS reclaim the context when the stream ends so it can't leak. A clean FIN
@@ -689,24 +720,39 @@ export class UniPairTopology {
    * aggregate incoming-uni source so standalone callers release its reader lock.
    * When the same operation closes the transport, pass `transportClosing`; the
    * backend then remains the sole owner of that aggregate source's terminal
-   * transition. Fire-and-forget teardown (idempotent; safe if already torn down).
+   * transition. For a clean close (`graceful`) the control streams are released
+   * rather than reset too, so the peer sees only the session close; an error
+   * close still resets them, retiring any write in flight. Fire-and-forget
+   * teardown (idempotent; safe if already torn down).
    */
-  shutdown(options: { transportClosing?: boolean } = {}): void {
+  shutdown(options: { transportClosing?: boolean; graceful?: boolean } = {}): void {
     const reason = new Error('session terminated');
+    this.controlShutdown ??= options.transportClosing === true && options.graceful === true ? 'release' : 'reset';
+    const release = this.controlShutdown === 'release';
     const router = this.incomingUniRouter;
     this.incomingUniRouter = null;
-    if (options.transportClosing) router?.retire(reason);
+    if (options.transportClosing) router?.retire(reason, { graceful: release });
     else router?.abort(reason);
     this.controlEpoch++;
+    // Draft 18 §3.3 and draft 22 §6.3 keep control streams open for the session.
+    // On a clean close, the transport ends them with the session; only release
+    // local ownership so a RESET_STREAM or STOP_SENDING cannot reach the peer
+    // first and turn a normal close into PROTOCOL_VIOLATION.
     const controlReader = this.controlReader;
     this.controlReader = null;
     if (controlReader) {
-      try { void controlReader.cancel(reason).catch(() => {}); } catch { /* already closed */ }
+      try {
+        if (release) controlReader.releaseLock();
+        else void controlReader.cancel(reason).catch(() => {});
+      } catch { /* already closed, or a read still pending */ }
     }
     const controlWriter = this.controlWriter;
     this.controlWriter = null;
     if (controlWriter) {
-      try { void controlWriter.abort(reason).catch(() => {}); } catch { /* already closed */ }
+      try {
+        if (release) controlWriter.releaseLock();
+        else void controlWriter.abort(reason).catch(() => {});
+      } catch { /* already closed */ }
     }
     for (const [, ctx] of this.contexts) void ctx.cancel(StreamResetCode18.CANCELLED);
     this.contexts.clear();
@@ -852,6 +898,10 @@ class RequestStreamContext {
    *  offending message is passed so the owner can record it raw before closing. */
   onFatalViolation?: (reason: string, message: DecodedControlMessage) => void;
 
+  /** Invoked when PUBLISH_DONE ends the subscription with `count` update
+   *  responses still owed; those updates have been rejected. */
+  onUnansweredUpdates?: (count: number) => void;
+
   /** Whether this stream ended because a GOAWAY migrated its request. The close
    *  is CLEAN (the owner gets a migration signal, not a stream error), but it is
    *  a LOCAL cancellation, not a peer FIN — an accepted FETCH must be reclaimed
@@ -951,7 +1001,7 @@ class RequestStreamContext {
 
   /**
    * Gracefully finish the stream: optionally write one final message (no response
-   * expected), then FIN our writable and STOP_SENDING the readable. Used for a
+   * expected), then STOP_SENDING the readable and FIN our writable. Used for a
    * local PUBLISH_DONE on an outbound PUBLISH (§10.11). Resolves `closed` cleanly;
    * the read loop is suppressed from reporting the teardown as a failure.
    */
@@ -961,8 +1011,7 @@ class RequestStreamContext {
     if (finalMessage) {
       try { await this.writer.write(this.codec.encode(finalMessage)); } catch { /* already closed */ }
     }
-    try { await this.writer.close(); } catch { /* already closed/aborted */ }
-    try { await this.reader.cancel(); } catch { /* already closed */ }
+    await stopThenFin(this.reader, this.writer);
     for (const d of this.queue.splice(0)) d.reject(new RequestCancelledError(StreamResetCode18.CANCELLED));
     this.closedDeferred.resolve();
   }
@@ -1039,8 +1088,8 @@ class RequestStreamContext {
           }
           // §10.11: PUBLISH_DONE is the publisher's TERMINAL message on a
           // subscription's request stream — accepted exactly once, only after
-          // a successful SUBSCRIBE_OK (never after REQUEST_ERROR), and only
-          // once all outstanding local update responses have settled. It is
+          // a successful SUBSCRIBE_OK (never after REQUEST_ERROR); update
+          // responses still owed are failed below. It is
           // not a response to any local operation — never FIFO-matched. On
           // receipt we FIN our own writable and keep READING until the peer's
           // clean FIN: `closed` resolves only on terminal completion, and any
@@ -1056,10 +1105,13 @@ class RequestStreamContext {
                 'PUBLISH_DONE without a preceding SUBSCRIBE_OK',
               );
             }
+            // §10.9 owes each update a response first. A publisher that ends the
+            // subscription without them made the updates moot: settle those as
+            // cancelled (the owner reports it once), not fail the session.
             if (this.queue.length > 0) {
-              throw new ProtocolViolationError(
-                'PUBLISH_DONE while update responses are still outstanding',
-              );
+              const unanswered = this.queue.splice(0);
+              for (const d of unanswered) d.reject(new RequestCancelledError(StreamResetCode18.CANCELLED));
+              this.onUnansweredUpdates?.(unanswered.length);
             }
             this.terminalSeen = true;
             await this.onPeerRequest?.(message);
@@ -1254,12 +1306,11 @@ class ContinuingRequestStreamContext {
     return d.promise;
   }
 
-  /** Gracefully close: FIN our writable + STOP_SENDING the readable. */
+  /** Gracefully close: STOP_SENDING the readable, then FIN our writable. */
   async close(): Promise<void> {
     if (this.closing) return;
     this.closing = true;
-    try { await this.writer.close(); } catch { /* already closed/aborted */ }
-    try { await this.reader.cancel(); } catch { /* already closed */ }
+    await stopThenFin(this.reader, this.writer);
     this.closedDeferred.resolve();
   }
 

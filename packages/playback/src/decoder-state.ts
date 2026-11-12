@@ -105,6 +105,17 @@ export class DecoderStateMachine {
         return { action: 'configure', config };
     }
 
+    /**
+     * Forget the last configuration (and a track end): the next `configure`
+     * reconfigures the decoder even with identical bytes. Used on a track
+     * switch, where the codec metadata that goes with the bytes (codec string,
+     * sample rate, channels) may differ although the bytes do not.
+     */
+    resetConfig(): void {
+        this.lastConfig = null;
+        if (this._state === DecoderState.ENDED) this._state = DecoderState.IDLE;
+    }
+
     /** Byte-level config comparison. */
     private configEquals(a: Uint8Array, b: Uint8Array): boolean {
         if (a.length !== b.length) return false;
