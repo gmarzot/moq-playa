@@ -1,0 +1,66 @@
+/* Gear popup shared by the G5 pages. Each page positions .settings-popup; colours
+   come from the page's tokens, with dark fallbacks for pages that define none. */
+.settings-popup {
+  display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 32px));
+  max-height: min(78vh, 640px); overflow-y: auto;
+  background: var(--surface, #1c1c28); border: 1px solid var(--border, #3a3a52); border-radius: 8px;
+  padding: 10px 12px; box-shadow: 0 6px 20px var(--shadow, rgba(0, 0, 0, .5));
+}
+.settings-popup[hidden] { display: none; }
+.settings-popup .sp-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font-size: .85rem; color: var(--text-label, #c8c8d8);
+}
+.settings-popup .sp-row[hidden] { display: none; }
+.settings-popup .sp-row select { max-width: 190px; }
+.settings-popup .sp-sep { border: 0; border-top: 1px solid var(--divider, #33334a); margin: 2px 0; }
+.settings-popup .sp-field { display: flex; flex-direction: column; gap: 4px; }
+.settings-popup .sp-field[hidden] { display: none; }
+.settings-popup .sp-field > label, .settings-popup .sp-label {
+  font-size: .68rem; color: var(--text-faint, #8a8aa0); text-transform: uppercase; letter-spacing: .5px;
+}
+.settings-popup input[type=text], .settings-popup input[type=number], .settings-popup .sp-field select {
+  width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--input-border, #44445c); background: var(--input-bg, #12121a); color: var(--text, #e8e8f0);
+  font-family: monospace; font-size: .82rem;
+}
+.settings-popup input:focus, .settings-popup select:focus { outline: none; border-color: var(--focus, #2a6); }
+.settings-popup .sp-inline { display: flex; gap: 6px; }
+.settings-popup .sp-inline > * { flex: 1 1 0; min-width: 0; }
+.settings-popup .sp-hint { font-size: .66rem; color: var(--text-dim, #707088); }
+.settings-popup .sp-check { display: flex; align-items: center; gap: 8px; font-size: .8rem; color: var(--text-soft, #b8b8c8); }
+.settings-popup .sp-check[hidden] { display: none; }
+.settings-popup .sp-check input { width: auto; margin: 0; }
+.settings-popup .sp-adv { border-top: 1px solid var(--divider, #33334a); padding-top: 2px; }
+.settings-popup .sp-adv > summary { cursor: pointer; font-size: .8rem; color: var(--text-soft, #b8b8c8); padding: 6px 0; }
+.settings-popup .sp-adv[open] > summary { color: var(--text-strong, #fff); }
+.settings-popup .sp-adv-body { display: flex; flex-direction: column; gap: 8px; padding-bottom: 4px; }
+.settings-popup .sp-actions { display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+.settings-popup .sp-apply {
+  padding: 6px 16px; font-size: .82rem; border-radius: 6px;
+  background: var(--active, #2a6); border: 1px solid var(--active, #2a6); color: var(--apply-fg, #fff);
+}
+.settings-popup .sp-apply:hover { background: var(--active-hover, #2b7); }
+.settings-popup .sp-apply[hidden] { display: none; }
+.settings-popup .sp-build { font-size: .66rem; color: var(--text-dim, #707088); margin-right: auto; }
+/* The relay field's menu of known relays stays inside the popup's scroll box. */
+.settings-popup .relay-combo { position: relative; display: flex; gap: 6px; }
+.settings-popup .relay-combo input[type=text] { flex: 1; min-width: 0; }
+.settings-popup .relay-combo-btn { flex: none; padding: 0 10px; }
+.settings-popup .relay-combo-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 10; padding: 4px;
+  background: var(--modal-bg, #1c1c28); border: 1px solid var(--input-border, #44445c); border-radius: 6px;
+  box-shadow: 0 8px 24px var(--modal-shadow, rgba(0, 0, 0, .6));
+}
+.settings-popup .relay-combo-item {
+  display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text, #e8e8f0);
+  padding: 6px 8px; border-radius: 4px; font-family: monospace; font-size: .8rem; overflow-wrap: anywhere;
+}
+.settings-popup .relay-combo-item:hover, .settings-popup .relay-combo-item:focus-visible {
+  background: var(--control-hover, #2a2a3c); outline: none;
+}
+.settings-popup .relay-combo-item[aria-selected=true] { font-weight: 700; }
+
+/* Log under a disclosure like the transport section; its copy button rides the summary line. */
+.log-panel > summary { position: relative; }
+.log-panel > summary .copy { position: static; margin-left: 10px; opacity: .6; vertical-align: middle; }
