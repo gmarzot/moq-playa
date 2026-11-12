@@ -7,7 +7,7 @@
  * @module
  */
 import { MoqtConnection } from '../adapter.js';
-import { createLoopback, type LoopbackTransport, type PipeFaults } from './loopback.js';
+import { createLoopback, type LoopbackOptions, type LoopbackTransport, type PipeFaults } from './loopback.js';
 import type { WebTransportLike } from '../types.js';
 import { varint, isRequestStreamDraft, type DraftVersion, type SetupOptions } from '@openmoq/transport';
 
@@ -59,13 +59,14 @@ export async function connectedPair(
   version: DraftVersion = 18,
   opts: {
     faults?: { a?: PipeFaults; b?: PipeFaults };
+    loopback?: LoopbackOptions;
     serverOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
     clientOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
     /** Extra Setup Options the server advertises (e.g. draft-22 maxRequestUpdates). */
     serverSetup?: SetupOptions;
   } = {},
 ): Promise<ConnectedPair> {
-  const { a, b } = createLoopback(opts.faults ?? {});
+  const { a, b } = createLoopback(opts.faults ?? {}, opts.loopback ?? {});
   const client = new MoqtConnection(version, opts.clientOptions);
   const server = new MoqtConnection(version, { role: 'server', ...(opts.serverOptions ?? {}) });
   const errors: Error[] = [];

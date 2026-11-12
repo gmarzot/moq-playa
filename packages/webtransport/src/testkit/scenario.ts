@@ -211,7 +211,10 @@ async function quiesce(p: ConnectedPair, signature?: () => number): Promise<void
  */
 export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult> {
   const version = opts.version ?? 18;
-  const pair = await connectedPair(version, opts.faults ? { faults: opts.faults } : {});
+  const pair = await connectedPair(version, {
+    ...(opts.faults ? { faults: opts.faults } : {}),
+    loopback: { answerStopSending: true },
+  });
   const { client, server, a, b, errors } = pair;
   const prng = makePrng(opts.seed);
   const log: TraceRecord[] = [];
