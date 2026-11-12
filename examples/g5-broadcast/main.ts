@@ -65,14 +65,11 @@ function storageSet(store: () => Storage, key: string, value: string | null): bo
   }
 }
 
-/**
- * Settings saved by the dialog, as URL parameters: per tab in sessionStorage
- * (kept across its reloads), and in localStorage as the start for new tabs.
- */
+/** Settings saved by the popup, as URL parameters, per tab in sessionStorage (kept across its reloads). */
 const SETTINGS_KEY = 'g5-broadcast.settings';
 /** Saved settings, each overridden by a URL parameter of the same name. */
 const params = (() => {
-  const saved = storageGet(() => sessionStorage, SETTINGS_KEY) ?? storageGet(() => localStorage, SETTINGS_KEY);
+  const saved = storageGet(() => sessionStorage, SETTINGS_KEY);
   const merged = new URLSearchParams(saved ?? '');
   const url = new URLSearchParams(window.location.search);
   for (const name of new Set(url.keys())) {
@@ -463,7 +460,6 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     const qs = np.toString();
     // An empty string, not removal: this tab chose the defaults.
     const saved = storageSet(() => sessionStorage, SETTINGS_KEY, qs);
-    storageSet(() => localStorage, SETTINGS_KEY, qs || null);
     const next = new URLSearchParams(saved ? '' : qs);
     const current = new URLSearchParams(window.location.search);
     for (const key of ['compat', 'minGroup', 'audioBitrate', 'audio', 'camera']) {
@@ -531,8 +527,8 @@ const canCaptureScreen = !!navigator.mediaDevices?.getDisplayMedia;
 // ─── Camera choice ───────────────────────────────────────────────────
 
 const CAMERA_KEY = 'g5-broadcast.camera';
-/** `front`, `back` or a device id, from `?camera=` else the last pick; null = the browser's default. */
-let cameraChoice: CameraChoice = params.get('camera') || storageGet(() => localStorage, CAMERA_KEY) || null;
+/** `front`, `back` or a device id, from `?camera=` else this tab's last pick; null = the browser's default. */
+let cameraChoice: CameraChoice = params.get('camera') || storageGet(() => sessionStorage, CAMERA_KEY) || null;
 /** Phones choose by facing; desktops by device. */
 const facingChoice = window.matchMedia?.('(pointer: coarse)').matches ?? false;
 /** [choice, label], the current choice first. */
@@ -559,7 +555,7 @@ async function refreshCameras(): Promise<void> {
   syncSourcePopup();
 }
 
-/** A pick replaces any `?camera=`, so a reload takes the latest pick from any tab. */
+/** A pick replaces any `?camera=`, so a reload takes this tab's latest pick. */
 function setCameraChoice(choice: string): void {
   cameraChoice = choice;
   const url = new URL(window.location.href);
@@ -568,7 +564,7 @@ function setCameraChoice(choice: string): void {
     window.history.replaceState(null, '', url);
   }
   params.delete('camera');
-  storageSet(() => localStorage, CAMERA_KEY, choice);
+  storageSet(() => sessionStorage, CAMERA_KEY, choice);
   void refreshCameras();
 }
 
