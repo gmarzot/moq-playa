@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ClockDriftEstimator } from './clock-drift.js';
+import { ClockDriftEstimator, clockAheadMs, shownLatencyMs } from './clock-drift.js';
 
 const MIN = 60_000;
 
@@ -93,5 +93,40 @@ describe('ClockDriftEstimator', () => {
     feed(est, 6 * MIN + 10_000, 7 * MIN, () => 70);
     const d = est.estimate(7 * MIN)!;
     expect(Math.abs(d.msPerMin)).toBeLessThan(0.5);
+  });
+
+  it('holds the correction at the newest sample instead of extrapolating', () => {
+    const est = new ClockDriftEstimator();
+    const floor = (t: number) => 70 + (5 * t) / MIN;
+    feed(est, 0, 10 * MIN, floor);
+    const atLast = est.estimate(10 * MIN)!;
+    expect(atLast.applied).toBe(true);
+    // Two hours with no samples (a hidden tab): the correction stays where the data ended.
+    expect(est.estimate(130 * MIN)!.correctionMs).toBeCloseTo(atLast.correctionMs, 6);
+  });
+
+  it('reset drops the fit and its reference level', () => {
+    const est = new ClockDriftEstimator();
+    feed(est, 0, 10 * MIN, (t) => 70 + (2 * t) / MIN);
+    expect(est.estimate(10 * MIN)!.applied).toBe(true);
+    est.reset();
+    expect(est.estimate(10 * MIN)).toBeNull();
+    feed(est, 10 * MIN, 16 * MIN, () => 40);
+    const d = est.estimate(16 * MIN)!;
+    expect(Math.abs(d.correctionMs)).toBeLessThan(3);
+  });
+});
+
+describe('latency readout', () => {
+  it('a raw floor below minus the clock error means the publisher clock is ahead', () => {
+    expect(clockAheadMs(-120, 80)).toBe(120);
+    expect(clockAheadMs(-60, 80)).toBeNull();
+    expect(clockAheadMs(35, 80)).toBeNull();
+  });
+
+  it('never shows a negative latency; within the clock error it reads 0', () => {
+    expect(shownLatencyMs(-60)).toBe(0);
+    expect(shownLatencyMs(0)).toBe(0);
+    expect(shownLatencyMs(42)).toBe(42);
   });
 });
