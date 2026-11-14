@@ -85,6 +85,7 @@ import { computePlaybackDelayUs,
   handlePipelineCommand as doPipelineCommand,
   handlePipelineEvent as doPipelineEvent,
   handleRecoveryAction as doRecoveryAction,
+  type PipelineCallbacks,
   type PipelineSet,
   type TrackInfo,
 } from './player-pipeline.js';
@@ -558,6 +559,16 @@ export class MoqtPlayer {
   private latencyPolicy: LatencyPolicy | null = null;
   /** Applies latency settings to the LOC playout; null before pipelines exist. */
   private applyLocPlayout: NonNullable<PipelineSet['apply']> | null = null;
+  /**
+   * LOC: a delay raise from updatePlayback. Frames already scheduled play out, then playback holds for
+   * the step, so the hold ends by `untilUs` (now + the new delay); that hold is not a stall.
+   */
+  private raiseHold: { untilUs: number; heldUs: number } | null = null;
+  /** A stall inside the raise hold, handled as a stall if it outlasts the hold by RAISE_HOLD_GRACE_MS. */
+  private raiseHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  private raiseHoldStall: { detectedUs: number; durationMs: number; onStall: (durationMs: number) => void } | null = null;
+  /** When the LOC renderer last drew a frame. */
+  private lastLocFrameUs = Number.NEGATIVE_INFINITY;
 
   /** Whether mediaSource.initialize() has been called. */
   private cmafInitialized = false;
@@ -1622,7 +1633,10 @@ export class MoqtPlayer {
     const targetMs = next.targetLatencyMs ?? this.catalogTargetLatencyMs ?? undefined;
     if (changed('targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs',
       'renderCushionFloorMs', 'renderCushionMaxMs') && this.applyLocPlayout) {
+      const beforeUs = this.getRenderCushionUs?.() ?? 0;
       this.latencyPolicy = this.applyLocPlayout(next, this.catalogTargetLatencyMs ?? undefined) ?? null;
+      const heldUs = this.getRenderCushionUs?.() ?? 0;
+      if (heldUs > beforeUs) this.raiseHold = { untilUs: this.clock.now() + heldUs, heldUs };
     }
     if (changed('targetLatencyMs', 'latencyMode', 'smoothFloorMs', 'smoothCeilingMs')) {
       this.mediaSource?.setLatency?.({
@@ -4667,6 +4681,7 @@ export class MoqtPlayer {
     this._stats.recordPlayStop();
     this.stopTicking();
     this.clearStallPark();
+    this.clearRaiseHold();
 
     // Flush pre-scheduled audio and queued video frames immediately
     this.commandDispatcher?.flush();
@@ -7128,6 +7143,7 @@ export class MoqtPlayer {
   /** How long a detected stall waits for delivery to resume before skipping
    *  to the next keyframe. */
   private static readonly STALL_PARK_MS = 1_500;
+  private static readonly RAISE_HOLD_GRACE_MS = 500;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
 
   /** Healthy time required before an upshift: fixed on VOD, backed off on live. */
@@ -7372,6 +7388,7 @@ export class MoqtPlayer {
     this.reconnect = null;
     this.follower.destroy();
     this.clearStallPark();
+    this.clearRaiseHold();
     if (this.currentMigration) {
       const txn = this.currentMigration;
       this.currentMigration = null;
@@ -9317,7 +9334,7 @@ export class MoqtPlayer {
   private createPipelinesFromTrackInfo(trackInfo: TrackInfo): void {
     if (this.pipelinesCreated) return;
 
-    const pipelines = createPipelines(this.config, this.clock, trackInfo, {
+    const callbacks: PipelineCallbacks = {
       onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
         if (this.mseRebuildAwaitingFrame) {
@@ -9332,10 +9349,12 @@ export class MoqtPlayer {
         this.emitter.emit('first_frame', { type: 'first_frame' });
       },
       onStallRecovered: (durationMs) => {
+        if (this.endRaiseHoldStall(durationMs)) return;
         this._stats.recordStallRecovered(durationMs);
         this.emitter.emit('stall_recovered', { type: 'stall_recovered', durationMs });
       },
       onStall: (durationMs) => {
+        if (this.deferRaiseHoldStall(durationMs, callbacks.onStall)) return;
         this._stats.recordStall(durationMs);
         this.emitter.emit('stall', { type: 'stall', durationMs });
         this.lastLocStallUs = this.clock.now();
@@ -9510,6 +9529,7 @@ export class MoqtPlayer {
       },
       onFrameRendered: (_captureTimestampUs, _actualRenderUs) => {
         this._stats.recordFrameRendered();
+        this.lastLocFrameUs = this.clock.now();
         this.clearStallPark();
         if (this.videoRecoveryActive) {
           // Pipeline reset(minFreshGroup) rejects stale in-flight objects,
@@ -9543,7 +9563,8 @@ export class MoqtPlayer {
           });
         }
       },
-    }, this._handshakeRttMs);
+    };
+    const pipelines = createPipelines(this.config, this.clock, trackInfo, callbacks, this._handshakeRttMs);
 
     // Store pipeline set in player fields — MUST happen before
     // configurePipelines() because configure() triggers onCommand
@@ -10618,6 +10639,56 @@ export class MoqtPlayer {
     if (this.stallParkTimer === null) return;
     clearTimeout(this.stallParkTimer);
     this.stallParkTimer = null;
+  }
+
+  /**
+   * A LOC stall detected inside the raise hold waits until the hold (a later
+   * raise's, if one came) has ended RAISE_HOLD_GRACE_MS ago; still stalled
+   * then, it is handled as a stall.
+   */
+  private deferRaiseHoldStall(durationMs: number, onStall: (durationMs: number) => void): boolean {
+    const graceUs = MoqtPlayer.RAISE_HOLD_GRACE_MS * 1000;
+    const detectedUs = this.clock.now();
+    if (!this.raiseHold || detectedUs > this.raiseHold.untilUs + graceUs) return false;
+    if (this.raiseHoldTimer !== null) return true;
+    this.raiseHoldStall = { detectedUs, durationMs, onStall };
+    const check = (): void => {
+      const now = this.clock.now();
+      const hold = this.raiseHold;
+      if (hold && now < hold.untilUs + graceUs) {
+        this.raiseHoldTimer = setTimeout(check, (hold.untilUs + graceUs - now) / 1000);
+        return;
+      }
+      const stall = this.raiseHoldStall;
+      this.clearRaiseHold();
+      // Frames drawn since detection with no recovery event: a seek or flush ended it.
+      if (!stall || this._destroyed || this.isTerminalState() || this.lastLocFrameUs > stall.detectedUs) return;
+      stall.onStall(stall.durationMs + (now - stall.detectedUs) / 1000);
+    };
+    this.raiseHoldTimer = setTimeout(check, (this.raiseHold.untilUs + graceUs - detectedUs) / 1000);
+    return true;
+  }
+
+  /** True when the recovered stall was the raise hold: logged, not counted. */
+  private endRaiseHoldStall(durationMs: number): boolean {
+    if (this.raiseHoldTimer === null || !this.raiseHold) return false;
+    const { untilUs, heldUs } = this.raiseHold;
+    const stall = this.raiseHoldStall;
+    this.clearRaiseHold();
+    // Recovered past the deadline (its timer ran late): a stall after all, counted before its recovery.
+    if (this.clock.now() > untilUs + MoqtPlayer.RAISE_HOLD_GRACE_MS * 1000) {
+      stall?.onStall(durationMs);
+      return false;
+    }
+    this.log.info('Latency: delay raised to %s s, held %s s', (heldUs / 1e6).toFixed(1), (durationMs / 1000).toFixed(1));
+    return true;
+  }
+
+  private clearRaiseHold(): void {
+    if (this.raiseHoldTimer !== null) clearTimeout(this.raiseHoldTimer);
+    this.raiseHoldTimer = null;
+    this.raiseHold = null;
+    this.raiseHoldStall = null;
   }
 
   /**

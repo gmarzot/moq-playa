@@ -9722,6 +9722,109 @@ describe('MoqtPlayer', () => {
       });
     });
 
+    it('LOC: a delay raise from updatePlayback holds without counting a stall', async () => {
+      const { player, renderer, feedGroups, simulateRenderedFrames } = await setupAbrTest();
+      const r = renderer as any;
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      const stalls: number[] = [];
+      player.on('stall', (e) => stalls.push(e.durationMs));
+      player.updatePlayback({ latencyMode: 'smooth', smoothFloorMs: 2000, smoothCeilingMs: 3000 });
+      const holdUs = (player as any).raiseHold.untilUs - clockTimeUs;
+      expect(holdUs).toBeGreaterThan(1_500_000);
+      advanceClock(500_000);
+      r.onStall?.(500);
+      advanceClock(holdUs - 500_000);
+      r.onStallRecovered?.(holdUs / 1000 - 300);
+      expect(player.stats.stallCount).toBe(0);
+      expect(player.stats.totalStallDurationMs).toBe(0);
+      expect(stalls).toHaveLength(0);
+      expect((player as any).lastLocStallUs).toBe(0);
+      expect((player as any).raiseHoldTimer).toBeNull();
+
+      advanceClock(5_000_000);
+      r.onStall?.(600);
+      expect(player.stats.stallCount).toBe(1);
+      await player.destroy();
+    });
+
+    it('LOC: a raise hold that starts once scheduled frames play out is not a stall', async () => {
+      const { player, renderer, feedGroups, simulateRenderedFrames } = await setupAbrTest();
+      const r = renderer as any;
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      player.updatePlayback({ latencyMode: 'smooth' });                // LIVE(+1s)
+      advanceClock(20_000_000);
+      simulateRenderedFrames(10);
+      player.updatePlayback({ latencyMode: 'smooth', smoothFloorMs: 2000, smoothCeilingMs: 3000 });
+      advanceClock(1_700_000);                                        // 1 s of frames already scheduled
+      r.onStall?.(500);
+      advanceClock(300_000);
+      r.onStallRecovered?.(800);
+      expect(player.stats.stallCount).toBe(0);
+      await player.destroy();
+    });
+
+    it('LOC: a stall that outlasts the raise hold is handled as a stall', async () => {
+      const { player, renderer, feedGroups, simulateRenderedFrames } = await setupAbrTest();
+      const r = renderer as any;
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      vi.useFakeTimers();
+      try {
+        player.updatePlayback({ latencyMode: 'smooth', smoothFloorMs: 2000, smoothCeilingMs: 3000 });
+        const holdUs = (player as any).raiseHold.untilUs - clockTimeUs;
+        advanceClock(500_000);
+        r.onStall?.(500);
+        expect(player.stats.stallCount).toBe(0);
+        advanceClock(holdUs);                     // the hold's end plus 0.5 s
+        vi.advanceTimersByTime(holdUs / 1000);
+        expect(player.stats.stallCount).toBe(1);
+        expect((player as any).lastLocStallUs).toBe(clockTimeUs);
+      } finally {
+        vi.useRealTimers();
+      }
+      await player.destroy();
+    });
+
+    it('LOC: frames drawn again without a recovery event (a seek) leave the raise hold uncounted', async () => {
+      const { player, renderer, feedGroups, simulateRenderedFrames } = await setupAbrTest();
+      const r = renderer as any;
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      vi.useFakeTimers();
+      try {
+        player.updatePlayback({ latencyMode: 'smooth', smoothFloorMs: 2000, smoothCeilingMs: 3000 });
+        const holdUs = (player as any).raiseHold.untilUs - clockTimeUs;
+        advanceClock(500_000);
+        r.onStall?.(500);
+        advanceClock(1_000_000);
+        simulateRenderedFrames(3);
+        advanceClock(holdUs);
+        vi.advanceTimersByTime(holdUs / 1000 + 1_000);
+        expect(player.stats.stallCount).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+      await player.destroy();
+    });
+
+    it('LOC: a recovery after the raise hold deadline counts as a stall', async () => {
+      const { player, renderer, feedGroups, simulateRenderedFrames } = await setupAbrTest();
+      const r = renderer as any;
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      player.updatePlayback({ latencyMode: 'smooth', smoothFloorMs: 2000, smoothCeilingMs: 3000 });
+      const holdUs = (player as any).raiseHold.untilUs - clockTimeUs;
+      advanceClock(500_000);
+      r.onStall?.(500);
+      advanceClock(holdUs + 1_000_000);                // its timer has not run yet
+      r.onStallRecovered?.(holdUs / 1000 + 1_000);
+      expect(player.stats.stallCount).toBe(1);
+      expect(player.stats.totalStallDurationMs).toBeGreaterThan(0);
+      await player.destroy();
+    });
+
     it('LOC: no upshift when recent stall within stability window (timestamp proves it)', async () => {
       const { player, renderer, feedGroups, simulateRenderedFrames, hasSubscribeTo } = await setupAbrTest();
 
