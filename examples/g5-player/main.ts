@@ -124,7 +124,7 @@ import { setBadge } from '../shared/status-badge.js';
 import type { BadgeTone } from '../shared/status-badge.js';
 import type { SubscriptionStatus } from '@openmoq/playa';
 import type { Level } from '@openmoq/playa';
-import { ClockDriftEstimator } from '../shared/clock-drift.js';
+import { ClockDriftEstimator, clockAheadMs, shownLatencyMs } from '../shared/clock-drift.js';
 import { ClockReference, describeClockOffset } from '../shared/clock-sync.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
@@ -1004,6 +1004,7 @@ async function main(): Promise<void> {
         : `Page ${state} after ${(awayMs / 1000).toFixed(1)}s away${rejoined ? ': rejoining live' : ''}`);
     }
     if (rejoined) rejoinAtMs = performance.now();
+    if (rejoined || (state === 'visible' && (awayMs ?? 0) > CLOCK_DRIFT_WINDOW_MS)) reanchorClock();
   });
   player.on('session_closed', ({ code, reason }) => {
     log(`Session closed${code !== undefined ? ` (code ${code})` : ''}${reason ? `: ${reason}` : ''}`);
@@ -1043,6 +1044,7 @@ async function main(): Promise<void> {
   });
   player.on('session_migrated', () => {
     log('Session re-established');
+    reanchorClock();
     rebaseSeqs(objSeq, { dropPending: true });
     setupBadgeState = { tone: 'ok', detail: 'Session re-established' };
     logCongestionControl();
@@ -1227,8 +1229,9 @@ async function main(): Promise<void> {
   const latHistory: Array<[number, number, bigint | undefined]> = [];
   /** Clock divergence rate from the drift fit, in ms per minute. */
   let clockDriftMsPerMin: number | null = null;
+  const CLOCK_DRIFT_WINDOW_MS = 10 * 60_000;
   /** Fitted from the latency floor; stalls, re-anchors and returns to view unsettle it. */
-  const clockDrift = new ClockDriftEstimator();
+  const clockDrift = new ClockDriftEstimator({ windowMs: CLOCK_DRIFT_WINDOW_MS });
   // Latency compares this machine's clock with the publisher's. The relay
   // site's /time (?clockUrl= overrides) calibrates it; without an answer the
   // figures read this clock uncorrected, and the label's hover says so.
@@ -1246,6 +1249,20 @@ async function main(): Promise<void> {
     },
   });
   const calibrateClock = (): Promise<void> => referenceClock.calibrate();
+  /** Drop the drift fit and measure this clock again. */
+  const reanchorClock = (): void => {
+    clockDrift.reset();
+    void calibrateClock();
+  };
+  /** The publisher's stated clock error (catalog `g5Clock.uncertaintyMs`). */
+  let publisherClockErrMs = 0;
+  /** Smallest clock error assumed (ms). */
+  const CLOCK_ERR_FLOOR_MS = 20;
+  /** Clock error (ms): this page's against the reference plus the publisher's. */
+  const clockErrorMs = (): number => Math.max(CLOCK_ERR_FLOOR_MS,
+    (referenceClock.offset ? referenceClock.offset.rttMs / 2 : 0) + publisherClockErrMs);
+  /** How far the publisher's clock runs ahead of ours beyond the clock error; null while latency is measurable. */
+  let clockAhead: number | null = null;
   /** Date.now() on the reference clock. */
   const wallNowMs = (): number => referenceClock.nowMs();
   void calibrateClock();
@@ -1675,7 +1692,7 @@ async function main(): Promise<void> {
     drop(latHistory);
     if (firstDroppedMs === Infinity) return;
     const corrected = (from: number, to: number): number[] =>
-      latHistory.filter(([t]) => t > from && t <= to).map(([, v]) => v - lastDriftCorrectionMs);
+      latHistory.filter(([t]) => t > from && t <= to).map(([, v]) => shownLatencyMs(v - lastDriftCorrectionMs));
     const lastTickMs = sampleAtMs.length ? sampleAtMs[sampleAtMs.length - 1]! : -Infinity;
     const pending = latWindow.filter(([t]) => t > lastTickMs).map(([, v]) => v);
     tickWorstRawMs = pending.length ? Math.max(...pending) : -Infinity;
@@ -2045,14 +2062,34 @@ async function main(): Promise<void> {
     const drift = clockDrift.estimate(tickNowMs);
     clockDriftMsPerMin = drift?.msPerMin ?? null;
     clockDriftApplied = drift?.applied ?? false;
-    const driftCorrectionMs = drift?.correctionMs ?? 0;
+    let driftCorrectionMs = drift?.correctionMs ?? 0;
+    const errMs = clockErrorMs();
+    const rawFloorMs = latRaw.length ? Math.min(...latRaw) : null;
+    // Latency below zero past the clock error: the drift fit is wrong.
+    if (!relativeDelay && driftCorrectionMs !== 0 && rawFloorMs !== null && rawFloorMs - driftCorrectionMs < -errMs) {
+      log(`Clock: latency read ${(driftCorrectionMs - rawFloorMs).toFixed(0)} ms below zero `
+        + `(±${errMs.toFixed(0)} ms); re-anchored`);
+      reanchorClock();
+      driftCorrectionMs = 0;
+      clockDriftMsPerMin = null;
+      clockDriftApplied = false;
+    }
+    // Even uncorrected below zero: the publisher's clock is ahead of ours.
+    const ahead = relativeDelay ? null : rawFloorMs === null ? clockAhead : clockAheadMs(rawFloorMs, errMs);
+    if ((ahead === null) !== (clockAhead === null)) {
+      log(ahead === null ? 'Clock: latency measurable again'
+        : `Clock: publisher timestamps are ${ahead.toFixed(0)} ms ahead of this page (±${errMs.toFixed(0)} ms); `
+          + 'latency withheld until the clocks agree');
+    }
+    clockAhead = ahead;
     lastDriftCorrectionMs = driftCorrectionMs;
     const latVals = driftCorrectionMs
       ? latRaw.map((v) => v - driftCorrectionMs) : latRaw;
     while (audioLatWindow.length && tickNowMs - audioLatWindow[0]![0] > LAT_WINDOW_MS) audioLatWindow.shift();
     const audioLat = audioLatWindow.map(([, v]) => v - driftCorrectionMs);
     audioLatPct = audioLat.length
-      ? [percentile(audioLat, 0.5), percentile(audioLat, 0.95), percentile(audioLat, 0.99)] : null;
+      ? [percentile(audioLat, 0.5), percentile(audioLat, 0.95), percentile(audioLat, 0.99)].map(shownLatencyMs) as
+        [number, number, number] : null;
     // MSE plays behind its buffered end, so on screen is roughly arrival plus that buffer.
     // The buffered-ahead term is a sawtooth between appends: report its p50
     // over the chart's window, as the drawn-frame E2E is on LOC.
@@ -2063,12 +2100,13 @@ async function main(): Promise<void> {
     const screenVals = screenWindow.map(([, v]) => v - driftCorrectionMs);
     // Every series takes a value on every tick, NaN where there is nothing to
     // report, so all of them index the same sample times.
-    const have = latVals.length > 0 && !frozen;
+    const have = latVals.length > 0 && !frozen && clockAhead === null;
     const queued = player.state !== 'idle' && !hidden;
     sampleAtMs.push(tickNowMs);
-    latP50Samples.push(have ? percentile(latVals, 0.5) : NaN);
-    latP95Samples.push(have ? percentile(latVals, 0.95) : NaN);
-    latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) && !frozen ? tickWorstRawMs - driftCorrectionMs : NaN);
+    latP50Samples.push(have ? shownLatencyMs(percentile(latVals, 0.5)) : NaN);
+    latP95Samples.push(have ? shownLatencyMs(percentile(latVals, 0.95)) : NaN);
+    latTickMaxSamples.push(Number.isFinite(tickWorstRawMs) && !frozen && clockAhead === null
+      ? shownLatencyMs(tickWorstRawMs - driftCorrectionMs) : NaN);
     jitSamples.push(!arrivalsSettling && (prevCaptureMs || expectedIntervalMs) ? jitterEwma : NaN);
     queuedASamples.push(queued && !queueSettling ? (aMs ?? NaN) : NaN);
     queuedVSamples.push(queued && !queueSettling ? (vMs ?? NaN) : NaN);
@@ -2141,7 +2179,7 @@ async function main(): Promise<void> {
       const u = underrunWindow;
       if (u.count > 0) {
         const lagNow = Math.max(0, ...lagSamples.map(([, d]) => d));
-        const pct = audioLatPct ? audioLatPct.map((v) => v.toFixed(0)).join('/') : '—';
+        const pct = clockAhead !== null ? 'clock' : audioLatPct ? audioLatPct.map((v) => v.toFixed(0)).join('/') : '—';
         log(`Audio underruns in ${UNDERRUN_REPORT_MS / 1000}s: ${u.count}, `
           + `${(u.gapSec * 1000).toFixed(0)} ms silent · ${u.late} late `
           + `(worst ${(u.worstLateSec * 1000).toFixed(0)} ms past its slot) · `
@@ -2179,18 +2217,26 @@ async function main(): Promise<void> {
 
     // Nothing is on screen to be late: a figure here would describe arrivals only.
     const STALLED = 'stalled';
-    latVal.textContent = frozen ? STALLED : latVals.length ? percentile(latVals, 0.5).toFixed(0) : '—';
-    latP95.textContent = frozen ? STALLED : latVals.length ? percentile(latVals, 0.95).toFixed(0) : '—';
+    // A publisher clock ahead of ours makes every figure here meaningless: say so instead.
+    const CLOCK = 'clock';
+    const clockFault = clockAhead !== null;
+    const shown = (v: number): string => shownLatencyMs(v).toFixed(0);
+    latVal.textContent = frozen ? STALLED : clockFault ? CLOCK : latVals.length ? shown(percentile(latVals, 0.5)) : '—';
+    latP95.textContent = frozen ? STALLED : clockFault ? CLOCK : latVals.length ? shown(percentile(latVals, 0.95)) : '—';
     const clockOffset = referenceClock.offset;
     latKind.textContent = relativeDelay ? 'relative delay' : 'latency';
-    latScreen.textContent = frozen ? STALLED : relativeDelay ? '—'
-      : screenVals.length ? percentile(screenVals, 0.5).toFixed(0)
-      : cmafPlayoutMs != null ? `≈${cmafPlayoutMs.toFixed(0)}` : '—';
-    latMax.textContent = frozen ? STALLED : peakMs?.toFixed(0) ?? '—';
+    latScreen.textContent = frozen ? STALLED : relativeDelay ? '—' : clockFault ? CLOCK
+      : screenVals.length ? shown(percentile(screenVals, 0.5))
+      : cmafPlayoutMs != null ? `≈${shown(cmafPlayoutMs)}` : '—';
+    latMax.textContent = frozen ? STALLED : clockFault ? CLOCK : peakMs?.toFixed(0) ?? '—';
+    for (const el of [latVal, latP95, latMax, latScreen]) el.style.color = clockFault ? 'var(--warn)' : '';
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
-      : [latencySource ? SOURCE_TIP[latencySource] : '',
+      : [clockAhead !== null
+          ? `Publisher timestamps are ${clockAhead.toFixed(0)} ms ahead of this page (clock error ±${errMs.toFixed(0)} ms): `
+            + 'latency is not measurable until the clocks agree.' : '',
+        latencySource ? SOURCE_TIP[latencySource] : '',
         clockOffset
           ? `Clock: ${(clockOffset.offsetMs >= 0 ? '+' : '') + clockOffset.offsetMs.toFixed(0)} ms against `
             + `${new URL(clockUrl).host}, ±${(clockOffset.rttMs / 2).toFixed(0)} ms; applied to latency and E2E.`
@@ -2368,6 +2414,7 @@ async function main(): Promise<void> {
     let clock: { source?: unknown; uncertaintyMs?: unknown } | undefined;
     try { clock = (JSON.parse(text) as { g5Clock?: typeof clock }).g5Clock; } catch { return; }
     const source = typeof clock?.source === 'string' ? hostOf(clock.source) : null;
+    publisherClockErrMs = typeof clock?.uncertaintyMs === 'number' ? clock.uncertaintyMs : 0;
     const key = clock === undefined ? 'absent' : source ?? 'none';
     if (key === publisherClockKey) return;
     publisherClockKey = key;

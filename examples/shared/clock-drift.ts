@@ -51,6 +51,14 @@ export class ClockDriftEstimator {
     this.maxTrustedMsPerMin = options.maxTrustedMsPerMin ?? 5;
   }
 
+  /** Start over: no samples, no reference level, no correction. */
+  reset(): void {
+    this.samples.length = 0;
+    this.settleUntilMs = null;
+    this.refFloorMs = null;
+    this.last = null;
+  }
+
   /** A stall, sync re-anchor or return to visibility: the floor is not settled. */
   disturb(atMs: number): void {
     this.settleUntilMs = Math.max(this.settleUntilMs ?? -Infinity, atMs + this.settleMs);
@@ -89,7 +97,8 @@ export class ClockDriftEstimator {
       this.last = { msPerMin, correctionMs: 0, applied: false };
       return this.last;
     }
-    const fittedMs = intercept + slope * (atMs - t0);
+    // No extrapolation: a fit says nothing about the clocks after its newest sample.
+    const fittedMs = intercept + slope * (Math.min(atMs, this.samples[n - 1]![0]) - t0);
     this.refFloorMs ??= fittedMs;
     this.last = { msPerMin, correctionMs: fittedMs - this.refFloorMs, applied: true };
     return this.last;
@@ -125,4 +134,17 @@ function median(values: number[]): number {
   const s = [...values].sort((a, b) => a - b);
   const mid = s.length >> 1;
   return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+
+/**
+ * How far the publisher's clock is ahead of ours (ms), judged by the raw
+ * latency floor against the clock error `errMs`; null while latency is measurable.
+ */
+export function clockAheadMs(rawFloorMs: number, errMs: number): number | null {
+  return rawFloorMs < -errMs ? -rawFloorMs : null;
+}
+
+/** A latency figure as shown: never negative; a value within the clock error below zero reads 0. */
+export function shownLatencyMs(valueMs: number): number {
+  return Math.max(0, valueMs);
 }
