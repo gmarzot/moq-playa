@@ -61,7 +61,7 @@ Forward State change, capture gaps, and the per-minute capture drift.
 Controls: play/pause, timeline, speaker (on phones it opens a volume slider
 with mute), ⚙ (View: every view of the catalog, grouped by program; Quality;
 Audio: the program's audio feeds; Language: the languages of the feed playing;
-Latency: Live, or 1 s / 2 s behind live; Connection settings), catalog panel.
+Latency: LIVE, or LIVE(+1s) / LIVE(+2s) behind live; Connection settings), catalog panel.
 A view this browser cannot decode is listed as "not supported here" and
 cannot be chosen.
 
@@ -84,7 +84,7 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | `live` |
 | `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
 | `targetLatency=` | overrides the catalog target (ms); see below | catalog value |
-| `latency=` | `live`, or `smooth` to play behind live (⚙ → Latency 1 s / 2 s sets it for this tab) | live |
+| `latency=` | `live`, or `smooth` to play behind live (⚙ → Latency LIVE(+1s) / LIVE(+2s) sets it for this tab) | live |
 | `latencyMin=` | with `latency=smooth`: where the delay starts and the lowest it steps back to (ms); 0 starts at the target | 1000 |
 | `latencyMax=` | with `latency=smooth`: the most late media raises the delay to (ms) | 2000 |
 | `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |

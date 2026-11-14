@@ -278,7 +278,7 @@ const CELL_TIPS: Record<string, string> = {
   'underruns': 'Audio ran dry. Small: total silence.',
   'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
   'dropped': "Video frames the browser didn't draw.",
-  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH when playing behind live (Latency 1 s or 2 s); they are not counted as lost.',
+  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH when playing behind live (LIVE(+1s) or LIVE(+2s)); they are not counted as lost.',
   'stalls': 'Time playback was interrupted.',
 };
 
