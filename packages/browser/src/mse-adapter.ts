@@ -845,6 +845,13 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly VIDEO_STUCK_MS = 1_000;
   private static readonly VIDEO_STUCK_MIN_MOVE_SEC = 0.5;
   private static readonly VIDEO_STUCK_COOLDOWN_MS = 5_000;
+  /** Video buffered ahead the stuck nudge needs; Live keeps about 0.25 s. */
+  private static readonly VIDEO_STUCK_MIN_AHEAD_SEC = 0.1;
+  /** After a video changeType: shorter stuck limits, checked every 100 ms. */
+  private static readonly VIDEO_SWITCH_WINDOW_MS = 3_000;
+  private static readonly VIDEO_SWITCH_STUCK_MS = 300;
+  private static readonly VIDEO_SWITCH_MIN_MOVE_SEC = 0.25;
+  private static readonly VIDEO_SWITCH_CHECK_MS = 100;
   /** After a stall, a cushion this far over target is shed by one seek (live only). */
   private static readonly STALL_SNAP_EXCESS_SEC = 1.0;
   /** Cap on the stall length the snap keeps above target. */
@@ -866,6 +873,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** Frames presented and playhead when the frame count last changed. */
   private videoFramesSeen: { frames: number; time: number; atMs: number } | null = null;
   private lastVideoStuckNudgeMs = Number.NEGATIVE_INFINITY;
+  private videoSwitchAtMs = Number.NEGATIVE_INFINITY;
+  private videoSwitchTimer: ReturnType<typeof setInterval> | null = null;
   /** Buffered end when the player resubscribed: the next hole after it cannot fill. */
   private discontinuityMark: { afterSec: number; atMs: number } | null = null;
   /** Suppresses ONE seek-generated waiting/timeupdate episode after a jump. */
@@ -1423,6 +1432,30 @@ export class MseMediaSource implements MediaSourceLike {
     // Re-trigger play through the owned lifecycle so a late codec switch cannot
     // restart a player that has been paused (intent withdrawn) or destroyed.
     this.resumePlayback();
+    if (mediaType === 'video') this.noteVideoSwitch();
+  }
+
+  /** Chrome can hold a switched rendition's first keyframe: check for a stuck picture every 100 ms for a while. */
+  private noteVideoSwitch(): void {
+    if (this.destroyed) return;
+    this.endVideoSwitchWindow();
+    this.videoSwitchAtMs = performance.now();
+    // Each switch may nudge once, whatever the previous one did.
+    this.lastVideoStuckNudgeMs = Number.NEGATIVE_INFINITY;
+    this.videoSwitchTimer = setInterval(() => {
+      const nowMs = performance.now();
+      if (this.destroyed || nowMs - this.videoSwitchAtMs >= MseMediaSource.VIDEO_SWITCH_WINDOW_MS) {
+        this.endVideoSwitchWindow();
+        return;
+      }
+      this.checkVideoStuck(nowMs);
+    }, MseMediaSource.VIDEO_SWITCH_CHECK_MS);
+  }
+
+  private endVideoSwitchWindow(): void {
+    if (this.videoSwitchTimer !== null) clearInterval(this.videoSwitchTimer);
+    this.videoSwitchTimer = null;
+    this.videoSwitchAtMs = Number.NEGATIVE_INFINITY;
   }
 
   /**
@@ -1630,6 +1663,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
     this.videoFramesSeen = null;
     this.lastVideoStuckNudgeMs = Number.NEGATIVE_INFINITY;
+    this.endVideoSwitchWindow();
     this.discontinuityMark = null;
     this.resetPlaybackRate();
   }
@@ -3685,7 +3719,8 @@ export class MseMediaSource implements MediaSourceLike {
   /**
    * Chrome's video renderer can stop presenting after a video hole while audio
    * moves the playhead on, until a seek. A playhead that moved with video
-   * buffered at it but no new frame for VIDEO_STUCK_MS is nudged 0.1 s on.
+   * buffered at it but no new frame for VIDEO_STUCK_MS (VIDEO_SWITCH_STUCK_MS
+   * just after a video changeType) is nudged up to 0.1 s on.
    */
   private checkVideoStuck(nowMs: number): void {
     const v = this.video;
@@ -3703,16 +3738,19 @@ export class MseMediaSource implements MediaSourceLike {
       this.videoFramesSeen = { frames: shown, time: ct, atMs: nowMs };
       return;
     }
-    if (nowMs - seen.atMs < MseMediaSource.VIDEO_STUCK_MS
-        || ct - seen.time < MseMediaSource.VIDEO_STUCK_MIN_MOVE_SEC
+    const switched = nowMs - this.videoSwitchAtMs < MseMediaSource.VIDEO_SWITCH_WINDOW_MS;
+    if (nowMs - seen.atMs < (switched ? MseMediaSource.VIDEO_SWITCH_STUCK_MS : MseMediaSource.VIDEO_STUCK_MS)
+        || ct - seen.time < (switched ? MseMediaSource.VIDEO_SWITCH_MIN_MOVE_SEC : MseMediaSource.VIDEO_STUCK_MIN_MOVE_SEC)
         || nowMs - this.lastVideoStuckNudgeMs < MseMediaSource.VIDEO_STUCK_COOLDOWN_MS) return;
     let videoAt = false;
     try {
       const b = this.videoBuffer.buffered;
-      for (let i = 0; i < b.length; i++) if (ct >= b.start(i) && b.end(i) - ct >= 0.2) videoAt = true;
+      for (let i = 0; i < b.length; i++) {
+        if (ct >= b.start(i) && b.end(i) - ct >= MseMediaSource.VIDEO_STUCK_MIN_AHEAD_SEC) videoAt = true;
+      }
     } catch { return; /* buffer detached */ }
     const end = this.containingRangeEnd(ct);
-    if (!videoAt || end === null || end - ct < MseMediaSource.STALL_NUDGE_MIN_AHEAD_SEC) return;
+    if (!videoAt || end === null || end - ct < MseMediaSource.VIDEO_STUCK_MIN_AHEAD_SEC) return;
     const to = Math.min(ct + 0.1, end - 0.05);
     this.lastVideoStuckNudgeMs = nowMs;
     this.videoFramesSeen = null;
