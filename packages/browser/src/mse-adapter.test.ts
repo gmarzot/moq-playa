@@ -1768,7 +1768,11 @@ describe('video stuck while the playhead moves', () => {
         const adjusts: Array<[string, number, number]> = [];
         adapter.onPlayheadAdjust = (kind, from, to) => adjusts.push([kind, from, to]);
         const check = (nowMs: number) => (adapter as any).checkVideoStuck(nowMs);
-        return { video, adjusts, check, setFrames: (n: number) => { frames = n; } };
+        const setBuffered = (r: Array<[number, number]>) => {
+            video.buffered = makeTimeRanges(r);
+            (adapter as any).videoBuffer = { buffered: makeTimeRanges(r) };
+        };
+        return { adapter, video, adjusts, check, setBuffered, setFrames: (n: number) => { frames = n; } };
     }
 
     it('nudges 0.1 s on when no new frame shows for 1 s while the playhead moves', () => {
@@ -1806,9 +1810,55 @@ describe('video stuck while the playhead moves', () => {
         const t = setup();
         (t as any).video.currentTime = 10;
         t.check(0);
-        t.video.currentTime = 24.9;                       // past the video range's useful end
+        t.video.currentTime = 24.95;                      // past the video range's useful end
         t.check(1_500);
         expect(t.adjusts).toHaveLength(0);
+    });
+
+    it('nudges with only 0.25 s of video buffered ahead', () => {
+        const s = setup();
+        s.setBuffered([[5, 11.25]]);
+        s.check(0);
+        s.video.currentTime = 11.0;
+        s.check(1_000);
+        expect(s.adjusts).toEqual([['nudge', 11.0, 11.1]]);
+    });
+
+    it('nudges after 300 ms without a frame right after a video changeType', () => {
+        vi.useFakeTimers();
+        let now = 0;
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+        try {
+            const s = setup();
+            (s.adapter as any).noteVideoSwitch();
+            const run = (ms: number) => {
+                for (let t = 0; t < ms; t += 100) { now += 100; s.video.currentTime += 0.1; vi.advanceTimersByTime(100); }
+            };
+            run(200);
+            expect(s.adjusts).toHaveLength(0);
+            run(200);
+            expect(s.adjusts).toHaveLength(1);
+            expect(s.adjusts[0][0]).toBe('nudge');
+            run(3_000);
+            expect((s.adapter as any).videoSwitchTimer).toBeNull();
+        } finally {
+            clock.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it('still waits 1 s once the switch window has passed', () => {
+        const s = setup();
+        (s.adapter as any).videoSwitchAtMs = -5_000;
+        s.check(0);
+        s.video.currentTime = 10.3;
+        s.check(300);
+        s.video.currentTime = 10.6;
+        s.check(600);
+        expect(s.adjusts).toHaveLength(0);
+        s.video.currentTime = 11.0;
+        s.check(1_000);
+        expect(s.adjusts).toEqual([['nudge', 11.0, 11.1]]);
     });
 
     it('stays quiet on a hidden page and nudges at most once per 5 s', () => {
