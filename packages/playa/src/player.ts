@@ -973,8 +973,10 @@ export class Player {
         duration: this._duration,
       });
       this.emitter.emit('levelsloaded', { levels: this._levels });
-      // A reconnect's catalog finds playback already running.
-      if ((this.options.autoplay ?? DEFAULTS.autoplay) && this._state !== 'playing') this.play();
+      // A reconnect's catalog finds playback running, or paused by the viewer or while hidden: leave it.
+      if ((this.options.autoplay ?? DEFAULTS.autoplay) && this._state !== 'playing' && this._state !== 'paused') {
+        this.play();
+      }
     });
 
     this.engine.on('first_frame', () => {

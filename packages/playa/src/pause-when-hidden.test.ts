@@ -15,10 +15,10 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-function setup(opts: { pauseWhenHidden?: boolean; muted?: boolean } = {}) {
+function setup(opts: { pauseWhenHidden?: boolean; muted?: boolean; autoplay?: boolean } = {}) {
   const player = new Player({ style: {}, appendChild: vi.fn() } as never, {
     url: 'https://relay.example/moq', namespace: 'test', audioActivation: 'gesture',
-    pauseWhenHidden: opts.pauseWhenHidden ?? true, muted: opts.muted ?? true,
+    pauseWhenHidden: opts.pauseWhenHidden ?? true, muted: opts.muted ?? true, autoplay: opts.autoplay ?? false,
   });
   const engine = (player as any).engine;
   vi.spyOn(engine, 'reconnectNow').mockImplementation(() => {});
@@ -32,6 +32,12 @@ function setup(opts: { pauseWhenHidden?: boolean; muted?: boolean } = {}) {
   const hide = () => { doc.hidden = true; (player as any).onLifecycle('hidden'); };
   const show = () => { doc.hidden = false; (player as any).onLifecycle('visible'); };
   return { player, enginePause, enginePlay, lifecycle, hide, show };
+}
+
+function emitCatalog(player: Player): void {
+  (player as any).engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+    { name: 'video', role: 'video', packaging: 'loc', codec: 'avc1.640028', isLive: true },
+  ] } });
 }
 
 describe('Player — pauseWhenHidden', () => {
@@ -114,6 +120,43 @@ describe('Player — pauseWhenHidden', () => {
       s.show();
       expect(s.enginePlay).toHaveBeenCalledTimes(1);
     } finally { await s.player.destroy(); }
+  });
+
+  it("a reconnect's catalog leaves a hidden-paused page paused; it still rejoins when shown", async () => {
+    const s = setup({ autoplay: true });
+    try {
+      s.hide();
+      vi.advanceTimersByTime(61_000);
+      expect(s.player.state).toBe('paused');
+      emitCatalog(s.player);
+      expect(s.enginePlay).not.toHaveBeenCalled();
+      expect(s.player.state).toBe('paused');
+      s.show();
+      expect(s.enginePlay).toHaveBeenCalledTimes(1);
+      expect(s.lifecycle.at(-1)).toMatchObject({ state: 'visible', rejoined: true });
+    } finally { await s.player.destroy(); }
+  });
+
+  it("a reconnect's catalog leaves a viewer's pause paused", async () => {
+    const s = setup({ autoplay: true });
+    try {
+      s.player.pause();
+      emitCatalog(s.player);
+      expect(s.enginePlay).not.toHaveBeenCalled();
+      expect(s.player.state).toBe('paused');
+    } finally { await s.player.destroy(); }
+  });
+
+  it('the first catalog autoplays', async () => {
+    const player = new Player({ style: {}, appendChild: vi.fn() } as never, {
+      url: 'https://relay.example/moq', namespace: 'test', audioActivation: 'gesture', muted: true, autoplay: true,
+    });
+    const enginePlay = vi.spyOn((player as any).engine, 'play').mockImplementation(() => {});
+    try {
+      emitCatalog(player);
+      expect(enginePlay).toHaveBeenCalledTimes(1);
+      expect(player.state).toBe('playing');
+    } finally { await player.destroy(); }
   });
 
   it('off by default', async () => {
