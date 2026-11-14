@@ -1847,6 +1847,28 @@ describe('video stuck while the playhead moves', () => {
         }
     });
 
+    it('a second switch soon after a nudge may nudge again', () => {
+        vi.useFakeTimers();
+        let now = 0;
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+        try {
+            const s = setup();
+            const run = (ms: number) => {
+                for (let t = 0; t < ms; t += 100) { now += 100; s.video.currentTime += 0.1; vi.advanceTimersByTime(100); }
+            };
+            (s.adapter as any).noteVideoSwitch();
+            run(400);
+            expect(s.adjusts).toHaveLength(1);
+            run(600);
+            (s.adapter as any).noteVideoSwitch();
+            run(400);
+            expect(s.adjusts).toHaveLength(2);
+        } finally {
+            clock.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
     it('still waits 1 s once the switch window has passed', () => {
         const s = setup();
         (s.adapter as any).videoSwitchAtMs = -5_000;

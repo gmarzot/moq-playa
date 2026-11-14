@@ -1440,6 +1440,8 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.destroyed) return;
     this.endVideoSwitchWindow();
     this.videoSwitchAtMs = performance.now();
+    // Each switch may nudge once, whatever the previous one did.
+    this.lastVideoStuckNudgeMs = Number.NEGATIVE_INFINITY;
     this.videoSwitchTimer = setInterval(() => {
       const nowMs = performance.now();
       if (this.destroyed || nowMs - this.videoSwitchAtMs >= MseMediaSource.VIDEO_SWITCH_WINDOW_MS) {
