@@ -11055,6 +11055,39 @@ describe('MoqtPlayer', () => {
         await player.destroy();
       });
 
+      it('frames dropped while the picture is frozen do not step down', async () => {
+        const { player, subscribedTo, ms } = await loadLive(500_000);
+        let q = { totalFrames: 1000, droppedFrames: 0 };
+        ms.getPlaybackQuality = vi.fn(() => q);
+        clockUs = 1 * S;
+        player.tick();
+        q = { totalFrames: 1060, droppedFrames: 60 };     // no new frame presented
+        clockUs = 1.6 * S;
+        player.tick();
+        q = { totalFrames: 1300, droppedFrames: 150 };
+        clockUs = 7 * S;
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(false);
+        expect((player as any).decodeCap).toBeNull();
+        await player.destroy();
+      });
+
+      it('a window holding a stall is not judged', async () => {
+        const { player, subscribedTo, ms } = await loadLive(500_000);
+        let q = { totalFrames: 1000, droppedFrames: 0 };
+        ms.getPlaybackQuality = vi.fn(() => q);
+        clockUs = 1 * S;
+        player.tick();
+        clockUs = 3 * S;
+        ms.onStall?.(300, 'media-gap');
+        q = { totalFrames: 1300, droppedFrames: 30 };
+        clockUs = 7 * S;
+        player.tick();
+        expect(subscribedTo('video-2')).toBe(false);
+        expect((player as any).decodeCap).toBeNull();
+        await player.destroy();
+      });
+
       it('Auto stays below a rung it could not decode until the cap lifts', async () => {
         const { player, subscribedTo } = await loadLive(500_000);
         (player as any).decodeCap = { kbps: 3000, untilUs: 60 * S };

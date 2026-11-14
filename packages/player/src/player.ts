@@ -7072,8 +7072,14 @@ export class MoqtPlayer {
   private static readonly DECODE_MIN_FRAMES = 60;
   /** How long Auto stays below a rung the device could not decode. */
   private static readonly DECODE_CAP_US = 300_000_000;
+  /** No new frame presented for this long: the picture is frozen, and frames dropped meanwhile are not judged. */
+  private static readonly DECODE_FREEZE_US = 500_000;
   /** Frame counts at the start of the current decode window; null until sampled. */
   private decodeWindow: { atUs: number; total: number; dropped: number; track: string } | null = null;
+  /** Presented frames (total − dropped) when that count last changed. */
+  private decodeShown: { frames: number; atUs: number } | null = null;
+  /** Last MSE stall of any cause: a decode window holding one is not judged. */
+  private lastMseStallAnyUs = Number.NEGATIVE_INFINITY;
   /** Auto stays below this bitrate (kbps) until `untilUs`. */
   private decodeCap: { kbps: number; untilUs: number } | null = null;
   /** Timestamp of last ABR downshift — gates upshift for stability. */
@@ -7133,15 +7139,26 @@ export class MoqtPlayer {
     return this.liveUpshiftWaitUs;
   }
 
-  /** MSE: whether the playing rung dropped more than its share of frames over the last window. A hidden page is not judged. */
+  /**
+   * MSE: whether the playing rung dropped more than its share of frames over the last window.
+   * A hidden page, a frozen picture and a window holding a stall are not judged.
+   */
   private decodeOverloaded(now: number, track: string | undefined): boolean {
     const q = this.mediaSource?.getPlaybackQuality?.();
     if (!q || !track || this.documentHidden()) {
       this.decodeWindow = null;
+      this.decodeShown = null;
+      return false;
+    }
+    const shown = q.totalFrames - q.droppedFrames;
+    if (!this.decodeShown || shown !== this.decodeShown.frames) {
+      this.decodeShown = { frames: shown, atUs: now };
+    } else if (now - this.decodeShown.atUs >= MoqtPlayer.DECODE_FREEZE_US) {
+      this.decodeWindow = null;
       return false;
     }
     const w = this.decodeWindow;
-    if (!w || w.track !== track || q.totalFrames < w.total) {
+    if (!w || w.track !== track || q.totalFrames < w.total || this.lastMseStallAnyUs >= w.atUs) {
       this.decodeWindow = { atUs: now, total: q.totalFrames, dropped: q.droppedFrames, track };
       return false;
     }
@@ -9559,6 +9576,7 @@ export class MoqtPlayer {
         this.emitter.emit('stall_recovered', { type: 'stall_recovered', durationMs });
       };
       this.mediaSource.onStall = (durationMs, cause) => {
+        this.lastMseStallAnyUs = this.clock.now();
         // A media-gap report is an already-elapsed interval, not a detection
         // latency, and nothing will later complete it.
         if (cause === 'media-gap') this._stats.recordResolvedStall(durationMs);
