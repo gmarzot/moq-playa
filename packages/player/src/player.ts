@@ -566,6 +566,9 @@ export class MoqtPlayer {
   private raiseHold: { untilUs: number; heldUs: number } | null = null;
   /** A stall inside the raise hold, handled as a stall if it outlasts the hold by RAISE_HOLD_GRACE_MS. */
   private raiseHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  private raiseHoldStall: { detectedUs: number; durationMs: number; onStall: (durationMs: number) => void } | null = null;
+  /** When the LOC renderer last drew a frame. */
+  private lastLocFrameUs = Number.NEGATIVE_INFINITY;
 
   /** Whether mediaSource.initialize() has been called. */
   private cmafInitialized = false;
@@ -9509,6 +9512,7 @@ export class MoqtPlayer {
       },
       onFrameRendered: (_captureTimestampUs, _actualRenderUs) => {
         this._stats.recordFrameRendered();
+        this.lastLocFrameUs = this.clock.now();
         this.clearStallPark();
         if (this.videoRecoveryActive) {
           // Pipeline reset(minFreshGroup) rejects stale in-flight objects,
@@ -10629,6 +10633,7 @@ export class MoqtPlayer {
     const detectedUs = this.clock.now();
     if (!this.raiseHold || detectedUs > this.raiseHold.untilUs + graceUs) return false;
     if (this.raiseHoldTimer !== null) return true;
+    this.raiseHoldStall = { detectedUs, durationMs, onStall };
     const check = (): void => {
       const now = this.clock.now();
       const hold = this.raiseHold;
@@ -10636,9 +10641,11 @@ export class MoqtPlayer {
         this.raiseHoldTimer = setTimeout(check, (hold.untilUs + graceUs - now) / 1000);
         return;
       }
+      const stall = this.raiseHoldStall;
       this.clearRaiseHold();
-      if (this._destroyed || this.isTerminalState()) return;
-      onStall(durationMs + (now - detectedUs) / 1000);
+      // Frames drawn since detection with no recovery event: a seek or flush ended it.
+      if (!stall || this._destroyed || this.isTerminalState() || this.lastLocFrameUs > stall.detectedUs) return;
+      stall.onStall(stall.durationMs + (now - stall.detectedUs) / 1000);
     };
     this.raiseHoldTimer = setTimeout(check, (this.raiseHold.untilUs + graceUs - detectedUs) / 1000);
     return true;
@@ -10647,8 +10654,14 @@ export class MoqtPlayer {
   /** True when the recovered stall was the raise hold: logged, not counted. */
   private endRaiseHoldStall(durationMs: number): boolean {
     if (this.raiseHoldTimer === null || !this.raiseHold) return false;
-    const { heldUs } = this.raiseHold;
+    const { untilUs, heldUs } = this.raiseHold;
+    const stall = this.raiseHoldStall;
     this.clearRaiseHold();
+    // Recovered past the deadline (its timer ran late): a stall after all, counted before its recovery.
+    if (this.clock.now() > untilUs + MoqtPlayer.RAISE_HOLD_GRACE_MS * 1000) {
+      stall?.onStall(durationMs);
+      return false;
+    }
     this.log.info('Latency: delay raised to %s s, held %s s', (heldUs / 1e6).toFixed(1), (durationMs / 1000).toFixed(1));
     return true;
   }
@@ -10657,6 +10670,7 @@ export class MoqtPlayer {
     if (this.raiseHoldTimer !== null) clearTimeout(this.raiseHoldTimer);
     this.raiseHoldTimer = null;
     this.raiseHold = null;
+    this.raiseHoldStall = null;
   }
 
   /**
