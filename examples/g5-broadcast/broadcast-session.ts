@@ -71,6 +71,9 @@ const END_SUBSCRIPTIONS_MS = 500;
 
 export interface BroadcastSessionOptions {
   catalog: BroadcastCatalogParams;
+  /** The namespace this broadcast publishes, one element per field. A SUBSCRIBE
+   *  for any other namespace is refused; without it, none is checked. */
+  namespace?: readonly Uint8Array[];
   /** MediaPublisher options; `draft` (the negotiated draft) also selects the
    *  catalog subgroup's wire flags. */
   publisher: MediaPublisherOptions;
@@ -157,18 +160,15 @@ export class BroadcastSession {
   private retired = false;
   /** endSubscriptions() has begun: new SUBSCRIBEs are ignored. */
   private ending = false;
-  /** Re-emission timer for the catalog track, and the alias it publishes on. */
+  /** Re-emission timer for the catalog track. */
   private catalogTimer: ReturnType<typeof setInterval> | null = null;
-  private catalogAlias: bigint | null = null;
   /** Last catalog group ID issued, and the current one: its Object 0 is the catalog. */
   private catalogGroupIssued: bigint | null = null;
   private catalogGroup: bigint | null = null;
   /** Draft-18: the current group's bytes, once built. */
   private catalogPayload: Uint8Array | null = null;
-  /** The track each accepted SUBSCRIBE serves, by request ID. */
+  /** The track each SUBSCRIBE serves, by request ID. A track may have several (§3.1). */
   private readonly subscribedTrack = new Map<bigint, string>();
-  /** The request currently served for each track. */
-  private readonly currentRequest = new Map<string, bigint>();
   /** Per accepted request: its alias and Forward State. */
   private readonly aliasOf = new Map<bigint, bigint>();
   private readonly forwardOf = new Map<bigint, boolean>();
@@ -196,12 +196,26 @@ export class BroadcastSession {
     if (opts.publisher.draft !== 14) this.catalogGroup = this.nextCatalogGroup();
   }
 
-  /** A track carries one alias, so a second concurrent subscription would be
-   *  served only the newest. */
-  private warnOnAliasReplace(track: string, armed: bigint | null, next: bigint): void {
-    if (armed === null || armed === next) return;
-    this.safeLog(`WARNING: ${track} alias ${armed} replaced by ${next} — this publisher `
-      + `serves ONE subscription per track; the earlier one now receives nothing`);
+  /** The track's subscriptions, by request ID. */
+  private requestsFor(track: string): bigint[] {
+    return [...this.subscribedTrack].filter(([, t]) => t === track).map(([requestId]) => requestId);
+  }
+
+  /** Aliases of the accepted catalog subscriptions that are forwarding. */
+  private catalogAliases(): bigint[] {
+    const aliases: bigint[] = [];
+    for (const [requestId, track] of this.subscribedTrack) {
+      const alias = this.aliasOf.get(requestId);
+      if (track === 'catalog' && alias !== undefined && this.forwardOf.get(requestId) !== false) aliases.push(alias);
+    }
+    return aliases;
+  }
+
+  /** Publish one catalog group on every forwarding catalog subscription. */
+  private publishCatalogEverywhere(payload: Uint8Array, groupId: bigint): Promise<void> {
+    const opts = { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY };
+    return Promise.all(this.catalogAliases().map((alias) =>
+      publishCatalogGroup(this.connection as never, alias, payload, opts))).then(() => {});
   }
 
   /** Wall-clock group IDs, kept strictly increasing. */
@@ -236,19 +250,18 @@ export class BroadcastSession {
   }
 
   /**
-   * Re-publish the catalog on an interval, as a cache refresh. Late viewers
-   * reach the latest group by FETCH ({@link handleFetch}). Best-effort: a
-   * failed re-emission is reported once and the interval continues.
+   * Re-publish the catalog on an interval, as a cache refresh, on every
+   * catalog subscription. Late viewers reach the latest group by FETCH
+   * ({@link handleFetch}). Best-effort: a failed re-emission is reported once
+   * and the interval continues.
    */
-  private startCatalogReemission(alias: bigint): void {
-    // A new catalog subscription has its own alias; the old one is gone.
+  private startCatalogReemission(): void {
     this.stopCatalogReemission();
-    this.catalogAlias = alias;
     const periodMs = this.opts.catalogIntervalMs ?? 0;
     if (periodMs <= 0) return;
     let reportedFailure = false;
     this.catalogTimer = setInterval(() => {
-      if (this.retired) return;
+      if (this.retired || this.catalogAliases().length === 0) return;
       let payload: Uint8Array;
       try {
         payload = buildCatalogPayload(this.opts.catalog);
@@ -256,10 +269,7 @@ export class BroadcastSession {
         return; // the first publish already proved the params build
       }
       const groupId = this.nextCatalogGroup();
-      this.trackWork(publishCatalogGroup(
-        this.connection as never, alias, payload,
-        { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY },
-      ).then(() => {
+      this.trackWork(this.publishCatalogEverywhere(payload, groupId).then(() => {
         this.noteCatalogGroup(groupId);
         if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
         if (!this.retired) this.opts.onCatalogReemitted?.(payload.byteLength);
@@ -283,9 +293,20 @@ export class BroadcastSession {
    * and void (the connection does not await its onSubscribe callback); every
    * async operation contains its own failure. Inert once retired.
    */
-  handleSubscribe(requestId: bigint, trackName: string, parameters?: ReadonlyMap<bigint, unknown>): void {
+  handleSubscribe(
+    requestId: bigint, trackName: string, parameters?: ReadonlyMap<bigint, unknown>, namespace?: readonly Uint8Array[],
+  ): void {
     if (this.retired || this.ending) {
       this.safeLog(`Ignoring SUBSCRIBE for "${trackName}" on ${this.retired ? 'a retired' : 'an ending'} broadcast session`);
+      return;
+    }
+    // A relay forwards a SUBSCRIBE to every publisher whose namespace is a prefix
+    // of the track's (§7): a track under a longer namespace is not ours.
+    if (namespace !== undefined && this.opts.namespace !== undefined && !sameNamespace(namespace, this.opts.namespace)) {
+      this.safeLog(`${trackName}: SUBSCRIBE for ${describeNamespace(namespace)} refused (reqId=${requestId}): not published here`);
+      this.connection.rejectSubscribe(this.wrapInt(requestId), this.wrapInt(this.requestErrors.DOES_NOT_EXIST),
+        'Track does not exist').catch((err: unknown) =>
+        this.safeLog(`SUBSCRIBE reqId=${requestId}: refusal not sent: ${(err as Error)?.message ?? err}`));
       return;
     }
     const alias = this.nextAlias++;
@@ -297,10 +318,7 @@ export class BroadcastSession {
       if (served && !this.subscribedTrack.has(requestId)) return;
       this.safeLog(`Failed to serve "${trackName}" subscription: ${(err as Error)?.message ?? err}`);
     };
-    if (served) {
-      this.subscribedTrack.set(requestId, trackName);
-      this.currentRequest.set(trackName, requestId);
-    }
+    if (served) this.subscribedTrack.set(requestId, trackName);
     const fill = isDraft22(this.opts.publisher.draft) && parameters?.has(FILL_PARAMETERS) === true;
 
     if (trackName === 'catalog') {
@@ -318,9 +336,8 @@ export class BroadcastSession {
         this.subscribeOkOptions(this.publisher.largestLocation('video'), this.dynamicGroups))
         .then(() => {
           if (this.retired) return; // never arm a retired generation's publisher
-          this.warnOnAliasReplace('video', this.publisher.videoAliasArmed, alias);
-          this.noteAccepted(requestId, alias);
-          this.publisher.setVideoAlias(alias);
+          if (!this.noteAccepted(requestId, alias)) return;
+          this.publisher.addVideoAlias(alias);
           this.safeLog('video: SUBSCRIBE_OK');
           if (fill) this.serveUnknownFill(requestId, 'video', report);
         })
@@ -338,9 +355,8 @@ export class BroadcastSession {
         this.subscribeOkOptions(this.publisher.largestLocation('audio')))
         .then(() => {
           if (this.retired) return;
-          this.warnOnAliasReplace('audio', this.publisher.audioAliasArmed, alias);
-          this.noteAccepted(requestId, alias);
-          this.publisher.setAudioAlias(alias);
+          if (!this.noteAccepted(requestId, alias)) return;
+          this.publisher.addAudioAlias(alias);
           this.safeLog('audio: SUBSCRIBE_OK');
           if (fill) this.serveUnknownFill(requestId, 'audio', report);
         })
@@ -390,7 +406,7 @@ export class BroadcastSession {
         this.noteAccepted(requestId, alias);
         if (!this.retired) {
           this.opts.onCatalogPublished?.(bytes);
-          this.startCatalogReemission(alias);
+          this.startCatalogReemission();
         }
       })
       .catch(report);
@@ -429,8 +445,8 @@ export class BroadcastSession {
         this.noteAccepted(requestId, alias);
         if (!this.retired) {
           this.opts.onCatalogPublished?.(bytes);
-          this.startCatalogReemission(alias);
-          if (!fetchOnly) this.resendCatalog(alias);
+          this.startCatalogReemission();
+          if (!fetchOnly) this.resendCatalog();
           if (fill) this.serveCatalogFill(requestId, largest.group, report);
         }
       })
@@ -491,7 +507,7 @@ export class BroadcastSession {
    * value past the largest group, asks the publisher for a new group.
    */
   handleNewGroupRequest(requestId: bigint, value: bigint): void {
-    if (this.retired || !this.dynamicGroups || this.currentRequest.get('video') !== requestId) return;
+    if (this.retired || !this.dynamicGroups || this.subscribedTrack.get(requestId) !== 'video') return;
     const largest = this.publisher.largestLocation('video');
     if (value !== 0n && largest !== null && value <= largest.group) return;
     this.safeLog(`video: NEW_GROUP_REQUEST ${value} (reqId=${requestId})`);
@@ -634,19 +650,17 @@ export class BroadcastSession {
     if (this.retired || this.ending) return;
     this.ending = true;
     this.stopCatalogReemission();
-    if (this.currentRequest.size === 0) return;
+    if (this.subscribedTrack.size === 0) return;
     this.publisher.retire();
     const drained = this.drainPublication();
     this.trackWork(drained);
     await this.settledWithin(drained, timeoutMs);
     const ends: Array<Promise<unknown>> = [];
-    for (const [track, requestId] of [...this.currentRequest]) {
-      this.currentRequest.delete(track);
+    for (const [requestId, track] of [...this.subscribedTrack]) {
       this.subscribedTrack.delete(requestId);
       const accepted = this.aliasOf.delete(requestId);
       this.forwardOf.delete(requestId);
       if (track === 'video' || track === 'audio') this.publisher.endTrack(track);
-      if (track === 'catalog') this.catalogAlias = null;
       if (!accepted) continue;
       this.endedReason.set(track, `PUBLISH_DONE TRACK_ENDED reqId=${requestId}`);
       ends.push(this.connection.publishDone(
@@ -660,27 +674,25 @@ export class BroadcastSession {
 
   /**
    * The relay ended a subscription, as it does upstream once its last viewer
-   * leaves. The namespace stays published: the track idles until a new
-   * SUBSCRIBE. A close for a request a newer SUBSCRIBE already replaced
-   * changes nothing.
+   * leaves. The track's other subscriptions are still served; with none left,
+   * the track idles until a new SUBSCRIBE, and the namespace stays published.
    */
   handleSubscribeClosed(requestId: bigint): void {
     if (this.retired) return;
     const track = this.subscribedTrack.get(requestId);
     if (track === undefined) return;
+    const alias = this.aliasOf.get(requestId);
     this.subscribedTrack.delete(requestId);
     this.aliasOf.delete(requestId);
     this.forwardOf.delete(requestId);
     this.safeLog(`${track}: SUBSCRIBE cancelled by the relay (reqId=${requestId})`);
-    if (this.currentRequest.get(track) !== requestId) return;
-    this.currentRequest.delete(track);
-    this.endedReason.set(track, `relay cancelled SUBSCRIBE reqId=${requestId}`);
-    if (track === 'catalog') {
-      this.stopCatalogReemission();
-      this.catalogAlias = null;
-    } else if (track === 'video' || track === 'audio') {
-      this.publisher.endTrack(track);
+    if (track === 'video' || track === 'audio') {
+      if (alias !== undefined) this.publisher.removeAlias(track, alias);
     }
+    if (this.requestsFor(track).length > 0) return;
+    this.endedReason.set(track, `relay cancelled SUBSCRIBE reqId=${requestId}`);
+    if (track === 'catalog') this.stopCatalogReemission();
+    else if (track === 'video' || track === 'audio') this.publisher.endTrack(track);
   }
 
   /**
@@ -692,19 +704,18 @@ export class BroadcastSession {
   handleForwardChange(requestId: bigint, forward: boolean): void {
     if (this.retired) return;
     const track = this.subscribedTrack.get(requestId);
-    if (track === undefined || this.currentRequest.get(track) !== requestId) return;
-    if (this.forwardOf.has(requestId)) this.forwardOf.set(requestId, forward);
+    const alias = this.aliasOf.get(requestId);
+    if (track === undefined || alias === undefined) return;
+    this.forwardOf.set(requestId, forward);
     this.safeLog(`${track}: Forward State ${forward ? 1 : 0} (REQUEST_UPDATE, reqId=${requestId})`);
     if (track === 'video' || track === 'audio') {
-      this.publisher.setForward(track, forward);
+      this.publisher.setForward(track, alias, forward);
     } else if (!forward) {
-      this.stopCatalogReemission();
-    } else if (this.catalogAlias !== null) {
-      if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogDelivery === 'fetch') {
-        this.startCatalogReemission(this.catalogAlias);
-      } else {
-        this.resendCatalog(this.catalogAlias);
-      }
+      if (this.catalogAliases().length === 0) this.stopCatalogReemission();
+    } else if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogDelivery === 'fetch') {
+      this.startCatalogReemission();
+    } else {
+      this.resendCatalog();
     }
   }
 
@@ -716,8 +727,9 @@ export class BroadcastSession {
       ? { group: this.catalogGroup!, object: 0n } : null;
   }
 
-  /** Send the catalog now, then resume re-emitting it on `alias`. */
-  private resendCatalog(alias: bigint): void {
+  /** Send the catalog now on every catalog subscription, then resume re-emitting it. */
+  private resendCatalog(): void {
+    if (this.catalogAliases().length === 0) return;
     let payload: Uint8Array;
     try {
       payload = buildCatalogPayload(this.opts.catalog);
@@ -725,23 +737,21 @@ export class BroadcastSession {
       return; // the first publish already proved the params build
     }
     const groupId = this.nextCatalogGroup();
-    const work = publishCatalogGroup(
-      this.connection as never, alias, payload,
-      { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY },
-    ).then(() => {
+    const work = this.publishCatalogEverywhere(payload, groupId).then(() => {
       this.noteCatalogGroup(groupId);
       if (isRequestStreamDraft(this.opts.publisher.draft) && this.catalogGroup === groupId) this.noteCatalogPayload(payload);
-      if (!this.retired && this.catalogAlias === alias) this.startCatalogReemission(alias);
+      if (!this.retired && this.catalogAliases().length > 0) this.startCatalogReemission();
     }).catch((err: unknown) => {
       this.safeLog(`Catalog resend failed: ${(err as Error)?.message ?? err}`);
     });
     this.trackWork(work);
   }
 
-  /** The track's current subscription, or why there is none. A closed
+  /** The track's newest accepted subscription, or why there is none. A closed
    *  session serves nothing. */
   trackStatus(track: 'catalog' | 'video' | 'audio'): TrackStatus {
-    const requestId = this.retired ? undefined : this.currentRequest.get(track);
+    const accepted = this.retired ? [] : this.requestsFor(track).filter((id) => this.aliasOf.has(id));
+    const requestId = accepted.length === 0 ? undefined : accepted.reduce((a, b) => (b > a ? b : a));
     const alias = requestId === undefined ? undefined : this.aliasOf.get(requestId);
     if (requestId === undefined || alias === undefined) {
       const ended = this.retired ? 'session closed' : this.endedReason.get(track);
@@ -756,12 +766,14 @@ export class BroadcastSession {
     };
   }
 
-  /** The subscription is accepted and served from now on. */
-  private noteAccepted(requestId: bigint, alias: bigint): void {
-    if (this.subscribedTrack.get(requestId) === undefined) return; // closed meanwhile
+  /** The subscription is accepted and served from now on; false if it closed meanwhile. */
+  private noteAccepted(requestId: bigint, alias: bigint): boolean {
+    const track = this.subscribedTrack.get(requestId);
+    if (track === undefined) return false;
     this.aliasOf.set(requestId, alias);
     this.forwardOf.set(requestId, true);
-    this.endedReason.delete(this.subscribedTrack.get(requestId)!);
+    this.endedReason.delete(track);
+    return true;
   }
 
   /**
@@ -861,6 +873,15 @@ function assertPositiveFinite(value: number, name: string): void {
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive finite number of milliseconds, got ${value}`);
   }
+}
+
+function sameNamespace(a: readonly Uint8Array[], b: readonly Uint8Array[]): boolean {
+  return a.length === b.length && a.every((field, i) => bytesEqual(field, b[i]!));
+}
+
+function describeNamespace(namespace: readonly Uint8Array[]): string {
+  const decoder = new TextDecoder();
+  return namespace.map((field) => decoder.decode(field)).join('/');
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {

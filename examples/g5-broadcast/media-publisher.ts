@@ -229,6 +229,15 @@ function assertPositiveInteger(value: number, name: string): void {
 }
 
 interface QueuedVideo { data: Uint8Array; meta: VideoChunkMeta }
+/** One accepted subscription a track is served on. */
+interface Outlet {
+  /** Open subgroup (the video group, or the LOCMAF audio group); null until the next group starts. */
+  streamId: bigint | null;
+  /** Forward State (§5.1), from the relay's REQUEST_UPDATE. */
+  forward: boolean;
+  /** A send was refused with Forward State 0: skipped until the probe clears it. */
+  refused: boolean;
+}
 interface QueuedAudio { data: Uint8Array; meta: AudioChunkMeta }
 
 export class MediaPublisher {
@@ -310,18 +319,14 @@ export class MediaPublisher {
   private videoLargest: { group: bigint; object: bigint } | null = null;
   private audioLargest: { group: bigint; object: bigint } | null = null;
 
-  private videoAlias: bigint | null = null;
-  private audioAlias: bigint | null = null;
+  /** Each track's accepted subscriptions, by alias. Every Object goes to each one (§3.1). */
+  private readonly outlets: Record<'video' | 'audio', Map<bigint, Outlet>> = { video: new Map(), audio: new Map() };
 
   private videoGroupId: bigint;
   private videoObjectId = 0n;
-  private videoStreamId: bigint | null = null;
-  /** The alias the open video subgroup was opened under. */
-  private videoStreamAlias: bigint | null = null;
   private audioGroupId: bigint;
-  /** LOCMAF: the open audio subgroup, its next object, and the video group it started under. */
-  private audioStreamId: bigint | null = null;
-  private audioStreamAlias: bigint | null = null;
+  /** LOCMAF: whether an audio group is open, its next object, and the video group it started under. */
+  private audioGroupOpen = false;
   private audioObjectId = 0n;
   private audioStreamVideoGroup: bigint | null = null;
   private audioGroupStartUs = 0n;
@@ -354,10 +359,6 @@ export class MediaPublisher {
 
   private stopped = false;
   private readonly ended = new Set<string>();
-  /** Tracks the relay has stopped forwarding (Forward State 0). */
-  private readonly paused = new Set<string>();
-  /** Tracks the relay reported paused; only its resume clears them. */
-  private readonly forwardPaused = new Set<string>();
   /** Pause episodes already reported, so a probe failure is not re-announced. */
   private readonly pauseReported = new Set<string>();
 
@@ -420,38 +421,75 @@ export class MediaPublisher {
     this.audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
   }
 
-  /** Bind the relay-subscribed aliases (from the accepted SUBSCRIBEs). A new
-   *  video subscription starts at a keyframe, requested now. */
-  setVideoAlias(alias: bigint): void {
-    this.videoAlias = alias;
-    this.ended.delete('video');
+  /** Serve an accepted subscription on `alias`, beside any the track already has.
+   *  A new video subscription starts at a keyframe, requested now. */
+  addVideoAlias(alias: bigint): void {
+    this.addOutlet('video', alias);
     this.requestKeyframe();
   }
-  setAudioAlias(alias: bigint): void { this.audioAlias = alias; this.ended.delete('audio'); }
+  addAudioAlias(alias: bigint): void { this.addOutlet('audio', alias); }
+
+  private addOutlet(track: 'video' | 'audio', alias: bigint): void {
+    this.outlets[track].set(alias, { streamId: null, forward: true, refused: false });
+    this.ended.delete(track);
+  }
+
+  /** One subscription ended. The adapter has reset its streams, so its open
+   *  subgroup is forgotten, not closed. The track ends with its last one. */
+  removeAlias(track: 'video' | 'audio', alias: bigint): void {
+    if (!this.outlets[track].delete(alias)) return;
+    if (this.outlets[track].size === 0) this.endTrack(track);
+  }
+
+  /** The aliases a track is served on, for the UI and tests. */
+  aliasesOf(track: 'video' | 'audio'): bigint[] { return [...this.outlets[track].keys()]; }
 
   /**
-   * The relay changed a track's Forward State (§5.1). A pause drops the queue
-   * and suppresses production until the resume; video then restarts at a
-   * keyframe, requested at once.
+   * The relay changed one subscription's Forward State (§5.1). With none left
+   * forwarding, the queue is dropped and production stops until a resume. A
+   * resumed video subscription restarts at a keyframe, requested at once.
    */
-  setForward(track: 'video' | 'audio', forward: boolean): void {
+  setForward(track: 'video' | 'audio', alias: bigint, forward: boolean): void {
+    const outlet = this.outlets[track].get(alias);
+    if (outlet === undefined) return;
+    const before = this.deliverable(track);
+    outlet.forward = forward;
     if (!forward) {
-      this.forwardPaused.add(track);
-      if (track === 'video') {
-        this.videoQueue.length = 0;
-        this.videoContinuityLost = true;
-      } else {
-        this.audioQueue.length = 0;
-      }
+      if (before && !this.deliverable(track)) this.dropQueue(track);
       return;
     }
-    this.forwardPaused.delete(track);
-    this.paused.delete(track);
+    outlet.refused = false;
     this.pauseReported.delete(track);
     if (track === 'video') {
-      this.videoContinuityLost = true;
+      this.closeOutletStream(outlet);
+      if (!before) this.videoContinuityLost = true;
       this.requestKeyframe();
     }
+  }
+
+  private static isDeliverable(outlet: Outlet): boolean { return outlet.forward && !outlet.refused; }
+
+  /** Some subscription of the track takes Objects now. */
+  private deliverable(track: 'video' | 'audio'): boolean {
+    for (const outlet of this.outlets[track].values()) if (MediaPublisher.isDeliverable(outlet)) return true;
+    return false;
+  }
+
+  /** Nothing can be delivered: drop the queue; video resumes at a keyframe. */
+  private dropQueue(track: 'video' | 'audio'): void {
+    if (track === 'video') {
+      this.videoQueue.length = 0;
+      this.videoContinuityLost = true;
+    } else {
+      this.audioQueue.length = 0;
+    }
+  }
+
+  private closeOutletStream(outlet: Outlet): void {
+    if (outlet.streamId === null) return;
+    const streamId = outlet.streamId;
+    outlet.streamId = null;
+    this.trackClose(streamId);
   }
 
   /** Largest (group, object) sent on a track, or null before its first. */
@@ -495,83 +533,124 @@ export class MediaPublisher {
     }
   }
 
-  /** The alias each track currently publishes to, or null when unarmed. */
-  get videoAliasArmed(): bigint | null { return this.videoAlias; }
-  get audioAliasArmed(): bigint | null { return this.audioAlias; }
-
   /** Tracks whose subscription ended, for the UI. */
   get endedTracks(): readonly string[] { return [...this.ended]; }
 
-  /** Tracks the relay is not currently forwarding, for the UI. */
-  get pausedTracks(): readonly string[] { return [...this.paused]; }
+  /** Tracks held by a refused send (Forward State 0), for the UI. */
+  get pausedTracks(): readonly string[] {
+    return (['video', 'audio'] as const).filter((track) => !this.deliverable(track)
+      && [...this.outlets[track].values()].some((outlet) => outlet.refused));
+  }
 
   /**
-   * Forward State 0: the relay wants no Objects for now. Distinct from
-   * retirement — the alias MUST be kept, because a resume flips Forward back
-   * to 1 without a new SUBSCRIBE. Queued frames are dropped and production is
-   * suppressed until a probe re-attempts one chunk.
+   * Forward State 0: the relay wants no Objects on this subscription for now.
+   * Distinct from retirement: the alias MUST be kept, because a resume flips
+   * Forward back to 1 without a new SUBSCRIBE. The subscription is skipped
+   * until a probe re-attempts it; with none left deliverable the queue is
+   * dropped and the pause reported once.
    */
-  private pauseTrack(track: 'video' | 'audio', err: unknown): boolean {
+  private refuseOutlet(track: 'video' | 'audio', outlet: Outlet, err: unknown): boolean {
     // Not the bare "§5.1": cancellation errors cite §5.1.1.
     if (!String((err as Error)?.message ?? '').includes('Forward State 0')) return false;
-    if (track === 'video') {
-      this.videoQueue.length = 0;
-      // Resume at a keyframe: dependents published across the gap are useless.
-      this.videoContinuityLost = true;
-    } else {
-      this.audioQueue.length = 0;
-    }
-    this.paused.add(track);
+    const before = this.deliverable(track);
+    outlet.refused = true;
+    if (before && !this.deliverable(track)) this.dropQueue(track);
     // The relay's REQUEST_UPDATE, when it arrived, already announced this.
-    if (!this.pauseReported.has(track) && !this.forwardPaused.has(track)) {
+    if (!this.deliverable(track) && outlet.forward && !this.pauseReported.has(track)) {
       this.pauseReported.add(track);
       this.status(track, 'Forward State 0 (a send was refused)');
     }
-    setTimeout(() => { this.paused.delete(track); }, this.pauseProbeMs);
+    setTimeout(() => { outlet.refused = false; }, this.pauseProbeMs);
     return true;
   }
 
-  /** A chunk got through: the pause episode, if any, is over. */
-  private noteSent(track: 'video' | 'audio'): void {
+  /** A send went through: the pause episode, if any, is over. */
+  private noteSent(track: 'video' | 'audio', outlet: Outlet): void {
     // A send already in flight when the relay paused proves nothing.
-    if (this.forwardPaused.has(track)) return;
+    if (!outlet.forward) return;
     if (!this.pauseReported.delete(track)) return;
-    this.paused.delete(track);
     this.status(track, 'Forward State 1 (a send went through)');
   }
 
   /**
-   * The track's subscription ended — the viewer left or the relay tore it
-   * down. Drop the queue and clear the alias, which the publish guards treat
-   * as "do not produce"; a later SUBSCRIBE calls setVideoAlias/setAudioAlias
-   * and production resumes. The adapter has already reset the subscription's
-   * streams, so the open video subgroup is forgotten, not closed, and the next
-   * keyframe opens a fresh one.
+   * The track's subscriptions all ended: the viewers left or the relay tore
+   * them down. Drop the queue and the subscriptions, which the publish guards
+   * treat as "do not produce"; a later SUBSCRIBE adds one and production
+   * resumes. The adapter has already reset their streams, so open subgroups
+   * are forgotten, not closed, and the next group opens fresh ones.
    */
   endTrack(track: 'video' | 'audio'): void {
-    if (track === 'video') {
-      this.videoAlias = null;
-      this.videoQueue.length = 0;
-      this.videoStreamId = null;
-      this.videoStreamAlias = null;
-    } else {
-      this.audioAlias = null;
+    this.outlets[track].clear();
+    if (track === 'video') this.videoQueue.length = 0;
+    else {
       this.audioQueue.length = 0;
+      this.audioGroupOpen = false;
     }
-    this.paused.delete(track);
-    this.forwardPaused.delete(track);
     this.pauseReported.delete(track);
     this.ended.add(track);
   }
 
-  /** A §10.11 publish error: the subscription ended before we were told. */
-  private retireTrack(track: 'video' | 'audio', err: unknown): boolean {
+  /** A §10.11 publish error: this subscription ended before we were told. */
+  private endOutlet(track: 'video' | 'audio', alias: bigint, err: unknown): boolean {
     if (!String((err as Error)?.message ?? '').includes('§10.11')) return false;
-    if (!this.ended.has(track)) {
-      this.status(track, 'SUBSCRIBE terminated (a send was refused); awaiting SUBSCRIBE');
+    this.outlets[track].delete(alias);
+    if (this.outlets[track].size === 0) {
+      if (!this.ended.has(track)) {
+        this.status(track, 'SUBSCRIBE terminated (a send was refused); awaiting SUBSCRIBE');
+      }
+      this.endTrack(track);
     }
-    this.endTrack(track);
     return true;
+  }
+
+  /** A publication to one subscription failed; the others are unaffected. */
+  private outletFailed(track: 'video' | 'audio', alias: bigint, outlet: Outlet, err: unknown): void {
+    if (this.outlets[track].get(alias) !== outlet) return; // that subscription is already gone
+    if (this.refuseOutlet(track, outlet, err) || this.endOutlet(track, alias, err)) return;
+    this.report(`${track} publish`, err);
+  }
+
+  /** The subscriptions that take Objects now, with their aliases. */
+  private deliverableOutlets(track: 'video' | 'audio'): Array<[bigint, Outlet]> {
+    return [...this.outlets[track]].filter(([, outlet]) => MediaPublisher.isDeliverable(outlet));
+  }
+
+  /** Open a new group's subgroup on each subscription in `targets`. */
+  private async openOutletStreams(
+    track: 'video' | 'audio', targets: Array<[bigint, Outlet]>, groupId: bigint, priority: number,
+  ): Promise<void> {
+    const outlets = this.outlets[track];
+    await Promise.all(targets.map(async ([alias, outlet]) => {
+      try {
+        const streamId = await this.connection.openSubgroup(
+          this.wrapInt(alias), this.wrapInt(groupId), this.wrapInt(0n), this.subgroupOptions(priority));
+        if (outlets.get(alias) === outlet && outlet.streamId === null) outlet.streamId = streamId;
+        else this.trackClose(streamId);
+      } catch (err) {
+        this.outletFailed(track, alias, outlet, err);
+      }
+    }));
+  }
+
+  /** Send one Object on each ready subscription's open subgroup. True if any took it. */
+  private async sendToOutlets(
+    track: 'video' | 'audio', ready: Array<[bigint, Outlet]>, objectId: bigint,
+    payload: Uint8Array, extensions: Uint8Array | undefined,
+  ): Promise<boolean> {
+    let sent = false;
+    await Promise.all(ready.map(async ([alias, outlet]) => {
+      const streamId = outlet.streamId!;
+      try {
+        await this.connection.sendObject(streamId, this.wrapInt(objectId), payload, extensions);
+        sent = true;
+        this.noteSent(track, outlet);
+      } catch (err) {
+        // The group is unusable on this subscription: it waits for the next one.
+        if (outlet.streamId === streamId) this.closeOutletStream(outlet);
+        this.outletFailed(track, alias, outlet, err);
+      }
+    }));
+    return sent;
   }
 
   /** The status sink is application code: a throw is reported, not raised. */
@@ -600,11 +679,10 @@ export class MediaPublisher {
   /**
    * Enqueue one encoded video chunk. Synchronous and void — safe to call
    * from a WebCodecs output callback. Dropped if the publisher is stopped
-   * or the video alias is not yet bound (never a stale-alias send).
+   * or no subscription takes Objects now.
    */
   publishVideo(data: Uint8Array, meta: VideoChunkMeta): void {
-    if (this.stopped || this.videoAlias === null
-        || this.paused.has('video') || this.forwardPaused.has('video')) return;
+    if (this.stopped || !this.deliverable('video')) return;
     if (this.videoQueue.length >= this.videoQueueMax) {
       // Overflow: the queued dependents can never all be delivered in time —
       // continuity is lost. Invalidate the whole backlog and recover at the
@@ -627,8 +705,7 @@ export class MediaPublisher {
 
   /** Enqueue one encoded audio chunk (same contract as {@link publishVideo}). */
   publishAudio(data: Uint8Array, meta: AudioChunkMeta): void {
-    if (this.stopped || this.audioAlias === null
-        || this.paused.has('audio') || this.forwardPaused.has('audio')) return;
+    if (this.stopped || !this.deliverable('audio')) return;
     if (this.audioQueue.length >= this.audioQueueMax) {
       // Audio chunks are independently decodable — drop the OLDEST to keep
       // the live edge. Report once per overflow episode.
@@ -672,16 +749,15 @@ export class MediaPublisher {
     while (this.pendingCloses.size > 0) {
       await Promise.all([...this.pendingCloses]);
     }
-    if (this.videoStreamId !== null) {
-      const sid = this.videoStreamId;
-      this.videoStreamId = null;
-      try { await this.connection.closeSubgroup(sid); } catch { /* already closed */ }
+    for (const track of ['video', 'audio'] as const) {
+      for (const outlet of this.outlets[track].values()) {
+        if (outlet.streamId === null) continue;
+        const sid = outlet.streamId;
+        outlet.streamId = null;
+        try { await this.connection.closeSubgroup(sid); } catch { /* already closed */ }
+      }
     }
-    if (this.audioStreamId !== null) {
-      const sid = this.audioStreamId;
-      this.audioStreamId = null;
-      try { await this.connection.closeSubgroup(sid); } catch { /* already closed */ }
-    }
+    this.audioGroupOpen = false;
   }
 
   /** Convenience for callers with no stalled-send hazard: retire + drain. */
@@ -727,15 +803,9 @@ export class MediaPublisher {
       try {
         while (this.videoQueue.length > 0 && !this.stopped) {
           const item = this.videoQueue.shift()!;
-          const alias = this.videoAlias;
           try {
             await this.sendVideoChunk(item.data, item.meta);
-            this.noteSent('video');
           } catch (err) {
-            // An error from an earlier subscription says nothing about this one.
-            if (alias !== this.videoAlias) continue;
-            if (this.pauseTrack('video', err)) break;
-            if (this.retireTrack('video', err)) break;
             this.report('video publish', err);
           }
         }
@@ -758,17 +828,11 @@ export class MediaPublisher {
     while (this.audioQueue.length > 0 && !this.stopped && this.audioInFlight.size < this.audioMaxInFlight) {
       const item = this.audioQueue.shift()!;
       const groupId = ++this.audioGroupId;
-      const alias = this.audioAlias;
       const inFlight = (async () => {
         try {
           await this.sendAudioChunk(item.data, item.meta, groupId);
-          this.noteSent('audio');
         } catch (err) {
-          // An error from an earlier subscription says nothing about this one.
-          if (alias !== this.audioAlias) return;
-          if (!this.pauseTrack('audio', err) && !this.retireTrack('audio', err)) {
-            this.report('audio publish', err);
-          }
+          this.report('audio publish', err);
         }
       })();
       this.audioInFlight.add(inFlight);
@@ -788,14 +852,9 @@ export class MediaPublisher {
       try {
         while (this.audioQueue.length > 0 && !this.stopped) {
           const item = this.audioQueue.shift()!;
-          const alias = this.audioAlias;
           try {
             await this.sendAudioGrouped(item.data, item.meta);
-            this.noteSent('audio');
           } catch (err) {
-            if (alias !== this.audioAlias) continue;
-            if (this.pauseTrack('audio', err)) break;
-            if (this.retireTrack('audio', err)) break;
             this.report('audio publish', err);
           }
         }
@@ -839,23 +898,25 @@ export class MediaPublisher {
   private async sendAudioGrouped(chunk: Uint8Array, meta: AudioChunkMeta): Promise<void> {
     const captureUs = this.toWallClockUs('audio', meta.timestampUs);
     const extensions = encodeLocHeaders({ captureTimestamp: captureUs }, this.locOptions());
-    const alias = this.audioAlias!;
-    if (this.audioStreamId === null || this.audioStreamAlias !== alias
+    const live = this.deliverableOutlets('audio');
+    if (live.length === 0) return;
+    // A subscription without the open group (new, resumed, or failed) starts the next one.
+    if (!this.audioGroupOpen || live.some(([, outlet]) => outlet.streamId === null)
         || this.audioStreamVideoGroup !== this.videoGroupId
         || captureUs - this.audioGroupStartUs >= LOCMAF_AUDIO_GROUP_MAX_US) {
-      if (this.audioStreamId !== null) {
-        const old = this.audioStreamId;
-        this.audioStreamId = null;
-        this.trackClose(old);
-      }
+      for (const outlet of this.outlets.audio.values()) this.closeOutletStream(outlet);
       this.audioGroupId++;
       this.audioObjectId = 0n;
       this.audioLocmafState = new LocmafGroupState();
       this.audioStreamVideoGroup = this.videoGroupId;
       this.audioGroupStartUs = captureUs;
-      this.audioStreamId = await this.connection.openSubgroup(
-        this.wrapInt(alias), this.wrapInt(this.audioGroupId), this.wrapInt(0n), this.subgroupOptions(64));
-      this.audioStreamAlias = alias;
+      this.audioGroupOpen = true;
+      await this.openOutletStreams('audio', live, this.audioGroupId, 64);
+    }
+    const ready = live.filter(([, outlet]) => outlet.streamId !== null);
+    if (ready.length === 0) {
+      this.audioGroupOpen = false;
+      return;
     }
     const duration = meta.durationUs && meta.durationUs > 0 ? meta.durationUs : DEFAULT_AUDIO_FRAME_US;
     const cmafChunk = buildChunk({
@@ -867,14 +928,10 @@ export class MediaPublisher {
       data: chunk,
     });
     const payload = this.toLocmaf('audio', cmafChunk, this.audioLocmafState, this.audioObjectId);
-    try {
-      await this.connection.sendObject(this.audioStreamId, this.wrapInt(this.audioObjectId), payload, extensions);
-    } catch (err) {
+    if (!await this.sendToOutlets('audio', ready, this.audioObjectId, payload, extensions)) {
       // The group's delta chain is broken: the next chunk opens a new group.
-      const broken = this.audioStreamId;
-      this.audioStreamId = null;
-      this.trackClose(broken);
-      throw err;
+      this.audioGroupOpen = false;
+      return;
     }
     this.noteAudioSent(chunk.byteLength, this.audioGroupId, this.audioObjectId);
     this.audioObjectId++;
@@ -1023,11 +1080,7 @@ export class MediaPublisher {
       // (the pump is the only one), so its close needs no await — but it
       // IS tracked, so drain() waits for it. The slot is cleared BEFORE the
       // new open: a failed open must leave NO stream, not revive the old one.
-      if (this.videoStreamId !== null) {
-        const oldStreamId = this.videoStreamId;
-        this.videoStreamId = null;
-        this.trackClose(oldStreamId);
-      }
+      for (const outlet of this.outlets.video.values()) this.closeOutletStream(outlet);
       this.videoGroupId++;
       this.videoObjectId = 0n;
       this.videoLocmafState = new LocmafGroupState();
@@ -1039,23 +1092,12 @@ export class MediaPublisher {
       // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
       // Without this, receivers cannot distinguish normal group completion
       // from an incomplete group and will wait for the intra-group timeout.
-      const alias = this.videoAlias!;
-      this.videoStreamId = await this.connection.openSubgroup(
-        this.wrapInt(alias), this.wrapInt(this.videoGroupId), this.wrapInt(0n),
-        this.subgroupOptions(128),
-      );
-      this.videoStreamAlias = alias;
+      await this.openOutletStreams('video', this.deliverableOutlets('video'), this.videoGroupId, 128);
     }
-    // A subgroup opened under an earlier subscription's alias cannot carry
-    // this one's frames.
-    if (this.videoStreamId !== null && this.videoStreamAlias !== this.videoAlias) {
-      const stale = this.videoStreamId;
-      this.videoStreamId = null;
-      this.trackClose(stale);
-    }
-    // No open subgroup — either pre-first-keyframe, or the group was retired
-    // by a failure. Dependent frames are dropped until the next keyframe.
-    if (this.videoStreamId === null) return;
+    // A subscription without the open subgroup (it joined, resumed, or failed
+    // mid-group) takes no dependent frames until the next keyframe.
+    const ready = this.deliverableOutlets('video').filter(([, outlet]) => outlet.streamId !== null);
+    if (ready.length === 0) return;
 
     const captureUs = this.toWallClockUs('video', meta.timestampUs);
     const chunk = !this.cmaf ? data
@@ -1064,17 +1106,10 @@ export class MediaPublisher {
     const payload = this.locmaf
       ? this.toLocmaf('video', chunk, this.videoLocmafState, this.videoObjectId)
       : chunk;
-    try {
-      await this.connection.sendObject(
-        this.videoStreamId, this.wrapInt(this.videoObjectId), payload, this.videoExtensions(meta, captureUs));
-    } catch (err) {
-      // LOC: Object 0 of a subgroup must be the independent frame. After a
-      // failed (or ambiguous) send the group is unusable — retire it, so
-      // deltas drop until the next keyframe opens a fresh group at Object 0.
-      const broken = this.videoStreamId;
-      this.videoStreamId = null;
-      this.trackClose(broken);
-      throw err;
+    // LOC: Object 0 of a subgroup must be the independent frame. A subscription
+    // whose send fails loses the group, so its deltas drop until the next keyframe.
+    if (!await this.sendToOutlets('video', ready, this.videoObjectId, payload, this.videoExtensions(meta, captureUs))) {
+      return;
     }
     this.videoLargest = { group: this.videoGroupId, object: this.videoObjectId };
     this.videoObjectId++;
@@ -1105,26 +1140,30 @@ export class MediaPublisher {
       : data;
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
-    if (this.audioDatagrams && this.connection.sendDatagram) {
-      await this.connection.sendDatagram(
-        this.audioAlias!, groupId, 0n, payload,
-        { publisherPriority: 64, ...(extensions ? { extensions } : {}) },
-      );
-      this.noteAudioSent(chunk.byteLength, groupId);
-      return;
-    }
-    const streamId = await this.connection.openSubgroup(
-      this.wrapInt(this.audioAlias!), this.wrapInt(groupId), this.wrapInt(0n),
-      this.subgroupOptions(64),
-    );
-    try {
-      await this.connection.sendObject(streamId, this.wrapInt(0n), payload, extensions);
-    } catch (err) {
-      this.trackClose(streamId); // best-effort terminal cleanup for the failed stream
-      throw err;
-    }
-    await this.trackClose(streamId);
-    this.noteAudioSent(chunk.byteLength, groupId);
+    const sendDatagram = this.audioDatagrams ? this.connection.sendDatagram?.bind(this.connection) : undefined;
+    let sent = false;
+    await Promise.all(this.deliverableOutlets('audio').map(async ([alias, outlet]) => {
+      try {
+        if (sendDatagram) {
+          await sendDatagram(alias, groupId, 0n, payload, { publisherPriority: 64, ...(extensions ? { extensions } : {}) });
+        } else {
+          const streamId = await this.connection.openSubgroup(
+            this.wrapInt(alias), this.wrapInt(groupId), this.wrapInt(0n), this.subgroupOptions(64));
+          try {
+            await this.connection.sendObject(streamId, this.wrapInt(0n), payload, extensions);
+          } catch (err) {
+            this.trackClose(streamId); // best-effort terminal cleanup for the failed stream
+            throw err;
+          }
+          await this.trackClose(streamId);
+        }
+        sent = true;
+        this.noteSent('audio', outlet);
+      } catch (err) {
+        this.outletFailed('audio', alias, outlet, err);
+      }
+    }));
+    if (sent) this.noteAudioSent(chunk.byteLength, groupId);
   }
 
   /**

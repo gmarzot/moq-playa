@@ -1408,6 +1408,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       sessionCatalog = catalog;
       const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
         catalog,
+        namespace: namespace.split('/').map((p) => new TextEncoder().encode(p)),
         ...(packaging !== 'loc' ? { catalogReady: () => attachCmafInit(catalog) }
           : locNeedsConfig() ? { catalogReady: () => attachLocConfig(catalog) } : {}),
         ...(carriedCatalog ? { carriedCatalog } : {}),
@@ -1471,8 +1472,8 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         }).catch(() => {});
         session.handleClose(error, reason);
       };
-      conn.onSubscribe = (requestId, _ns, trackName, parameters) => {
-        session.handleSubscribe(requestId, new TextDecoder().decode(trackName), parameters);
+      conn.onSubscribe = (requestId, ns, trackName, parameters) => {
+        session.handleSubscribe(requestId, new TextDecoder().decode(trackName), parameters, ns);
       };
       conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
       conn.onFetch = (requestId, fetch) => session.handleFetch(requestId, fetch);

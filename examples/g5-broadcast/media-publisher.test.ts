@@ -95,7 +95,7 @@ describe('MediaPublisher — serialized video publication', () => {
   it('back-to-back chunks with deferred sends get UNIQUE, ORDERED object IDs on one subgroup', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn);
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     // WebCodecs delivers three chunks synchronously while the first send is
     // still in flight — the exact interleaving that made unserialized
@@ -115,7 +115,7 @@ describe('MediaPublisher — serialized video publication', () => {
   it('a keyframe queued behind in-flight deltas rotates the group AFTER they complete — no premature close', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn);
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());   // group A, object 0
     pub.publishVideo(chunk(1), delta());  // group A, object 1
@@ -138,7 +138,7 @@ describe('MediaPublisher — serialized video publication', () => {
   it('chunks before the first keyframe are skipped without opening a stream', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn);
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), delta());
     await settle();
     expect(conn.opened).toHaveLength(0);
@@ -159,7 +159,7 @@ describe('MediaPublisher — serialized video publication', () => {
     };
     const errors: string[] = [];
     const pub = makePublisher(conn, { onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());   // keyframe — send FAILS
     pub.publishVideo(chunk(1), delta());  // dependent frame — must be DROPPED
@@ -191,7 +191,7 @@ describe('MediaPublisher — serialized video publication', () => {
     };
     const errors: string[] = [];
     const pub = makePublisher(conn, { onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());   // group A opens, object 0
     await settle();                     // group A is established before the flag flips
@@ -222,7 +222,7 @@ describe('MediaPublisher — serialized video publication', () => {
     const pub = makePublisher(conn, {
       onError: () => { throw new Error('error sink itself blew up'); },
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());   // fails → onError throws → must not poison the chain
     pub.publishVideo(chunk(1), kf());   // fresh keyframe must still publish
     await settle();
@@ -254,7 +254,7 @@ describe('MediaPublisher — Forward State 0 pause', () => {
       onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
       onStatus: (track, message) => statuses.push(`${track}: ${message}`),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());
     await settle();
@@ -278,7 +278,7 @@ describe('MediaPublisher — Forward State 0 pause', () => {
       pauseProbeMs: 1,
       onStatus: (track, message) => statuses.push(`${track}: ${message}`),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());
     await settle();
@@ -306,7 +306,7 @@ describe('MediaPublisher — audio publication', () => {
     };
     const errors: string[] = [];
     const pub = makePublisher(conn, { onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`) });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(0), { timestampUs: 500 });
     pub.publishAudio(chunk(1), { timestampUs: 500 });
     await settle();
@@ -319,7 +319,7 @@ describe('MediaPublisher — audio publication', () => {
   it('publishes one object per group on sequential group IDs', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn);
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(0), { timestampUs: 500 });
     pub.publishAudio(chunk(1), { timestampUs: 500 });
     await settle();
@@ -337,7 +337,7 @@ describe('MediaPublisher — CMAF packaging', () => {
   it('wraps a video frame in a CMAF chunk whose decode time is the capture timestamp', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(7), { isKeyframe: true, timestampUs: 1_000, durationUs: 41_708 });
     await settle();
 
@@ -354,7 +354,7 @@ describe('MediaPublisher — CMAF packaging', () => {
   it('gives a video frame the median recent capture interval, not the last one', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     // 24 fps, then a frame 4 ms after the last (burst), then one after a skipped frame.
     const stamps = [0, 41_700, 83_400, 125_100, 129_100, 208_500];
     stamps.forEach((timestampUs, i) => pub.publishVideo(chunk(i), { isKeyframe: i === 0, timestampUs }));
@@ -370,7 +370,7 @@ describe('MediaPublisher — CMAF packaging', () => {
   it('wraps an audio chunk the same way, one per group', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(9), { timestampUs: 500, durationUs: 20_000 });
     await settle();
 
@@ -390,7 +390,7 @@ describe('MediaPublisher — CMAF packaging', () => {
   const publishFrames = async (stamps: number[]) => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     stamps.forEach((timestampUs, i) =>
       pub.publishVideo(chunk(i), { isKeyframe: i === 0, timestampUs, durationUs: 41_700 }));
     await settle();
@@ -420,8 +420,8 @@ describe('MediaPublisher — CMAF packaging', () => {
   it('sends a LOC payload as the bare frame', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn);
-    pub.setAudioAlias(3n);
-    pub.setVideoAlias(2n);
+    pub.addAudioAlias(3n);
+    pub.addVideoAlias(2n);
     pub.publishAudio(chunk(9), { timestampUs: 500 });
     pub.publishVideo(chunk(8), kf());
     await settle();
@@ -431,7 +431,7 @@ describe('MediaPublisher — CMAF packaging', () => {
   it('CMAF payloads carry no Private Properties block', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(9), kf());
     await settle();
     expect(conn.sends[0]!.payload[0]).not.toBe(0x0a);
@@ -451,8 +451,8 @@ describe('MediaPublisher — self-describing CMAF objects', () => {
       packaging: 'cmaf', selfDescribing: sd, cmafInit: () => ({ videoInit: VINIT, audioInit: AINIT }),
       wallClockUs: () => wall,
     });
-    pub.setVideoAlias(2n);
-    pub.setAudioAlias(3n);
+    pub.addVideoAlias(2n);
+    pub.addAudioAlias(3n);
     pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 0 });
     pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 41_700 });
     pub.publishAudio(chunk(3), { timestampUs: 0 });
@@ -474,7 +474,7 @@ describe('MediaPublisher — self-describing CMAF objects', () => {
   it('sends no header without self-describing', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', cmafInit: () => ({ videoInit: VINIT, audioInit: AINIT }) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(1), kf());
     await settle();
     expect(startsWith(conn.sends[0]!.payload, VINIT)).toBe(false);
@@ -485,7 +485,7 @@ describe('MediaPublisher — LOC Video Config', () => {
   it.each([16, 18, 22] as const)('draft-%i carries VIDEO_CONFIG on keyframes only', async (draft) => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     const videoConfig = new Uint8Array([7, 7]);
     pub.publishVideo(chunk(1), { ...kf(1_000), videoConfig });
     pub.publishVideo(chunk(2), { ...delta(2_000), videoConfig });
@@ -511,8 +511,8 @@ describe('MediaPublisher — self-describing LOC objects', () => {
   it.each([16, 18] as const)('draft-%i video and audio carry a wall-clock Timestamp and codec string', async (draft) => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft, selfDescribing, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
-    pub.setAudioAlias(3n);
+    pub.addVideoAlias(2n);
+    pub.addAudioAlias(3n);
     pub.publishVideo(chunk(1), { ...kf(), videoConfig: new Uint8Array([7]) });
     pub.publishAudio(chunk(2), { timestampUs: 500 });
     await settle();
@@ -532,8 +532,8 @@ describe('MediaPublisher — self-describing LOC objects', () => {
   it.each([16, 18] as const)('draft-%i locTimescale adds Timescale 1000000', async (draft) => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft, selfDescribing, locTimescale: true, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
-    pub.setAudioAlias(3n);
+    pub.addVideoAlias(2n);
+    pub.addAudioAlias(3n);
     pub.publishVideo(chunk(1), kf());
     pub.publishAudio(chunk(2), { timestampUs: 500 });
     await settle();
@@ -549,7 +549,7 @@ describe('MediaPublisher — self-describing LOC objects', () => {
   it('applies to LOC only', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { packaging: 'cmaf', selfDescribing, wallClockUs: () => wall });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(2), { timestampUs: 500 });
     await settle();
     const headers = parseLocHeaders(conn.sends[0]!.extensions!, { wireProfile: locWireProfileForDraft(16) });
@@ -575,7 +575,7 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     const run = async (packaging: 'cmaf' | 'locmaf') => {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { packaging, cmafInit, wallClockUs: () => wall });
-      pub.setVideoAlias(2n);
+      pub.addVideoAlias(2n);
       frames.forEach((f, i) => pub.publishVideo(chunk(i), f));
       await settle();
       return { conn, pub };
@@ -648,8 +648,8 @@ describe('MediaPublisher — LOCMAF packaging', () => {
   it('groups audio with video: one subgroup per video group, deltas inside it', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft: 18, packaging: 'locmaf', cmafInit, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
-    pub.setAudioAlias(3n);
+    pub.addVideoAlias(2n);
+    pub.addAudioAlias(3n);
     const audio = (from: number, n: number) => {
       for (let i = 0; i < n; i++) pub.publishAudio(chunk(i), { timestampUs: from + i * 20_000, durationUs: 20_000 });
     };
@@ -676,7 +676,7 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     const audioDeltas = async (durationUs?: number) => {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { draft: 18, packaging: 'locmaf', cmafInit, wallClockUs: () => wall });
-      pub.setAudioAlias(3n);
+      pub.addAudioAlias(3n);
       for (let i = 0; i < 16; i++) {
         pub.publishAudio(chunk(i), { timestampUs: Math.round(i * 21_333.33), ...(durationUs ? { durationUs } : {}) });
       }
@@ -694,7 +694,7 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     const pub = makePublisher(conn, {
       draft: 18, packaging: 'locmaf', cmafInit, wallClockUs: () => wall, audioQueueMax: 200,
     });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     for (let i = 0; i < 150; i++) pub.publishAudio(chunk(i % 250), { timestampUs: i * 20_000, durationUs: 20_000 });
     await settle();
     await pub.stop();
@@ -712,7 +712,7 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     const pub = makePublisher(conn, {
       draft: 18, audioDatagrams: true, packaging: 'locmaf', cmafInit, wallClockUs: () => wall,
     });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(9), { timestampUs: 500, durationUs: 20_000 });
     await settle();
 
@@ -733,7 +733,7 @@ describe('MediaPublisher — LOCMAF packaging', () => {
     const conn = recordingConnection();
     const errors: unknown[] = [];
     const pub = makePublisher(conn, { packaging: 'locmaf', onError: (_c, e) => errors.push(e) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), frame(true, 0));
     await settle();
 
@@ -746,7 +746,7 @@ describe('MediaPublisher — broadcast generations', () => {
   it('stop() drains deterministically: in-flight work completes, queued work is dropped, late enqueues are ignored', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn);
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
 
     pub.publishVideo(chunk(0), kf());   // becomes in flight (held)
     pub.publishVideo(chunk(1), delta());  // queued, not started
@@ -773,7 +773,7 @@ describe('MediaPublisher — broadcast generations', () => {
   it('a deferred rotation close is TRACKED: drain does not resolve until it settles', async () => {
     const conn = recordingConnection({ holdCloses: true });
     const pub = makePublisher(conn);
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());   // group A
     pub.publishVideo(chunk(1), kf());   // rotation: close(A) HELD, group B opens
     await settle();
@@ -801,7 +801,7 @@ describe('MediaPublisher — broadcast generations', () => {
     const conn = recordingConnection({ holdSends: true });
     const errors: string[] = [];
     const pub = makePublisher(conn, { onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     expect(conn.pendingCount()).toBe(1); // the send is stalled
@@ -819,8 +819,8 @@ describe('MediaPublisher — broadcast generations', () => {
     // Cycle 1: broadcast on connection A with aliases bound.
     const connA = recordingConnection();
     const pubA = makePublisher(connA);
-    pubA.setVideoAlias(2n);
-    pubA.setAudioAlias(3n);
+    pubA.addVideoAlias(2n);
+    pubA.addAudioAlias(3n);
     pubA.publishVideo(chunk(0), kf());
     pubA.publishAudio(chunk(1), { timestampUs: 500 });
     await settle();
@@ -840,7 +840,7 @@ describe('MediaPublisher — broadcast generations', () => {
     expect(connB.sends).toHaveLength(0);
 
     // Once the new session's aliases bind, publication resumes — on B only.
-    pubB.setVideoAlias(7n);
+    pubB.addVideoAlias(7n);
     pubB.publishVideo(chunk(4), kf());
     await settle();
     expect(connB.opened).toHaveLength(1);
@@ -859,8 +859,8 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     for (const draft of [14, 16, 18] as const) {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { draft });
-      pub.setVideoAlias(2n);
-      pub.setAudioAlias(3n);
+      pub.addVideoAlias(2n);
+      pub.addAudioAlias(3n);
       pub.publishVideo(chunk(0), kf());
       pub.publishAudio(chunk(1), { timestampUs: 500 });
       await settle();
@@ -882,7 +882,7 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     const wallClockUs = () => timestampUs;
     const conn18 = recordingConnection();
     const pub18 = makePublisher(conn18, { draft: 18, wallClockUs });
-    pub18.setVideoAlias(2n);
+    pub18.addVideoAlias(2n);
     pub18.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
 
@@ -896,7 +896,7 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     // profile) — proving the profile is draft-bound, not fixed.
     const conn16 = recordingConnection();
     const pub16 = makePublisher(conn16, { draft: 16, wallClockUs });
-    pub16.setVideoAlias(2n);
+    pub16.addVideoAlias(2n);
     pub16.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
     const ext16 = conn16.sends[0]!.extensions;
@@ -910,7 +910,7 @@ describe('MediaPublisher — frame marking', () => {
   it('marks no frame discardable: without temporal layers every P-frame is a reference', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { draft: 18 });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     pub.publishVideo(chunk(1), delta());
     await conn.releaseAll();
@@ -931,7 +931,7 @@ describe('MediaPublisher — bounded backpressure', () => {
       onKeyframeNeeded: () => { keyframes++; },
       onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     keyframes = 0;
 
     // One keyframe starts a group; its send is held. 500 deltas pour in.
@@ -978,7 +978,7 @@ describe('MediaPublisher — bounded backpressure', () => {
       audioMaxInFlight: MAX_IN_FLIGHT,
       onError: (ctx, err) => errors.push(`${ctx}: ${(err as Error).message}`),
     });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
 
     pub.publishAudio(chunk(0), { timestampUs: 0 }); // held in flight
     await settle();
@@ -1005,7 +1005,7 @@ describe('MediaPublisher — audio publication concurrency', () => {
     // live as ~3x audio decimation against a real relay.
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn);
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
 
     for (let i = 0; i < 5; i++) pub.publishAudio(chunk(i), { timestampUs: i * 20_000 });
     await settle();
@@ -1025,7 +1025,7 @@ describe('MediaPublisher — audio publication concurrency', () => {
   it('bounds audio concurrency: a sustained burst never exceeds the in-flight cap', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn, { audioMaxInFlight: 4, audioQueueMax: 100 });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
 
     for (let i = 0; i < 50; i++) pub.publishAudio(chunk(i), { timestampUs: i * 20_000 });
     await settle();
@@ -1041,7 +1041,7 @@ describe('MediaPublisher — audio publication concurrency', () => {
   it('drain() awaits every concurrent audio send in flight', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn);
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     for (let i = 0; i < 3; i++) pub.publishAudio(chunk(i), { timestampUs: i });
     await settle();
 
@@ -1064,8 +1064,8 @@ describe('MediaPublisher — wall-clock rebase', () => {
     // Chrome hands the two tracks unrelated bases: boot-relative video,
     // context-relative audio. This is the case that broke rendering.
     const pub = makePublisher(conn, { draft: 18, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
-    pub.setAudioAlias(3n);
+    pub.addVideoAlias(2n);
+    pub.addAudioAlias(3n);
     pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 208_027_000_000 });
     pub.publishAudio(chunk(2), { timestampUs: 107_000_000 });
     await settle();
@@ -1080,7 +1080,7 @@ describe('MediaPublisher — wall-clock rebase', () => {
     const conn = recordingConnection();
     const wall = 1_700_000_000_000_000;
     const pub = makePublisher(conn, { draft: 18, wallClockUs: () => wall });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 5_000_000 });
     pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 5_040_000 });
     await settle();
@@ -1103,7 +1103,7 @@ describe('MediaPublisher — wall-clock rebase', () => {
       timeOriginUs: () => null,
       onAnchor: (r: AnchorReport) => reports.push(r),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     for (; i < delaysUs.length; i++) {
       pub.publishVideo(chunk(i), { isKeyframe: i === 0, timestampUs: i * 40_000 });
       await settle();
@@ -1127,7 +1127,7 @@ describe('MediaPublisher — wall-clock rebase', () => {
       timeOriginUs: () => null,
       onAnchor: (r: AnchorReport) => reports.push(r),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     for (let n = 0; n < 60; n++) {
       pub.publishVideo(chunk(n), { isKeyframe: n === 0, timestampUs: n * 40_000 });
       await settle();
@@ -1151,7 +1151,7 @@ describe('MediaPublisher — subscription ended under us', () => {
       onError: (ctx) => errors.push(ctx),
       onStatus: (track, message) => statuses.push(`${track}: ${message}`),
     });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     for (let i = 0; i < 40; i++) pub.publishAudio(chunk(i), { timestampUs: i * 20_000 });
     await settle();
 
@@ -1172,13 +1172,13 @@ describe('MediaPublisher — subscription ended under us', () => {
       return realOpen(...args);
     };
     const pub = makePublisher(conn, { onError: () => {} });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(1), { timestampUs: 0 });
     await settle();
     expect(pub.endedTracks).toContain('audio');
 
     fail = false;
-    pub.setAudioAlias(3n);              // the relay subscribed again
+    pub.addAudioAlias(3n);              // the relay subscribed again
     pub.publishAudio(chunk(2), { timestampUs: 20_000 });
     await settle();
     expect(pub.endedTracks).not.toContain('audio');
@@ -1189,7 +1189,7 @@ describe('MediaPublisher — subscription ended under us', () => {
     const conn = recordingConnection();
     const errors: string[] = [];
     const pub = makePublisher(conn, { onError: (ctx) => errors.push(ctx) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     pub.publishVideo(chunk(1), delta());
     await settle();
@@ -1203,7 +1203,7 @@ describe('MediaPublisher — subscription ended under us', () => {
     expect(pub.endedTracks).toEqual(['video']);
     expect(conn.sends).toHaveLength(2);
 
-    pub.setVideoAlias(5n);
+    pub.addVideoAlias(5n);
     pub.publishVideo(chunk(3), delta());   // a delta cannot start the new subscription
     pub.publishVideo(chunk(4), kf());
     await settle();
@@ -1223,7 +1223,7 @@ describe('MediaPublisher — subscription ended under us', () => {
     };
     const errors: string[] = [];
     const pub = makePublisher(conn, { onError: (ctx) => errors.push(ctx) });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     expect(pub.pausedTracks).toEqual([]);
@@ -1240,14 +1240,14 @@ describe('MediaPublisher — subscription ended under us', () => {
         `sendObject: stream ${String(sid)} belongs to a subscription with `
         + 'Forward State 0 — no Objects may be sent (§5.1)')));
     const pub = makePublisher(conn, { onError: () => {} });   // default probe interval
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     expect(pub.pausedTracks).toEqual(['video']);
 
     pub.endTrack('video');
     forwarding = true;
-    pub.setVideoAlias(5n);
+    pub.addVideoAlias(5n);
     pub.publishVideo(chunk(1), kf());
     await settle();
     expect(pub.pausedTracks).toEqual([]);
@@ -1271,7 +1271,7 @@ describe('MediaPublisher — audio over datagrams', () => {
     const conn = recordingConnection();
     const sent = withDatagrams(conn);
     const pub = makePublisher(conn, { draft: 18, audioDatagrams: true });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
 
     pub.publishAudio(chunk(0), { timestampUs: 1_000 });
     pub.publishAudio(chunk(1), { timestampUs: 21_000 });
@@ -1293,7 +1293,7 @@ describe('MediaPublisher — audio over datagrams', () => {
     const conn = recordingConnection();
     const sent = withDatagrams(conn);
     const pub = makePublisher(conn, { draft: 16, audioDatagrams: true });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
 
     pub.publishAudio(chunk(0), { timestampUs: 1_000 });
     await settle();
@@ -1313,22 +1313,22 @@ describe('MediaPublisher — relay Forward State changes', () => {
       onKeyframeNeeded: () => { keyframeRequests++; },
       pauseProbeMs: 1,
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     const afterBind = keyframeRequests;
     pub.publishVideo(chunk(0), kf());
     await settle();
 
-    pub.setForward('video', false);
+    pub.setForward('video', 2n, false);
     pub.publishVideo(chunk(1), delta());
     pub.publishVideo(chunk(2), kf());
     await new Promise((r) => setTimeout(r, 5));   // past any retry window
     pub.publishVideo(chunk(3), kf());
     await settle();
     expect(conn.sends.map((s) => s.payload[0])).toEqual([0]);
-    expect(pub.videoAliasArmed).toBe(2n);
+    expect(pub.aliasesOf('video')).toEqual([2n]);
     expect(errors).toEqual([]);
 
-    pub.setForward('video', true);
+    pub.setForward('video', 2n, true);
     expect(keyframeRequests).toBe(afterBind + 1);
     pub.publishVideo(chunk(4), delta());          // no reference after the gap
     pub.publishVideo(chunk(5), kf());
@@ -1340,13 +1340,13 @@ describe('MediaPublisher — relay Forward State changes', () => {
     const conn = recordingConnection({ holdCloses: true });
     const pub = makePublisher(conn);
     expect(pub.largestLocation('video')).toBeNull();
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     pub.publishVideo(chunk(1), delta());
     await settle();
     expect(pub.largestLocation('video')).toEqual({ group: conn.opened[0]!.groupId, object: 1n });
 
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(2), { timestampUs: 0 });
     pub.publishAudio(chunk(3), { timestampUs: 20_000 });
     await settle();
@@ -1365,9 +1365,9 @@ describe('MediaPublisher — relay Forward State changes', () => {
       onError: (ctx) => errors.push(ctx),
       onKeyframeNeeded: () => { calls++; if (calls === 2) throw new Error('encoder closed'); },
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     expect(calls).toBe(1);
-    expect(() => pub.setVideoAlias(5n)).not.toThrow();
+    expect(() => pub.addVideoAlias(5n)).not.toThrow();
     expect(errors).toEqual(['keyframe request']);
   });
 });
@@ -1379,7 +1379,7 @@ describe('MediaPublisher — new group requests', () => {
     const pub = makePublisher(recordingConnection(), {
       wallClockUs: () => wall, minGroupMs: 500, onKeyframeNeeded: () => { keyframes++; },
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     wall += 600_000;
@@ -1401,7 +1401,7 @@ describe('MediaPublisher — new group requests', () => {
     const pub = makePublisher(recordingConnection(), {
       wallClockUs: () => 1_700_000_000_000_000, minGroupMs: 20, onKeyframeNeeded: () => { keyframes++; },
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     pub.requestNewGroup();
@@ -1425,7 +1425,7 @@ describe('MediaPublisher — new group requests', () => {
     const pub = makePublisher(recordingConnection(), {
       wallClockUs: () => 1_700_000_000_000_000, minGroupMs: 10, onKeyframeNeeded: () => { keyframes++; },
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     pub.requestNewGroup();
@@ -1450,7 +1450,7 @@ describe('MediaPublisher — capture clock drift', () => {
       driftReportMs: 10,
       onDrift: (r) => reports.push(r),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     // The wall clock advances 1000 µs a frame, the video stamps 990: the
     // video clock runs slow by 10 µs a frame.
     for (let k = 0; k <= 20; k++) {
@@ -1472,8 +1472,8 @@ describe('MediaPublisher — capture clock drift', () => {
     const pub = makePublisher(conn, {
       draft: 18, wallClockUs: () => wallUs, monotonicNowUs: () => monoUs,
     });
-    pub.setVideoAlias(2n);
-    pub.setAudioAlias(3n);
+    pub.addVideoAlias(2n);
+    pub.addAudioAlias(3n);
     // Both tracks keep the monotonic clock, from unrelated bases; after the
     // anchor the wall clock runs 2 ms ahead of it.
     for (let k = 0; k < 400; k++) {
@@ -1497,7 +1497,7 @@ describe('MediaPublisher — capture clock drift', () => {
     const pub = makePublisher(conn, {
       draft: 18, wallClockUs: () => monoUs + offsetUs, monotonicNowUs: () => monoUs,
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     for (let k = 0; k < 600; k++) {
       monoUs = epoch + k * 20_000;
       if (k === 100) offsetUs += 40_000;     // a recalibration
@@ -1526,7 +1526,7 @@ describe('MediaPublisher — capture clock drift', () => {
       driftReportMs: 1_000,
       onDrift: (r) => reports.push(r),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     for (let k = 0; k <= 200; k++) {
       monoUs = epoch + k * 20_000;
       wallUs = monoUs + (k === 0 ? 0 : 2_000);
@@ -1548,7 +1548,7 @@ describe('MediaPublisher — capture clock drift', () => {
       onDrift: () => { throw new Error('sink bug'); },
       onError: (ctx) => errors.push(ctx),
     });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     for (let k = 0; k <= 2; k++) {
       wallUs += 1_000;
       pub.publishVideo(chunk(k), { isKeyframe: k === 0, timestampUs: k * 1_000 });
@@ -1558,12 +1558,12 @@ describe('MediaPublisher — capture clock drift', () => {
   });
 });
 
-describe('MediaPublisher — a new subscription replacing an old one', () => {
+describe('MediaPublisher — a second subscription beside an earlier one', () => {
   const terminated = (sid: unknown) => new MoqtConnectionError(
     `sendObject: stream ${String(sid)} belongs to a terminated subscription — no further Objects (§10.11)`,
     { errorSource: 'data' });
 
-  it('a new video alias does not inherit the old subgroup, so its errors cannot retire video', async () => {
+  it('a new video alias does not inherit the old subgroup; the old one ending leaves it serving', async () => {
     const conn = recordingConnection();
     const realSend = conn.sendObject.bind(conn);
     let oldStream: bigint | null = null;
@@ -1571,45 +1571,156 @@ describe('MediaPublisher — a new subscription replacing an old one', () => {
       ? Promise.reject(terminated(sid))
       : realSend(sid, oid, payload, ext));
     const pub = makePublisher(conn, { onError: () => {} });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
     oldStream = conn.opened[0]!.streamId;            // its subscription has since ended
 
-    pub.setVideoAlias(5n);                           // the relay subscribed again
+    pub.addVideoAlias(5n);                           // the relay subscribed again
     pub.publishVideo(chunk(1), delta());             // no reference on the new alias
     pub.publishVideo(chunk(2), kf());
     await settle();
     expect(pub.endedTracks).toEqual([]);
-    expect(pub.videoAliasArmed).toBe(5n);
+    expect(pub.aliasesOf('video')).toEqual([5n]);
     expect(conn.opened.at(-1)!.alias).toBe(5n);
     expect(conn.sends.at(-1)!.payload[0]).toBe(2);
   });
 
-  it('a late video error from the previous subscription is ignored', async () => {
+  it('a late video error ends only the earlier subscription', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn, { onError: () => {} });
-    pub.setVideoAlias(2n);
+    pub.addVideoAlias(2n);
     pub.publishVideo(chunk(0), kf());
     await settle();
 
-    pub.setVideoAlias(5n);
+    pub.addVideoAlias(5n);
     await conn.rejectAllPending(terminated(conn.opened[0]!.streamId));
     expect(pub.endedTracks).toEqual([]);
-    expect(pub.videoAliasArmed).toBe(5n);
+    expect(pub.aliasesOf('video')).toEqual([5n]);
   });
 
-  it('a late audio error from the previous subscription is ignored', async () => {
+  it('a late audio error ends only the earlier subscription', async () => {
     const conn = recordingConnection({ holdSends: true });
     const pub = makePublisher(conn, { onError: () => {} });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(0), { timestampUs: 0 });
     await settle();
 
-    pub.setAudioAlias(7n);
+    pub.addAudioAlias(7n);
     await conn.rejectAllPending(terminated(conn.opened[0]!.streamId));
     expect(pub.endedTracks).toEqual([]);
-    expect(pub.audioAliasArmed).toBe(7n);
+    expect(pub.aliasesOf('audio')).toEqual([7n]);
+  });
+});
+
+describe('MediaPublisher — concurrent subscriptions to one track (§3.1)', () => {
+  const terminated = (sid: unknown) => new MoqtConnectionError(
+    `sendObject: stream ${String(sid)} belongs to a terminated subscription — no further Objects (§10.11)`,
+    { errorSource: 'data' });
+
+  it('every video Object goes to each subscription on its own subgroup', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.addVideoAlias(2n);
+    pub.addVideoAlias(5n);
+    pub.publishVideo(chunk(0), kf());
+    pub.publishVideo(chunk(1), delta());
+    await settle();
+    expect(conn.opened.map((o) => o.alias)).toEqual([2n, 5n]);
+    expect(conn.opened[0]!.groupId).toBe(conn.opened[1]!.groupId);
+    const byStream = (sid: bigint) => conn.sends.filter((s) => s.streamId === sid)
+      .map((s) => [s.objectId, s.payload[0]]);
+    expect(byStream(conn.opened[0]!.streamId)).toEqual([[0n, 0], [1n, 1]]);
+    expect(byStream(conn.opened[1]!.streamId)).toEqual([[0n, 0], [1n, 1]]);
+    expect(pub.frameCount).toBe(2);
+  });
+
+  it('a subscription added mid-group starts at the next keyframe; the first keeps its deltas', async () => {
+    const conn = recordingConnection();
+    let keyframeRequests = 0;
+    const pub = makePublisher(conn, { onKeyframeNeeded: () => { keyframeRequests++; } });
+    pub.addVideoAlias(2n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    pub.addVideoAlias(5n);
+    expect(keyframeRequests).toBe(2);
+    pub.publishVideo(chunk(1), delta());
+    pub.publishVideo(chunk(2), kf());
+    await settle();
+    const aliasOf = new Map(conn.opened.map((o) => [o.streamId, o.alias]));
+    expect(conn.sends.map((s) => [aliasOf.get(s.streamId), s.payload[0]]))
+      .toEqual([[2n, 0], [2n, 1], [2n, 2], [5n, 2]]);
+  });
+
+  it('one subscription ending leaves the other served, and the track live', async () => {
+    const conn = recordingConnection();
+    const realSend = conn.sendObject.bind(conn);
+    const pub = makePublisher(conn, { onError: () => {} });
+    pub.addVideoAlias(2n);
+    pub.addVideoAlias(5n);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    const ended = conn.opened[0]!.streamId;
+    conn.sendObject = (sid, oid, payload, ext) => (sid === ended
+      ? Promise.reject(terminated(sid))
+      : realSend(sid, oid, payload, ext));
+    pub.publishVideo(chunk(1), delta());
+    pub.publishVideo(chunk(2), delta());
+    await settle();
+    expect(pub.aliasesOf('video')).toEqual([5n]);
+    expect(pub.endedTracks).toEqual([]);
+    expect(conn.sends.filter((s) => s.streamId === conn.opened[1]!.streamId).map((s) => s.payload[0]))
+      .toEqual([0, 1, 2]);
+  });
+
+  it('a Forward State 0 on one subscription holds only that one', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.addVideoAlias(2n);
+    pub.addVideoAlias(5n);
+    pub.setForward('video', 2n, false);
+    pub.publishVideo(chunk(0), kf());
+    await settle();
+    expect(conn.opened.map((o) => o.alias)).toEqual([5n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([0]);
+  });
+
+  it('each audio chunk goes to each subscription', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.addAudioAlias(3n);
+    pub.addAudioAlias(7n);
+    pub.publishAudio(chunk(0), { timestampUs: 0 });
+    await settle();
+    expect(conn.opened.map((o) => o.alias).sort()).toEqual([3n, 7n]);
+    expect(conn.opened[0]!.groupId).toBe(conn.opened[1]!.groupId);
+    expect(conn.sends).toHaveLength(2);
+    expect(pub.audioChunkCount).toBe(1);
+  });
+
+  it('LOCMAF audio: a new subscription starts a new group on both', async () => {
+    const conn = recordingConnection();
+    const cmafInit = () => ({
+      videoInit: buildVideoInit({
+        trackId: CMAF_VIDEO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, codec: 'avc1.42c01e',
+        width: 640, height: 360, description: new Uint8Array([0x01, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+      }),
+      audioInit: buildAudioInit({
+        trackId: CMAF_AUDIO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, sampleRate: 48_000, channels: 1,
+      }),
+    });
+    const pub = makePublisher(conn, { draft: 18, packaging: 'locmaf', cmafInit });
+    pub.addAudioAlias(3n);
+    pub.publishAudio(chunk(0), { timestampUs: 0 });
+    pub.publishAudio(chunk(1), { timestampUs: 20_000 });
+    await settle();
+    pub.addAudioAlias(7n);
+    pub.publishAudio(chunk(2), { timestampUs: 40_000 });
+    await settle();
+    expect(conn.opened.map((o) => o.alias)).toEqual([3n, 3n, 7n]);
+    expect(conn.opened[1]!.groupId).toBe(conn.opened[2]!.groupId);
+    expect(conn.opened[1]!.groupId).toBeGreaterThan(conn.opened[0]!.groupId);
+    expect(conn.sends.slice(2).map((s) => s.objectId)).toEqual([0n, 0n]);
   });
 });
 
@@ -1629,11 +1740,11 @@ describe('MediaPublisher — status reports', () => {
     };
     const statuses: string[] = [];
     const pub = makePublisher(conn, { onStatus: (track, message) => statuses.push(`${track}: ${message}`) });
-    pub.setAudioAlias(3n);
+    pub.addAudioAlias(3n);
     pub.publishAudio(chunk(0), { timestampUs: 0 });        // stays in flight
     pub.publishAudio(chunk(1), { timestampUs: 20_000 });   // refused at Forward State 0
     await settle();
-    pub.setForward('audio', false);                        // the relay's REQUEST_UPDATE
+    pub.setForward('audio', 3n, false);                    // the relay's REQUEST_UPDATE
     land();
     await settle();
     expect(statuses).toEqual(['audio: Forward State 0 (a send was refused)']);
