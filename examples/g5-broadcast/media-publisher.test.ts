@@ -1698,6 +1698,34 @@ describe('MediaPublisher — concurrent subscriptions to one track (§3.1)', () 
     expect(pub.audioChunkCount).toBe(1);
   });
 
+  it('LOCMAF audio: a resumed subscription rejoins at a new group, not mid-chain', async () => {
+    const conn = recordingConnection();
+    const cmafInit = () => ({
+      videoInit: buildVideoInit({
+        trackId: CMAF_VIDEO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, codec: 'avc1.42c01e',
+        width: 640, height: 360, description: new Uint8Array([0x01, 0x42, 0xc0, 0x1e, 0xff, 0xe0, 0x00]),
+      }),
+      audioInit: buildAudioInit({
+        trackId: CMAF_AUDIO_TRACK_ID, timescale: MICROSECOND_TIMESCALE, sampleRate: 48_000, channels: 1,
+      }),
+    });
+    const pub = makePublisher(conn, { draft: 18, packaging: 'locmaf', cmafInit });
+    pub.addAudioAlias(3n);
+    pub.addAudioAlias(7n);
+    pub.publishAudio(chunk(0), { timestampUs: 0 });
+    await settle();
+    pub.setForward('audio', 7n, false);
+    pub.publishAudio(chunk(1), { timestampUs: 20_000 });
+    await settle();
+    pub.setForward('audio', 7n, true);
+    pub.publishAudio(chunk(2), { timestampUs: 40_000 });
+    await settle();
+    const resumed = conn.opened.filter((o) => o.alias === 7n);
+    expect(resumed).toHaveLength(2);
+    expect(resumed[1]!.groupId).toBeGreaterThan(resumed[0]!.groupId);
+    expect(conn.sends.filter((s) => s.streamId === resumed[1]!.streamId).map((s) => s.objectId)).toEqual([0n]);
+  });
+
   it('LOCMAF audio: a new subscription starts a new group on both', async () => {
     const conn = recordingConnection();
     const cmafInit = () => ({

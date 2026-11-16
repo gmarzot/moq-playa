@@ -211,11 +211,18 @@ export class BroadcastSession {
     return aliases;
   }
 
-  /** Publish one catalog group on every forwarding catalog subscription. */
-  private publishCatalogEverywhere(payload: Uint8Array, groupId: bigint): Promise<void> {
+  /** Publish one catalog group on every forwarding catalog subscription. Rejects only
+   *  when it reached none, so a group some subscriber holds is always recorded. */
+  private async publishCatalogEverywhere(payload: Uint8Array, groupId: bigint): Promise<void> {
     const opts = { draft: this.opts.publisher.draft, groupId, publisherPriority: CATALOG_PRIORITY };
-    return Promise.all(this.catalogAliases().map((alias) =>
-      publishCatalogGroup(this.connection as never, alias, payload, opts))).then(() => {});
+    const aliases = this.catalogAliases();
+    const results = await Promise.allSettled(aliases.map((alias) =>
+      publishCatalogGroup(this.connection as never, alias, payload, opts)));
+    const failed = results.flatMap((r, i) => (r.status === 'rejected' ? [[aliases[i]!, r.reason] as const] : []));
+    if (failed.length > 0 && failed.length === aliases.length) throw failed[0]![1];
+    for (const [alias, reason] of failed) {
+      this.safeLog(`Catalog group ${groupId} not sent on alias ${alias}: ${(reason as Error)?.message ?? reason}`);
+    }
   }
 
   /** Wall-clock group IDs, kept strictly increasing. */

@@ -447,7 +447,8 @@ export class MediaPublisher {
   /**
    * The relay changed one subscription's Forward State (§5.1). With none left
    * forwarding, the queue is dropped and production stops until a resume. A
-   * resumed video subscription restarts at a keyframe, requested at once.
+   * resumed subscription restarts at the next group; for video, a keyframe is
+   * requested at once.
    */
   setForward(track: 'video' | 'audio', alias: bigint, forward: boolean): void {
     const outlet = this.outlets[track].get(alias);
@@ -460,8 +461,9 @@ export class MediaPublisher {
     }
     outlet.refused = false;
     this.pauseReported.delete(track);
+    // Its open group went on without it: it rejoins at the next one.
+    this.closeOutletStream(outlet);
     if (track === 'video') {
-      this.closeOutletStream(outlet);
       if (!before) this.videoContinuityLost = true;
       this.requestKeyframe();
     }

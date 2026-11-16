@@ -548,6 +548,31 @@ describe('BroadcastSession — subscription ended by the relay', () => {
     }
   });
 
+  it('a re-emitted catalog group that reached one subscription is recorded', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const realOpen = conn.openSubgroup.bind(conn);
+      conn.openSubgroup = async (alias, ...rest) => {
+        if (alias === 1n && conn.groups.length > 0) throw new Error('stream refused');
+        return realOpen(alias, ...rest);
+      };
+      const { session, lines } = loggedSession(conn, 50);
+      session.handleSubscribe(1n, 'catalog');           // alias 1
+      session.handleSubscribe(3n, 'catalog');           // alias 2
+      await vi.advanceTimersByTimeAsync(60);
+      const latest = conn.groups.at(-1)!;
+      expect(lines.some((l) => l.startsWith(`Catalog group ${latest} not sent on alias 1`))).toBe(true);
+      session.handleTrackStatus(4n, { trackName: new TextEncoder().encode('catalog') } as unknown as TrackStatus);
+      await vi.advanceTimersByTimeAsync(0);
+      const { value: largest } = readLocation(conn.trackStatuses.at(-1)!.get(0x09n)![0] as Uint8Array, 0);
+      expect(largest.group).toBe(latest);
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('catalog re-emission stops when its subscription ends', async () => {
     vi.useFakeTimers();
     try {
