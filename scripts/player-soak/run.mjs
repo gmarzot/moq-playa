@@ -37,15 +37,20 @@ const { values: args } = parseArgs({ options: {
   'broadcast-player': { type: 'string' },
   'lead-minutes': { type: 'string', default: '10' },
   'wait-s': { type: 'string', default: '420' },
-  tag: { type: 'string', default: process.env.SOAK_TAG ?? randomUUID().slice(0, 8) },
+  tag: { type: 'string', default: process.env.SOAK_TAG },
   'skip-build': { type: 'boolean', default: false },
   profile: { type: 'string' },
   variant: { type: 'string' },
   'adverse-minutes': { type: 'string', default: '0' },
 } });
 
+// A player finds the broadcaster's namespace only by its tag.
+if (args['broadcast-player'] && !args.tag) {
+  console.error("--broadcast-player needs the broadcaster's --tag (or SOAK_TAG)");
+  process.exit(2);
+}
 const minutes = Number(args.minutes);
-const tag = args.tag.replace(/[^a-z0-9]/gi, '').toLowerCase();
+const tag = (args.tag || randomUUID().slice(0, 8)).replace(/[^a-z0-9]/gi, '').toLowerCase();
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${tag}`;
 const out = resolve(root, 'reports/player-soak', runId);
 const children = new Set();
@@ -447,7 +452,7 @@ try {
     const b = { ...broadcastCase(cases, args.broadcaster, args.variant), params: cases.broadcastParams };
     const adverseMinutes = Number(args['adverse-minutes']);
     const adverse = adverseMinutes > 0 && cases.adverse.broadcasts.includes(args.broadcaster)
-      ? cases.adverse.broadcasts.length * (adverseMinutes + 1) : 0;
+      ? cases.adverse.broadcasts.length * (adverseMinutes + 2) : 0;
     const playMinutes = args.variant ? adverse : Math.max(b.relayInfo.playDrafts.length * (minutes + 1), adverse);
     const draft = b.relayInfo.playDrafts[0];
     const rejoin = args.variant ? null : { name: `rejoin-g5-${b.packaging}-${b.relay}-d${draft}`, url: b.relayInfo.url,
