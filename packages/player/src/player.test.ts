@@ -10688,6 +10688,113 @@ describe('MoqtPlayer', () => {
       expect(qc.currentVideoTrack?.name).toBe('v0');
       expect(qc.currentIndex).toBe(0);
     });
+    describe('live: steps down when the link falls behind the rung', () => {
+      let clockUs = 0;
+      const clock = { now: () => clockUs };
+      const FRAME_US = 33_333;
+
+      async function loadLive() {
+        clockUs = 0;
+        const adapter = createMockAdapter();
+        const ms = createMockMediaSource(2_000_000);
+        const assembler: { opts: any } = { opts: null };
+        const player = new MoqtPlayer({
+          url: 'https://relay.example.com/moq',
+          namespace: 'live/broadcast',
+          createTransport: vi.fn(async () => ({}) as any),
+          createConnection: () => adapter as unknown as MoqtConnection,
+          catalogBootstrap: 'subscribe',
+          clock,
+          createMediaSource: () => ms as any,
+          createCmafAssembler: (opts: any) => {
+            assembler.opts = opts;
+            return { push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() };
+          },
+          qualitySwitchCooldownMs: 1,
+        });
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+        ackCatalog(adapter);
+        adapter._triggerObject(0n, {
+          kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+          payload: new TextEncoder().encode(CMAF_ABR_CATALOG),
+        } as MoqtObject);
+        await new Promise(r => setTimeout(r, 0));
+        expect((player as any).qualityController.currentVideoTrack?.name).toBe('video-1');
+        expect(assembler.opts?.onSegment).toBeTypeOf('function');
+        const subsBefore = (adapter.subscribe as any).mock.calls.length;
+        const subscribedTo = (name: string): boolean => (adapter.subscribe as any).mock.calls.slice(subsBefore)
+          .some((c: any) => { try { return new TextDecoder().decode(c[1]) === name; } catch { return false; } });
+
+        /** 30 fragments a second of `track`, each emitted `lagAt(t)` µs after its media time. */
+        function feedSegments(seconds: number, lagAt: (t: number) => number, track = 'video-1'): void {
+          for (let i = 0; i < seconds * 30; i++) {
+            clockUs += FRAME_US;
+            assembler.opts.onSegment('video', new Uint8Array(100), track, BigInt(Math.floor(i / 60)),
+              (clockUs - lagAt(clockUs)) / 1_000_000);
+            player.tick();
+          }
+        }
+        return { player, subscribedTo, feedSegments, assembler };
+      }
+
+      /** Link-rate samples: objects that took the time `kbps` implies. */
+      function timeLink(player: MoqtPlayer, kbps: number): void {
+        for (let i = 0; i < 3; i++) {
+          (player as any).recordDeliverySpans({
+            kind: 'data', objectId: varint(5), payload: new Uint8Array(100_000),
+            socketFirstMs: 0, socketStartMs: 100, socketLastMs: 100 + 800_000 / kbps, assemblyBusyMs: 0,
+          });
+        }
+      }
+
+      it('steps down when media times arrive ever later', async () => {
+        const t = await loadLive();
+        t.feedSegments(8, (us) => 200_000 + us * 0.15);
+        expect(t.subscribedTo('video-2')).toBe(true);
+        await t.player.destroy();
+      });
+
+      it('holds while media times keep pace', async () => {
+        const t = await loadLive();
+        t.feedSegments(10, () => 200_000);
+        expect(t.subscribedTo('video-2')).toBe(false);
+        await t.player.destroy();
+      });
+
+      it('holds through a step in the media timeline', async () => {
+        const t = await loadLive();
+        t.feedSegments(10, (us) => (us < 4_000_000 ? 200_000 : 900_000));
+        expect(t.subscribedTo('video-2')).toBe(false);
+        await t.player.destroy();
+      });
+
+      it('steps down on a link under the rung once video lags', async () => {
+        const t = await loadLive();
+        timeLink(t.player, 1_000);
+        t.feedSegments(8, (us) => 200_000 + us * 0.03);
+        expect(t.subscribedTo('video-2')).toBe(true);
+        await t.player.destroy();
+      });
+
+      it('ignores fragments of a track that is not playing', async () => {
+        const t = await loadLive();
+        t.feedSegments(8, (us) => 200_000 + us * 0.15, 'video-0');
+        expect(t.subscribedTo('video-2')).toBe(false);
+        await t.player.destroy();
+      });
+
+      it('starts the evidence over on a timeline discontinuity', async () => {
+        const t = await loadLive();
+        t.feedSegments(2, () => 200_000);
+        expect((t.player as any).videoDeliveryLag.excessLagUs(clockUs)).toBe(0);
+        t.assembler.opts.onDiscontinuity('video', 'video-1');
+        expect((t.player as any).videoDeliveryLag.excessLagUs(clockUs)).toBeNull();
+        await t.player.destroy();
+      });
+    });
+
     describe('live link rate', () => {
       let clockUs = 0;
       const clock = { now: () => clockUs };

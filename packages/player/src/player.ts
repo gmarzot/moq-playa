@@ -34,7 +34,7 @@ import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import type { MoqtObjectData } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator, ArrivalDelayTrend, isKeyframePayload } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, DeliveryLagDetector, isKeyframePayload } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
@@ -3727,6 +3727,7 @@ export class MoqtPlayer {
     });
     this.subscriptionManager = new SubscriptionManager();
     this.bandwidthEstimator = new BandwidthEstimator();
+    this.resetVideoLag();
 
     // Set draft version for version-aware KVP encoding
     // Draft-14 §1.4.2: absolute type IDs
@@ -3826,7 +3827,7 @@ export class MoqtPlayer {
       this.lastMediaArrivalUs = this.clock.now();
       if (mediaType === 'video' && obj.kind === 'data' && headers.captureTimestamp !== undefined
           && trackName === this.qualityController?.currentVideoTrack?.name) {
-        this.videoArrivalDelay.record(trackName, this.lastMediaArrivalUs, Number(headers.captureTimestamp));
+        this.recordVideoLag(trackName, Number(headers.captureTimestamp), this.lastMediaArrivalUs);
       }
       // Emit raw event (recording, analytics, custom processing)
       this.emitter.emit('media_object', {
@@ -7113,13 +7114,13 @@ export class MoqtPlayer {
   private lastAbrUpshiftUs = 0;
   /** Live upshift wait; doubles on each failed upshift, resets once an upshift holds 2 min. */
   private liveUpshiftWaitUs = MoqtPlayer.ABR_LIVE_UPSHIFT_WAIT_US;
-  /** Live LOC: video arriving this much later across the window steps down. */
-  private static readonly ABR_BACKLOG_RISE_US = 400_000;
-  /** Live LOC: a link rate under the rung's bitrate this long, with video arriving ABR_LINK_SHORT_RISE_US later, steps down. */
+  /** Live: a link rate under the rung's bitrate this long, with video lag ABR_LINK_SHORT_LAG_US above its floor, steps down. */
   private static readonly ABR_LINK_SHORT_US = 3_000_000;
-  private static readonly ABR_LINK_SHORT_RISE_US = 100_000;
-  /** Arrival delay of the playing video track. */
-  private readonly videoArrivalDelay = new ArrivalDelayTrend();
+  private static readonly ABR_LINK_SHORT_LAG_US = 100_000;
+  /** Delivery lag of the playing video track: LOC capture times, CMAF media times. */
+  private readonly videoDeliveryLag = new DeliveryLagDetector();
+  /** Track the lag evidence belongs to. */
+  private videoLagTrack: string | null = null;
   /** Since when the link rate has been under the playing rung's bitrate. */
   private linkShort: { track: string; sinceUs: number } | null = null;
   /** When the link was last found behind a rung: within ABR_LINK_LAG_MEMORY_US it corroborates a short link rate. */
@@ -7223,12 +7224,25 @@ export class MoqtPlayer {
     return true;
   }
 
+  private recordVideoLag(track: string, captureUs: number, arrivalUs: number): void {
+    if (track !== this.videoLagTrack) {
+      this.videoDeliveryLag.reset();
+      this.videoLagTrack = track;
+    }
+    this.videoDeliveryLag.record(captureUs, arrivalUs);
+  }
+
+  private resetVideoLag(): void {
+    this.videoDeliveryLag.reset();
+    this.videoLagTrack = null;
+  }
+
   /**
-   * Live LOC: why the link falls behind the playing rung, or null. Video
-   * arriving ever later behind capture, or a link rate under the rung's
-   * bitrate while arrivals start to lag or lagged within the last 30 s.
+   * Live: why the link falls behind the playing rung, or null. Video lag
+   * standing above its floor and still rising, or a link rate under the
+   * rung's bitrate while video starts to lag or lagged within the last 30 s.
    */
-  private locLinkShort(now: number, linkKbps: number): string | null {
+  private linkShortReason(now: number, linkKbps: number): string | null {
     const track = this.bufferAbrController?.currentTrack;
     if (!track) return null;
     if (linkKbps > 0 && linkKbps < track.bitrateKbps) {
@@ -7236,13 +7250,15 @@ export class MoqtPlayer {
     } else {
       this.linkShort = null;
     }
-    const riseUs = this.videoArrivalDelay.riseUs(track.name, now);
-    if (riseUs > MoqtPlayer.ABR_BACKLOG_RISE_US) {
+    // Evidence of another track, such as the rung a switch just left, does not count.
+    const lag = this.videoLagTrack === track.name ? this.videoDeliveryLag : null;
+    const excessUs = lag?.excessLagUs(now) ?? 0;
+    if (lag?.isCongested(now)) {
       this.lastLinkLagUs = now;
-      return `video arriving ${Math.round(riseUs / 1000)} ms later`;
+      return `video ${Math.round(excessUs / 1000)} ms late and rising`;
     }
     // A rung the link cannot drain leaves a flat backlog: a recent lag stands in for a rise.
-    const lagging = riseUs > MoqtPlayer.ABR_LINK_SHORT_RISE_US
+    const lagging = excessUs > MoqtPlayer.ABR_LINK_SHORT_LAG_US
       || now - this.lastLinkLagUs < MoqtPlayer.ABR_LINK_LAG_MEMORY_US;
     if (this.linkShort && now - this.linkShort.sinceUs >= MoqtPlayer.ABR_LINK_SHORT_US && lagging) {
       this.lastLinkLagUs = now;
@@ -7289,7 +7305,7 @@ export class MoqtPlayer {
       // after stalls, decode errors, or partial group abandonment.
       const bufferedGroups = this.videoPipeline.bufferedGroupCount;
       const healthy = this.isLocDeliveryHealthy(upshiftWaitUs);
-      shortReason = live ? this.locLinkShort(now, linkKbps) : null;
+      shortReason = live ? this.linkShortReason(now, linkKbps) : null;
       if (shortReason) {
         effectiveBufferUs = 0;
       } else if (!healthy) {
@@ -7307,9 +7323,13 @@ export class MoqtPlayer {
       // arrives on demand), not starving. Only report low buffer when
       // bandwidth can't sustain the current track.
       const bufferUs = this.mediaSource.getBufferAheadUs();
-      if (bufferUs === null) return; // no trustworthy signal yet — hold
+      shortReason = live ? this.linkShortReason(now, linkKbps) : null;
       const currentBitrateKbps = this.bufferAbrController.currentTrack?.bitrateKbps ?? 0;
-      if (bufferUs === 0) {
+      if (shortReason) {
+        effectiveBufferUs = 0;
+      } else if (bufferUs === null) {
+        return; // no trustworthy signal yet — hold
+      } else if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
@@ -9809,6 +9829,7 @@ export class MoqtPlayer {
     this.cmafHoldingForAttach = false;
     this.cmafAssembler?.reset();
     this.cmafCaptures.clear();
+    this.resetVideoLag();
     if (this.cmafPendingInit) {
       for (const mt of ['video', 'audio'] as const) {
         const bytes = this.cmafPendingInit[mt]?.bytes;
@@ -9951,6 +9972,7 @@ export class MoqtPlayer {
   private buildCmafAssembler(): void {
     const ms = this.mediaSource!;
     this.cmafCaptures.clear();
+    this.resetVideoLag();
     const timestampOffsetSet = { video: false, audio: false };
     if (!this.config.createCmafAssembler) {
       throw new Error('CMAF tracks require createCmafAssembler in MoqtPlayerConfig');
@@ -9958,7 +9980,12 @@ export class MoqtPlayer {
     this.cmafAssembler = this.config.createCmafAssembler({
       onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint, presentationStartSec?: number) => {
         if (mediaType === 'audio' && this.mseAudioDropped !== null) return;
-        if (mediaType === 'video' && presentationStartSec !== undefined) this.cmafCaptures.noteSegment(groupId, presentationStartSec);
+        if (mediaType === 'video' && presentationStartSec !== undefined) {
+          this.cmafCaptures.noteSegment(groupId, presentationStartSec);
+          if (segTrackName === this.qualityController?.currentVideoTrack?.name) {
+            this.recordVideoLag(segTrackName, presentationStartSec * 1_000_000, this.clock.now());
+          }
+        }
         if (!timestampOffsetSet[mediaType]) {
           timestampOffsetSet[mediaType] = true;
           if ('setTimestampOffset' in ms) {
@@ -9969,7 +9996,10 @@ export class MoqtPlayer {
         this.renewCmafFirstFrameDeadline(mediaType);
       },
       onDiscontinuity: (mediaType, trackName) => {
-        if (mediaType === 'video') this.cmafCaptures.clear();
+        if (mediaType === 'video') {
+          this.cmafCaptures.clear();
+          this.resetVideoLag();
+        }
         if ('clearTimeline' in ms) {
           (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
         }
@@ -11445,6 +11475,7 @@ export class MoqtPlayer {
     // reference (which anchors A/V sync) is stale.
     if (mediaType === 'video') {
       this.videoPipeline?.reset();
+      this.resetVideoLag();
     } else {
       this.audioPipeline?.reset();
     }
