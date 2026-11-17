@@ -89,7 +89,8 @@ export { PlaybackPipeline } from './pipeline.js';
 export type { PipelineOptions } from './pipeline.js';
 
 export { BandwidthEstimator } from './bandwidth-estimator.js';
-export { ArrivalDelayTrend } from './arrival-delay-trend.js';
+export { DeliveryLagDetector } from './delivery-lag-detector.js';
+export type { DeliveryLagConfig } from './delivery-lag-detector.js';
 
 export { BufferBasedController } from './buffer-based-controller.js';
 export type { AbrTrack, AbrSignals, AbrDecision, BufferBasedConfig } from './buffer-based-controller.js';
