@@ -5291,6 +5291,15 @@ export class MoqtPlayer {
     trackName: string,
     options: { startGroup: number | bigint; startObject: number | bigint; endGroup: number | bigint; endObject: number | bigint },
   ): Promise<bigint> {
+    return this.fetchTrack(trackName, options);
+  }
+
+  /** {@link fetch}, optionally with a SUBSCRIBER_PRIORITY. */
+  private async fetchTrack(
+    trackName: string,
+    options: { startGroup: number | bigint; startObject: number | bigint; endGroup: number | bigint; endObject: number | bigint },
+    subscriberPriority?: number,
+  ): Promise<bigint> {
     if (!this.connection) throw new Error('Player not loaded');
     const connAtCall = this.connection;
 
@@ -5302,6 +5311,7 @@ export class MoqtPlayer {
       startObject: varint(BigInt(options.startObject)),
       endGroup: varint(BigInt(options.endGroup)),
       endObject: varint(BigInt(options.endObject)),
+      ...(subscriberPriority === undefined ? {} : { subscriberPriority: varint(BigInt(subscriberPriority)) }),
     };
 
     // Capture the owning subscription before sending. Its confirmed alias
@@ -6983,7 +6993,8 @@ export class MoqtPlayer {
       deadlineMs: Math.min(AudioRepair.DEFAULT_DEADLINE_MS, (this.config.smoothFloorMs ?? SMOOTH_FLOOR_MS) / 2),
       fetch: (range) => {
         const track = this.activeTrackName('audio');
-        return track === undefined ? Promise.reject(new Error('no audio track')) : this.fetch(track, range);
+        return track === undefined ? Promise.reject(new Error('no audio track'))
+          : this.fetchTrack(track, range, mediaSubscriberPriority(this.config, 'audio'));
       },
       cancel: (requestId) => { this.fetchCancel(requestId).catch(() => { /* session gone */ }); },
       onGiveUp: () => this.log.warn('Audio repair paused: FETCH is failing for recent audio'),
@@ -10350,6 +10361,7 @@ export class MoqtPlayer {
               joiningFetchType: 'relative',
               joiningRequestId: reqIdBigInt,
               joiningStart: 0n,
+              subscriberPriority: varint(BigInt(subscriberPriority)),
               onRequestId: registerWarmFetch,
             } as never);
             registerWarmFetch(BigInt(fetchReqId));
