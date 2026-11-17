@@ -478,6 +478,8 @@ export function createPipelines(
       // Armed Smooth drops before decode only audio late past the ceiling; the rest raises the cushion.
       getPlaybackDelayUs: () => (playout?.policy?.armed ? playout.policy.ceilingUs : undefined)
         ?? playout?.cushion.currentUs ?? cushionUs(),
+      // LIVE holds no latency policy: late audio follows delivery there.
+      followLateAudio: () => !playout?.policy,
     });
   }
 
