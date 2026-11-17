@@ -78,7 +78,9 @@ import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
 import type { CmafAssemblerLike } from './interfaces.js';
-import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions, invalidGoawayUriReason } from './player-connect.js';
+import {
+  buildConnectUrl, buildSetupOptions, buildSubscribeOptions, invalidGoawayUriReason, mediaSubscriberPriority, videoSwitchPriority,
+} from './player-connect.js';
 import { computePlaybackDelayUs,
   createPipelines,
   configurePipelines,
@@ -1078,7 +1080,11 @@ export class MoqtPlayer {
    */
   private readonly activeSubscriptions = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint | null }
+    {
+      trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint | null;
+      /** SUBSCRIBER_PRIORITY a media SUBSCRIBE carried. */
+      subscriberPriority?: number;
+    }
   >();
 
   /**
@@ -1985,7 +1991,7 @@ export class MoqtPlayer {
     try {
       sw.newRequestId = await this.subscribeReplacementTrack(
         trackName, 'audio', mediaTrackPackaging(target.packaging), subscribeOptions,
-        (id) => { sw.newRequestId = id; });
+        mediaSubscriberPriority(this.config, 'audio'), (id) => { sw.newRequestId = id; });
     } catch (err) {
       if (this.pendingAudioSwitch === sw) this.pendingAudioSwitch = null;
       throw err;
@@ -2153,6 +2159,7 @@ export class MoqtPlayer {
     mediaType: 'video' | 'audio',
     packaging: TrackPackaging,
     subscribeOptions: object,
+    subscriberPriority: number,
     onRegistered?: (requestId: bigint) => void,
   ): Promise<bigint> {
     const conn = this.connection!;
@@ -2164,13 +2171,14 @@ export class MoqtPlayer {
       registeredId = id;
       if (!this.subscriptionManager || this.connection !== conn) return;
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null, subscriberPriority });
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging, ...this.catalogInitConfig(trackName) });
       onRegistered?.(id);
     };
     try {
       const reqId = await conn.subscribe(nsBytes, nameBytes,
-        { ...subscribeOptions, onRequestId: (id: bigint) => register(BigInt(id)) } as never);
+        { ...subscribeOptions, subscriberPriority: varint(BigInt(subscriberPriority)),
+          onRequestId: (id: bigint) => register(BigInt(id)) } as never);
       register(BigInt(reqId));
       return BigInt(reqId);
     } catch (err) {
@@ -3278,7 +3286,11 @@ export class MoqtPlayer {
     // Determine packaging from catalog
     const packaging: TrackPackaging = mediaTrackPackaging(targetTrack.packaging);
     const switchConn = this.connection;
-    const reqIdBigInt = await this.subscribeReplacementTrack(trackName, 'video', packaging, subscribeOptions);
+    const downSwitch = (targetTrack.bitrate ?? 0) < (currentTrack.bitrate ?? 0);
+    const outgoingPriority = currentVideoRequestId === null ? undefined
+      : this.activeSubscriptions.get(currentVideoRequestId)?.subscriberPriority;
+    const reqIdBigInt = await this.subscribeReplacementTrack(trackName, 'video', packaging, subscribeOptions,
+      videoSwitchPriority(this.config, outgoingPriority, downSwitch));
 
     if (!this.subscriptionManager) return; // destroyed during await
     // Refused (REQUEST_ERROR) or superseded by a session migration while the
@@ -4294,6 +4306,7 @@ export class MoqtPlayer {
           if (!intent) return;
           this._mediaSubsExpected++;
           const knownTrackOptions = subscribeOptions ?? defaultMediaSubscriptionFilter(true);
+          const subscriberPriority = mediaSubscriberPriority(this.config, mediaType);
           // Pre-send ownership (§9.10): register inside onRequestId so a
           // zero-latency SUBSCRIBE_OK can never beat the registration; adapters
           // that don't invoke the callback fall back to post-await.
@@ -4306,7 +4319,7 @@ export class MoqtPlayer {
             }
             this.pendingAliasBinds.add(reqIdBigInt);
             this.activeSubscriptions.set(reqIdBigInt, {
-              trackName: track.name, mediaType, trackAlias: null,
+              trackName: track.name, mediaType, trackAlias: null, subscriberPriority,
             });
             this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType, ...this.catalogInitConfig(track.name) });
             // Authorization may delay this registration until after the catalog
@@ -4320,7 +4333,8 @@ export class MoqtPlayer {
           try {
             const reqId = await conn.subscribe(
               nsBytes, this.enc.encode(track.name),
-              { ...(knownTrackOptions ?? {}), onRequestId: (id: bigint) => { knownRegisteredId = id; registerKnownSub(id); } } as never,
+              { ...(knownTrackOptions ?? {}), subscriberPriority: varint(BigInt(subscriberPriority)),
+                onRequestId: (id: bigint) => { knownRegisteredId = id; registerKnownSub(id); } } as never,
             );
             if (this._destroyed || this.isTerminalState() || this.connection !== conn) {
               if (knownRegisteredId === null) void conn.unsubscribe(varint(BigInt(reqId))).catch(() => { /* best effort */ });
@@ -5277,6 +5291,15 @@ export class MoqtPlayer {
     trackName: string,
     options: { startGroup: number | bigint; startObject: number | bigint; endGroup: number | bigint; endObject: number | bigint },
   ): Promise<bigint> {
+    return this.fetchTrack(trackName, options);
+  }
+
+  /** {@link fetch}, optionally with a SUBSCRIBER_PRIORITY. */
+  private async fetchTrack(
+    trackName: string,
+    options: { startGroup: number | bigint; startObject: number | bigint; endGroup: number | bigint; endObject: number | bigint },
+    subscriberPriority?: number,
+  ): Promise<bigint> {
     if (!this.connection) throw new Error('Player not loaded');
     const connAtCall = this.connection;
 
@@ -5288,6 +5311,7 @@ export class MoqtPlayer {
       startObject: varint(BigInt(options.startObject)),
       endGroup: varint(BigInt(options.endGroup)),
       endObject: varint(BigInt(options.endObject)),
+      ...(subscriberPriority === undefined ? {} : { subscriberPriority: varint(BigInt(subscriberPriority)) }),
     };
 
     // Capture the owning subscription before sending. Its confirmed alias
@@ -6969,7 +6993,8 @@ export class MoqtPlayer {
       deadlineMs: Math.min(AudioRepair.DEFAULT_DEADLINE_MS, (this.config.smoothFloorMs ?? SMOOTH_FLOOR_MS) / 2),
       fetch: (range) => {
         const track = this.activeTrackName('audio');
-        return track === undefined ? Promise.reject(new Error('no audio track')) : this.fetch(track, range);
+        return track === undefined ? Promise.reject(new Error('no audio track'))
+          : this.fetchTrack(track, range, mediaSubscriberPriority(this.config, 'audio'));
       },
       cancel: (requestId) => { this.fetchCancel(requestId).catch(() => { /* session gone */ }); },
       onGiveUp: () => this.log.warn('Audio repair paused: FETCH is failing for recent audio'),
@@ -10235,6 +10260,8 @@ export class MoqtPlayer {
       // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
       // draft 22: the SUBSCRIBE itself asks for the current group as a fill.
       const warmFill = warmStart && isDraft22(conn.draftVersion);
+      // A draft-22 fill inherits the SUBSCRIBE's priority (§3.4).
+      const subscriberPriority = mediaSubscriberPriority(this.config, mediaType);
       const mediaOptions = {
         ...(warmStart
           ? {
@@ -10244,6 +10271,7 @@ export class MoqtPlayer {
           }
           : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true))),
         ...(newGroupRequest ? { newGroupRequest: 0n } : {}),
+        subscriberPriority: varint(BigInt(subscriberPriority)),
       };
       // Pre-send ownership (§9.10): register inside onRequestId — a
       // zero-latency SUBSCRIBE_OK must find the pending entry already in place. Adapters
@@ -10253,14 +10281,15 @@ export class MoqtPlayer {
         + ` nsFields=${nsBytes.length} nsHex=${nsBytes.map(hexBytes).join('/')}`
         + ` track="${name}" trackHex=${hexBytes(nameBytes)}`
         + ` filter=${(mediaOptions as { subscriptionFilter?: { type?: string } }).subscriptionFilter?.type ?? 'default'}`
-        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}${newGroupRequest ? ' newGroupRequest=0' : ''}`;
+        + ` packaging=${packaging}${warmStart ? ' warmStart' : ''}${newGroupRequest ? ' newGroupRequest=0' : ''}`
+        + ` priority=${subscriberPriority}`;
       let subRegistered = false;
       const registerMediaSub = (reqIdBigInt: bigint): void => {
         if (subRegistered) return;
         subRegistered = true;
         if (!live()) throw new Error('Media subscription retired before emission');
         this.pendingAliasBinds.add(reqIdBigInt);
-        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null });
+        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null, subscriberPriority });
         this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging, ...this.catalogInitConfig(name) });
         this.recordMediaSubWire(reqIdBigInt, wireDetail);
         this.log.info('SUBSCRIBE media reqId=%s %s', reqIdBigInt.toString(), wireDetail);
@@ -10332,6 +10361,7 @@ export class MoqtPlayer {
               joiningFetchType: 'relative',
               joiningRequestId: reqIdBigInt,
               joiningStart: 0n,
+              subscriberPriority: varint(BigInt(subscriberPriority)),
               onRequestId: registerWarmFetch,
             } as never);
             registerWarmFetch(BigInt(fetchReqId));
@@ -11444,6 +11474,7 @@ export class MoqtPlayer {
     const nameBytes = this.enc.encode(trackName);
     const filter = defaultMediaSubscriptionFilter(isLive);
     const warm = cause === 'migration' ? this.warmResubscribeOptions(track, packaging, mediaType, this.connection) : null;
+    const subscriberPriority = mediaSubscriberPriority(this.config, mediaType);
 
     // Pre-send ownership (§9.10): a same-tick SUBSCRIBE_OK must find the
     // pending entry; the EVENT still waits for the send to succeed.
@@ -11454,7 +11485,7 @@ export class MoqtPlayer {
       resubRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== resubConn) return;
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null, subscriberPriority });
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging, ...this.catalogInitConfig(trackName) });
     };
     // Start through the CAPTURED connection and attach both observers before
@@ -11462,7 +11493,8 @@ export class MoqtPlayer {
     // player, and `this.connection` is mutable. Announcing afterwards also
     // makes the event's contract true — the replacement has really started.
     const pending = resubConn.subscribe(nsBytes, nameBytes,
-      { ...(warm?.options ?? filter), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
+      { ...(warm?.options ?? filter), subscriberPriority: varint(BigInt(subscriberPriority)),
+        onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
       if (!this.subscriptionManager) return;
