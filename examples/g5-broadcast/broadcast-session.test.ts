@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { BroadcastSession, refusalRetryDelayMs } from './broadcast-session.js';
 import type { BroadcastSessionConnection, CarriedCatalog } from './broadcast-session.js';
 import type { Fetch, TrackStatus } from '@openmoq/transport';
-import { readLocation } from '@openmoq/transport';
+import { readLocation, RequestError22 } from '@openmoq/transport';
 import { buildCatalogPayload } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
 
@@ -231,10 +231,9 @@ describe('BroadcastSession — generation isolation', () => {
     session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
     await settle();
     expect(conn.sends).toHaveLength(0); // nothing published on the retired generation
-    // The guard itself is pinned white-box: the publisher's stopped latch
-    // already drops publishes, so the alias slot staying UNBOUND is the only
-    // observable proof the retired continuation did not run.
-    expect((session.publisher as unknown as { videoAlias: bigint | null }).videoAlias).toBeNull();
+    // The publisher's stopped latch already drops publishes, so the alias
+    // staying unbound is the only proof the retired continuation did not run.
+    expect(session.publisher.aliasesOf('video')).toEqual([]);
   });
 
   it('shutdown closes the connection BEFORE draining, so a stalled send cannot wedge it', async () => {
@@ -515,20 +514,20 @@ describe('BroadcastSession — subscription ended by the relay', () => {
     const { session, lines } = loggedSession(conn);
     session.handleSubscribe(5n, 'audio');
     await settle();
-    expect(session.publisher.audioAliasArmed).toBe(1n);
+    expect(session.publisher.aliasesOf('audio')).toEqual([1n]);
 
     session.handleSubscribeClosed(5n);
     expect(lines).toContain('audio: SUBSCRIBE cancelled by the relay (reqId=5)');
-    expect(session.publisher.audioAliasArmed).toBeNull();
+    expect(session.publisher.aliasesOf('audio')).toEqual([]);
     expect(session.publisher.endedTracks).toEqual(['audio']);
 
     session.handleSubscribe(9n, 'audio');
     await settle();
-    expect(session.publisher.audioAliasArmed).toBe(2n);
+    expect(session.publisher.aliasesOf('audio')).toEqual([2n]);
     expect(session.publisher.endedTracks).toEqual([]);
   });
 
-  it('a new catalog SUBSCRIBE moves re-emission to its own alias', async () => {
+  it('a second catalog SUBSCRIBE is re-emitted to beside the first', async () => {
     vi.useFakeTimers();
     try {
       const conn = recordingConnection();
@@ -539,10 +538,35 @@ describe('BroadcastSession — subscription ended by the relay', () => {
 
       session.handleSubscribe(3n, 'catalog');           // alias 2, no close in between
       await vi.advanceTimersByTimeAsync(0);
-      const atSwitch = aliases.length;
+      const atSecond = aliases.length;
       await vi.advanceTimersByTimeAsync(160);
-      expect(aliases.length).toBeGreaterThan(atSwitch);
-      expect(aliases.slice(atSwitch).every((a) => a === 2n)).toBe(true);
+      expect(aliases.length).toBeGreaterThan(atSecond);
+      expect(new Set(aliases.slice(atSecond))).toEqual(new Set([1n, 2n]));
+      session.handleClose(0, 'test');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a re-emitted catalog group that reached one subscription is recorded', async () => {
+    vi.useFakeTimers();
+    try {
+      const conn = recordingConnection();
+      const realOpen = conn.openSubgroup.bind(conn);
+      conn.openSubgroup = async (alias, ...rest) => {
+        if (alias === 1n && conn.groups.length > 0) throw new Error('stream refused');
+        return realOpen(alias, ...rest);
+      };
+      const { session, lines } = loggedSession(conn, 50);
+      session.handleSubscribe(1n, 'catalog');           // alias 1
+      session.handleSubscribe(3n, 'catalog');           // alias 2
+      await vi.advanceTimersByTimeAsync(60);
+      const latest = conn.groups.at(-1)!;
+      expect(lines.some((l) => l.startsWith(`Catalog group ${latest} not sent on alias 1`))).toBe(true);
+      session.handleTrackStatus(4n, { trackName: new TextEncoder().encode('catalog') } as unknown as TrackStatus);
+      await vi.advanceTimersByTimeAsync(0);
+      const { value: largest } = readLocation(conn.trackStatuses.at(-1)!.get(0x09n)![0] as Uint8Array, 0);
+      expect(largest.group).toBe(latest);
       session.handleClose(0, 'test');
     } finally {
       vi.useRealTimers();
@@ -570,25 +594,26 @@ describe('BroadcastSession — subscription ended by the relay', () => {
     }
   });
 
-  it('a close for a replaced request leaves the newer subscription serving', async () => {
+  it('cancelling one of two video subscriptions leaves the other serving', async () => {
     const conn = recordingConnection();
     const { session, lines } = loggedSession(conn);
     session.handleSubscribe(3n, 'video');
-    session.handleSubscribe(7n, 'video');               // the relay subscribed again
+    session.handleSubscribe(7n, 'video');               // a second, concurrent subscription
     await settle();
-    expect(session.publisher.videoAliasArmed).toBe(2n);
+    expect(session.publisher.aliasesOf('video')).toEqual([1n, 2n]);
 
     session.handleSubscribeClosed(3n);
     expect(lines).toContain('video: SUBSCRIBE cancelled by the relay (reqId=3)');
-    expect(session.publisher.videoAliasArmed).toBe(2n);
+    expect(session.publisher.aliasesOf('video')).toEqual([2n]);
     expect(session.publisher.endedTracks).toEqual([]);
+    expect(session.trackStatus('video')).toMatchObject({ state: 'live', requestId: 7n, alias: 2n });
   });
 });
 
 describe('BroadcastSession — relay Forward State changes', () => {
   const frame = (tag: number) => [new Uint8Array([tag]), { isKeyframe: true, timestampUs: tag }] as const;
 
-  it('a media pause and resume reach the publisher; a replaced request is ignored', async () => {
+  it('a media pause and resume reach the publisher; a pause holds only its own subscription', async () => {
     const conn = recordingConnection();
     const { session, lines } = loggedSession(conn);
     session.handleSubscribe(3n, 'video');
@@ -606,12 +631,12 @@ describe('BroadcastSession — relay Forward State changes', () => {
     await settle();
     expect(conn.sends).toHaveLength(1);
 
-    session.handleSubscribe(7n, 'video');               // the relay subscribed again
+    session.handleSubscribe(7n, 'video');               // a second, concurrent subscription
     await settle();
-    session.handleForwardChange(3n, false);             // late, on the old request
+    session.handleForwardChange(3n, false);
     session.publisher.publishVideo(...frame(3));
     await settle();
-    expect(conn.sends).toHaveLength(2);
+    expect(conn.sends).toHaveLength(2);                 // only the forwarding one
   });
 
   it('a catalog pause holds re-emission; a resume sends one at once and re-emission restarts', async () => {
@@ -1064,12 +1089,12 @@ describe('BroadcastSession — ending its subscriptions (§10.11)', () => {
     session.handleSubscribe(3n, 'video');
     session.handleSubscribe(5n, 'audio');
     await settle();
-    expect(session.publisher.videoAliasArmed).not.toBeNull();
+    expect(session.publisher.aliasesOf('video')).not.toEqual([]);
 
     await session.endSubscriptions();
     expect(conn.dones.sort((a, b) => Number(a[0] - b[0]))).toEqual([[1n, 2n], [3n, 2n], [5n, 2n]]);
-    expect(session.publisher.videoAliasArmed).toBeNull();
-    expect(session.publisher.audioAliasArmed).toBeNull();
+    expect(session.publisher.aliasesOf('video')).toEqual([]);
+    expect(session.publisher.aliasesOf('audio')).toEqual([]);
     expect(session.trackStatus('video')).toEqual({ state: 'none', ended: 'PUBLISH_DONE TRACK_ENDED reqId=3' });
     expect(lines).toContain('PUBLISH_DONE TRACK_ENDED on 3 subscription(s)');
 
@@ -1191,5 +1216,46 @@ describe('refusalRetryDelayMs', () => {
   it('is null when the request may not be retried', () => {
     expect(refusalRetryDelayMs(0n)).toBeNull();
     expect(refusalRetryDelayMs(undefined)).toBeNull();
+  });
+});
+
+describe('BroadcastSession — the namespace of a SUBSCRIBE', () => {
+  const fields = (ns: string) => ns.split('/').map((f) => new TextEncoder().encode(f));
+  const OURS = 'ci/soak/aiomoqt-relay/cmaf';
+  function namespacedSession(conn: BroadcastSessionConnection) {
+    const lines: string[] = [];
+    const session = new BroadcastSession(conn, {
+      catalog: CATALOG,
+      publisher: { wrapInt, draft: 22 },
+      log: (m) => lines.push(m),
+      catalogIntervalMs: 0,
+      namespace: fields(OURS),
+    });
+    return { session, lines };
+  }
+
+  it('a SUBSCRIBE under a longer namespace is refused as DOES_NOT_EXIST and serves nothing', async () => {
+    const conn = recordingConnection();
+    const refusals: Array<[bigint, bigint, string]> = [];
+    conn.rejectSubscribe = async (requestId, code, reason) => {
+      refusals.push([requestId as bigint, code as bigint, reason]);
+    };
+    const { session, lines } = namespacedSession(conn);
+    session.handleSubscribe(5n, 'video', undefined, fields(`${OURS}/restart`));
+    await settle();
+    expect(refusals).toEqual([[5n, RequestError22.DOES_NOT_EXIST, 'Track does not exist']]);
+    expect(conn.calls).not.toContain('acceptSubscribe');
+    expect(session.publisher.aliasesOf('video')).toEqual([]);
+    expect(session.trackStatus('video')).toEqual({ state: 'none' });
+    expect(lines).toContain(`video: SUBSCRIBE for ${OURS}/restart refused (reqId=5): not published here`);
+  });
+
+  it('a SUBSCRIBE for its own namespace is served', async () => {
+    const conn = recordingConnection();
+    const { session } = namespacedSession(conn);
+    session.handleSubscribe(5n, 'video', undefined, fields(OURS));
+    await settle();
+    expect(conn.calls).toContain('acceptSubscribe');
+    expect(session.publisher.aliasesOf('video')).toEqual([1n]);
   });
 });
