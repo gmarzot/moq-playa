@@ -54,9 +54,9 @@ export interface PipelineOptions {
      */
     readonly getPlaybackDelayUs?: () => number;
     /**
-     * True while late audio follows delivery (LIVE): a sustained late run steps
-     * the reference past its lateness, at most 1 s per step. Otherwise a run
-     * moves it at most 100 ms per 2 s. Read per decision.
+     * True while late audio follows delivery (LIVE): a sustained late run whose
+     * lateness is not shrinking steps the reference past it, at most 1 s per
+     * step. Otherwise a run moves it at most 100 ms per 2 s. Read per decision.
      */
     readonly followLateAudio?: () => boolean;
 }
@@ -133,6 +133,8 @@ export class PlaybackPipeline {
  * sync reference was last re-anchored from audio.
  */
     private _lateAudioSinceUs: number | null = null;
+    /** Lateness of the frame that opened the current late-run window. */
+    private _lateAudioRunLateUs = 0;
     private _lastAudioReanchorUs = Number.NEGATIVE_INFINITY;
     private _lateAudioDrops = 0;
     private readonly getPlaybackDelayUs: (() => number) | undefined;
@@ -488,15 +490,23 @@ export class PlaybackPipeline {
         return timing.offsetUs + cushionUs < -this.sync.lateThresholdUs;
     }
 
-    private shouldReanchorAudio(): boolean {
+    private shouldReanchorAudio(lateUs: number): boolean {
         const now = this.clock.now();
         if (this._lateAudioSinceUs === null) {
             this._lateAudioSinceUs = now;
+            this._lateAudioRunLateUs = lateUs;
             return false;
         }
         if (now - this._lateAudioSinceUs < PlaybackPipeline.AUDIO_REANCHOR_AFTER_US) return false;
-        if (!this.followsLateAudio
-            && now - this._lastAudioReanchorUs < PlaybackPipeline.AUDIO_REANCHOR_MIN_INTERVAL_US) return false;
+        const follow = this.followsLateAudio;
+        if (follow && lateUs < this._lateAudioRunLateUs - PlaybackPipeline.REFERENCE_TOLERANCE_US) {
+            // Shrinking lateness is a backlog draining: it ends by itself, and a
+            // step would stay in the audio output as lag. Judge the next window.
+            this._lateAudioSinceUs = now;
+            this._lateAudioRunLateUs = lateUs;
+            return false;
+        }
+        if (!follow && now - this._lastAudioReanchorUs < PlaybackPipeline.AUDIO_REANCHOR_MIN_INTERVAL_US) return false;
         this._lateAudioSinceUs = null;
         this._lastAudioReanchorUs = now;
         return true;
@@ -962,7 +972,7 @@ export class PlaybackPipeline {
                     // recomputes timing at decoder output and CanvasRenderer
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = this.clock.now();
-                } else if (this.mediaType === 'audio' && this.shouldReanchorAudio()) {
+                } else if (this.mediaType === 'audio' && this.shouldReanchorAudio(-timing.offsetUs)) {
                     // The reference was set once, from the first audio frame's
                     // transit. Audio that stays later than that by more than
                     // the drop threshold would otherwise be dropped for the
@@ -990,7 +1000,7 @@ export class PlaybackPipeline {
                 const pastSlotUs = this.mediaType === 'audio'
                     ? -(timing.offsetUs + (this.getPlaybackDelayUs?.() ?? 0)) : 0;
                 if (pastSlotUs > 0) {
-                    if (this.shouldReanchorAudio()) {
+                    if (this.shouldReanchorAudio(-timing.offsetUs)) {
                         if (this.followsLateAudio) {
                             renderTimeUs = this.stepLateAudio(timing, headers.captureTimestamp);
                         } else {

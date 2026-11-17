@@ -2,9 +2,10 @@
  * Late audio under delivery deficits, replayed on the audio pipeline.
  *
  * Following late audio (LIVE) steps the shared reference past a sustained late
- * run, at most 1 s per step. Without it (LIVE(+1s), LIVE(+2s)) a run moves the
- * reference at most 100 ms per 2 s; those cases pin that rule's values. Armed
- * LIVE(+1s) and LIVE(+2s) judge audio against their 2 s and 3 s ceilings.
+ * run, at most 1 s per step, unless its lateness is shrinking. Without it
+ * (LIVE(+1s), LIVE(+2s)) a run moves the reference at most 100 ms per 2 s;
+ * those cases pin that rule's values. Armed LIVE(+1s) and LIVE(+2s) judge audio
+ * against their 2 s and 3 s ceilings.
  */
 import { describe, it, expect } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
@@ -131,6 +132,17 @@ function jitter(h: Harness) {
     return { played: h.decoded() - d0, dropped: h.pipeline.lateAudioDrops, steps: h.steps(), finalShiftUs: h.shift() };
 }
 
+/** Delivery stalls for `stallUs`, the backlog drains at `speed` times real time, then 10 s on time. */
+function drain(h: Harness, stallUs: number, speed: number) {
+    h.warm();
+    const d0 = h.decoded();
+    let at = due(30) + stallUs, i = 31;
+    for (; due(i) < at; i++) { h.emit(at, i); at += FRAME_US / speed; }
+    const end = i + 500;
+    for (; i <= end; i++) h.emit(due(i), i);
+    return { played: h.decoded() - d0, of: end - 30, steps: h.steps(), finalShiftUs: h.shift() };
+}
+
 const follow = () => true;
 
 describe('late audio following delivery (LIVE)', () => {
@@ -177,6 +189,36 @@ describe('late audio following delivery (LIVE)', () => {
         expect({ played: r.played, dropped: r.dropped, steps: r.steps }).toEqual({ played: 461, dropped: 39, steps: 3 });
         expect(r.maxStepUs).toBe(1_000_000);
         expect(r.finalShiftUs).toBe(20_000);
+    });
+
+    for (const { stallUs, speed, played, of } of [
+        { stallUs: 1_000_000, speed: 2, played: 531, of: 599 },
+        { stallUs: 1_000_000, speed: 1.5, played: 546, of: 649 },
+        { stallUs: 3_000_000, speed: 1.5, played: 546, of: 948 },
+    ]) {
+        it(`a ${stallUs / 1e6} s stall draining at ${speed}x takes no step: the backlog ends on its own`, () => {
+            expect(drain(harness(LIVE_CUSHION_US, follow), stallUs, speed))
+                .toEqual({ played, of, steps: 0, finalShiftUs: 0 });
+        });
+    }
+
+    it('a late run that stops shrinking steps', () => {
+        const h = harness(LIVE_CUSHION_US, follow);
+        h.warm();
+        // 1 s stall, then the backlog drains at 2x for 300 ms and delivery stays that late.
+        let at = due(30) + 1_000_000, i = 31;
+        for (; i <= 60; i++) { h.emit(at, i); at += FRAME_US / 2; }
+        const lateUs = at - due(i), steadyFrom = i;
+        expect(h.steps()).toBe(0);
+        let steppedAt = 0, d0 = 0;
+        for (; i <= 160; i++) {
+            h.emit(due(i) + lateUs, i);
+            if (steppedAt === 0 && h.steps() === 1) { steppedAt = i; d0 = h.decoded(); }
+        }
+        expect(h.steps()).toBe(1);
+        // Within two windows of the lateness holding still; every frame after it plays.
+        expect((steppedAt - steadyFrom) * FRAME_US).toBeLessThanOrEqual(500_000);
+        expect(h.decoded() - d0).toBe(160 - steppedAt);
     });
 
     it('jitter alone never steps', () => {
@@ -249,6 +291,20 @@ describe('late audio not following delivery: values of the 100 ms per 2 s rule',
         it(`${mode}: delivery 3 s late for 10 s`, () => {
             const r = lateFor10s(harness(cushionUs, () => false), 3_000_000);
             expect({ played: r.played, dropped: r.dropped, steps: r.steps, shiftUs: r.shiftUs }).toEqual(expected);
+        });
+    }
+
+    for (const { mode, cushionUs, stallUs, speed, expected } of [
+        { mode: 'LIVE cushion', cushionUs: LIVE_CUSHION_US, stallUs: 1_000_000, speed: 2,
+            expected: { played: 542, of: 599, steps: 1, finalShiftUs: 20_000 } },
+        { mode: 'LIVE(+1s)', cushionUs: PLUS_1S_CEILING_US, stallUs: 3_000_000, speed: 1.5,
+            expected: { played: 832, of: 948, steps: 1, finalShiftUs: 20_000 } },
+        { mode: 'LIVE(+2s)', cushionUs: PLUS_2S_CEILING_US, stallUs: 3_000_000, speed: 1.5,
+            expected: { played: 948, of: 948, steps: 0, finalShiftUs: 0 } },
+    ]) {
+        it(`${mode}: a ${stallUs / 1e6} s stall draining at ${speed}x`, () => {
+            const r = drain(harness(cushionUs, () => false), stallUs, speed);
+            expect({ ...r, finalShiftUs: Math.round(r.finalShiftUs) }).toEqual(expected);
         });
     }
 });
