@@ -267,17 +267,6 @@ interface PendingAudioSwitch {
   noDataTimer?: ReturnType<typeof setTimeout>;
 }
 
-/**
- * Check if two CMAF codec strings are compatible without changeType().
- * Returns true only if the exact codec string matches — different
- * profile/level/resolution within the same family (e.g., avc1.640028
- * vs avc1.64001e) still needs changeType() because the SourceBuffer's
- * init segment (SPS/PPS) must match the media segments.
- */
-function codecsCompatible(a: string, b: string): boolean {
-  return a === b;
-}
-
 /** Why a media track is re-subscribed. */
 type ResubscribeCause = 'too_far_behind' | 'publish_done' | 'liveness' | 'migration' | 'refused' | 'namespace_return';
 
@@ -635,9 +624,8 @@ export class MoqtPlayer {
   /**
    * Init segment bytes received from each subscribed init track, keyed
    * by init track name. Populated as `onInitObject` fires; consulted on
-   * track switch when the new track's codec differs from the SourceBuffer's
-   * current codec, so we can call `mediaSource.changeType()` immediately
-   * instead of re-subscribing.
+   * every CMAF track switch, so the target's init is in hand without
+   * re-subscribing.
    */
   private readonly initSegmentByTrack = new Map<string, Uint8Array>();
 
@@ -645,7 +633,7 @@ export class MoqtPlayer {
    * Pending lazy init-track subscriptions, keyed by init track name.
    * Resolved when the first init object for that track arrives.
    * Used by `selectVideoTrack` to await init bytes before initiating a
-   * codec-changing switch.
+   * CMAF switch.
    */
   private readonly pendingInitTrackSubs = new Map<
     string,
@@ -656,10 +644,8 @@ export class MoqtPlayer {
 
   /**
    * Codec string the video SourceBuffer was last initialized for (or
-   * retyped to). Compared against the target track's codec on switch
-   * to decide whether `mediaSource.changeType()` is required. Works
-   * for both inline-`initData` catalogs and separate-`initTrack`
-   * catalogs — the codec is the canonical canary either way.
+   * retyped to). A switch to a different codec cannot commit without
+   * the target's init.
    */
   private currentVideoCodec: string | null = null;
 
@@ -2957,10 +2943,9 @@ export class MoqtPlayer {
    * to the init track if necessary.
    *
    * Returns the init segment payload. Used by `selectVideoTrack` to
-   * pre-fetch the new codec's init bytes before starting a switch that
-   * crosses codec families — the make-before-break flow needs init in
-   * hand at switch-completion time so it can call
-   * `mediaSource.changeType()` synchronously between unsubscribing the
+   * pre-fetch the target's init bytes before starting a switch — the
+   * make-before-break flow needs init in hand at switch-completion time
+   * so it can call `mediaSource.changeType()` before unsubscribing the
    * old track and flushing staged new-track segments.
    */
   private async ensureInitTrack(initTrackName: string): Promise<Uint8Array> {
@@ -3186,9 +3171,9 @@ export class MoqtPlayer {
       ? { from: currentTrack.altGroup, to: targetTrack.altGroup }
       : undefined;
 
-    // For CMAF: if the switch crosses codec families, the SourceBuffer
-    // needs to be retyped via changeType() with the new init segment.
-    // Resolve the init source up-front so the actual switch — fired in
+    // For CMAF: every switch appends the target's own init segment, since an
+    // equal codec string does not imply the same track_ID, parameter sets or
+    // trex. Resolve the init source up-front so the actual switch — fired in
     // completePendingVideoSwitch when the new keyframe arrives — has
     // bytes in hand and stays atomic.
     //
@@ -3203,12 +3188,14 @@ export class MoqtPlayer {
     // switch can't proceed. Reject now so the existing subscription
     // stays intact — better than racing the rejection mid-async, where
     // the abort path would have to undo a partial commit.
-    const needsCodecChange = this.usesMse(targetTrack.packaging)
-        && targetTrack.codec !== undefined
+    const cmafTarget = this.usesMse(targetTrack.packaging) && targetTrack.codec !== undefined;
+    const needsCodecChange = cmafTarget
         && (this.currentVideoCodec === null
-            || !codecsCompatible(targetTrack.codec, this.currentVideoCodec)
+            || targetTrack.codec !== this.currentVideoCodec
             || viewChange !== undefined);
-    if (needsCodecChange) {
+    const declaresInit = targetTrack.initData !== undefined || targetTrack.initRef !== undefined
+        || targetTrack.initTrack !== undefined;
+    if (needsCodecChange || (cmafTarget && declaresInit)) {
       // Resolve the inline init once (track.initData or an initRef → root inline
       // initDataList entry); fall back to an initTrack subscription otherwise.
       let inlineInit: Uint8Array | undefined;
@@ -3219,12 +3206,12 @@ export class MoqtPlayer {
           `Cannot switch to "${trackName}": ${err instanceof Error ? err.message : String(err)} for codec "${targetTrack.codec}"`,
         );
       }
-      if (!inlineInit && !targetTrack.initTrack) {
+      if (needsCodecChange && !inlineInit && !targetTrack.initTrack) {
         throw new Error(
           `Cannot switch to "${trackName}": catalog provides no inline init (initData/initRef) or initTrack for codec "${targetTrack.codec}"`,
         );
       }
-      this.log.info('[SWITCH] codec change "%s" → "%s" (codec "%s" → "%s"): prefetching init',
+      this.log.info('[SWITCH] prepare "%s" → "%s" (codec "%s" → "%s"): prefetching init',
         currentVideoTrackName, trackName,
         this.currentVideoCodec ?? '(unknown)', targetTrack.codec);
       if (!inlineInit && targetTrack.initTrack) {
@@ -3365,25 +3352,25 @@ export class MoqtPlayer {
       (t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'video',
     );
 
-    // CMAF path: if the new track has a different codec than the
-    // SourceBuffer was created with, ask the adapter to retype it
-    // BEFORE the old track is unsubscribed. If the retype fails (or
-    // the init bytes are missing), the switch is aborted cleanly
-    // — old track keeps playing, new track is unsubscribed, staged
-    // bytes are dropped — and the user sees an error event. Without
-    // this, a failed pivot tears down the only known-good subscription
-    // and strands playback in an unrecoverable state.
-    const needsChangeType = newTrack !== undefined && this.usesMse(newTrack.packaging)
-      && newTrack.codec !== undefined
+    // CMAF path: append the new track's init segment (the adapter retypes
+    // the SourceBuffer only when the MIME type changes) BEFORE the old
+    // track is unsubscribed. If that fails, or a codec change has no init
+    // bytes, the switch is aborted cleanly — old track keeps playing, new
+    // track is unsubscribed, staged bytes are dropped — and the user sees
+    // an error event. Without this, a failed pivot tears down the only
+    // known-good subscription and strands playback in an unrecoverable state.
+    const cmafTarget = newTrack !== undefined && this.usesMse(newTrack.packaging)
+      && newTrack.codec !== undefined;
+    const codecChange = cmafTarget
       && (this.currentVideoCodec === null
-          || !codecsCompatible(newTrack.codec, this.currentVideoCodec)
+          || newTrack.codec !== this.currentVideoCodec
           || sw.viewChange !== undefined);
 
-    if (needsChangeType && newTrack && this.mediaSource?.changeType) {
+    let initData: Uint8Array | undefined;
+    if (cmafTarget && newTrack && this.mediaSource?.changeType) {
       // Inline init (`initData` or an `initRef` → root inline entry) is Base64
       // (CatalogTrack §5.1.20 / MSF-01 §5.1.7); decode it. initTrack-delivered
       // cache holds raw Uint8Array.
-      let initData: Uint8Array | undefined;
       try {
         initData = this.decodeResolvedInlineInitData(newTrack)
           ?? (newTrack.initTrack ? this.initSegmentByTrack.get(newTrack.initTrack) : undefined);
@@ -3391,7 +3378,7 @@ export class MoqtPlayer {
         this.abortPendingVideoSwitch(sw, err instanceof Error ? err : new Error(String(err)));
         return;
       }
-      if (!initData) {
+      if (!initData && codecChange) {
         // selectVideoTrack should have pre-fetched this. Hitting here
         // means the catalog has neither inline initData nor an
         // initTrack for the target codec — abort, don't touch old.
@@ -3404,12 +3391,15 @@ export class MoqtPlayer {
         ));
         return;
       }
-      this.log.info('[SWITCH] codec change → calling MSE changeType: "%s" → "%s"',
-        this.currentVideoCodec ?? '(unknown)', newTrack.codec);
+    }
+
+    if (initData && newTrack && this.mediaSource?.changeType) {
+      this.log.info('[SWITCH] appending target init via MSE changeType: "%s" → "%s" (codec "%s" → "%s")',
+        sw.oldTrackName, sw.newTrackName, this.currentVideoCodec ?? '(unknown)', newTrack.codec);
       // Pin the assembler to the new track first: old-track fragments that
-      // arrive while the SourceBuffer is re-typed must not be appended after
-      // the new init (an old keyframe would decode with the new parameter
-      // sets). New-track objects keep staging until the flush below.
+      // arrive while the target init is appended must not follow it (an old
+      // keyframe would decode with the new parameter sets). New-track
+      // objects keep staging until the flush below.
       const pinnedInit = initData;
       this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
       this.mediaSource.changeType('video', newTrack.codec ?? '', pinnedInit)
@@ -3418,7 +3408,7 @@ export class MoqtPlayer {
           // The new track's timescale and trex defaults drive the rebase.
           this.cmafAssembler?.setInitSegment?.('video', pinnedInit);
           // Pivot succeeded. NOW it's safe to tear down the old track
-          // and flush the staged new-track segments into the retyped
+          // and flush the staged new-track segments into the reinitialized
           // SourceBuffer.
           this.unsubscribeOldVideoTrack(sw);
           this.currentVideoCodec = newTrack.codec ?? null;
@@ -3438,7 +3428,7 @@ export class MoqtPlayer {
       return;
     }
 
-    // ── Same-codec / LOC paths: tear down old, then commit new ──
+    // ── LOC, and CMAF without a target init: tear down old, then commit new ──
     this.unsubscribeOldVideoTrack(sw);
 
     // Find the keyframe group ID for resetForTrackSwitch — use the
@@ -4103,8 +4093,7 @@ export class MoqtPlayer {
         (t: CatalogTrack) => t.role === 'audio' && t.initTrack === trackName,
       );
 
-      // Cache the init bytes so future codec-changing track switches
-      // can call mediaSource.changeType() immediately instead of
+      // Cache the init bytes for future track switches instead of
       // re-fetching. Resolves any pending lazy-subscribe waiter.
       this.initSegmentByTrack.set(trackName, obj.payload);
       const pending = this.pendingInitTrackSubs.get(trackName);

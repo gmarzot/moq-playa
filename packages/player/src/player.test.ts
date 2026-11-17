@@ -13863,6 +13863,87 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
+  /** Two renditions of one view with one codec string. */
+  const sameCodecLadder = JSON.stringify({
+    version: 1,
+    tracks: [
+      { name: 'video_720p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
+        codec: 'av01.0.08M.08', width: 1280, height: 720, bitrate: 3_000_000, initData: btoa('\x01\x01\x01\x01') },
+      { name: 'video_540p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
+        codec: 'av01.0.08M.08', width: 960, height: 540, bitrate: 1_500_000, initData: btoa('\x02\x02\x02\x02') },
+      { name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio',
+        codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', initData: btoa('\x03\x03\x03\x03') },
+    ],
+  });
+
+  async function loadSameCodecLadder(adapter: ReturnType<typeof createMockAdapter>, changeType: () => Promise<void>) {
+    const mockMs = {
+      initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array) => changeType()),
+    };
+    const assembler = {
+      push: vi.fn(), selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+    };
+    const player = await loadWithCatalog(adapter, sameCodecLadder, {
+      startLevel: 0, autoQuality: false,
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => assembler,
+    } as Partial<MoqtPlayerConfig>);
+    expect(subscribedNames(adapter)).toContain('video_720p');
+    assembler.setInitSegment.mockClear();
+    return { player, mockMs, assembler };
+  }
+
+  it('appends the target init for a same-view CMAF switch with an identical codec string', async () => {
+    const adapter = createMockAdapter();
+    const { player, mockMs, assembler } = await loadSameCodecLadder(adapter, () => Promise.resolve());
+    const oldReqId = await requestIdOf(adapter, 'video_720p');
+    const switched = vi.fn();
+    player.on('quality_switched', switched);
+
+    await player.selectVideoTrack('video_540p');
+    expect(mockMs.changeType).not.toHaveBeenCalled();
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    const [mt, codec, init] = mockMs.changeType.mock.calls[0]!;
+    expect(mt).toBe('video');
+    expect(codec).toBe('av01.0.08M.08');
+    expect(Array.from(init)).toEqual([2, 2, 2, 2]);
+    expect(assembler.setInitSegment).toHaveBeenCalledWith('video', init);
+    expect(switched).toHaveBeenCalledWith(expect.objectContaining({ fromTrackName: 'video_720p', toTrackName: 'video_540p' }));
+    expect(unsubscribedIds(adapter)).toContain(oldReqId);
+
+    await player.destroy();
+  });
+
+  it('keeps the old rendition when a same-codec target init is rejected', async () => {
+    const adapter = createMockAdapter();
+    const { player, mockMs } = await loadSameCodecLadder(adapter,
+      () => Promise.reject(new Error('CHUNK_DEMUXER_ERROR_APPEND_FAILED')));
+    const oldReqId = await requestIdOf(adapter, 'video_720p');
+    const switched = vi.fn();
+    const failed = vi.fn();
+    player.on('quality_switched', switched);
+    player.on('quality_switch_failed', failed);
+    player.on('error', () => {});
+
+    await player.selectVideoTrack('video_540p');
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    expect(switched).not.toHaveBeenCalled();
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video_540p' }));
+    expect(unsubscribedIds(adapter)).not.toContain(oldReqId);
+    expect(unsubscribedIds(adapter)).toContain(await requestIdOf(adapter, 'video_540p'));
+
+    await player.destroy();
+  });
+
   it('re-inits MSE for a CMAF view switch even with an identical codec string', async () => {
     const adapter = createMockAdapter();
     const mockMs = {
