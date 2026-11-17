@@ -1968,3 +1968,49 @@ describe('CmafAssembler — audio decode order', () => {
     expect(assembler.audioOrderStats).toMatchObject({ restored: 0, missing: 0, late: 0 });
   });
 });
+
+describe('CmafAssembler — rendition switch to another timescale', () => {
+  /** Minimal init: moov(trak(mdia(mdhd v0 with `timescale`))). */
+  function init(timescale: number): Uint8Array {
+    const mdhd = new Uint8Array(24);
+    new DataView(mdhd.buffer).setUint32(12, timescale);
+    return buildBox('moov', buildBox('trak', buildBox('mdia', buildBox('mdhd', mdhd))));
+  }
+
+  it.each(['video', 'audio'] as const)('%s: places the first fragment after a 90 kHz → 1 kHz switch on the running timeline', (mediaType) => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    assembler.setInitSegment(mediaType, init(90_000));
+    assembler.selectTrack(mediaType, 'old');
+    for (let s = 0; s < 10; s++) {
+      assembler.push(mediaType, 'old', BigInt(s), concat(buildMoof(s * 90_000, s + 1, 90_000), buildMdat(new Uint8Array([1]))));
+    }
+
+    assembler.setInitSegment(mediaType, init(1_000));
+    assembler.selectTrack(mediaType, 'new');
+    assembler.push(mediaType, 'new', 10n, concat(buildMoof(10_000, 11, 1_000), buildMdat(new Uint8Array([2]))));
+    assembler.push(mediaType, 'new', 11n, concat(buildMoof(11_000, 12, 1_000), buildMdat(new Uint8Array([3]))));
+
+    const out = onSegment.mock.calls.slice(-2).map(([, seg]) => readBaseMediaDecodeTime(seg as Uint8Array));
+    expect(out).toEqual([10_000n, 11_000n]); // 10 s and 11 s at 1 kHz
+  });
+
+  it('emits a segment held across the switch in its own timescale', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    assembler.setInitSegment('audio', init(90_000));
+    assembler.selectTrack('audio', 'old');
+    for (const s of [0, 1, 2, 3, 4, 5, 6, 7, 9]) {
+      assembler.push('audio', 'old', BigInt(s), concat(buildMoof(s * 90_000, s + 1, 90_000), buildMdat(new Uint8Array([1]))));
+    }
+    expect(onSegment).toHaveBeenCalledTimes(8); // 9 s waits for the missing 8 s
+
+    assembler.setInitSegment('audio', init(1_000));
+    expect(onSegment).toHaveBeenCalledTimes(9);
+    assembler.selectTrack('audio', 'new');
+    assembler.push('audio', 'new', 10n, concat(buildMoof(10_000, 11, 1_000), buildMdat(new Uint8Array([2]))));
+
+    expect(readBaseMediaDecodeTime(onSegment.mock.calls.at(-1)![1] as Uint8Array)).toBe(10_000n);
+    assembler.destroy();
+  });
+});

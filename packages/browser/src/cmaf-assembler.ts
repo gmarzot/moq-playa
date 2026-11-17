@@ -358,12 +358,16 @@ export class CmafAssembler {
    * `null` if the new init has no mvex/trex). A new init means a new
    * track configuration — leftover trex from the previous track must
    * not leak into rewrites of the new stream's fragments.
+   *
+   * A changed timescale rescales the track's retained tick positions.
    */
   setInitSegment(mediaType: 'video' | 'audio', initBytes: Uint8Array): void {
     // Record the track's media timescale (mdhd) — required to derive this
     // track's rebase epoch from the shared cross-track epoch. Overwrites on
     // every init for the same reason as the trex below.
     const timescale = readMdhdTimescale(initBytes);
+    const previous = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (previous && timescale && previous !== timescale) this.rescaleTrack(mediaType, previous, timescale);
     if (mediaType === 'video') {
       this.videoTimescale = timescale;
     } else {
@@ -373,6 +377,34 @@ export class CmafAssembler {
     const trex = trexMap.size > 0 ? trexMap.values().next().value! : null;
     if (mediaType === 'video') this.videoTrex = trex;
     else this.audioTrex = trex;
+  }
+
+  /**
+   * Convert one track's retained tick positions from timescale `from` to `to`.
+   * Held segments are in the old timescale and trex, so they are emitted first.
+   * The shared epoch and output origin carry their own timescale.
+   */
+  private rescaleTrack(mediaType: 'video' | 'audio', from: number, to: number): void {
+    this.flushHeld(mediaType);
+    const scale = (ticks: bigint | null): bigint | null =>
+      ticks === null ? null : (ticks * BigInt(to)) / BigInt(from);
+    const o = this.order[mediaType];
+    o.lastStart = scale(o.lastStart);
+    o.end = scale(o.end);
+    o.holdHead = scale(o.holdHead);
+    if (mediaType === 'video') {
+      this.videoEpoch = scale(this.videoEpoch);
+      this.videoOutputOffset = scale(this.videoOutputOffset)!;
+      this.lastVideoBmd = scale(this.lastVideoBmd);
+      this.lastVideoOutputBmd = scale(this.lastVideoOutputBmd);
+      this.lastVideoOutputEnd = scale(this.lastVideoOutputEnd);
+    } else {
+      this.audioEpoch = scale(this.audioEpoch);
+      this.audioOutputOffset = scale(this.audioOutputOffset)!;
+      this.lastAudioBmd = scale(this.lastAudioBmd);
+      this.lastAudioOutputBmd = scale(this.lastAudioOutputBmd);
+      this.lastAudioOutputEnd = scale(this.lastAudioOutputEnd);
+    }
   }
 
   /**
