@@ -53,6 +53,12 @@ export interface PipelineOptions {
      * it: a frame the cushion still covers plays on time.
      */
     readonly getPlaybackDelayUs?: () => number;
+    /**
+     * True while late audio follows delivery (LIVE): a sustained late run whose
+     * lateness is not shrinking steps the reference past it, at most 1 s per
+     * step. Otherwise a run moves it at most 100 ms per 2 s. Read per decision.
+     */
+    readonly followLateAudio?: () => boolean;
 }
 
 /**
@@ -127,9 +133,12 @@ export class PlaybackPipeline {
  * sync reference was last re-anchored from audio.
  */
     private _lateAudioSinceUs: number | null = null;
+    /** Lateness of the frame that opened the current late-run window. */
+    private _lateAudioRunLateUs = 0;
     private _lastAudioReanchorUs = Number.NEGATIVE_INFINITY;
     private _lateAudioDrops = 0;
     private readonly getPlaybackDelayUs: (() => number) | undefined;
+    private readonly followLateAudio: (() => boolean) | undefined;
     /** Sustained audio lateness before re-anchoring (one jittery frame must not). */
     /** How long video waits on an advertised audio track to anchor the shared
      *  reference before anchoring itself. */
@@ -137,6 +146,8 @@ export class PlaybackPipeline {
     private static readonly AUDIO_REANCHOR_AFTER_US = 250_000;
     /** Minimum spacing between audio re-anchors. */
     private static readonly AUDIO_REANCHOR_MIN_INTERVAL_US = 2_000_000;
+    /** Largest shift one step applies when following late audio. */
+    private static readonly FOLLOW_LATE_AUDIO_MAX_STEP_US = 1_000_000;
     /** Lookahead left in place when the reference walks down, so ordinary
      *  jitter does not make frames late. */
     private static readonly REFERENCE_TOLERANCE_US = 20_000;
@@ -178,6 +189,7 @@ export class PlaybackPipeline {
         this.recovery = opts.recovery;
         this._videoOnly = opts.videoOnly ?? false;
         this.getPlaybackDelayUs = opts.getPlaybackDelayUs;
+        this.followLateAudio = opts.followLateAudio;
         this.isLive = opts.isLive ?? true;
 
         // Bounded release: live video defaults to 5 objects/tick + 3 max
@@ -478,17 +490,42 @@ export class PlaybackPipeline {
         return timing.offsetUs + cushionUs < -this.sync.lateThresholdUs;
     }
 
-    private shouldReanchorAudio(): boolean {
+    private shouldReanchorAudio(lateUs: number): boolean {
         const now = this.clock.now();
         if (this._lateAudioSinceUs === null) {
             this._lateAudioSinceUs = now;
+            this._lateAudioRunLateUs = lateUs;
             return false;
         }
         if (now - this._lateAudioSinceUs < PlaybackPipeline.AUDIO_REANCHOR_AFTER_US) return false;
-        if (now - this._lastAudioReanchorUs < PlaybackPipeline.AUDIO_REANCHOR_MIN_INTERVAL_US) return false;
+        const follow = this.followsLateAudio;
+        if (follow && lateUs < this._lateAudioRunLateUs - PlaybackPipeline.REFERENCE_TOLERANCE_US) {
+            // Shrinking lateness is a backlog draining: it ends by itself, and a
+            // step would stay in the audio output as lag. Judge the next window.
+            this._lateAudioSinceUs = now;
+            this._lateAudioRunLateUs = lateUs;
+            return false;
+        }
+        if (!follow && now - this._lastAudioReanchorUs < PlaybackPipeline.AUDIO_REANCHOR_MIN_INTERVAL_US) return false;
         this._lateAudioSinceUs = null;
         this._lastAudioReanchorUs = now;
         return true;
+    }
+
+    private get followsLateAudio(): boolean {
+        return this.followLateAudio?.() === true;
+    }
+
+    /**
+     * Following late audio: shift the reference by the frame's lateness plus the
+     * walk-down tolerance, landing it where an on-time frame sits. More would be
+     * walked back at once but kept by the audio output, as audio behind video.
+     * Returns the frame's render time on the shifted reference.
+     */
+    private stepLateAudio(timing: RenderTiming, captureUs: bigint): number {
+        this.sync.reanchorAudioBounded(-timing.offsetUs + PlaybackPipeline.REFERENCE_TOLERANCE_US,
+            PlaybackPipeline.FOLLOW_LATE_AUDIO_MAX_STEP_US);
+        return this.sync.computeAudioRenderTime(captureUs)?.renderTimeUs ?? this.clock.now();
     }
 
     reset(targetGroupId?: bigint): void {
@@ -935,16 +972,20 @@ export class PlaybackPipeline {
                     // recomputes timing at decoder output and CanvasRenderer
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = this.clock.now();
-                } else if (this.mediaType === 'audio' && this.shouldReanchorAudio()) {
+                } else if (this.mediaType === 'audio' && this.shouldReanchorAudio(-timing.offsetUs)) {
                     // The reference was set once, from the first audio frame's
                     // transit. Audio that stays later than that by more than
                     // the drop threshold would otherwise be dropped for the
                     // rest of the session while video keeps rendering.
                     // Bounded step; early frames walk it back via lowerReference.
                     const lateByUs = -timing.offsetUs;
-                    this.sync.reanchorAudioBounded(lateByUs);
+                    if (this.followsLateAudio) {
+                        renderTimeUs = this.stepLateAudio(timing, headers.captureTimestamp);
+                    } else {
+                        this.sync.reanchorAudioBounded(lateByUs);
+                        renderTimeUs = this.clock.now();
+                    }
                     this.onEvent({ type: 'audio_reanchored', lateByUs });
-                    renderTimeUs = this.clock.now();
                 } else {
                     if (this.mediaType === 'audio') this._lateAudioDrops++;
                     return; // Genuinely late and safe to discard — skip
@@ -959,11 +1000,15 @@ export class PlaybackPipeline {
                 const pastSlotUs = this.mediaType === 'audio'
                     ? -(timing.offsetUs + (this.getPlaybackDelayUs?.() ?? 0)) : 0;
                 if (pastSlotUs > 0) {
-                    if (this.shouldReanchorAudio()) {
-                        this.sync.reanchorAudioBounded(pastSlotUs + PlaybackPipeline.REFERENCE_TOLERANCE_US);
+                    if (this.shouldReanchorAudio(-timing.offsetUs)) {
+                        if (this.followsLateAudio) {
+                            renderTimeUs = this.stepLateAudio(timing, headers.captureTimestamp);
+                        } else {
+                            this.sync.reanchorAudioBounded(pastSlotUs + PlaybackPipeline.REFERENCE_TOLERANCE_US);
+                            renderTimeUs = this.sync.computeAudioRenderTime(headers.captureTimestamp)?.renderTimeUs
+                                ?? this.clock.now();
+                        }
                         this.onEvent({ type: 'audio_reanchored', lateByUs: -timing.offsetUs });
-                        renderTimeUs = this.sync.computeAudioRenderTime(headers.captureTimestamp)?.renderTimeUs
-                            ?? this.clock.now();
                     }
                 } else if (this.mediaType === 'audio') {
                     this._lateAudioSinceUs = null;

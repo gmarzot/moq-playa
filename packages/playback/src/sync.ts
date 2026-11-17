@@ -235,15 +235,16 @@ export class SyncController {
     }
 
     /**
-     * Shift the reference later for late audio, by at most MAX_REANCHOR_STEP_US.
+     * Shift the reference later for late audio, by at most `maxStepUs`.
      * The excess stays visible as lead and is retired by {@link lowerReference}.
      *
      * @param lateByUs how far behind its render time the frame is (positive)
+     * @param maxStepUs largest shift applied; default MAX_REANCHOR_STEP_US
      * @returns the shift applied
      */
-    reanchorAudioBounded(lateByUs: number): number {
+    reanchorAudioBounded(lateByUs: number, maxStepUs = SyncController.MAX_REANCHOR_STEP_US): number {
         if (this.localBaselineUs === undefined) return 0;
-        const step = Math.min(Math.max(0, lateByUs), SyncController.MAX_REANCHOR_STEP_US);
+        const step = Math.min(Math.max(0, lateByUs), maxStepUs);
         if (step <= 0) return 0;
         this.localBaselineUs += step;
         this._baselineDebtUs += step;
