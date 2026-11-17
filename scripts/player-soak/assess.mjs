@@ -5,7 +5,7 @@
  * Report-only, except the verdict: no-playback when nothing played, no-audio
  * when the catalog lists an audio track that is never heard, and, under an
  * adverse profile, unrecovered when no fresh frame follows a disruption or the
- * picture is still frozen at the end.
+ * picture is still frozen at the end. A ladder case adds its ABR switches.
  */
 
 const STALL_MS = 500;
@@ -128,9 +128,67 @@ export function recoveryReport(samples, ticks, disruptions, frozen) {
   });
 }
 
+/**
+ * An ABR switch from a player console line: direction, target track, trigger and the
+ * logged reason, or null. Playwright gives a console call as its format string followed
+ * by the arguments, unsubstituted; a substituted line reads too.
+ */
+export function abrSwitch(text) {
+  let m = /frames dropped → downshift to (?:%s;.* min \S+ \S+ (\S+) \S+ \S+$|([^;\s]+))/.exec(text);
+  if (m) return { direction: 'down', to: m[1] ?? m[2], kind: 'decode', reason: null };
+  m = /MSE stall (?:%dms → emergency downshift to %s \S+ (\S+)|\d+ms → emergency downshift to (\S+))/.exec(text);
+  if (m) return { direction: 'down', to: m[1] ?? m[2], kind: 'stall', reason: null };
+  m = /→ (?:%s to %s%s \S+ \S+ \S+ (downshift|upshift) (\S+)|(downshift|upshift) to (\S+?))(?:\s+\((.*)\))?\s*$/.exec(text);
+  if (!m) return null;
+  const reason = m[5] ?? null;
+  const kind = reason === null ? 'buffer' : /late and rising|arriving .* later/.test(reason) ? 'lag'
+    : /kbps under/.test(reason) ? 'link' : /probing/.test(reason) ? 'probe' : 'other';
+  return { direction: (m[1] ?? m[3]) === 'downshift' ? 'down' : 'up', to: m[2] ?? m[4], kind, reason };
+}
+
+/**
+ * Renditions played, from the per-second stats (bitrate and resolution of the playing
+ * track), and the switches the player logged with their reasons. Times are seconds
+ * from `startEpochMs`, the play click.
+ */
+export function abrReport(ticks, log = [], startEpochMs = ticks[0]?.wallEpochMs ?? 0) {
+  const played = ticks.filter((t) => Number(t.stats?.bitrate) > 0);
+  const kbpsOf = (t) => Math.round(Number(t.stats.bitrate) / 1000);
+  const at = (ms) => +((ms - startEpochMs) / 1000).toFixed(1);
+  const timeline = [];
+  const levels = new Map();
+  let downshifts = 0;
+  let upshifts = 0;
+  let firstTickDownS = null;
+  played.forEach((t, i) => {
+    const kbps = kbpsOf(t);
+    const height = t.stats.resolution?.height ?? null;
+    const prev = played[i - 1];
+    if (prev && kbps < kbpsOf(prev)) { downshifts++; firstTickDownS ??= at(t.wallEpochMs); }
+    if (prev && kbps > kbpsOf(prev)) upshifts++;
+    if (timeline.at(-1)?.kbps !== kbps) timeline.push({ atS: at(t.wallEpochMs), kbps, height });
+    const level = levels.get(kbps) ?? { kbps, height, seconds: 0 };
+    level.seconds += played[i + 1] ? (played[i + 1].wallEpochMs - t.wallEpochMs) / 1000 : 0;
+    levels.set(kbps, level);
+  });
+  const switches = log.map((l) => ({ atS: at(l.t), ...abrSwitch(l.text) })).filter((s) => s.direction);
+  const down = switches.filter((s) => s.direction === 'down');
+  const reasons = {};
+  for (const s of down) reasons[s.kind] = (reasons[s.kind] ?? 0) + 1;
+  return {
+    timeline,
+    timeAtLevelS: [...levels.values()].sort((a, b) => b.kbps - a.kbps)
+      .map((l) => ({ ...l, seconds: Math.round(l.seconds) })),
+    downshifts,
+    upshifts,
+    firstDownshiftS: down[0]?.atS ?? firstTickDownS,
+    logged: { downshifts: down.length, upshifts: switches.length - down.length, reasons, switches },
+  };
+}
+
 const COUNTERS = ['stallCount', 'stallDurationMs', 'framesDropped', 'audioUnderruns', 'gapCount', 'framesRendered'];
 
-export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false }) {
+export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false, abrLog = null }) {
   const first = samples[0];
   const last = samples.at(-1);
   const durationMs = first && last ? last.wallMs - first.wallMs : 0;
@@ -205,13 +263,15 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
       stalls: intervalSummary(stalls),
       rebufferRatio: durationMs > 0 ? +(intervalSummary(stalls).totalMs / durationMs).toFixed(4) : null,
       frozen: intervalSummary(frozen),
-      audioGaps: intervalSummary(audioGaps),
+      audioGaps: { ...intervalSummary(audioGaps), p99Ms: audioGaps.length
+        ? Math.round(quantile(audioGaps.map((g) => g.durationMs), 0.99)) : null },
       fps: { mean: +fpsMean.toFixed(2), minPerMinute: fpsPerMinute.length ? +Math.min(...fpsPerMinute).toFixed(2) : null,
         expected: expected.videoFps ?? null },
       resolution,
       resolutionMatches: expected.videoWidth ? resolution?.width === expected.videoWidth && resolution?.height === expected.videoHeight : null,
     },
     latency: latencyReport(ticks),
+    ...(abrLog ? { abr: abrReport(ticks, abrLog, startup.clickedEpochMs) } : {}),
     player,
     events,
     intervals: { stalls, frozen, audioGaps },

@@ -138,6 +138,45 @@
       "aiomoqt-relay:loc"
     ]
   },
+  "ladders": [
+    {
+      "relay": "aiomoqt-relay",
+      "id": "ladder-cmaf",
+      "packaging": "cmaf",
+      "namespace": "openmoq/aiomoqt/mtt_00/bbb_4k30/cmaf/h264/1080/30/aac/2/msf/catalog/2000/1/0/alt4",
+      "profile": "capped",
+      "auto": true,
+      "level": 0,
+      "expected": {
+        "videoFps": 30
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "id": "ladder-loc",
+      "packaging": "loc",
+      "namespace": "openmoq/aiomoqt/mtt_00/bbb_4k30/loc/h264/1080/30/aac/2/msf/catalog/2000/1/0/alt4",
+      "profile": "capped",
+      "auto": true,
+      "level": 0,
+      "expected": {
+        "videoFps": 30
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
+      "id": "ladder-loc-top",
+      "packaging": "loc",
+      "namespace": "openmoq/aiomoqt/mtt_00/bbb_4k30/loc/h264/1080/30/aac/2/msf/catalog/2000/1/0/alt4",
+      "profile": "capped",
+      "level": 0,
+      "expected": {
+        "videoWidth": 1920,
+        "videoHeight": 1080,
+        "videoFps": 30
+      }
+    }
+  ],
   "restartEveryS": 75,
   "profiles": {
     "lossy": {

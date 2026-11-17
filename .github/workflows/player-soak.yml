@@ -11,14 +11,14 @@ on:
         description: Minutes per case
         default: '5'
       only:
-        description: 'Run only these RELAY:CASEs or adverse profiles, comma-separated, e.g. aiomoqt-relay:cmaf,blackouts (empty: all)'
+        description: 'Run only these RELAY:CASEs, ladders or adverse profiles, comma-separated, e.g. aiomoqt-relay:cmaf,blackouts (empty: all)'
         default: ''
       broadcast:
         description: Also soak synthetic g5-broadcast streams
         type: boolean
         default: true
       adverse:
-        description: Also play the broadcasts under the adverse profiles
+        description: Also play the broadcasts and the test-track ladders under the adverse profiles
         type: boolean
         default: true
       adverse_minutes:
@@ -61,6 +61,7 @@ jobs:
       adverse: ${{ steps.cases.outputs.adverse }}
       restart: ${{ steps.cases.outputs.restart }}
       adverse_broadcasts: ${{ steps.cases.outputs.adverse_broadcasts }}
+      ladder: ${{ steps.cases.outputs.ladder }}
     steps:
       - uses: actions/checkout@v4
       # A scheduled run is skipped when it starts outside 01:00-11:00 UTC or when
@@ -100,8 +101,10 @@ jobs:
             const broadcast = process.env.BROADCAST === "true" ? c.broadcast.map(key) : [];
             const profiles = process.env.ADVERSE === "true" ? Object.keys(c.profiles)
               .filter((p) => process.env.SMOKE !== "true" || c.profiles[p].smoke) : [];
-            if (process.env.SKIP === "true") { mtt.length = 0; broadcast.length = 0; profiles.length = 0; }
-            const all = [...mtt, ...broadcast, ...profiles];
+            const ladders = process.env.ADVERSE === "true" && process.env.SMOKE !== "true"
+              ? c.ladders.map((l) => `${l.relay}:${l.id}`) : [];
+            if (process.env.SKIP === "true") { mtt.length = 0; broadcast.length = 0; profiles.length = 0; ladders.length = 0; }
+            const all = [...mtt, ...broadcast, ...profiles, ...ladders];
             const unknown = (only ?? []).filter((o) => !all.includes(o));
             if (unknown.length) {
               console.error(`::error::unknown case ${unknown.join(",")}; cases: ${all.join(" ")}`);
@@ -113,8 +116,14 @@ jobs:
             const needed = new Set(player);
             if (adverse.some((p) => !c.profiles[p].variant)) c.adverse.broadcasts.forEach((b) => needed.add(b));
             const restart = adverse.some((p) => c.profiles[p].variant === "restart") ? c.adverse.broadcasts : [];
+            // Ladders on one stream share its test-track job, so they play on one runner.
+            const streams = {};
+            for (const k of pick(ladders)) {
+              const l = c.ladders.find((x) => `${x.relay}:${x.id}` === k);
+              (streams[`${l.relay} ${l.namespace}`] ??= []).push(k);
+            }
             const out = { mtt: pick(mtt), broadcaster: c.broadcast.map(key).filter((b) => needed.has(b)), player, adverse,
-              restart, adverse_broadcasts: c.adverse.broadcasts.join(",") };
+              restart, adverse_broadcasts: c.adverse.broadcasts.join(","), ladder: Object.values(streams).map((g) => g.join(",")) };
             require("fs").appendFileSync(process.env.GITHUB_OUTPUT,
               Object.entries(out).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}\n`).join(""));
           '
@@ -244,6 +253,45 @@ jobs:
         if: always()
         with:
           name: player-soak-${{ github.run_id }}-restart-broadcaster-${{ strategy.job-index }}
+          path: reports/player-soak/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Test-track ABR ladders under their profile, one runner per stream, shaped as the adverse player.
+  ladder-player:
+    needs: cases
+    if: needs.cases.outputs.ladder != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ladders: ${{ fromJSON(needs.cases.outputs.ladder) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chrome
+      - name: Play ${{ matrix.ladders }}
+        env:
+          MTT_API_KEY: ${{ secrets.MTT_API_KEY }}
+        run: |
+          if [ -z "$MTT_API_KEY" ]; then
+            echo "::notice::MTT_API_KEY is not set; ladder cases skipped"
+            exit 0
+          fi
+          sudo sh scripts/player-soak/netns.sh soak
+          sudo ip netns exec soak sudo -u "$USER" env "PATH=$PATH" "HOME=$HOME" SOAK_NETNS=soak \
+            "SOAK_TAG=$SOAK_TAG" "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" "MTT_API_KEY=$MTT_API_KEY" \
+            node scripts/player-soak/run.mjs --ladder "${{ matrix.ladders }}" --minutes "$ADVERSE_MINUTES"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: player-soak-${{ github.run_id }}-ladder-${{ strategy.job-index }}
           path: reports/player-soak/
           if-no-files-found: warn
           retention-days: 30

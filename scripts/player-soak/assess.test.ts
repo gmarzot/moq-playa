@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { PlaybackSample } from '../player-acceptance/assessment.mjs';
-import { assessSoak, latencyReport, quietIntervals, recoveryReport } from './assess.mjs';
+import { abrReport, abrSwitch, assessSoak, latencyReport, quietIntervals, recoveryReport } from './assess.mjs';
 import { MttClient } from './mtt.mjs';
 
 const T0 = 1_000_000;
@@ -23,7 +23,7 @@ describe('player soak assessment', () => {
     // Measured from the first sample that did not advance.
     expect(r.playback.stalls).toEqual({ count: 1, totalMs: 2250, longestMs: 2250 });
     expect(r.playback.frozen.count).toBe(1);
-    expect(r.playback.audioGaps).toEqual({ count: 1, totalMs: 2500, longestMs: 2500 });
+    expect(r.playback.audioGaps).toEqual({ count: 1, totalMs: 2500, longestMs: 2500, p99Ms: 2500 });
     expect(r.playback.fps.mean).toBeGreaterThan(29);
   });
 
@@ -133,6 +133,69 @@ describe('player soak recovery', () => {
     })(), 1500);
     expect(recoveryReport(s, [], [], frozen)).toEqual([expect.objectContaining({
       kind: 'freeze', freshFrameAfterMs: 1750, stableLatencyAfterMs: null })]);
+  });
+});
+
+describe('player soak ABR ladder', () => {
+  /** One tick a second playing the rung at `kbps(second)`. */
+  const ticks = (n: number, kbps: (s: number) => number) => Array.from({ length: n }, (_, s) => ({
+    wallEpochMs: T0 + s * 1000,
+    stats: { bitrate: kbps(s) * 1000, resolution: { width: 0, height: { 4500: 1080, 2500: 720, 1500: 540 }[kbps(s)] ?? 0 } },
+  }));
+  const line = (atS: number, text: string) => ({ t: T0 + atS * 1000, text: `[moqt] ${text}` });
+
+  it('reads switch lines as Playwright reports them and as substituted text', () => {
+    const fmt = 'Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s%s';
+    expect(abrSwitch(`[moqt] ${fmt} 0 2400.5 2300 downshift video_1  (video 480 ms late and rising)`))
+      .toEqual({ direction: 'down', to: 'video_1', kind: 'lag', reason: 'video 480 ms late and rising' });
+    expect(abrSwitch(`[moqt] ${fmt} 0 2400 2300 downshift video_1  (video arriving 450 ms later)`)?.kind).toBe('lag');
+    expect(abrSwitch(`[moqt] ${fmt} 0 2400 2300 downshift video_2 `))
+      .toEqual({ direction: 'down', to: 'video_2', kind: 'buffer', reason: null });
+    expect(abrSwitch(`[moqt] ${fmt} 2 60000 2300 upshift video  (no link rate: probing)`))
+      .toMatchObject({ direction: 'up', to: 'video', kind: 'probe' });
+    expect(abrSwitch('[moqt] Buffer 0.0s, BW 2400kbps (arrival 2300kbps) → downshift to video_1 (link 2500 kbps under 4500 kbps)'))
+      .toMatchObject({ direction: 'down', to: 'video_1', kind: 'link' });
+    expect(abrSwitch('[moqt] Over %d%% of %s frames dropped → downshift to %s; Auto stays below %s for %d min 5 video video_1 video 5'))
+      .toMatchObject({ to: 'video_1', kind: 'decode' });
+    expect(abrSwitch('[moqt] MSE stall %dms → emergency downshift to %s 600 video_2')).toMatchObject({ to: 'video_2', kind: 'stall' });
+    expect(abrSwitch('[moqt] [SWITCH] start: "%s" → "%s" (newReqId=%s, oldReqId=%s) video video_1 5 3')).toBeNull();
+  });
+
+  it('gives the time at each level, the shifts, the first downshift and its reasons', () => {
+    const t = ticks(60, (s) => (s < 10 ? 4500 : s < 40 ? 2500 : s < 50 ? 1500 : 2500));
+    const log = [
+      line(8, 'Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s%s 0 2400 2300 downshift video_1  (video 480 ms late and rising)'),
+      line(38, 'Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s%s 0 2400 2300 downshift video_2  (link 2400 kbps under 2500 kbps)'),
+      line(48, 'Buffer %.1fs, BW %.0fkbps (arrival %.0fkbps) → %s to %s%s 2 9000 1500 upshift video_1 '),
+    ];
+    const r = abrReport(t, log, T0 - 2000);
+    expect(r.timeline).toEqual([{ atS: 2, kbps: 4500, height: 1080 }, { atS: 12, kbps: 2500, height: 720 },
+      { atS: 42, kbps: 1500, height: 540 }, { atS: 52, kbps: 2500, height: 720 }]);
+    expect(r.timeAtLevelS).toEqual([{ kbps: 4500, height: 1080, seconds: 10 }, { kbps: 2500, height: 720, seconds: 39 },
+      { kbps: 1500, height: 540, seconds: 10 }]);
+    expect(r).toMatchObject({ downshifts: 2, upshifts: 1, firstDownshiftS: 10 });
+    expect(r.logged).toMatchObject({ downshifts: 2, upshifts: 1, reasons: { lag: 1, link: 1 } });
+  });
+
+  it('takes the first downshift from the stats when the log has none, and holds one rung when manual', () => {
+    expect(abrReport(ticks(20, (s) => (s < 5 ? 4500 : 2500)), []).firstDownshiftS).toBe(5);
+    const held = abrReport(ticks(20, () => 4500), []);
+    expect(held).toMatchObject({ downshifts: 0, upshifts: 0, firstDownshiftS: null,
+      timeAtLevelS: [{ kbps: 4500, height: 1080, seconds: 19 }] });
+  });
+
+  it('is in the summary only for a ladder case, timed from the play click', () => {
+    const s = samples(40, () => ({}));
+    const t = ticks(10, (sec) => (sec < 5 ? 4500 : 2500));
+    expect(assessSoak({ samples: s, ticks: t }).abr).toBeUndefined();
+    const r = assessSoak({ samples: s, ticks: t, abrLog: [], startup: { clickedEpochMs: T0 - 3000 } });
+    expect(r.abr).toMatchObject({ downshifts: 1, firstDownshiftS: 8 });
+  });
+
+  it('gives the p99 audio gap', () => {
+    const gaps = new Set([10, 11, 12, 30, 31, 32, 33, 34, 35, 36]);
+    const r = assessSoak({ samples: samples(60, (i) => (gaps.has(i) ? { audioRms: 0 } : {})), ticks: [] });
+    expect(r.playback.audioGaps).toMatchObject({ count: 2, totalMs: 2500, p99Ms: 1750 });
   });
 });
 

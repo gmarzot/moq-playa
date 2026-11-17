@@ -9,6 +9,8 @@
  *                    hidden tab, publisher restarts); first play draft only
  *   --variant restart   the broadcaster restarts every cases.restartEveryS; players use its namespace
  *   --adverse-minutes M   keep a broadcaster up for the adverse players too
+ *   --ladder RELAY:ID[,…]   moq-test-tracks ABR ladders (cases.ladders) under their profile, with ABR
+ *                    switches in the summary (MTT_API_KEY)
  *
  * A broadcaster the relay pauses (video Forward State 0) gets one 30 s viewer, `rejoin-…`,
  * which has to resume it.
@@ -42,11 +44,17 @@ const { values: args } = parseArgs({ options: {
   profile: { type: 'string' },
   variant: { type: 'string' },
   'adverse-minutes': { type: 'string', default: '0' },
+  ladder: { type: 'string' },
 } });
 
 // A player finds the broadcaster's namespace only by its tag.
 if (args['broadcast-player'] && !args.tag) {
   console.error("--broadcast-player needs the broadcaster's --tag (or SOAK_TAG)");
+  process.exit(2);
+}
+// Both shape the whole machine's relay traffic.
+if (args.ladder && args.profile) {
+  console.error('--ladder and --profile each shape the network; run them separately');
   process.exit(2);
 }
 const minutes = Number(args.minutes);
@@ -146,7 +154,13 @@ async function playCase(browser, webUrl, c, impair = null) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
   const consoleFile = join(dir, 'console.jsonl');
-  page.on('console', (m) => void appendFile(consoleFile, `${json({ t: Date.now(), type: m.type(), text: m.text() })}\n`));
+  // A ladder case keeps the player's ABR switch lines for its summary.
+  const abrLog = c.abr ? [] : null;
+  page.on('console', (m) => {
+    const line = { t: Date.now(), type: m.type(), text: m.text() };
+    void appendFile(consoleFile, `${json(line)}\n`);
+    if (abrLog && /downshift|upshift/.test(line.text)) abrLog.push(line);
+  });
   page.on('pageerror', (e) => void appendFile(consoleFile, `${json({ t: Date.now(), type: 'pageerror', text: e.message })}\n`));
   // Viewers play as G5 does: from the current group, following the namespace.
   // The player logs at info level into console.jsonl.
@@ -156,6 +170,8 @@ async function playCase(browser, webUrl, c, impair = null) {
   if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
   const latency = c.latency ?? c.profile?.latency;
   if (latency) query.set('latency', latency);
+  if (c.auto) query.set('auto', '1');
+  if (c.level !== undefined) query.set('level', String(c.level));
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
   // The disruption in progress; cleared only once its stop() succeeds.
@@ -224,7 +240,7 @@ async function playCase(browser, webUrl, c, impair = null) {
     const summary = { name: c.name, url: c.url, namespace: c.namespace, draft: c.draft, packaging: c.packaging,
       ...(c.profileName ? { profile: c.profileName } : {}),
       ...(publisherEnded ? { publisherEnded } : {}),
-      ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile) }) };
+      ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile), abrLog }) };
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
   } catch (error) {
@@ -276,6 +292,52 @@ async function runMtt(browser, webUrl, cases) {
     }
   };
   await Promise.all(Array.from({ length: Number(args.concurrency) }, worker));
+  return results;
+}
+
+/**
+ * moq-test-tracks ABR ladders under their profile, `specs` being RELAY:ID keys of
+ * cases.ladders: one service job per stream, its plays one after another.
+ */
+async function runLadders(browser, webUrl, cases, specs) {
+  const ladders = specs.map((spec) => {
+    const l = cases.ladders.find((x) => `${x.relay}:${x.id}` === spec);
+    if (!l) throw new Error(`unknown ladder ${spec}`);
+    if (!cases.profiles[l.profile]) throw new Error(`unknown profile ${l.profile}`);
+    return { ...l, relayInfo: cases.relays[l.relay] };
+  });
+  const client = new MttClient({ key: process.env.MTT_API_KEY, base: process.env.MTT_API_BASE });
+  const impair = await Impairment.forRelays([...new Set(ladders.map((l) => l.relayInfo.url))]);
+  await impair.setup();
+  const results = [];
+  for (const plays of Map.groupBy(ladders, (l) => `${l.relay} ${l.namespace}`).values()) {
+    const { relay, relayInfo, namespace } = plays[0];
+    const draft = relayInfo.playDrafts[0];
+    const names = plays.map((l) => `${l.profile}-${l.id}-${relay}-d${draft}`);
+    let job;
+    try {
+      const ttl = Math.ceil(plays.length * (minutes + 2) * 60) + 300;
+      job = await client.start({ namespace, relay, draft: relayInfo.publishDraft, mode: 'publish', ttl_s: ttl },
+        { log: (m) => log(relay, namespace, m) });
+      log(relay, `job ${job.id} ${job.joined ? 'joined' : 'started'}: ${job.namespace ?? namespace}`);
+      await client.waitRunning(job.id);
+      for (const [i, l] of plays.entries()) {
+        const profile = cases.profiles[l.profile];
+        await impair.apply(profile);
+        log(`profile ${l.profile}: shaping ${impair.addresses.join(', ')} on ${impair.dev}`);
+        results.push(await playCase(browser, webUrl, { name: names[i], url: relayInfo.url,
+          namespace: job.namespace ?? namespace, draft, packaging: l.packaging, expected: l.expected, profile,
+          profileName: l.profile, auto: l.auto, level: l.level, abr: true }, impair));
+        await impair.apply({});
+      }
+    } catch (error) {
+      for (const name of names) {
+        if (!results.some((r) => r.name === name)) results.push({ name, verdict: 'error', error: String(error).slice(0, 500) });
+      }
+    } finally {
+      if (job && !job.joined) await client.stop(job.id).catch((e) => log('stop failed', String(e)));
+    }
+  }
   return results;
 }
 
@@ -413,6 +475,20 @@ const recoveryCell = (rec) => {
     .filter(Boolean).join(', ');
   return `${rec.events.length}, ${rec.freshFrameAfterMsMax ?? '—'} / ${rec.stableLatencyAfterMsMax ?? '—'}${flags ? ` (${flags})` : ''}`;
 };
+const latencyCell = (r, media) => {
+  const lat = Object.entries(r.latency ?? {}).find(([k]) => k.startsWith(`${media}/`))?.[1];
+  return lat ? `${Math.round(lat.p50)} / ${Math.round(lat.p95)}` : '—';
+};
+const abrRow = (r) => {
+  const { abr, playback: pb } = r;
+  const first = abr.logged.switches.find((s) => s.direction === 'down');
+  const reasons = [Object.entries(abr.logged.reasons).map(([kind, n]) => `${kind} ×${n}`).join(', '),
+    first?.reason ? `first: ${first.reason}` : ''].filter(Boolean).join('; ');
+  return `| ${r.name} | ${abr.timeAtLevelS.map((l) => `${l.kbps}k ${l.seconds} s`).join(', ') || '—'} `
+    + `| ${abr.downshifts} / ${abr.upshifts} | ${abr.firstDownshiftS ?? '—'} | ${reasons || '—'} `
+    + `| ${pb.audioGaps.count} / ${pb.audioGaps.totalMs} / ${pb.audioGaps.p99Ms ?? '—'} | ${r.player?.audioUnderruns ?? '—'} `
+    + `| ${latencyCell(r, 'video')} | ${latencyCell(r, 'audio')} |`;
+};
 const startupCell = (b) => (b ? [b.transportConnectedMs, b.setupCompleteMs, b.catalogReceivedMs, b.firstObjectReceivedMs,
   b.firstFrameRenderedMs].map((v) => (v == null ? '—' : Math.round(v))).join(' / ') : '—');
 
@@ -434,11 +510,18 @@ async function report(results) {
   const md = [`### Player soak ${runId} (${minutes} min per case)`, '',
     '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms '
       + '| dropped / underruns | recovery: events, max fresh / settled ms | startup: connect / setup / catalog / object / frame ms | error |',
-    '|---|---|---|---|---|---|---|---|---|---|---|', ...rows, ''].join('\n');
-  await writeFile(join(out, 'summary.md'), md);
+    '|---|---|---|---|---|---|---|---|---|---|---|', ...rows, ''];
+  const ladders = results.filter((r) => r.abr);
+  if (ladders.length) {
+    md.push('#### ABR ladders', '', '| case | time at each level | down / up shifts | first downshift s '
+      + '| downshift reasons | audio gaps n / total / p99 ms | audio underruns | video latency p50 / p95 ms '
+      + '| audio latency p50 / p95 ms |', '|---|---|---|---|---|---|---|---|---|', ...ladders.map(abrRow), '');
+  }
+  const text = md.join('\n');
+  await writeFile(join(out, 'summary.md'), text);
   await writeFile(join(out, 'summary.json'), `${json({ runId, minutes, results })}\n`);
-  if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, `${md}\n`);
-  console.log(md);
+  if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, `${text}\n`);
+  console.log(text);
 }
 
 await mkdir(out, { recursive: true });
@@ -467,6 +550,7 @@ try {
     const browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome', args: browserArgs });
     let results = [];
     if (args.mtt) results = await runMtt(browser, webUrl, cases);
+    if (args.ladder) results.push(...await runLadders(browser, webUrl, cases, args.ladder.split(',')));
     if (args['broadcast-player']) {
       const profile = args.profile ? cases.profiles[args.profile] : null;
       if (args.profile && !profile) throw new Error(`unknown profile ${args.profile}`);

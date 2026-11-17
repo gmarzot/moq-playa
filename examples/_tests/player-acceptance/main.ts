@@ -44,7 +44,7 @@ let firstFrameTimestampUs: number | undefined;
 
 const player = new Player(null, {
   url: params.get('url')!, namespace: params.get('ns')!,
-  video, canvas, ...(pin ? { certHash: pin } : {}), draftVersion: draft, autoQuality: false,
+  video, canvas, ...(pin ? { certHash: pin } : {}), draftVersion: draft, autoQuality: params.get('auto') === '1',
   ...(params.has('gestureAudio') ? { audioActivation: 'gesture' as const } : {}),
   startLevel: Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
