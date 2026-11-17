@@ -180,3 +180,34 @@ export function buildSubscribeOptions(config: MoqtPlayerConfig): {
 
   return options;
 }
+
+/** SUBSCRIBER_PRIORITY of a request that omits the parameter (§9.2.2.3). */
+const DEFAULT_SUBSCRIBER_PRIORITY = 128;
+
+/** Steps audio subscribes ahead of the video base. */
+const AUDIO_PRIORITY_LEAD = 2;
+
+/**
+ * SUBSCRIBER_PRIORITY for a media SUBSCRIBE: video at the configured base,
+ * audio two steps ahead (clamped at 0), so a relay that schedules by
+ * subscriber priority sends audio first on a congested link.
+ *
+ * @see draft-ietf-moq-transport-22 §5.1.2
+ */
+export function mediaSubscriberPriority(config: MoqtPlayerConfig, mediaType: 'video' | 'audio'): number {
+  const base = config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
+  return mediaType === 'audio' ? Math.max(0, base - AUDIO_PRIORITY_LEAD) : base;
+}
+
+/**
+ * SUBSCRIBER_PRIORITY for a video switch target. A down-switch goes one step
+ * ahead of the outgoing rendition, so its first group does not queue behind
+ * the outgoing backlog, while that stays behind audio; else it ties the
+ * outgoing rendition. Any other switch returns to the base.
+ */
+export function videoSwitchPriority(config: MoqtPlayerConfig, outgoing: number | undefined, downSwitch: boolean): number {
+  const base = mediaSubscriberPriority(config, 'video');
+  if (!downSwitch) return base;
+  const from = outgoing ?? base;
+  return from - 1 > mediaSubscriberPriority(config, 'audio') ? from - 1 : from;
+}

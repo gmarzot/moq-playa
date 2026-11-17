@@ -9,7 +9,9 @@
 
 import { describe, it, expect } from 'vitest';
 import { varint } from '@openmoq/transport';
-import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions } from './player-connect.js';
+import {
+  buildConnectUrl, buildSetupOptions, buildSubscribeOptions, mediaSubscriberPriority, videoSwitchPriority,
+} from './player-connect.js';
 import type { MoqtPlayerConfig } from './config.js';
 
 /** Minimal config for testing — only the fields these functions read. */
@@ -208,5 +210,40 @@ describe('buildSubscribeOptions', () => {
     });
     const options = buildSubscribeOptions(config);
     expect(options?.subscriptionFilter).toEqual({ type: 'NextGroupStart' });
+  });
+});
+
+// ─── media subscriber priority ───────────────────────────────────────
+
+describe('mediaSubscriberPriority', () => {
+  it.each([
+    [undefined, 128, 126],
+    [64, 64, 62],
+    [255, 255, 253],
+    [1, 1, 0],
+    [0, 0, 0],
+  ])('base %s: video %i, audio %i', (base, video, audio) => {
+    const config = minimalConfig(base === undefined ? {} : { subscriberPriority: base });
+    expect(mediaSubscriberPriority(config, 'video')).toBe(video);
+    expect(mediaSubscriberPriority(config, 'audio')).toBe(audio);
+  });
+});
+
+describe('videoSwitchPriority', () => {
+  it.each([
+    // [base, outgoing, downSwitch, target]
+    [undefined, undefined, true, 127],
+    [undefined, 128, true, 127],
+    [undefined, 127, true, 127],
+    [undefined, 127, false, 128],
+    [64, 64, true, 63],
+    [64, 63, true, 63],
+    [64, 63, false, 64],
+    [2, 2, true, 1],
+    [1, 1, true, 1],
+    [0, 0, true, 0],
+  ])('base %s, outgoing %s, down %s: target %i', (base, outgoing, downSwitch, target) => {
+    const config = minimalConfig(base === undefined ? {} : { subscriberPriority: base });
+    expect(videoSwitchPriority(config, outgoing, downSwitch)).toBe(target);
   });
 });
