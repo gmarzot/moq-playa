@@ -37,7 +37,7 @@ neither fails.
 Evidence goes to `reports/player-soak/<run>/`: per case `samples.jsonl`,
 `ticks.jsonl`, `console.jsonl` and `summary.json`; per run `summary.json` and
 `summary.md`. Metrics: startup time, stalls and rebuffer ratio, frozen picture,
-audio gaps, frame rate per minute, latency p50/p95/max per minute and its
+audio gaps (count, total, longest, p99), frame rate per minute, latency p50/p95/max per minute and its
 drift, and the player's dropped frames, audio underruns, gaps, A/V skew and
 cushion. Report-only, except that the run fails when a case does not play, or
 when its catalog lists an audio track that is never heard (`no-audio`).
@@ -58,6 +58,18 @@ another, first play draft only) under a profile from `cases.json`:
 | `blackouts` | all relay traffic dropped for 3 s at 30 s and 10 s at 75 s |
 | `hidden-tab` | tab hidden for 5 s at 30 s and 20 s at 75 s |
 | `republish` | plays `…/<packaging>/restart`, whose broadcaster (`--variant restart`) stops and starts every `restartEveryS` |
+
+`--ladder RELAY:ID[,…]` plays a moq-test-tracks ABR ladder from `cases.ladders`
+(MTT_API_KEY) under its profile, first play draft only: `ladder-cmaf` and
+`ladder-loc` in Auto from the top rung, `ladder-loc-top` held on the top rung (LOC,
+where the playback pipeline's late-audio handling runs). Ladders on one stream
+share its job and play one after another. Their summary adds the time at each
+rendition, down- and upshifts, the first downshift and the reasons the player
+logged, report-only.
+
+```bash
+MTT_API_KEY=… pnpm test:player:soak --ladder aiomoqt-relay:ladder-loc,aiomoqt-relay:ladder-loc-top --minutes 3
+```
 
 Shaping uses `tc` netem through sudo (`impair.mjs`), on disposable CI runners,
 never a shared host. In CI the shaped player runs in a network namespace
@@ -83,6 +95,7 @@ pnpm test:player:soak --broadcast-player aiomoqt-relay:cmaf --tag t1 --profile b
 
 CI: `.github/workflows/player-soak.yml`, on demand and nightly; it needs the
 `MTT_API_KEY` repository secret (a moq-test-tracks key with the `run` role).
-Each profile gets one runner for the `adverse.broadcasts`; a pull request runs
-only the profiles marked `smoke`. A dispatch's `only` takes a comma-separated
+Each profile gets one runner for the `adverse.broadcasts`, and each ladder stream
+one runner (`ladder-player`); a pull request runs only the profiles marked
+`smoke`, and no ladder. A dispatch's `only` takes a comma-separated
 list, e.g. `bursty,bursty-smooth` plays both against the same broadcasts.
