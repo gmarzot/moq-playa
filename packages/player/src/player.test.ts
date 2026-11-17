@@ -14204,6 +14204,30 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
+  it('a MediaSource rebuild after a CMAF audio switch re-initializes with the new audio init', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.resolve());
+    const rebuild = vi.fn();
+    Object.assign(h.mockMs, { rebuild });
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), { ...h.config, initialProgram: 2 });
+    player.on('error', () => {});
+    await player.selectAudioTrack('audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+    expect(player.currentAudioTrack).toBe('audio_match_es');
+
+    h.mockMs.onError!(Object.assign(
+      new Error('MSE pipeline failed on the video append: CHUNK_DEMUXER_ERROR_APPEND_FAILED (code=3)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'video' },
+    ));
+
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    const reinit = (h.mockMs.initialize.mock.calls.at(-1) as any)[0];
+    expect(reinit.audio.codec).toBe('mp4a.40.2');
+    expect(Array.from(reinit.audio.initData as Uint8Array)).toEqual([6, 6, 6, 6]);
+
+    await player.destroy();
+  });
+
   it('rolls a CMAF audio switch back when changeType fails, keeping the old track', async () => {
     const adapter = createMockAdapter();
     const h = cmafHarness(() => Promise.reject(new Error('no')));

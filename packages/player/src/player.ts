@@ -2030,6 +2030,11 @@ export class MoqtPlayer {
       if (this.pendingAudioSwitch !== sw) return; // destroyed meanwhile
       this.pendingAudioSwitch = null;
       if (sw.initData) this.cmafAssembler?.setInitSegment?.('audio', sw.initData);
+      // A MediaSource rebuild re-initializes from the playing track.
+      const recovery = this.cmafPendingInit;
+      if (sw.initData && recovery?.audio) {
+        recovery.audio = { codec: track?.codec ?? recovery.audio.codec, bytes: sw.initData };
+      }
       this.retireOldAudioTrack(sw);
       for (const { trackName, groupId, payload } of sw.staged) {
         this.cmafAssembler?.push('audio', trackName, groupId, payload);
