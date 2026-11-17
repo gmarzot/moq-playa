@@ -372,6 +372,13 @@ function authorizationParameters(options: AuthorizationOptions, base?: Parameter
   return parameters;
 }
 
+/** Set a FETCH's SUBSCRIBER_PRIORITY; the publisher uses 128 when it is omitted. */
+function setFetchPriority(parameters: Parameters, priority: Varint | undefined): void {
+  if (priority === undefined) return;
+  if (priority < 0n || priority > 255n) throw new RangeError(`SUBSCRIBER_PRIORITY must be 0-255, got ${priority}`);
+  parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [priority]);
+}
+
 /** Options for creating a subscription (draft-16 section 9.2.2). */
 export interface SubscribeOptions extends AuthorizationOptions {
   /** §9.2.2.2: Duration in milliseconds. MUST be > 0. */
@@ -452,6 +459,8 @@ export interface FetchOptions extends AuthorizationOptions {
   startObject: bigint;
   endGroup?: bigint;
   endObject?: bigint;
+  /** SUBSCRIBER_PRIORITY, 0-255, lower is higher priority. Omitted: 128. */
+  subscriberPriority?: Varint;
   /**
    * Requested Group Order (§9.2.2.4 / §10.2). Sets the GROUP_ORDER (0x22)
    * parameter (Ascending = 0x1, Descending = 0x2). When omitted, the parameter
@@ -468,6 +477,8 @@ export interface FetchOptions extends AuthorizationOptions {
  * with (and never overlapping) the subscription's delivery.
  */
 export interface JoiningFetchOptions extends AuthorizationOptions {
+  /** SUBSCRIBER_PRIORITY, 0-255, lower is higher priority. Omitted: 128. */
+  subscriberPriority?: Varint;
   /** 'relative' = Fetch Type 0x2, 'absolute' = 0x3. */
   joiningFetchType: 'relative' | 'absolute';
   /** Request ID of OUR outbound SUBSCRIBE to join (NOT a track alias). */
@@ -3543,6 +3554,7 @@ export class Session {
   ): RequestResult {
     this.assertEstablishedOrDraining('fetch');
     const parameters = authorizationParameters(options);
+    setFetchPriority(parameters, options.subscriberPriority);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3630,6 +3642,7 @@ export class Session {
   joiningFetch(options: JoiningFetchOptions): RequestResult {
     this.assertEstablishedOrDraining('joiningFetch');
     const parameters = authorizationParameters(options);
+    setFetchPriority(parameters, options.subscriberPriority);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(

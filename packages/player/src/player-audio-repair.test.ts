@@ -9,7 +9,7 @@ function makePlayer(latencyMode: 'live' | 'smooth') {
     latencyMode,
   } as any) as any;
   player.activeSubscriptions.set(1n, { mediaType: 'audio', trackName: 'audio', trackAlias: 7n });
-  const fetch = vi.spyOn(player, 'fetch').mockResolvedValue(9n);
+  const fetch = vi.spyOn(player, 'fetchTrack').mockResolvedValue(9n);
   const pipeline = { setMinGapTimeoutUs: vi.fn() };
   player.audioPipeline = pipeline;
   return { player, fetch, pipeline };
@@ -34,7 +34,7 @@ describe('MoqtPlayer audio datagram repair', () => {
     player.noteAudioDatagram(7n, 10n, 0n);
     player.noteAudioDatagram(7n, 12n, 0n);
     await vi.advanceTimersByTimeAsync(30);
-    expect(fetch).toHaveBeenCalledWith('audio', { startGroup: 11n, startObject: 0n, endGroup: 11n, endObject: 0n });
+    expect(fetch).toHaveBeenCalledWith('audio', { startGroup: 11n, startObject: 0n, endGroup: 11n, endObject: 0n }, 126);
     expect(pipeline.setMinGapTimeoutUs).toHaveBeenLastCalledWith(400_000);
   });
 

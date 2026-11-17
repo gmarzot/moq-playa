@@ -2648,6 +2648,83 @@ describe('MoqtPlayer', () => {
       expect(videoCall[2].subscriberPriority).toEqual(varint(64n));
     });
 
+    /** SUBSCRIBER_PRIORITY of the latest SUBSCRIBE for `name`. */
+    const priorityOf = (adapter: ReturnType<typeof createMockAdapter>, name: string): unknown =>
+      (adapter.subscribe as any).mock.calls.filter((c: any) => new TextDecoder().decode(c[1]) === name)
+        .at(-1)?.[2]?.subscriberPriority;
+
+    it.each([
+      [{}, 128n, 126n],
+      [{ subscriberPriority: 64 }, 64n, 62n],
+      [{ subscriberPriority: 255 }, 255n, 253n],
+      [{ subscriberPriority: 1 }, 1n, 0n],
+      [{ subscriberPriority: 0 }, 0n, 0n],
+    ] as const)('audio subscribes two steps ahead of the video base (config %o)', async (config, video, audio) => {
+      const adapter = createMockAdapter();
+      const player = new MoqtPlayer({ ...createConfig(adapter), ...config });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 0));
+
+      expect(priorityOf(adapter, 'video')).toEqual(varint(video));
+      expect(priorityOf(adapter, 'audio')).toEqual(varint(audio));
+      expect((adapter.subscribe as any).mock.calls[0][2]?.subscriberPriority).toBeUndefined(); // catalog
+      await player.destroy();
+    });
+
+    it('known tracks subscribe audio ahead of video before any catalog', async () => {
+      const adapter = createMockAdapter();
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        knownTracks: {
+          video: { name: 'video', codec: 'av01.0.08M.10', width: 1920, height: 1080 },
+          audio: { name: 'audio', codec: 'opus', samplerate: 48000, channels: 2 },
+        },
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+
+      expect(priorityOf(adapter, 'video')).toEqual(varint(128n));
+      expect(priorityOf(adapter, 'audio')).toEqual(varint(126n));
+      await player.destroy();
+    });
+
+    it('a PUBLISH_DONE resubscribe keeps each track\'s priority', async () => {
+      const adapter = createMockAdapter();
+      const player = new MoqtPlayer({ ...createConfig(adapter), subscriberPriority: 64 });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 0));
+      await ackMedia(adapter);
+
+      const before = (adapter.subscribe as any).mock.calls.length;
+      for (const result of (adapter.subscribe as any).mock.results.slice(1, before)) {
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE', requestId: await result.value,
+          statusCode: varint(0x06), streamCount: varint(0), errorReason: 'too far behind',
+        } as any);
+      }
+      await vi.waitFor(() => expect((adapter.subscribe as any).mock.calls.length).toBe(before + 2));
+
+      const resubscribed = (adapter.subscribe as any).mock.calls.slice(before)
+        .map((c: any) => [new TextDecoder().decode(c[1]), c[2]?.subscriberPriority]);
+      expect(resubscribed).toEqual(expect.arrayContaining([['video', varint(64n)], ['audio', varint(62n)]]));
+      await player.destroy();
+    });
+
     it('passes groupOrder to adapter.subscribe as options (§9.2.2.4)', async () => {
       // §9.2.2.4: "It is an enum indicating how to prioritize Objects
       // from different groups [...] Ascending (0x1) or Descending (0x2)."
@@ -14121,6 +14198,59 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     expect(subscribedNames(adapter)).toEqual(expect.arrayContaining(['video_match_main', 'audio_match_es']));
     expect(subscribedNames(adapter)).not.toContain('audio_match_en');
 
+    await player.destroy();
+  });
+
+  /** A three-rung LOC ladder plus audio. */
+  function ladderCatalog(): string {
+    const rung = (name: string, bitrate: number, width: number, height: number) => ({
+      name, packaging: 'loc', isLive: true, role: 'video', renderGroup: 1, altGroup: 1,
+      codec: 'avc1.64001f', width, height, bitrate,
+    });
+    return JSON.stringify({
+      version: 1,
+      tracks: [
+        rung('v3000', 3_000_000, 1920, 1080), rung('v1500', 1_500_000, 1280, 720), rung('v500', 500_000, 640, 360),
+        { name: 'audio', packaging: 'loc', isLive: true, role: 'audio', renderGroup: 1,
+          codec: 'opus', samplerate: 48000, channelConfig: '2' },
+      ],
+    });
+  }
+
+  it.each([
+    [{}, [128n, 127n, 128n, 127n, 127n]],
+    [{ subscriberPriority: 64 }, [64n, 63n, 64n, 63n, 63n]],
+    [{ subscriberPriority: 2 }, [2n, 1n, 2n, 1n, 1n]],
+    [{ subscriberPriority: 1 }, [1n, 1n, 1n, 1n, 1n]],
+    [{ subscriberPriority: 0 }, [0n, 0n, 0n, 0n, 0n]],
+  ] as const)('video switches (config %o): a down-switch goes one step ahead while behind audio, an up-switch at the base', async (config, expected) => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, ladderCatalog(), config);
+    const keyframe = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67]);
+    const steps = ['v500', 'v3000', 'v1500', 'v500'];
+    for (const [i, target] of steps.entries()) {
+      await player.selectVideoTrack(target);
+      await landSubscription(adapter, target, keyframe, 10 * (i + 1));
+      expect(player.currentVideoTrack).toBe(target);
+    }
+
+    const video = (adapter.subscribe as any).mock.calls
+      .filter((c: any) => new TextDecoder().decode(c[1]).startsWith('v'))
+      .map((c: any) => [new TextDecoder().decode(c[1]), c[2]?.subscriberPriority]);
+    expect(video).toEqual(['v1500', ...steps].map((name, i) => [name, varint(expected[i]!)]));
+    // No REQUEST_UPDATE re-prioritizes a subscription after the fact.
+    expect(adapter.requestUpdate).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('an audio language switch subscribes at the audio priority', async () => {
+    const adapter = createMockAdapter();
+    const player = await loadWithCatalog(adapter, boothCatalog('loc'), { initialProgram: 2, subscriberPriority: 64 });
+
+    await player.selectAudioTrack('audio_match_es');
+    const call = (adapter.subscribe as any).mock.calls.at(-1);
+    expect(new TextDecoder().decode(call[1])).toBe('audio_match_es');
+    expect(call[2]?.subscriberPriority).toEqual(varint(62n));
     await player.destroy();
   });
 
