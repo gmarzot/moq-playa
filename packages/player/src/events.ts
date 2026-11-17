@@ -464,10 +464,11 @@ export interface QualitySwitchingEvent {
 
 /**
  * Quality switch committed — the new track is now driving decode and
- * rendering. For CMAF codec changes this fires after
- * `mediaSource.changeType()` resolves and the staged keyframe is
- * appended; for same-codec/LOC switches it fires on the next-group
- * keyframe boundary.
+ * rendering. For CMAF this fires after `mediaSource.changeType()` has
+ * appended the target's init (retyping the SourceBuffer only when the
+ * MIME type changes) and the staged keyframe is appended; for LOC, and
+ * CMAF targets without an init, it fires on the next-group keyframe
+ * boundary.
  *
  * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
  */
