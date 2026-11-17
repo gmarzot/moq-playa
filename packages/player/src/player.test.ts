@@ -13863,6 +13863,136 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
+  /** Renditions of one view with one codec string; 360p's init comes only from an init track. */
+  const sameCodecLadder = JSON.stringify({
+    version: 1,
+    tracks: [
+      { name: 'video_720p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
+        codec: 'av01.0.08M.08', width: 1280, height: 720, bitrate: 3_000_000, initData: btoa('\x01\x01\x01\x01') },
+      { name: 'video_540p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
+        codec: 'av01.0.08M.08', width: 960, height: 540, bitrate: 1_500_000, initData: btoa('\x02\x02\x02\x02') },
+      { name: 'video_360p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
+        codec: 'av01.0.08M.08', width: 640, height: 360, bitrate: 600_000, initTrack: 'init_360p' },
+      { name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio',
+        codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', initData: btoa('\x03\x03\x03\x03') },
+    ],
+  });
+
+  async function loadSameCodecLadder(adapter: ReturnType<typeof createMockAdapter>, changeType: () => Promise<void>) {
+    const mockMs = {
+      initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+      mediaElement: null,
+      onFirstFrame: null as (() => void) | null,
+      onError: null as ((error: Error) => void) | null,
+      onStall: null as ((durationMs: number) => void) | null,
+      changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array) => changeType()),
+      rebuild: vi.fn(),
+    };
+    const assembler = {
+      push: vi.fn(), selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+    };
+    const player = await loadWithCatalog(adapter, sameCodecLadder, {
+      startLevel: 0, autoQuality: false,
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => assembler,
+    } as Partial<MoqtPlayerConfig>);
+    expect(subscribedNames(adapter)).toContain('video_720p');
+    assembler.setInitSegment.mockClear();
+    return { player, mockMs, assembler };
+  }
+
+  it('appends the target init for a same-view CMAF switch with an identical codec string', async () => {
+    const adapter = createMockAdapter();
+    const { player, mockMs, assembler } = await loadSameCodecLadder(adapter, () => Promise.resolve());
+    const oldReqId = await requestIdOf(adapter, 'video_720p');
+    const switched = vi.fn();
+    player.on('quality_switched', switched);
+
+    await player.selectVideoTrack('video_540p');
+    expect(mockMs.changeType).not.toHaveBeenCalled();
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    const [mt, codec, init] = mockMs.changeType.mock.calls[0]!;
+    expect(mt).toBe('video');
+    expect(codec).toBe('av01.0.08M.08');
+    expect(Array.from(init)).toEqual([2, 2, 2, 2]);
+    expect(assembler.setInitSegment).toHaveBeenCalledWith('video', init);
+    expect(switched).toHaveBeenCalledWith(expect.objectContaining({ fromTrackName: 'video_720p', toTrackName: 'video_540p' }));
+    expect(unsubscribedIds(adapter)).toContain(oldReqId);
+
+    await player.destroy();
+  });
+
+  it('a MediaSource rebuild after a same-codec switch re-initializes with the target init', async () => {
+    const adapter = createMockAdapter();
+    const { player, mockMs } = await loadSameCodecLadder(adapter, () => Promise.resolve());
+    player.on('error', () => {});
+    await player.selectVideoTrack('video_540p');
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+    const initsBefore = mockMs.initialize.mock.calls.length;
+
+    mockMs.onError!(Object.assign(
+      new Error('MSE pipeline failed on the video append: CHUNK_DEMUXER_ERROR_APPEND_FAILED (code=3)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'video' },
+    ));
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize).toHaveBeenCalledTimes(initsBefore + 1);
+    const reinit = (mockMs.initialize.mock.calls.at(-1) as any)[0];
+    expect(reinit.video.codec).toBe('av01.0.08M.08');
+    expect(Array.from(reinit.video.initData as Uint8Array)).toEqual([2, 2, 2, 2]);
+
+    await player.destroy();
+  });
+
+  it('gives up a switch whose init track never delivers and frees the next switch', async () => {
+    const adapter = createMockAdapter();
+    const { player } = await loadSameCodecLadder(adapter, () => Promise.resolve());
+    vi.useFakeTimers();
+    try {
+      let outcome: 'pending' | 'resolved' | 'rejected' = 'pending';
+      void player.selectVideoTrack('video_360p').then(() => { outcome = 'resolved'; }, () => { outcome = 'rejected'; });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(subscribedNames(adapter)).toContain('init_360p');
+      expect(subscribedNames(adapter)).not.toContain('video_360p');
+      const initReqId = await requestIdOf(adapter, 'init_360p');
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(outcome).toBe('rejected');
+      expect(unsubscribedIds(adapter)).toContain(initReqId);
+      await player.selectVideoTrack('video_540p', 'abr', 'downshift');
+      expect(subscribedNames(adapter)).toContain('video_540p');
+    } finally {
+      vi.useRealTimers();
+      await player.destroy();
+    }
+  });
+
+  it('keeps the old rendition when a same-codec target init is rejected', async () => {
+    const adapter = createMockAdapter();
+    const { player, mockMs } = await loadSameCodecLadder(adapter,
+      () => Promise.reject(new Error('CHUNK_DEMUXER_ERROR_APPEND_FAILED')));
+    const oldReqId = await requestIdOf(adapter, 'video_720p');
+    const switched = vi.fn();
+    const failed = vi.fn();
+    player.on('quality_switched', switched);
+    player.on('quality_switch_failed', failed);
+    player.on('error', () => {});
+
+    await player.selectVideoTrack('video_540p');
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+
+    expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+    expect(switched).not.toHaveBeenCalled();
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'video_540p' }));
+    expect(unsubscribedIds(adapter)).not.toContain(oldReqId);
+    expect(unsubscribedIds(adapter)).toContain(await requestIdOf(adapter, 'video_540p'));
+
+    await player.destroy();
+  });
+
   it('re-inits MSE for a CMAF view switch even with an identical codec string', async () => {
     const adapter = createMockAdapter();
     const mockMs = {
@@ -14070,6 +14200,30 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     expect(h.assembler.push).toHaveBeenCalledWith('audio', 'audio_match_es', 7n, expect.any(Uint8Array));
     expect(unsubscribedIds(adapter)).toContain(oldAudio);
     expect(changed).toHaveBeenCalledWith(expect.objectContaining({ toTrackName: 'audio_match_es', lang: 'es' }));
+
+    await player.destroy();
+  });
+
+  it('a MediaSource rebuild after a CMAF audio switch re-initializes with the new audio init', async () => {
+    const adapter = createMockAdapter();
+    const h = cmafHarness(() => Promise.resolve());
+    const rebuild = vi.fn();
+    Object.assign(h.mockMs, { rebuild });
+    const player = await loadWithCatalog(adapter, boothCatalog('cmaf'), { ...h.config, initialProgram: 2 });
+    player.on('error', () => {});
+    await player.selectAudioTrack('audio_match_es');
+    await landSubscription(adapter, 'audio_match_es', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+    expect(player.currentAudioTrack).toBe('audio_match_es');
+
+    h.mockMs.onError!(Object.assign(
+      new Error('MSE pipeline failed on the video append: CHUNK_DEMUXER_ERROR_APPEND_FAILED (code=3)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'video' },
+    ));
+
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    const reinit = (h.mockMs.initialize.mock.calls.at(-1) as any)[0];
+    expect(reinit.audio.codec).toBe('mp4a.40.2');
+    expect(Array.from(reinit.audio.initData as Uint8Array)).toEqual([6, 6, 6, 6]);
 
     await player.destroy();
   });

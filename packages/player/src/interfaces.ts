@@ -295,22 +295,23 @@ export interface MediaSourceLike {
   ): void;
 
   /**
-   * Re-initialize a SourceBuffer for a new codec / init segment.
+   * Re-initialize a SourceBuffer with a switch target's init segment.
    *
-   * Called by the player when a track switch crosses codec families
-   * (e.g. AVC → HEVC). Adapters that delegate decoding to the browser
-   * (MSE) implement this via `SourceBuffer.changeType()` plus the new
-   * track's init segment. Adapters with custom decode pipelines (e.g.,
-   * a future canvas-renderer adapter) need not implement it.
+   * Called by the player on every CMAF track switch whose target init is
+   * known. The init is appended on every call: an unchanged MIME type does
+   * not imply the same track_ID, parameter sets or trex. MSE adapters call
+   * `SourceBuffer.changeType()` only when the MIME type changes (e.g.
+   * AVC → HEVC). Adapters with custom decode pipelines (e.g., a future
+   * canvas-renderer adapter) need not implement it.
    *
    * Resolves once the init segment has been parsed by MSE and the
-   * SourceBuffer is ready to accept media bytes for the new codec.
+   * SourceBuffer is ready to accept the target's media bytes.
    * Any media bytes queued during the operation are appended after.
    *
-   * @param mediaType Which SourceBuffer to retype.
-   * @param codec Codec string for the new mime type
+   * @param mediaType Which SourceBuffer to re-initialize.
+   * @param codec Codec string of the target track
    *              (e.g. `"hvc1.1.6.L93.90"`).
-   * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
+   * @param initData Raw init segment bytes (ftyp+moov) of the target track.
    *
    * The SourceBuffer keeps its timestampOffset: the player's CMAF assembler
    * already places the new track's fragments on the running timeline.

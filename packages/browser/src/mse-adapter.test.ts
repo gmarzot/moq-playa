@@ -1279,6 +1279,60 @@ describe('MseMediaSource — changeType', () => {
             adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 100)),
         ).rejects.toThrow(/changeType not supported/);
     });
+
+    const mime = (codec: string) => `video/mp4; codecs="${codec}"`;
+
+    it.each([true, false])('appends each same-MIME target init without retyping (native changeType present: %s)', async (native) => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        if (!native) (vsb as unknown as { changeType?: unknown }).changeType = undefined;
+        const initCountBefore = vsb.appendedPayloads.length;
+
+        await adapter.changeType('video', 'avc1.42c01e', makeInit(7, 200));
+        await adapter.changeType('video', 'avc1.42c01e', makeInit(9, 300));
+
+        expect(vsb.changeTypeCalls).toEqual([]);
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore + 2);
+    });
+
+    it('retypes only when the MIME changes, tracking the last one', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCountBefore = vsb.appendedPayloads.length;
+
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(7, 200));
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(8, 300));
+        await adapter.changeType('video', 'avc1.42c01e', makeInit(1, 100));
+
+        expect(vsb.changeTypeCalls).toEqual([mime('hvc1.1.6.L93.90'), mime('avc1.42c01e')]);
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore + 3);
+    });
+
+    it('keeps the old MIME when the native retype throws', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const native = vi.spyOn(vsb, 'changeType').mockImplementationOnce(() => { throw new Error('unsupported target'); });
+        const initCountBefore = vsb.appendedPayloads.length;
+
+        await expect(adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(7, 200))).rejects.toThrow('unsupported target');
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore);
+        await adapter.changeType('video', 'avc1.42c01e', makeInit(1, 100));
+        expect(native).toHaveBeenCalledTimes(1);
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(7, 200));
+        expect(native).toHaveBeenCalledTimes(2);
+    });
+
+    it('compares against the replacement SourceBuffer MIME after reset', async () => {
+        const { adapter } = await makeReadyAdapter();
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(7, 200));
+        adapter.reset();
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        await flush();
+        const replacement = currentMs.videoBuffer;
+        const initCountBefore = replacement.appendedPayloads.length;
+
+        await adapter.changeType('video', 'avc1.42c01e', makeInit(9, 300));
+
+        expect(replacement.changeTypeCalls).toEqual([]);
+        expect(replacement.appendedPayloads.length).toBe(initCountBefore + 1);
+    });
 });
 
 // ─── Autoplay startup-seek (longest buffered range) ────────────────────
