@@ -2971,6 +2971,18 @@ export class MoqtPlayer {
       }
       rejectInit(err);
     };
+    // An init track that is accepted but never delivers must not hold the switch waiting on it.
+    const deadline = setTimeout(() => {
+      if (this.pendingInitTrackSubs.get(initTrackName)?.promise !== promise) return;
+      const initReqId = this.initTrackRequestIds.get(initTrackName);
+      if (initReqId !== undefined) {
+        this.initTrackRequestIds.delete(initTrackName);
+        if (this.connection) this.retireMediaSubscription(initReqId, this.connection);
+        this.connection?.unsubscribe(varint(initReqId)).catch(() => {});
+      }
+      failInitTrack(new Error(`init track "${initTrackName}" delivered nothing within ${SWITCH_NO_DATA_TIMEOUT_MS} ms`));
+    }, SWITCH_NO_DATA_TIMEOUT_MS);
+    void promise.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
 
     void (async () => {
       try {
@@ -3407,6 +3419,10 @@ export class MoqtPlayer {
           if (this.pendingVideoSwitch !== sw) return; // aborted or destroyed meanwhile
           // The new track's timescale and trex defaults drive the rebase.
           this.cmafAssembler?.setInitSegment?.('video', pinnedInit);
+          // A MediaSource rebuild re-initializes from the playing rendition.
+          if (this.cmafPendingInit?.video) {
+            this.cmafPendingInit.video = { codec: newTrack.codec ?? '', bytes: pinnedInit };
+          }
           // Pivot succeeded. NOW it's safe to tear down the old track
           // and flush the staged new-track segments into the reinitialized
           // SourceBuffer.

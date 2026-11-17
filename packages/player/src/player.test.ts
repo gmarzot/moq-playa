@@ -13863,7 +13863,7 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     await player.destroy();
   });
 
-  /** Two renditions of one view with one codec string. */
+  /** Renditions of one view with one codec string; 360p's init comes only from an init track. */
   const sameCodecLadder = JSON.stringify({
     version: 1,
     tracks: [
@@ -13871,6 +13871,8 @@ describe('MoqtPlayer — video views (altGroups)', () => {
         codec: 'av01.0.08M.08', width: 1280, height: 720, bitrate: 3_000_000, initData: btoa('\x01\x01\x01\x01') },
       { name: 'video_540p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
         codec: 'av01.0.08M.08', width: 960, height: 540, bitrate: 1_500_000, initData: btoa('\x02\x02\x02\x02') },
+      { name: 'video_360p', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1,
+        codec: 'av01.0.08M.08', width: 640, height: 360, bitrate: 600_000, initTrack: 'init_360p' },
       { name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio',
         codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', initData: btoa('\x03\x03\x03\x03') },
     ],
@@ -13884,6 +13886,7 @@ describe('MoqtPlayer — video views (altGroups)', () => {
       onError: null as ((error: Error) => void) | null,
       onStall: null as ((durationMs: number) => void) | null,
       changeType: vi.fn((_mt: string, _codec: string, _init: Uint8Array) => changeType()),
+      rebuild: vi.fn(),
     };
     const assembler = {
       push: vi.fn(), selectTrack: vi.fn(), setInitSegment: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
@@ -13919,6 +13922,52 @@ describe('MoqtPlayer — video views (altGroups)', () => {
     expect(unsubscribedIds(adapter)).toContain(oldReqId);
 
     await player.destroy();
+  });
+
+  it('a MediaSource rebuild after a same-codec switch re-initializes with the target init', async () => {
+    const adapter = createMockAdapter();
+    const { player, mockMs } = await loadSameCodecLadder(adapter, () => Promise.resolve());
+    player.on('error', () => {});
+    await player.selectVideoTrack('video_540p');
+    await landLatestSubscription(adapter, new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]));
+    const initsBefore = mockMs.initialize.mock.calls.length;
+
+    mockMs.onError!(Object.assign(
+      new Error('MSE pipeline failed on the video append: CHUNK_DEMUXER_ERROR_APPEND_FAILED (code=3)'),
+      { name: 'MediaPipelineFailedError', mediaType: 'video' },
+    ));
+
+    expect(mockMs.rebuild).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize).toHaveBeenCalledTimes(initsBefore + 1);
+    const reinit = (mockMs.initialize.mock.calls.at(-1) as any)[0];
+    expect(reinit.video.codec).toBe('av01.0.08M.08');
+    expect(Array.from(reinit.video.initData as Uint8Array)).toEqual([2, 2, 2, 2]);
+
+    await player.destroy();
+  });
+
+  it('gives up a switch whose init track never delivers and frees the next switch', async () => {
+    const adapter = createMockAdapter();
+    const { player } = await loadSameCodecLadder(adapter, () => Promise.resolve());
+    vi.useFakeTimers();
+    try {
+      let outcome: 'pending' | 'resolved' | 'rejected' = 'pending';
+      void player.selectVideoTrack('video_360p').then(() => { outcome = 'resolved'; }, () => { outcome = 'rejected'; });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(subscribedNames(adapter)).toContain('init_360p');
+      expect(subscribedNames(adapter)).not.toContain('video_360p');
+      const initReqId = await requestIdOf(adapter, 'init_360p');
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(outcome).toBe('rejected');
+      expect(unsubscribedIds(adapter)).toContain(initReqId);
+      await player.selectVideoTrack('video_540p', 'abr', 'downshift');
+      expect(subscribedNames(adapter)).toContain('video_540p');
+    } finally {
+      vi.useRealTimers();
+      await player.destroy();
+    }
   });
 
   it('keeps the old rendition when a same-codec target init is rejected', async () => {
