@@ -884,3 +884,56 @@ describe('createPipelines — apply to a running session', () => {
     expect(s.result.getRenderCushionUs!()).toBe(500_000 - RENDER_CUSHION_FALL_US_PER_SEC);
   });
 });
+
+describe('createPipelines — late audio follows delivery in LIVE only', () => {
+  const C0 = 1_000_000_000n;
+  function locAudio(latencyMode: 'live' | 'smooth') {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const callbacks = mockCallbacks();
+    const config = minimalConfig({ latencyMode });
+    const result = createPipelines(config, clock,
+      { video: undefined, audio: { codec: 'opus', packaging: 'loc', samplerate: 48000 } }, callbacks);
+    const audio = result.audioPipeline!;
+    audio.configure(new Uint8Array([1]));
+    let group = 0;
+    /** The next 20 ms frame arrives `lateUs` after its on-time arrival. */
+    const push = (lateUs: number) => {
+      nowUs = 100_000 + group * 20_000 + lateUs;
+      audio.pushObject({ kind: 'data', trackAlias: varint(1), groupId: varint(group), subgroupId: varint(0),
+        objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: new Uint8Array([1]) },
+      { captureTimestamp: C0 + BigInt(group * 20_000) });
+      audio.tick();
+      group++;
+    };
+    const shift = () => result.syncController.computeAudioRenderTime(C0)!.renderTimeUs - 100_000;
+    const steps = () => vi.mocked(callbacks.onEvent).mock.calls
+      .filter(([, evt]) => evt.type === 'audio_reanchored').length;
+    return { config, result, push, shift, steps };
+  }
+
+  for (const { label, mode, shiftUs } of [
+    { label: 'LIVE', mode: 'live' as const, shiftUs: 1_000_000 },
+    { label: 'LIVE(+1s)', mode: 'smooth' as const, shiftUs: 100_000 },
+  ]) {
+    it(`${label}: a 300 ms run of audio 3 s late steps the reference by ${shiftUs / 1000} ms`, () => {
+      const s = locAudio(mode);
+      s.push(0);
+      for (let i = 0; i < 15; i++) s.push(3_000_000);
+      expect(s.steps()).toBe(1);
+      expect(s.shift()).toBe(shiftUs);
+    });
+  }
+
+  it('switching from LIVE(+1s) to LIVE applies at the next late-audio decision', () => {
+    const s = locAudio('smooth');
+    s.push(0);
+    for (let i = 0; i < 15; i++) s.push(3_000_000);
+    expect(s.shift()).toBe(100_000);
+    s.result.apply!({ ...s.config, latencyMode: 'live' }, undefined);
+    // Inside the 2 s spacing LIVE(+1s) would not step again; LIVE steps by up to 1 s.
+    for (let i = 0; i < 15; i++) s.push(3_000_000);
+    expect(s.steps()).toBe(2);
+    expect(s.shift()).toBe(1_100_000);
+  });
+});
