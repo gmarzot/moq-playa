@@ -228,6 +228,13 @@ describe('SyncController', () => {
             expect(sync.baselineDebtUs).toBe(100_000);
         });
 
+        it('takes the caller\'s bound when given one', () => {
+            const { sync } = newSync();
+            expect(sync.reanchorAudioBounded(620_000, 1_000_000)).toBe(620_000);
+            expect(sync.reanchorAudioBounded(5_000_000, 1_000_000)).toBe(1_000_000);
+            expect(sync.baselineDebtUs).toBe(1_620_000);
+        });
+
         it('accumulates debt across re-anchors', () => {
             const { sync } = newSync();
             sync.reanchorAudioBounded(30_000);
