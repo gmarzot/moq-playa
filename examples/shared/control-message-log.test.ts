@@ -36,6 +36,21 @@ describe('describeControlMessage', () => {
     expect(describeControlMessage(ok)).toBe('SUBSCRIBE_OK requestId=4 trackAlias=2 0x7f=3B trackProperties={0x30:[1]}');
   });
 
+  it('redacts authorization tokens', () => {
+    const subscribe = {
+      type: 'SUBSCRIBE',
+      requestId: 2n,
+      parameters: new Map([[0x03n, [text('secret-token')]], [0x10n, [1n]]]),
+    };
+    expect(describeControlMessage(subscribe)).toBe('SUBSCRIBE requestId=2 AUTHORIZATION_TOKEN=<redacted>×1 FORWARD=1');
+    const setup = { type: 'SETUP', setupOptions: new Map([[0x01n, [text('/moq')]], [0x03n, [text('secret')]]]) };
+    expect(describeControlMessage(setup)).toBe('SETUP 0x1="/moq" AUTHORIZATION_TOKEN=<redacted>×1');
+    const typed = { type: 'CLIENT_SETUP', authTokens: [{ alias: 1n, tokenValue: text('secret') }] };
+    expect(describeControlMessage(typed)).toBe('CLIENT_SETUP authTokens=<redacted>');
+    const nested = { type: 'X', options: { tokenValue: text('secret'), alias: 1n } };
+    expect(describeControlMessage(nested)).toBe('X options={tokenValue:<redacted> alias:1}');
+  });
+
   it('caps the line', () => {
     const line = describeControlMessage({ type: 'GOAWAY', newSessionUri: text('x'.repeat(60)) }, 40);
     expect(line).toHaveLength(40);

@@ -14,6 +14,10 @@ const PARAM_NAMES: ReadonlyMap<bigint, string> = (() => {
 })();
 
 const MAX_TEXT_BYTES = 64;
+/** AUTHORIZATION_TOKEN, in message parameters and setup options alike. */
+const AUTH_TOKEN_CODE = 0x03n;
+const REDACTED = '<redacted>';
+const isTokenKey = (key: string): boolean => /token/i.test(key);
 
 function describeBytes(b: Uint8Array): string | null {
   if (b.byteLength > MAX_TEXT_BYTES || !b.every((c) => c >= 0x20 && c < 0x7f)) return null;
@@ -36,18 +40,22 @@ function describeValue(v: unknown, depth = 0): string {
     return `{${[...v].map(([k, x]) => `${typeof k === 'bigint' ? `0x${k.toString(16)}` : String(k)}:${describeValue(x, depth + 1)}`).join(' ')}}`;
   }
   if (v !== null && typeof v === 'object') {
-    return `{${Object.entries(v).filter(([, x]) => x !== undefined).map(([k, x]) => `${k}:${describeValue(x, depth + 1)}`).join(' ')}}`;
+    return `{${Object.entries(v).filter(([, x]) => x !== undefined)
+      .map(([k, x]) => `${k}:${isTokenKey(k) ? REDACTED : describeValue(x, depth + 1)}`).join(' ')}}`;
   }
   return String(v);
 }
 
-function describeParameters(params: Map<unknown, unknown>): string {
+function describeParameters(params: Map<unknown, unknown>, names: ReadonlyMap<bigint, string>): string {
   return [...params].map(([code, values]) => {
-    const name = typeof code === 'bigint' ? (PARAM_NAMES.get(code) ?? `0x${code.toString(16)}`) : String(code);
+    const name = typeof code === 'bigint' ? (names.get(code) ?? `0x${code.toString(16)}`) : String(code);
     const list = Array.isArray(values) ? values : [values];
+    if (code === AUTH_TOKEN_CODE) return `${name}=${REDACTED}×${list.length}`;
     return `${name}=${list.map((x) => describeValue(x)).join(',')}`;
   }).join(' ');
 }
+
+const NO_NAMES: ReadonlyMap<bigint, string> = new Map([[AUTH_TOKEN_CODE, 'AUTHORIZATION_TOKEN']]);
 
 export function describeControlMessage(message: unknown, maxChars = 300): string {
   if (message === null || typeof message !== 'object') return String(message);
@@ -55,8 +63,10 @@ export function describeControlMessage(message: unknown, maxChars = 300): string
   const parts = [String(type)];
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined) continue;
-    if (key === 'parameters' && value instanceof Map) {
-      if (value.size > 0) parts.push(describeParameters(value));
+    if ((key === 'parameters' || key === 'setupOptions') && value instanceof Map) {
+      if (value.size > 0) parts.push(describeParameters(value, key === 'parameters' ? PARAM_NAMES : NO_NAMES));
+    } else if (isTokenKey(key)) {
+      parts.push(`${key}=${REDACTED}`);
     } else {
       parts.push(`${key}=${describeValue(value)}`);
     }
