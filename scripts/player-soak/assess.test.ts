@@ -147,16 +147,19 @@ describe('player soak hidden-tab pause', () => {
       { wallEpochMs: T0 + 17_000, events: [{ timeMs: 0, type: 'stall', data: {} }, { timeMs: 0, type: 'stall', data: {} }] },
       { wallEpochMs: T0 + 33_000, events: [{ timeMs: 0, type: 'stall', data: {} }] },
     ];
-    const r = assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true, hiddenPause: true });
+    const nudgeLog = [16_000, 21_000, 35_000, 45_000].map((ms) => ({ t: T0 + ms, text: '[MSE] stall nudge 1.00 → 1.10' }));
+    const r = assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true, hiddenPause: true, nudgeLog });
     expect(r.verdict).toBe('played');
     expect(r.hiddenPause).toEqual([
       { startEpochMs: T0 + 5000, hiddenMs: 10_000, paused: 'silent', freshFrameAfterMs: 0,
         stalls: { count: 1, totalMs: 3000, longestMs: 3000 }, frozen: { count: 1, totalMs: 3000, longestMs: 3000 },
-        playerStalls: 2 },
+        stallNudges: 2, playerStalls: 2 },
       { startEpochMs: T0 + 30_000, hiddenMs: 10_000, paused: null, freshFrameAfterMs: 0,
         stalls: { count: 0, totalMs: 0, longestMs: 0 }, frozen: { count: 0, totalMs: 0, longestMs: 0 },
-        playerStalls: 0 },
+        stallNudges: 1, playerStalls: 0 },
     ]);
+    expect(assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true, hiddenPause: true })
+      .hiddenPause?.map((h) => h.stallNudges)).toEqual([null, null]);
     expect(assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true })).not.toHaveProperty('hiddenPause');
   });
 });

@@ -161,10 +161,12 @@ async function playCase(browser, webUrl, c, impair = null) {
   const consoleFile = join(dir, 'console.jsonl');
   // A ladder case keeps the player's ABR switch lines for its summary.
   const abrLog = c.abr ? [] : null;
+  const nudgeLog = c.pauseWhenHidden ? [] : null;
   page.on('console', (m) => {
     const line = { t: Date.now(), type: m.type(), text: m.text() };
     void appendFile(consoleFile, `${json(line)}\n`);
     if (abrLog && /downshift|upshift/.test(line.text)) abrLog.push(line);
+    if (nudgeLog && line.text.startsWith('[MSE] stall nudge')) nudgeLog.push(line);
   });
   page.on('pageerror', (e) => void appendFile(consoleFile, `${json({ t: Date.now(), type: 'pageerror', text: e.message })}\n`));
   // Viewers play as G5 does: from the current group, following the namespace.
@@ -247,7 +249,7 @@ async function playCase(browser, webUrl, c, impair = null) {
       ...(c.profileName ? { profile: c.profileName } : {}),
       ...(publisherEnded ? { publisherEnded } : {}),
       ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile), abrLog,
-        hiddenPause: Boolean(c.pauseWhenHidden) }) };
+        hiddenPause: Boolean(c.pauseWhenHidden), nudgeLog }) };
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
   } catch (error) {
@@ -529,10 +531,11 @@ async function report(results) {
   const paused = results.filter((r) => r.hiddenPause);
   if (paused.length) {
     md.push('#### Hidden-tab pause', '', '| case | hide | hidden s | paused | first fresh frame ms '
-      + '| after return: stalls n / ms | frozen n / ms | player stalls |', '|---|---|---|---|---|---|---|---|',
+      + '| after return: stalls n / ms | frozen n / ms | MSE stall nudges | player stalls |',
+      '|---|---|---|---|---|---|---|---|---|',
       ...paused.flatMap((r) => r.hiddenPause.map((h, i) => `| ${r.name} | ${i + 1} | ${Math.round(h.hiddenMs / 1000)} `
       + `| ${h.paused ?? 'no'} | ${h.freshFrameAfterMs ?? '—'} | ${h.stalls.count} / ${h.stalls.totalMs} `
-      + `| ${h.frozen.count} / ${h.frozen.totalMs} | ${h.playerStalls} |`)), '');
+      + `| ${h.frozen.count} / ${h.frozen.totalMs} | ${h.stallNudges ?? '—'} | ${h.playerStalls} |`)), '');
   }
   const text = md.join('\n');
   await writeFile(join(out, 'summary.md'), text);

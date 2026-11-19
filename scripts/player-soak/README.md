@@ -65,7 +65,7 @@ another, first play draft only) under a profile from `cases.json`:
 where the playback pipeline's late-audio handling runs), and `ladder-cmaf-hidden-pause`
 unshaped in Auto with `pauseWhenHidden`, muted and hidden 90 s at 30 s and 150 s at 180 s
 (6.75 min); its report-only `hiddenPause` gives per return whether delivery paused, the first
-fresh frame, and the stalls, frozen pictures and player stall events that followed. Ladders on
+fresh frame, and the stalls, frozen pictures, MSE stall nudges and player stall events that followed. Ladders on
 one stream share its job and play one after another. Their summary adds the time at each
 rendition, down- and upshifts, the first downshift and the reasons the player
 logged, report-only.

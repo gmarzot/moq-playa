@@ -51,6 +51,8 @@ export interface HiddenPause {
   /** From the return until the next hide or the end. */
   stalls: { count: number; totalMs: number; longestMs: number };
   frozen: { count: number; totalMs: number; longestMs: number };
+  /** `[MSE] stall nudge` lines; null without the console log. */
+  stallNudges: number | null;
   playerStalls: number;
 }
 
@@ -60,7 +62,7 @@ export function quietIntervals(samples: PlaybackSample[], active: (s: PlaybackSa
 export function latencyReport(ticks: SoakTick[]): Record<string, LatencyKeyReport>;
 export function recoveryReport(samples: PlaybackSample[], ticks: SoakTick[], disruptions: Disruption[], frozen: Interval[]): Recovery[];
 export function hiddenPauseReport(samples: PlaybackSample[], ticks: SoakTick[], recovery: Recovery[],
-  intervals: { stalls: Interval[]; frozen: Interval[] }): HiddenPause[];
+  intervals: { stalls: Interval[]; frozen: Interval[]; nudges?: { t: number; text: string }[] | null }): HiddenPause[];
 export function assessSoak(input: {
   samples: PlaybackSample[];
   ticks: SoakTick[];
@@ -72,6 +74,8 @@ export function assessSoak(input: {
   abrLog?: { t: number; text: string }[] | null;
   /** A pauseWhenHidden case; adds `hiddenPause`. */
   hiddenPause?: boolean;
+  /** Player console `[MSE] stall nudge` lines, for `hiddenPause`. */
+  nudgeLog?: { t: number; text: string }[] | null;
 }): {
   verdict: 'played' | 'no-playback' | 'no-audio' | 'unrecovered';
   audio: { advertised: boolean; audible: boolean };

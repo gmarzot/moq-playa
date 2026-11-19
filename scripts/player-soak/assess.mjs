@@ -189,10 +189,10 @@ export function abrReport(ticks, log = [], startEpochMs = ticks[0]?.wallEpochMs 
 
 /**
  * Per hidden-tab disruption: whether pauseWhenHidden paused delivery, the first fresh
- * frame after the return, and the stalls, frozen pictures and player stall events
- * from the return until the next hide or the end.
+ * frame after the return, and the stalls, frozen pictures, MSE stall nudges (null
+ * without their log) and player stall events from the return until the next hide or the end.
  */
-export function hiddenPauseReport(samples, ticks, recovery, { stalls, frozen }) {
+export function hiddenPauseReport(samples, ticks, recovery, { stalls, frozen, nudges = null }) {
   const offset = samples.length ? samples[0].wallEpochMs - samples[0].wallMs : 0;
   const hides = recovery.filter((r) => r.kind === 'hidden');
   const paused = ticks.flatMap((t) => (t.events ?? []).filter((e) => e.type === 'lifecycle' && e.data?.paused)
@@ -209,6 +209,7 @@ export function hiddenPauseReport(samples, ticks, recovery, { stalls, frozen }) 
       freshFrameAfterMs: h.freshFrameAfterMs,
       stalls: after(stalls),
       frozen: after(frozen),
+      stallNudges: nudges === null ? null : nudges.filter((l) => l.t >= visibleAt && l.t < until).length,
       playerStalls: ticks.filter((t) => t.wallEpochMs >= visibleAt && t.wallEpochMs < until)
         .flatMap((t) => t.events ?? []).filter((e) => e.type === 'stall').length,
     };
@@ -218,7 +219,7 @@ export function hiddenPauseReport(samples, ticks, recovery, { stalls, frozen }) 
 const COUNTERS = ['stallCount', 'stallDurationMs', 'framesDropped', 'audioUnderruns', 'gapCount', 'framesRendered'];
 
 export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false, abrLog = null,
-  hiddenPause = false }) {
+  hiddenPause = false, nudgeLog = null }) {
   const first = samples[0];
   const last = samples.at(-1);
   const durationMs = first && last ? last.wallMs - first.wallMs : 0;
@@ -302,7 +303,7 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
     },
     latency: latencyReport(ticks),
     ...(abrLog ? { abr: abrReport(ticks, abrLog, startup.clickedEpochMs) } : {}),
-    ...(hiddenPause ? { hiddenPause: hiddenPauseReport(samples, ticks, recovery, { stalls, frozen }) } : {}),
+    ...(hiddenPause ? { hiddenPause: hiddenPauseReport(samples, ticks, recovery, { stalls, frozen, nudges: nudgeLog }) } : {}),
     player,
     events,
     intervals: { stalls, frozen, audioGaps },
