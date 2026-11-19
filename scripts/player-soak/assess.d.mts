@@ -42,11 +42,25 @@ export interface AbrReport {
   logged: { downshifts: number; upshifts: number; reasons: Record<string, number>; switches: (AbrSwitch & { atS: number })[] };
 }
 
+export interface HiddenPause {
+  startEpochMs: number;
+  hiddenMs: number;
+  /** Why pauseWhenHidden paused delivery during the hide, or null when it did not. */
+  paused: 'silent' | 'throttled' | null;
+  freshFrameAfterMs: number | null;
+  /** From the return until the next hide or the end. */
+  stalls: { count: number; totalMs: number; longestMs: number };
+  frozen: { count: number; totalMs: number; longestMs: number };
+  playerStalls: number;
+}
+
 export function abrSwitch(text: string): AbrSwitch | null;
 export function abrReport(ticks: SoakTick[], log?: { t: number; text: string }[], startEpochMs?: number): AbrReport;
 export function quietIntervals(samples: PlaybackSample[], active: (s: PlaybackSample) => boolean, minMs: number): Interval[];
 export function latencyReport(ticks: SoakTick[]): Record<string, LatencyKeyReport>;
 export function recoveryReport(samples: PlaybackSample[], ticks: SoakTick[], disruptions: Disruption[], frozen: Interval[]): Recovery[];
+export function hiddenPauseReport(samples: PlaybackSample[], ticks: SoakTick[], recovery: Recovery[],
+  intervals: { stalls: Interval[]; frozen: Interval[] }): HiddenPause[];
 export function assessSoak(input: {
   samples: PlaybackSample[];
   ticks: SoakTick[];
@@ -56,6 +70,8 @@ export function assessSoak(input: {
   adverse?: boolean;
   /** Player console lines; adds `abr`. */
   abrLog?: { t: number; text: string }[] | null;
+  /** A pauseWhenHidden case; adds `hiddenPause`. */
+  hiddenPause?: boolean;
 }): {
   verdict: 'played' | 'no-playback' | 'no-audio' | 'unrecovered';
   audio: { advertised: boolean; audible: boolean };
@@ -82,6 +98,7 @@ export function assessSoak(input: {
   };
   latency: Record<string, LatencyKeyReport>;
   abr?: AbrReport;
+  hiddenPause?: HiddenPause[];
   player: Record<string, unknown>;
   events: Record<string, number>;
 };

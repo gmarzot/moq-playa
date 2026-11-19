@@ -62,8 +62,11 @@ another, first play draft only) under a profile from `cases.json`:
 `--ladder RELAY:ID[,…]` plays a moq-test-tracks ABR ladder from `cases.ladders`
 (MTT_API_KEY) under its profile, first play draft only: `ladder-cmaf` and
 `ladder-loc` in Auto from the top rung, `ladder-loc-top` held on the top rung (LOC,
-where the playback pipeline's late-audio handling runs). Ladders on one stream
-share its job and play one after another. Their summary adds the time at each
+where the playback pipeline's late-audio handling runs), and `ladder-cmaf-hidden-pause`
+unshaped in Auto with `pauseWhenHidden`, muted and hidden 90 s at 30 s and 150 s at 180 s
+(6.75 min); its report-only `hiddenPause` gives per return whether delivery paused, the first
+fresh frame, and the stalls, frozen pictures and player stall events that followed. Ladders on
+one stream share its job and play one after another. Their summary adds the time at each
 rendition, down- and upshifts, the first downshift and the reasons the player
 logged, report-only.
 

@@ -5,7 +5,8 @@
  * Report-only, except the verdict: no-playback when nothing played, no-audio
  * when the catalog lists an audio track that is never heard, and, under an
  * adverse profile, unrecovered when no fresh frame follows a disruption or the
- * picture is still frozen at the end. A ladder case adds its ABR switches.
+ * picture is still frozen at the end. A ladder case adds its ABR switches, and a
+ * pauseWhenHidden case how each return from a hidden tab played.
  */
 
 const STALL_MS = 500;
@@ -186,9 +187,38 @@ export function abrReport(ticks, log = [], startEpochMs = ticks[0]?.wallEpochMs 
   };
 }
 
+/**
+ * Per hidden-tab disruption: whether pauseWhenHidden paused delivery, the first fresh
+ * frame after the return, and the stalls, frozen pictures and player stall events
+ * from the return until the next hide or the end.
+ */
+export function hiddenPauseReport(samples, ticks, recovery, { stalls, frozen }) {
+  const offset = samples.length ? samples[0].wallEpochMs - samples[0].wallMs : 0;
+  const hides = recovery.filter((r) => r.kind === 'hidden');
+  const paused = ticks.flatMap((t) => (t.events ?? []).filter((e) => e.type === 'lifecycle' && e.data?.paused)
+    .map((e) => ({ at: t.wallEpochMs, reason: e.data.paused })));
+  return hides.map((h, i) => {
+    const visibleAt = h.startEpochMs + h.durationMs;
+    const until = hides[i + 1]?.startEpochMs ?? Infinity;
+    const after = (list) => intervalSummary(list.filter((x) => x.startMs + offset >= visibleAt && x.startMs + offset < until));
+    return {
+      startEpochMs: h.startEpochMs,
+      hiddenMs: h.durationMs,
+      // Drained with the next tick, up to a second after the event.
+      paused: paused.find((p) => p.at > h.startEpochMs && p.at <= visibleAt + 2000)?.reason ?? null,
+      freshFrameAfterMs: h.freshFrameAfterMs,
+      stalls: after(stalls),
+      frozen: after(frozen),
+      playerStalls: ticks.filter((t) => t.wallEpochMs >= visibleAt && t.wallEpochMs < until)
+        .flatMap((t) => t.events ?? []).filter((e) => e.type === 'stall').length,
+    };
+  });
+}
+
 const COUNTERS = ['stallCount', 'stallDurationMs', 'framesDropped', 'audioUnderruns', 'gapCount', 'framesRendered'];
 
-export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false, abrLog = null }) {
+export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false, abrLog = null,
+  hiddenPause = false }) {
   const first = samples[0];
   const last = samples.at(-1);
   const durationMs = first && last ? last.wallMs - first.wallMs : 0;
@@ -272,6 +302,7 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
     },
     latency: latencyReport(ticks),
     ...(abrLog ? { abr: abrReport(ticks, abrLog, startup.clickedEpochMs) } : {}),
+    ...(hiddenPause ? { hiddenPause: hiddenPauseReport(samples, ticks, recovery, { stalls, frozen }) } : {}),
     player,
     events,
     intervals: { stalls, frozen, audioGaps },

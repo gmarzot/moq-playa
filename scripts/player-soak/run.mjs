@@ -9,8 +9,8 @@
  *                    hidden tab, publisher restarts); first play draft only
  *   --variant restart   the broadcaster restarts every cases.restartEveryS; players use its namespace
  *   --adverse-minutes M   keep a broadcaster up for the adverse players too
- *   --ladder RELAY:ID[,…]   moq-test-tracks ABR ladders (cases.ladders) under their profile, with ABR
- *                    switches in the summary (MTT_API_KEY)
+ *   --ladder RELAY:ID[,…]   moq-test-tracks ABR ladders (cases.ladders) under their profile (or
+ *                    unshaped, with their own events), with ABR switches in the summary (MTT_API_KEY)
  *
  * A broadcaster the relay pauses (video Forward State 0) gets one 30 s viewer, `rejoin-…`,
  * which has to resume it.
@@ -139,9 +139,14 @@ async function startDisruption(e, { impair, context, page }) {
   }
   if (e.hiddenS) {
     const state = {};
+    // Muted, the page counts as silent for pauseWhenHidden.
+    if (e.muted) await page.evaluate(() => window.playerAcceptance.setMuted(true));
     await setHidden(context, page, true, state);
     return { kind: 'hidden', method: state.method, plannedMs: e.hiddenS * 1000, startEpochMs: Date.now(),
-      stop: () => setHidden(context, page, false, state) };
+      stop: async () => {
+        await setHidden(context, page, false, state);
+        if (e.muted) await page.evaluate(() => window.playerAcceptance.setMuted(false));
+      } };
   }
   throw new Error(`unknown profile event ${JSON.stringify(e)}`);
 }
@@ -172,6 +177,7 @@ async function playCase(browser, webUrl, c, impair = null) {
   if (latency) query.set('latency', latency);
   if (c.auto) query.set('auto', '1');
   if (c.level !== undefined) query.set('level', String(c.level));
+  if (c.pauseWhenHidden) query.set('pauseWhenHidden', '1');
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
   // The disruption in progress; cleared only once its stop() succeeds.
@@ -240,7 +246,8 @@ async function playCase(browser, webUrl, c, impair = null) {
     const summary = { name: c.name, url: c.url, namespace: c.namespace, draft: c.draft, packaging: c.packaging,
       ...(c.profileName ? { profile: c.profileName } : {}),
       ...(publisherEnded ? { publisherEnded } : {}),
-      ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile), abrLog }) };
+      ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile), abrLog,
+        hiddenPause: Boolean(c.pauseWhenHidden) }) };
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
     return summary;
   } catch (error) {
@@ -297,13 +304,14 @@ async function runMtt(browser, webUrl, cases) {
 
 /**
  * moq-test-tracks ABR ladders under their profile, `specs` being RELAY:ID keys of
- * cases.ladders: one service job per stream, its plays one after another.
+ * cases.ladders: one service job per stream, its plays one after another. A ladder
+ * without a profile plays unshaped, with its own `events`.
  */
 async function runLadders(browser, webUrl, cases, specs) {
   const ladders = specs.map((spec) => {
     const l = cases.ladders.find((x) => `${x.relay}:${x.id}` === spec);
     if (!l) throw new Error(`unknown ladder ${spec}`);
-    if (!cases.profiles[l.profile]) throw new Error(`unknown profile ${l.profile}`);
+    if (l.profile && !cases.profiles[l.profile]) throw new Error(`unknown profile ${l.profile}`);
     return { ...l, relayInfo: cases.relays[l.relay] };
   });
   const client = new MttClient({ key: process.env.MTT_API_KEY, base: process.env.MTT_API_BASE });
@@ -313,21 +321,22 @@ async function runLadders(browser, webUrl, cases, specs) {
   for (const plays of Map.groupBy(ladders, (l) => `${l.relay} ${l.namespace}`).values()) {
     const { relay, relayInfo, namespace } = plays[0];
     const draft = relayInfo.playDrafts[0];
-    const names = plays.map((l) => `${l.profile}-${l.id}-${relay}-d${draft}`);
+    const names = plays.map((l) => `${l.profile ? `${l.profile}-` : ''}${l.id}-${relay}-d${draft}`);
     let job;
     try {
-      const ttl = Math.ceil(plays.length * (minutes + 2) * 60) + 300;
+      const ttl = Math.ceil(plays.reduce((n, l) => n + (l.minutes ?? minutes) + 2, 0) * 60) + 300;
       job = await client.start({ namespace, relay, draft: relayInfo.publishDraft, mode: 'publish', ttl_s: ttl },
         { log: (m) => log(relay, namespace, m) });
       log(relay, `job ${job.id} ${job.joined ? 'joined' : 'started'}: ${job.namespace ?? namespace}`);
       await client.waitRunning(job.id);
       for (const [i, l] of plays.entries()) {
-        const profile = cases.profiles[l.profile];
+        const profile = { ...(l.profile ? cases.profiles[l.profile] : {}), ...(l.events ? { events: l.events } : {}) };
         await impair.apply(profile);
-        log(`profile ${l.profile}: shaping ${impair.addresses.join(', ')} on ${impair.dev}`);
+        log(l.profile ? `profile ${l.profile}: shaping ${impair.addresses.join(', ')} on ${impair.dev}` : `${l.id}: unshaped`);
         results.push(await playCase(browser, webUrl, { name: names[i], url: relayInfo.url,
           namespace: job.namespace ?? namespace, draft, packaging: l.packaging, expected: l.expected, profile,
-          profileName: l.profile, auto: l.auto, level: l.level, abr: true }, impair));
+          profileName: l.profile, auto: l.auto, level: l.level, minutes: l.minutes, pauseWhenHidden: l.pauseWhenHidden,
+          abr: true }, impair));
         await impair.apply({});
       }
     } catch (error) {
@@ -516,6 +525,14 @@ async function report(results) {
     md.push('#### ABR ladders', '', '| case | time at each level | down / up shifts | first downshift s '
       + '| downshift reasons | audio gaps n / total / p99 ms | audio underruns | video latency p50 / p95 ms '
       + '| audio latency p50 / p95 ms |', '|---|---|---|---|---|---|---|---|---|', ...ladders.map(abrRow), '');
+  }
+  const paused = results.filter((r) => r.hiddenPause);
+  if (paused.length) {
+    md.push('#### Hidden-tab pause', '', '| case | hide | hidden s | paused | first fresh frame ms '
+      + '| after return: stalls n / ms | frozen n / ms | player stalls |', '|---|---|---|---|---|---|---|---|',
+      ...paused.flatMap((r) => r.hiddenPause.map((h, i) => `| ${r.name} | ${i + 1} | ${Math.round(h.hiddenMs / 1000)} `
+      + `| ${h.paused ?? 'no'} | ${h.freshFrameAfterMs ?? '—'} | ${h.stalls.count} / ${h.stalls.totalMs} `
+      + `| ${h.frozen.count} / ${h.frozen.totalMs} | ${h.playerStalls} |`)), '');
   }
   const text = md.join('\n');
   await writeFile(join(out, 'summary.md'), text);

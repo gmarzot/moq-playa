@@ -153,6 +153,31 @@
     },
     {
       "relay": "aiomoqt-relay",
+      "id": "ladder-cmaf-hidden-pause",
+      "packaging": "cmaf",
+      "namespace": "openmoq/aiomoqt/mtt_00/bbb_4k30/cmaf/h264/1080/30/aac/2/msf/catalog/2000/1/0/alt4",
+      "auto": true,
+      "level": 0,
+      "minutes": 6.75,
+      "pauseWhenHidden": true,
+      "events": [
+        {
+          "atS": 30,
+          "hiddenS": 90,
+          "muted": true
+        },
+        {
+          "atS": 180,
+          "hiddenS": 150,
+          "muted": true
+        }
+      ],
+      "expected": {
+        "videoFps": 30
+      }
+    },
+    {
+      "relay": "aiomoqt-relay",
       "id": "ladder-loc",
       "packaging": "loc",
       "namespace": "openmoq/aiomoqt/mtt_00/bbb_4k30/loc/h264/1080/30/aac/2/msf/catalog/2000/1/0/alt4",
