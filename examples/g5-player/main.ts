@@ -121,6 +121,7 @@ import { attachSettingsPopup, rememberOpen, rememberedOpen } from '../shared/set
 import '../shared/settings-popup.css';
 import { copyOnClick } from '../shared/copyable.js';
 import { setBadge } from '../shared/status-badge.js';
+import { describeControlMessage } from '../shared/control-message-log.js';
 import type { BadgeTone } from '../shared/status-badge.js';
 import type { SubscriptionStatus } from '@openmoq/playa';
 import type { Level } from '@openmoq/playa';
@@ -529,6 +530,11 @@ async function main(): Promise<void> {
     compatReported = line;
     log(`compat: ${line}`);
   };
+  /** `?debug=1`: each control message where it crosses the wire. */
+  const noteControlMessage = (e: { type: string; message?: unknown }): void => {
+    if (!debug || (e.type !== 'control_message_created' && e.type !== 'control_message_parsed')) return;
+    log(`MoQT ${e.type === 'control_message_created' ? 'send' : 'recv'}: ${describeControlMessage(e.message)}`);
+  };
   const player = new Player(playerContainer, {
     url: relayUrl,
     namespace,
@@ -542,7 +548,7 @@ async function main(): Promise<void> {
     ...(latencyMode === 'smooth' ? { latencyMode } : {}),
     ...(smoothCeilingMs ? { smoothCeilingMs } : {}),
     ...(smoothFloorMs !== undefined ? { smoothFloorMs } : {}),
-    moqtPlayerConfig: engineConfig,
+    moqtPlayerConfig: { ...engineConfig, onQlogEvent: noteControlMessage },
   });
   const optionSummary = Object.entries({
     ...engineConfig, targetLatencyMs: targetLatencyOverrideMs,
@@ -679,14 +685,59 @@ async function main(): Promise<void> {
   /** Silence is counted from the resume, not across the pause. */
   let resumedAtMs = -Infinity;
   player.on('play', () => { resumedAtMs = performance.now(); });
+  /** Last arrival of a Forward State 1 subscription silent past SILENT_MS while playing, else null. */
+  const quietSinceMs = (sub: SubscriptionStatus, nowMs: number): number | null => {
+    if (!sub.established || !sub.forward || player.state !== 'playing') return null;
+    const arrived = sub.kind === 'video' || sub.kind === 'audio' ? lastArrivalMs[sub.kind] : undefined;
+    if (arrived === undefined) return null;
+    const last = Math.max(arrived, resumedAtMs);
+    return nowMs - last > SILENT_MS ? last : null;
+  };
+  /** Quiet FWD spells per media type: the first logged as it starts, ended ones summed once a minute. */
+  const QUIET_REPORT_MS = 60_000;
+  const quietSpells = {
+    video: { sinceMs: null as number | null, logged: false, count: 0, longestMs: 0 },
+    audio: { sinceMs: null as number | null, logged: false, count: 0, longestMs: 0 },
+  };
+  let quietReportAtMs = performance.now();
+  const noteQuietSpells = (subs: readonly SubscriptionStatus[], nowMs: number): void => {
+    for (const kind of ['video', 'audio'] as const) {
+      const q = quietSpells[kind];
+      const sub = subs.find((s) => s.kind === kind && s.established && s.forward);
+      const sinceMs = sub ? quietSinceMs(sub, nowMs) : null;
+      if (sinceMs === null) {
+        if (q.sinceMs !== null) {
+          q.count++;
+          q.longestMs = Math.max(q.longestMs, nowMs - q.sinceMs);
+          q.sinceMs = null;
+        }
+      } else if (q.sinceMs === null) {
+        q.sinceMs = sinceMs;
+        if (!q.logged) {
+          q.logged = true;
+          log(`FWD ${kind} quiet: nothing has arrived for ${((nowMs - sinceMs) / 1000).toFixed(1)} s; `
+            + `the subscription is in Forward State 1 (SUBSCRIBE reqId=${sub!.requestId})`);
+        }
+      }
+    }
+    if (nowMs - quietReportAtMs < QUIET_REPORT_MS) return;
+    quietReportAtMs = nowMs;
+    for (const kind of ['video', 'audio'] as const) {
+      const q = quietSpells[kind];
+      if (q.count > 0) {
+        log(`FWD ${kind} quiet ${q.count}× in the last ${QUIET_REPORT_MS / 1000} s, longest ${(q.longestMs / 1000).toFixed(1)} s`);
+      }
+      q.count = 0;
+      q.longestMs = 0;
+    }
+  };
   const subscriptionBadge = (el: HTMLElement, sub: SubscriptionStatus | undefined, nowMs: number): void => {
     if (!sub) { setBadge(el, 'FWD --', 'idle', 'No subscription'); return; }
     const req = `SUBSCRIBE reqId=${sub.requestId}${sub.alias !== null ? ` · alias=${sub.alias}` : ''}`;
     if (!sub.established) { setBadge(el, 'FWD …', 'idle', `${req} sent; awaiting SUBSCRIBE_OK`); return; }
     if (!sub.forward) { setBadge(el, 'FWD 0', 'wait', `${req} · Forward State 0: paused by this player`); return; }
-    const arrived = sub.kind === 'video' || sub.kind === 'audio' ? lastArrivalMs[sub.kind] : undefined;
-    const last = arrived === undefined ? undefined : Math.max(arrived, resumedAtMs);
-    if (last !== undefined && nowMs - last > SILENT_MS && player.state === 'playing') {
+    const last = quietSinceMs(sub, nowMs);
+    if (last !== null) {
       setBadge(el, 'FWD 1', 'quiet',
         `${req} · Forward State 1, but nothing has arrived for ${((nowMs - last) / 1000).toFixed(1)}s`);
       return;
@@ -698,6 +749,7 @@ async function main(): Promise<void> {
     setBadge(setupBadge, 'SETUP', setupBadgeState.tone, setupBadgeState.detail);
     setBadge(nsBadge, 'SUB_NS', nsBadgeState.tone, nsBadgeState.detail);
     const subs = player.subscriptions;
+    noteQuietSpells(subs, nowMs);
     const catSub = subs.find((s) => s.kind === 'catalog');
     const phase = player.catalogBootstrapPhase;
     if (!catalogArrived && phase !== null && phase !== lastCatalogPhase) {
