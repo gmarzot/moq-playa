@@ -1064,7 +1064,15 @@ export class MoqtPlayer {
    */
   private readonly activeSubscriptions = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint | null }
+    {
+      trackName: string;
+      mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
+      trackAlias: bigint | null;
+      /** DYNAMIC_GROUPS = 1 on the track (draft-22 §10.6). */
+      dynamicGroups?: true;
+      /** Largest Group ID received; kept only for dynamic-group video. */
+      largestGroup?: bigint;
+    }
   >();
 
   /**
@@ -4510,6 +4518,17 @@ export class MoqtPlayer {
     this.mediaRefusals.delete(trackName);
   }
 
+  /** Largest Group ID received on a dynamic-group video subscription (draft-22 §9.20.19). */
+  private noteVideoGroup(alias: bigint, groupId: bigint): void {
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackAlias !== alias) continue;
+      if (sub.dynamicGroups && (sub.largestGroup === undefined || groupId > sub.largestGroup)) {
+        sub.largestGroup = groupId;
+      }
+      return;
+    }
+  }
+
   /** A relay skips a subscriber ahead by resetting a group's stream and resuming at a newer group. */
   private noteGroupSequence(mediaType: 'video' | 'audio', trackName: string, alias: bigint, groupId: bigint): void {
     const abandoned = this.abandonedMediaGroup.get(alias);
@@ -4623,9 +4642,11 @@ export class MoqtPlayer {
    * Start playback — begin ticking pipelines.
    *
    * If resuming from paused, sends REQUEST_UPDATE forward:1 to resume
-   * object delivery at the source.
+   * object delivery at the source; on video with DYNAMIC_GROUPS = 1 it also
+   * carries NEW_GROUP_REQUEST so the publisher starts a new group.
    * @see draft-ietf-moq-transport-16 §9.11 (REQUEST_UPDATE)
    * @see draft-ietf-moq-transport-16 §9.2.2.8 (FORWARD parameter)
+   * @see draft-ietf-moq-transport-22 §9.20.19 (NEW_GROUP_REQUEST)
    */
   play(): void {
     this.log.info('play()');
@@ -4728,15 +4749,21 @@ export class MoqtPlayer {
    */
   private sendForwardUpdate(forward: 0 | 1): void {
     if (!this.connection) return;
-    for (const [requestId] of this.activeSubscriptions) {
-      if (this.isSubscriptionEstablished(requestId)) this.requestForward(requestId, forward);
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      if (!this.isSubscriptionEstablished(requestId)) continue;
+      // Resume asks dynamic-group video for a new group, so the next keyframe
+      // need not wait out the current group (draft-22 §9.20.19, §10.6).
+      const newGroupRequest = forward === 1 && sub.mediaType === 'video' && sub.dynamicGroups
+        ? (sub.largestGroup ?? -1n) + 1n : undefined;
+      this.requestForward(requestId, forward, newGroupRequest);
     }
   }
 
   /** REQUEST_UPDATE with FORWARD for one subscription; a failure is reported, not thrown. */
-  private requestForward(requestId: bigint, forward: 0 | 1): void {
+  private requestForward(requestId: bigint, forward: 0 | 1, newGroupRequest?: bigint): void {
     if (!this.connection) return;
-    this.connection.requestUpdate(varint(requestId), { forward }).catch((err: unknown) => {
+    const options = newGroupRequest === undefined ? { forward } : { forward, newGroupRequest };
+    this.connection.requestUpdate(varint(requestId), options).catch((err: unknown) => {
       const cause = err instanceof Error ? err : new Error(String(err));
       this.log.warn('REQUEST_UPDATE forward:%d failed for reqId=%s: %s', forward, requestId, cause.message);
       this.emitError(createPlayerError(
@@ -8355,6 +8382,7 @@ export class MoqtPlayer {
           // means no state is retained for it.
           const confirmed = this.subscriptionManager?.getMediaType(alias);
           if (confirmed !== 'video') return;
+          this.noteVideoGroup(alias, BigInt(sub.groupId));
           subgroupLifecycle.set(streamId, {
             groupId: sub.groupId,
             endOfGroup: sub.isEndOfGroup,
@@ -8470,6 +8498,7 @@ export class MoqtPlayer {
         const datagramMedia = this.subscriptionManager?.getMediaType(alias);
         if (datagramMedia === undefined || !this.subscriptionManager) return;
         if (datagramMedia === 'audio' || datagramMedia === 'video') this._datagramObjects[datagramMedia]++;
+        if (datagramMedia === 'video') this.noteVideoGroup(alias, BigInt(datagram.groupId));
         if (datagramMedia === 'audio' && datagram.status === undefined) {
           this.noteAudioDatagram(alias, BigInt(datagram.groupId), BigInt(datagram.objectId));
         }
