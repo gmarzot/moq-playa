@@ -339,6 +339,13 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ renderCushionFloorMs: 300, renderCushionMaxMs: 200 }))).toThrow(RangeError);
   });
 
+  it('accepts the three congestionControl values and rejects others', () => {
+    for (const cc of ['default', 'throughput', 'low-latency'] as const) {
+      expect(() => validateConfig(minConfig({ congestionControl: cc }))).not.toThrow();
+    }
+    expect(() => validateConfig(minConfig({ congestionControl: 'fast' as any }))).toThrow(RangeError);
+  });
+
   it('accepts a render cushion floor at or below its max', () => {
     expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 50 }))).not.toThrow();
     expect(() => validateConfig(minConfig({ renderCushionFloorMs: 50, renderCushionMaxMs: 400 }))).not.toThrow();

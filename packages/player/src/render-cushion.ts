@@ -31,6 +31,13 @@ import type { ClockSource } from '@openmoq/playback';
 export const RENDER_CUSHION_MAX_US = 750_000;
 
 /**
+ * Render-range cap unless low-latency congestion control is requested: room
+ * for a publisher that sends a group in one burst. The cushion still only
+ * rises when its inputs push it.
+ */
+export const RENDER_CUSHION_BURST_MAX_US = 3_000_000;
+
+/**
  * Upward slew (µs of cushion per second of wall clock). The playout buffer
  * can only fill as fast as media arrives, so faster adoption buys nothing;
  * 100 ms/s reaches the cap from the floor in ~5.5 s.

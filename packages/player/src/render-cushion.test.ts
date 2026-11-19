@@ -15,6 +15,7 @@ import { describe, it, expect } from 'vitest';
 import {
   RenderCushionSmoother,
   RENDER_CUSHION_MAX_US,
+  RENDER_CUSHION_BURST_MAX_US,
   RENDER_CUSHION_RISE_US_PER_SEC,
   RENDER_CUSHION_FALL_US_PER_SEC,
 } from './render-cushion.js';
@@ -34,6 +35,14 @@ describe('RenderCushionSmoother', () => {
     expect(s.raiseTo(5_000_000)).toBe(2_000_000);
     clock.advance(1_000_000);
     expect(s.update(200_000)).toBe(2_000_000 - RENDER_CUSHION_FALL_US_PER_SEC);
+  });
+
+  it('repeated raises reach the burst cap and clamp there', () => {
+    const clock = makeClock();
+    const s = new RenderCushionSmoother({ floorUs: 200_000, maxUs: RENDER_CUSHION_BURST_MAX_US }, clock);
+    s.update(0);
+    for (const us of [900_000, 1_800_000, 2_700_000]) expect(s.raiseTo(us)).toBe(us);
+    expect(s.raiseTo(4_000_000)).toBe(RENDER_CUSHION_BURST_MAX_US);
   });
 
   it('first update snaps to the clamped target (no slew from fiction)', () => {

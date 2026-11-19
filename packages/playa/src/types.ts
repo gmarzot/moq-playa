@@ -35,7 +35,9 @@ export interface PlayerOptions {
   /** Issuer-supplied credentials for SETUP and subsequent requests. */
   readonly authorization?: MoqtPlayerConfig['authorization'];
   /** WebTransport congestion-control hint, which the browser may ignore;
-   *  `Player.congestionControl` reports what it applied. */
+   *  `Player.congestionControl` reports what it applied. `'low-latency'` also
+   *  keeps the LOC render cushion at its live cap; otherwise it may grow to
+   *  ride out bursty arrival. */
   readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
   /** Draft-18: incoming streams allowed to await classification or SETUP at
    *  once; at the bound, intake waits. Default: no bound beyond QUIC's

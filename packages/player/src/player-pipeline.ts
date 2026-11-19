@@ -24,7 +24,7 @@ import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
-import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
+import { RenderCushionSmoother, RENDER_CUSHION_MAX_US, RENDER_CUSHION_BURST_MAX_US } from './render-cushion.js';
 import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
@@ -194,12 +194,16 @@ function cushionBounds(
     ? config.renderCushionFloorMs * 1000
     : computePlaybackDelayUs(undefined, handshakeRttMs,
       targetLatencyMs !== undefined ? targetLatencyMs * 1000 : undefined);
-  // The cap follows the target latency when one is known (config, else
-  // catalog), so jitter cannot grow the cushion past the latency the
-  // publisher asked for; an explicit cap wins. A floor above the cap lifts it.
-  const defaultMaxUs = targetLatencyMs !== undefined
-    ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
-    : RENDER_CUSHION_MAX_US;
+  // Low-latency congestion control keeps the live cap, which follows the
+  // target latency when one is known (config, else catalog). Otherwise the
+  // cap leaves room for bursty arrival. An explicit cap wins; a floor above
+  // the cap lifts it.
+  const lowLatency = config.congestionControl === 'low-latency';
+  const defaultMaxUs = !lowLatency
+    ? RENDER_CUSHION_BURST_MAX_US
+    : targetLatencyMs !== undefined
+      ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
+      : RENDER_CUSHION_MAX_US;
   const maxUs = Math.max(
     config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : defaultMaxUs,
     floorUs,

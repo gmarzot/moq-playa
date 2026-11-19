@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { RENDER_CUSHION_MAX_US, RENDER_CUSHION_FALL_US_PER_SEC, RENDER_CUSHION_RISE_US_PER_SEC } from './render-cushion.js';
+import { RENDER_CUSHION_MAX_US, RENDER_CUSHION_BURST_MAX_US, RENDER_CUSHION_FALL_US_PER_SEC, RENDER_CUSHION_RISE_US_PER_SEC } from './render-cushion.js';
 import {
   computePlaybackDelayUs,
   createPipelines,
@@ -774,18 +774,18 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     schedule(capped);
     expect(capped.getRenderCushionUs!()).toBe(120_000);
 
-    const lifted = createPipelines(withDecoder({ renderCushionFloorMs: 900 }), mockClock, LOC_AV, mockCallbacks());
+    const lifted = createPipelines(withDecoder({ renderCushionFloorMs: 900, congestionControl: 'low-latency' }), mockClock, LOC_AV, mockCallbacks());
     schedule(lifted);
     expect(lifted.getRenderCushionUs!()).toBe(900_000);
 
-    // No explicit cap: the catalog target latency is the ceiling, and a
-    // config target latency overrides the catalog's.
-    const byCatalog = createPipelines(withDecoder({ renderCushionFloorMs: 50 }), mockClock,
+    // Low latency, no explicit cap: the catalog target latency is the
+    // ceiling, and a config target latency overrides the catalog's.
+    const byCatalog = createPipelines(withDecoder({ renderCushionFloorMs: 50, congestionControl: 'low-latency' }), mockClock,
       { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
     schedule(byCatalog);
     expect(byCatalog.getRenderCushionUs!()).toBe(100_000);
 
-    const byConfig = createPipelines(withDecoder({ renderCushionFloorMs: 50, targetLatencyMs: 300 }), mockClock,
+    const byConfig = createPipelines(withDecoder({ renderCushionFloorMs: 50, targetLatencyMs: 300, congestionControl: 'low-latency' }), mockClock,
       { ...LOC_AV, targetLatencyMs: 100 }, mockCallbacks());
     schedule(byConfig);
     expect(byConfig.getRenderCushionUs!()).toBe(300_000);
@@ -804,6 +804,123 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     };
     const result = createPipelines(minimalConfig({ createMediaSource: () => ({ initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null }) as any }), mockClock, cmaf, mockCallbacks());
     expect(result.getRenderCushionUs).toBeUndefined();
+  });
+});
+
+describe('createPipelines — LOC cushion cap by requested congestion control', () => {
+  const LOC_AV: TrackInfo = {
+    video: { codec: 'avc1.64001e', width: 1920, height: 1080, packaging: 'loc' },
+    audio: { codec: 'opus', samplerate: 48000, packaging: 'loc' },
+  };
+
+  /** A LOC session whose gap timeout reads `gapUs()`; `schedule` advances the cushion. */
+  function session(overrides: Partial<MoqtPlayerConfig>, gapUs: () => number, trackInfo: TrackInfo = LOC_AV) {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const result = createPipelines(minimalConfig({
+      createVideoDecoder: () => ({
+        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+        state: 'unconfigured', decodeQueueSize: 0, ondequeue: null,
+      }) as any,
+      ...overrides,
+    }), clock, trackInfo, mockCallbacks());
+    Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', { get: gapUs, configurable: true });
+    return {
+      result,
+      at: (us: number) => { nowUs = us; },
+      schedule: (): number => (result.commandDispatcher as any)._getPlaybackDelayUs(),
+    };
+  }
+
+  /** The cap: the first scheduled update snaps to min(gap, cap). */
+  const capUs = (overrides: Partial<MoqtPlayerConfig>, trackInfo?: TrackInfo): number =>
+    session(overrides, () => 10_000_000, trackInfo).schedule();
+
+  it('low-latency keeps the live cap; throughput, default and unset take the burst cap', () => {
+    expect(capUs({ congestionControl: 'low-latency' })).toBe(RENDER_CUSHION_MAX_US);
+    expect(capUs({ congestionControl: 'throughput' })).toBe(RENDER_CUSHION_BURST_MAX_US);
+    expect(capUs({ congestionControl: 'default' })).toBe(RENDER_CUSHION_BURST_MAX_US);
+    expect(capUs({})).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
+  it('an explicit renderCushionMaxMs wins in every mode', () => {
+    for (const cc of ['low-latency', 'throughput', 'default', undefined] as const) {
+      expect(capUs({ renderCushionMaxMs: 1200, ...(cc ? { congestionControl: cc } : {}) })).toBe(1_200_000);
+    }
+  });
+
+  it('the target latency caps only under low latency', () => {
+    const target = { ...LOC_AV, targetLatencyMs: 400 };
+    expect(capUs({ congestionControl: 'low-latency' }, target)).toBe(400_000);
+    expect(capUs({ congestionControl: 'low-latency', targetLatencyMs: 600 }, target)).toBe(600_000);
+    expect(capUs({ congestionControl: 'low-latency', targetLatencyMs: 2000 }, target)).toBe(RENDER_CUSHION_MAX_US);
+    expect(capUs({ congestionControl: 'throughput' }, target)).toBe(RENDER_CUSHION_BURST_MAX_US);
+    expect(capUs({}, target)).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
+  it('a sustained high gap timeout slews the cushion up to the burst cap and no further', () => {
+    let gapUs = 0;
+    const s = session({}, () => gapUs);
+    expect(s.schedule()).toBe(200_000);
+    gapUs = 3_500_000;
+    let prevUs = 200_000;
+    for (let t = 1; t <= 40; t++) {
+      s.at(t * 1_000_000);
+      const us = s.schedule();
+      expect(us).toBeGreaterThanOrEqual(prevUs);
+      expect(us - prevUs).toBeLessThanOrEqual(RENDER_CUSHION_RISE_US_PER_SEC);
+      prevUs = us;
+    }
+    expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
+  it('a clean steady stream keeps the cushion at the floor under the burst cap', () => {
+    const s = session({}, () => 120_000);
+    for (let t = 0; t <= 600; t++) {
+      s.at(t * 100_000);
+      expect(s.schedule()).toBe(200_000);
+    }
+  });
+
+  it('smooth: repeated late arrivals raise the cushion to the burst cap, never past it', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const result = createPipelines(minimalConfig({
+      latencyMode: 'smooth',
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
+    }), clock, { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
+    Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', { get: () => 0, configurable: true });
+    expect(result.latencyPolicy?.stats.ceilingMs).toBe(RENDER_CUSHION_BURST_MAX_US / 1000);
+
+    nowUs = 100_000;
+    result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
+    nowUs = 200_000;
+    videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);
+    // Past the startup grace, each frame arrives 400 ms later than the last relative to its slot.
+    let prevUs = result.getRenderCushionUs!();
+    const seen: number[] = [];
+    for (let i = 1; i <= 10; i++) {
+      nowUs = 3_200_000 + i * 1_000_000;
+      videoDecoder.onFrame?.({ timestamp: 1_100_000 + nowUs - 200_000 - i * 400_000 - 1_000_000, close: vi.fn() } as any, 0);
+      const us = result.getRenderCushionUs!();
+      expect(us).toBeGreaterThanOrEqual(prevUs);
+      expect(us).toBeLessThanOrEqual(RENDER_CUSHION_BURST_MAX_US);
+      seen.push(us);
+      prevUs = us;
+    }
+    expect(seen.some((us) => us > 2_000_000 && us < RENDER_CUSHION_BURST_MAX_US)).toBe(true);
+    expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
   });
 });
 
