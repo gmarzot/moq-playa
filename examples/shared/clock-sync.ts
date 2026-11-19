@@ -33,6 +33,20 @@ export function offsetFromSamples(samples: readonly ClockSample[]): ClockOffset 
   };
 }
 
+/**
+ * Date.now() at `perfMs`, a performance.now() timestamp, through the clocks'
+ * pairing at `perfNowMs`/`wallNowMs`. performance.timeOrigin is fixed at page
+ * load, and timeOrigin + perfMs drifts from Date.now() over hours.
+ */
+export function wallMsAt(perfMs: number, perfNowMs: number, wallNowMs: number): number {
+  return wallNowMs - (perfNowMs - perfMs);
+}
+
+/** How far Date.now() runs ahead of performance.timeOrigin + performance.now() (ms). */
+export function pageTimerLagMs(timeOriginMs: number, perfNowMs: number, wallNowMs: number): number {
+  return wallNowMs - (timeOriginMs + perfNowMs);
+}
+
 /** A `/time` body: seconds since the epoch with a fraction (nginx `$msec`), as ms. */
 export function parseServerTime(body: string): number | null {
   const s = Number(body.trim());
