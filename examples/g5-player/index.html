@@ -91,6 +91,9 @@
       --badge-ok-fg: #4d4;
       --badge-ok-border: #2f5a35;
       --badge-ok-bg: #16271a;
+      --badge-quiet-fg: #8fae95;
+      --badge-quiet-border: #2f4235;
+      --badge-quiet-bg: #1b231d;
       --badge-bad-fg: #e55;
       --badge-bad-border: #5a2f2f;
       --badge-bad-bg: #271616;
@@ -180,6 +183,9 @@
       --badge-ok-fg: #1e7a46;
       --badge-ok-border: #4ea26c;
       --badge-ok-bg: #e8f5ec;
+      --badge-quiet-fg: #4f6e59;
+      --badge-quiet-border: #9db8a5;
+      --badge-quiet-bg: #eef3ef;
       --badge-bad-fg: #b3261e;
       --badge-bad-border: #db7368;
       --badge-bad-bg: #fbe9e7;
@@ -535,7 +541,7 @@
     }
     .cat-head .cat-link:hover { color: var(--text-hover); text-decoration: underline; }
     /* MoQT state badges: one word; grey idle, yellow waiting or paused,
-       green flowing, red fault. Right-justified on their line. */
+       green flowing, grey-green active but quiet, red fault. Right-justified on their line. */
     .badge {
       border-radius: 4px; padding: 1px 6px; white-space: nowrap; flex-shrink: 0;
       font-weight: 700; font-size: .68rem; letter-spacing: .06em;
@@ -543,6 +549,7 @@
     }
     .badge.wait { color: var(--badge-wait-fg); border-color: var(--badge-wait-border); background: var(--badge-wait-bg); }
     .badge.ok { color: var(--badge-ok-fg); border-color: var(--badge-ok-border); background: var(--badge-ok-bg); }
+    .badge.quiet { color: var(--badge-quiet-fg); border-color: var(--badge-quiet-border); background: var(--badge-quiet-bg); }
     .badge.bad { color: var(--badge-bad-fg); border-color: var(--badge-bad-border); background: var(--badge-bad-bg); }
     .cat-track .badge { margin-left: auto; }
     .cat-badges { display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto; }
