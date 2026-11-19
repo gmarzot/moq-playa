@@ -2149,6 +2149,110 @@ describe('MoqtPlayer', () => {
       expect(call[1]).toEqual({ forward: 1 });
     });
 
+    describe('resume NEW_GROUP_REQUEST (draft-22 §9.20.19, §10.6)', () => {
+      /** Media request IDs by track name, after SUBSCRIBE_OK with the given Track Properties. */
+      async function ackWithProps(
+        adapter: ReturnType<typeof createMockAdapter>,
+        propsFor: (name: string) => Map<bigint, unknown[]> | undefined,
+      ): Promise<Map<string, bigint>> {
+        const ids = new Map<string, bigint>();
+        const calls = vi.mocked(adapter.subscribe).mock.calls;
+        const results = vi.mocked(adapter.subscribe).mock.results;
+        for (let i = 1; i < calls.length; i++) {
+          const name = new TextDecoder().decode((calls[i] as any)[1]);
+          const requestId = await results[i]!.value;
+          ids.set(name, BigInt(requestId));
+          const trackProperties = propsFor(name);
+          adapter._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map(),
+            ...(trackProperties ? { trackProperties } : {}),
+          } as unknown as ControlMessage);
+        }
+        return ids;
+      }
+
+      function openSubgroup(adapter: ReturnType<typeof createMockAdapter>, streamId: bigint, alias: bigint, groupId: number) {
+        adapter._triggerDataStream(streamId, {
+          type: 'subgroup',
+          header: {
+            typeByte: 0x10, trackAlias: varint(alias), groupId: varint(groupId), subgroupId: varint(0),
+            publisherPriority: 128, hasExtensions: false, isEndOfGroup: false,
+          },
+        } as unknown as DataStreamHeader);
+      }
+
+      const dynamic = () => new Map<bigint, unknown[]>([[0x30n, [1n]]]);
+
+      async function resume(adapter: ReturnType<typeof createMockAdapter>, player: MoqtPlayer) {
+        player.play();
+        player.pause();
+        (adapter.requestUpdate as any).mockClear();
+        player.play();
+        return new Map(vi.mocked(adapter.requestUpdate).mock.calls.map((c: any[]) => [BigInt(c[0]), c[1]]));
+      }
+
+      it('dynamic-group video asks for the group after the largest one received', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+        const ids = await ackWithProps(adapter, (name) => (name === 'video' ? dynamic() : undefined));
+        const video = ids.get('video')!;
+        openSubgroup(adapter, 4n, video, 7);
+        openSubgroup(adapter, 8n, video, 9);
+        openSubgroup(adapter, 12n, video, 8);
+
+        const updates = await resume(adapter, player);
+        expect(updates.get(video)).toEqual({ forward: 1, newGroupRequest: 10n });
+        await player.destroy();
+      });
+
+      it('dynamic-group video with no group received asks with 0', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+        const ids = await ackWithProps(adapter, (name) => (name === 'video' ? dynamic() : undefined));
+
+        const updates = await resume(adapter, player);
+        expect(updates.get(ids.get('video')!)).toEqual({ forward: 1, newGroupRequest: 0n });
+        await player.destroy();
+      });
+
+      it('video without DYNAMIC_GROUPS = 1 resumes with forward only', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+        const ids = await ackWithProps(adapter, (name) => (name === 'video'
+          ? new Map<bigint, unknown[]>([[0x30n, [0n]]]) : undefined));
+        openSubgroup(adapter, 4n, ids.get('video')!, 7);
+
+        const updates = await resume(adapter, player);
+        expect(updates.get(ids.get('video')!)).toEqual({ forward: 1 });
+        await player.destroy();
+      });
+
+      it('audio never carries it, even with DYNAMIC_GROUPS = 1', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+        const ids = await ackWithProps(adapter, dynamic);
+        openSubgroup(adapter, 6n, ids.get('audio')!, 3);
+
+        const updates = await resume(adapter, player);
+        expect(updates.get(ids.get('audio')!)).toEqual({ forward: 1 });
+        expect(updates.get(ids.get('video')!)).toEqual({ forward: 1, newGroupRequest: 0n });
+        await player.destroy();
+      });
+
+      it('pause sends forward:0 only', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadCatalogAndSubscribe(adapter, { ack: false });
+        const ids = await ackWithProps(adapter, dynamic);
+        openSubgroup(adapter, 4n, ids.get('video')!, 7);
+        player.play();
+        (adapter.requestUpdate as any).mockClear();
+
+        player.pause();
+        for (const call of vi.mocked(adapter.requestUpdate).mock.calls) expect(call[1]).toEqual({ forward: 0 });
+        await player.destroy();
+      });
+    });
+
     it('play() emits error when requestUpdate rejects (§9.11)', async () => {
       const adapter = createMockAdapter();
       const player = await loadCatalogAndSubscribe(adapter);

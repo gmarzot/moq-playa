@@ -26,6 +26,8 @@ export interface ActiveSubscription {
   trackName: string;
   /** Unknown until SUBSCRIBE_OK; a Request ID is never an alias. */
   trackAlias: bigint | null;
+  /** Track Property DYNAMIC_GROUPS (0x30) = 1 at SUBSCRIBE_OK (draft-22 §10.6). */
+  dynamicGroups?: true;
 }
 
 /** Pending media subscription info stored per requestId. */
@@ -239,6 +241,7 @@ export function handleControlMessage(
         const props = (msg as { trackProperties?: Map<bigint, unknown[]> }).trackProperties;
         // Draft-18 TIMESCALE track property (0x08): the units of the track's object Timestamps.
         const timescale = props?.get(0x08n)?.[0];
+        if (props?.get(0x30n)?.[0] === 1n) active.dynamicGroups = true;
         // Timestamp properties: Track Properties, or Track Extensions on draft-16.
         const ext = (msg as { trackExtensions?: unknown }).trackExtensions;
         const timestamps = parseTimestampTrack(
