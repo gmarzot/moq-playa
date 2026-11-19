@@ -136,6 +136,34 @@ describe('player soak recovery', () => {
   });
 });
 
+describe('player soak hidden-tab pause', () => {
+  it('gives each return from a hidden tab: paused or not, first fresh frame, and what followed', () => {
+    // Picture and playhead held for 3 s soon after the first return.
+    const s = samples(200, (i) => (i > 64 && i < 77 ? { pictureDigest: '64', presentedFrames: 480, mediaTimeS: 16 } : {}));
+    const hides = [{ kind: 'hidden', method: 'emulated', startEpochMs: T0 + 5000, endEpochMs: T0 + 15_000 },
+      { kind: 'hidden', method: 'emulated', startEpochMs: T0 + 30_000, endEpochMs: T0 + 40_000 }];
+    const t = [
+      { wallEpochMs: T0 + 12_000, events: [{ timeMs: 0, type: 'lifecycle', data: { state: 'hidden', paused: 'silent' } }] },
+      { wallEpochMs: T0 + 17_000, events: [{ timeMs: 0, type: 'stall', data: {} }, { timeMs: 0, type: 'stall', data: {} }] },
+      { wallEpochMs: T0 + 33_000, events: [{ timeMs: 0, type: 'stall', data: {} }] },
+    ];
+    const nudgeLog = [16_000, 21_000, 35_000, 45_000].map((ms) => ({ t: T0 + ms, text: '[MSE] stall nudge 1.00 → 1.10' }));
+    const r = assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true, hiddenPause: true, nudgeLog });
+    expect(r.verdict).toBe('played');
+    expect(r.hiddenPause).toEqual([
+      { startEpochMs: T0 + 5000, hiddenMs: 10_000, paused: 'silent', freshFrameAfterMs: 0,
+        stalls: { count: 1, totalMs: 3000, longestMs: 3000 }, frozen: { count: 1, totalMs: 3000, longestMs: 3000 },
+        stallNudges: 2, playerStalls: 2 },
+      { startEpochMs: T0 + 30_000, hiddenMs: 10_000, paused: null, freshFrameAfterMs: 0,
+        stalls: { count: 0, totalMs: 0, longestMs: 0 }, frozen: { count: 0, totalMs: 0, longestMs: 0 },
+        stallNudges: 1, playerStalls: 0 },
+    ]);
+    expect(assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true, hiddenPause: true })
+      .hiddenPause?.map((h) => h.stallNudges)).toEqual([null, null]);
+    expect(assessSoak({ samples: s, ticks: t, disruptions: hides, adverse: true })).not.toHaveProperty('hiddenPause');
+  });
+});
+
 describe('player soak ABR ladder', () => {
   /** One tick a second playing the rung at `kbps(second)`. */
   const ticks = (n: number, kbps: (s: number) => number) => Array.from({ length: n }, (_, s) => ({

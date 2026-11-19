@@ -49,6 +49,7 @@ const player = new Player(null, {
   startLevel: Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   ...(params.get('latency') === 'smooth' ? { latencyMode: 'smooth' as const } : {}),
+  ...(params.get('pauseWhenHidden') === '1' ? { pauseWhenHidden: true } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : (['error', 'warn', 'info'] as const).find((l) => l === params.get('log')) ?? 'none',
     ...(params.get('warmStart') === '1' ? { warmStartCurrentGroup: true } : {}),
@@ -75,6 +76,15 @@ const player = new Player(null, {
     },
   },
 });
+
+/** Log the MSE adapter's playhead nudges, reported only to this hook; the adapter exists after the catalog. */
+function hookPlayheadAdjust(): void {
+  const ms = (player as any).engine?.mediaSource;
+  if (ms && ms.onPlayheadAdjust === null) {
+    ms.onPlayheadAdjust = (kind: string, from: number, to: number) => console.warn(
+      `[MSE] ${kind === 'nudge' ? 'stall nudge' : 'post-stall snap to live edge'} ${from.toFixed(2)} → ${to.toFixed(2)}`);
+  }
+}
 
 for (const type of ['ready', 'playing', 'statechange', 'error', 'stall'] as const) {
   player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
@@ -134,6 +144,7 @@ function audioRms(): number {
 
 function sample(): void {
   if (!recording || !analyser) return;
+  hookPlayheadAdjust();
   probe.drawImage(frameOutput ? canvas : video, 0, 0, 64, 36);
   if (canvasObserver) {
     firstFrameTimestampUs ??= canvasObserver.timestampUs;
