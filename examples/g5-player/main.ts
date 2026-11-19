@@ -627,7 +627,7 @@ async function main(): Promise<void> {
 
   // ── MoQT state badges ─────────────────────────────────────────────
   // SETUP is the session; each FWD is one SUBSCRIBE: grey none or awaiting
-  // SUBSCRIBE_OK, yellow Forward State 0, green objects arriving, red silent.
+  // SUBSCRIBE_OK, yellow Forward State 0, green objects arriving, grey-green no object for a second.
 
   let setupBadgeState: { tone: BadgeTone; detail: string } = { tone: 'idle', detail: 'No session' };
   /** The catalog SUBSCRIBE can be accepted long before any catalog arrives. */
@@ -687,7 +687,7 @@ async function main(): Promise<void> {
     const arrived = sub.kind === 'video' || sub.kind === 'audio' ? lastArrivalMs[sub.kind] : undefined;
     const last = arrived === undefined ? undefined : Math.max(arrived, resumedAtMs);
     if (last !== undefined && nowMs - last > SILENT_MS && player.state === 'playing') {
-      setBadge(el, 'FWD 1', 'bad',
+      setBadge(el, 'FWD 1', 'quiet',
         `${req} · Forward State 1, but nothing has arrived for ${((nowMs - last) / 1000).toFixed(1)}s`);
       return;
     }
