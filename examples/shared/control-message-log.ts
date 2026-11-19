@@ -1,17 +1,20 @@
 /**
  * One MoQT control message as a log line: its type, then its fields, with
- * message parameters by name.
+ * message and setup parameters by name.
  */
-import { MessageParam } from '@openmoq/transport';
+import { MessageParam, SetupParam } from '@openmoq/transport';
 
-/** MessageParam names by type code; the first name wins where drafts share a code. */
-const PARAM_NAMES: ReadonlyMap<bigint, string> = (() => {
+/** Parameter names by type code; the first name wins where drafts share a code. */
+function namesOf(params: Record<string, bigint>): ReadonlyMap<bigint, string> {
   const names = new Map<bigint, string>();
-  for (const [name, code] of Object.entries(MessageParam)) {
+  for (const [name, code] of Object.entries(params)) {
     if (!names.has(BigInt(code))) names.set(BigInt(code), name);
   }
   return names;
-})();
+}
+const PARAM_NAMES = namesOf(MessageParam);
+const SETUP_NAMES = namesOf(SetupParam);
+const SETUP_TYPES = new Set(['CLIENT_SETUP', 'SERVER_SETUP', 'SETUP']);
 
 const MAX_TEXT_BYTES = 64;
 /** AUTHORIZATION_TOKEN, in message parameters and setup options alike. */
@@ -55,16 +58,18 @@ function describeParameters(params: Map<unknown, unknown>, names: ReadonlyMap<bi
   }).join(' ');
 }
 
-const NO_NAMES: ReadonlyMap<bigint, string> = new Map([[AUTH_TOKEN_CODE, 'AUTHORIZATION_TOKEN']]);
 
 export function describeControlMessage(message: unknown, maxChars = 300): string {
   if (message === null || typeof message !== 'object') return String(message);
   const { type, ...fields } = message as Record<string, unknown>;
+  // trackExtensions is the deprecated alias of trackProperties.
+  if (fields['trackProperties'] !== undefined) delete fields['trackExtensions'];
   const parts = [String(type)];
   for (const [key, value] of Object.entries(fields)) {
-    if (value === undefined) continue;
+    if (value === undefined || (value instanceof Map && value.size === 0)) continue;
     if ((key === 'parameters' || key === 'setupOptions') && value instanceof Map) {
-      if (value.size > 0) parts.push(describeParameters(value, key === 'parameters' ? PARAM_NAMES : NO_NAMES));
+      const setup = key === 'setupOptions' || SETUP_TYPES.has(String(type));
+      parts.push(describeParameters(value, setup ? SETUP_NAMES : PARAM_NAMES));
     } else if (isTokenKey(key)) {
       parts.push(`${key}=${REDACTED}`);
     } else {

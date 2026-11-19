@@ -533,7 +533,7 @@ async function main(): Promise<void> {
   /** `?debug=1`: each control message where it crosses the wire. */
   const noteControlMessage = (e: { type: string; message?: unknown }): void => {
     if (!debug || (e.type !== 'control_message_created' && e.type !== 'control_message_parsed')) return;
-    log(`MoQT ${e.type === 'control_message_created' ? 'send' : 'recv'}: ${describeControlMessage(e.message)}`);
+    log(`MOQT ${e.type === 'control_message_created' ? 'send' : 'recv'}: ${describeControlMessage(e.message)}`);
   };
   const player = new Player(playerContainer, {
     url: relayUrl,
