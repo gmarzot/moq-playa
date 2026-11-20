@@ -1096,6 +1096,8 @@ function runFactoryPath(
     driftThresholdMs: harness.driftThresholdUs / 1000,
     maxBufferDepth: harness.maxBufferDepth,
     lateFrameThresholdMs: harness.dropThresholdUs / 1000,
+    // The manual arm models the gap-driven cushion under the live cap.
+    congestionControl: 'low-latency',
     createVideoDecoder: () => decoder,
     createRenderer: () => renderer,
   };

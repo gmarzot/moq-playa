@@ -19,6 +19,7 @@ import {
   type TrackInfo,
 } from './player-pipeline.js';
 import type { MoqtPlayerConfig } from './config.js';
+import { SMOOTH_MARGIN_US } from './latency-policy.js';
 import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@openmoq/playback';
 import type { CommandDispatcher } from './command-dispatcher.js';
 import type { MediaSourceLike, VideoDecoderLike, VideoRendererLike } from './interfaces.js';
@@ -312,7 +313,7 @@ describe('createPipelines', () => {
     expect(renderer.enqueue).toHaveBeenCalledTimes(2);
   });
 
-  it('smooth latency: a late frame raises the shared cushion and renders at its new slot; live renders it now', () => {
+  it('smooth latency: a late frame raises the shared cushion and renders at its new slot; low-latency live renders it now', () => {
     const run = (latencyMode: 'live' | 'smooth') => {
       let nowUs = 0;
       const clock: ClockSource = { now: () => nowUs };
@@ -331,6 +332,7 @@ describe('createPipelines', () => {
         createRenderer: () => renderer as any,
         latencyMode,
         smoothFloorMs: 0,
+        ...(latencyMode === 'live' ? { congestionControl: 'low-latency' as const } : {}),
       });
       const trackInfo: TrackInfo = { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined };
       const result = createPipelines(config, clock, trackInfo, mockCallbacks());
@@ -812,16 +814,28 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
     video: { codec: 'avc1.64001e', width: 1920, height: 1080, packaging: 'loc' },
     audio: { codec: 'opus', samplerate: 48000, packaging: 'loc' },
   };
+  const EXPANDING = ['throughput', 'default', undefined] as const;
+  type Mode = (typeof EXPANDING)[number] | 'low-latency';
+  const ALL_MODES: readonly Mode[] = [...EXPANDING, 'low-latency'];
+  const cc = (mode: Mode): Partial<MoqtPlayerConfig> => (mode ? { congestionControl: mode } : {});
 
-  /** A LOC session whose gap timeout reads `gapUs()`; `schedule` advances the cushion. */
-  function session(overrides: Partial<MoqtPlayerConfig>, gapUs: () => number, trackInfo: TrackInfo = LOC_AV) {
+  /** A LOC video session whose gap timeout reads `gapUs()`; frames go straight to decoder output. */
+  function session(overrides: Partial<MoqtPlayerConfig>, gapUs: () => number = () => 0, trackInfo: TrackInfo = LOC_AV) {
     let nowUs = 0;
     const clock: ClockSource = { now: () => nowUs };
+    const videoDecoder = {
+      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
+      state: 'configured', decodeQueueSize: 0, ondequeue: null,
+      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
+      onError: null as ((error: Error) => void) | null,
+    };
+    const renderer = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
     const result = createPipelines(minimalConfig({
-      createVideoDecoder: () => ({
-        configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
-        state: 'unconfigured', decodeQueueSize: 0, ondequeue: null,
-      }) as any,
+      createVideoDecoder: () => videoDecoder as any,
+      createRenderer: () => renderer as any,
       ...overrides,
     }), clock, trackInfo, mockCallbacks());
     Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', { get: gapUs, configurable: true });
@@ -829,33 +843,48 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
       result,
       at: (us: number) => { nowUs = us; },
       schedule: (): number => (result.commandDispatcher as any)._getPlaybackDelayUs(),
+      /** Reference: capture 1.0 s renders at 0.1 s. */
+      anchor: () => { nowUs = 100_000; result.syncController.setAudioReference(1_000_000n); },
+      /** Decoder output for the frame captured at `captureUs`; returns its render time. */
+      frame: (captureUs: number): number => {
+        videoDecoder.onFrame?.({ timestamp: captureUs, close: vi.fn() } as any, 0);
+        return renderer.enqueue.mock.calls.at(-1)![1] as number;
+      },
+      cushionUs: () => result.getRenderCushionUs!(),
     };
   }
+  /** Render time before the cushion for a capture time, under `anchor()`. */
+  const baseRenderUs = (captureUs: number) => 100_000 + captureUs - 1_000_000;
 
   /** The cap: the first scheduled update snaps to min(gap, cap). */
   const capUs = (overrides: Partial<MoqtPlayerConfig>, trackInfo?: TrackInfo): number =>
     session(overrides, () => 10_000_000, trackInfo).schedule();
 
-  it('low-latency keeps the live cap; throughput, default and unset take the burst cap', () => {
-    expect(capUs({ congestionControl: 'low-latency' })).toBe(RENDER_CUSHION_MAX_US);
-    expect(capUs({ congestionControl: 'throughput' })).toBe(RENDER_CUSHION_BURST_MAX_US);
-    expect(capUs({ congestionControl: 'default' })).toBe(RENDER_CUSHION_BURST_MAX_US);
-    expect(capUs({})).toBe(RENDER_CUSHION_BURST_MAX_US);
+  it('low-latency holds the live cap; throughput, default and unset take the burst cap', () => {
+    expect(capUs(cc('low-latency'))).toBe(RENDER_CUSHION_MAX_US);
+    for (const mode of EXPANDING) expect(capUs(cc(mode))).toBe(RENDER_CUSHION_BURST_MAX_US);
   });
 
   it('an explicit renderCushionMaxMs wins in every mode', () => {
-    for (const cc of ['low-latency', 'throughput', 'default', undefined] as const) {
-      expect(capUs({ renderCushionMaxMs: 1200, ...(cc ? { congestionControl: cc } : {}) })).toBe(1_200_000);
+    for (const mode of ALL_MODES) {
+      expect(capUs({ renderCushionMaxMs: 1200, ...cc(mode) })).toBe(1_200_000);
     }
   });
 
   it('the target latency caps only under low latency', () => {
     const target = { ...LOC_AV, targetLatencyMs: 400 };
-    expect(capUs({ congestionControl: 'low-latency' }, target)).toBe(400_000);
-    expect(capUs({ congestionControl: 'low-latency', targetLatencyMs: 600 }, target)).toBe(600_000);
-    expect(capUs({ congestionControl: 'low-latency', targetLatencyMs: 2000 }, target)).toBe(RENDER_CUSHION_MAX_US);
-    expect(capUs({ congestionControl: 'throughput' }, target)).toBe(RENDER_CUSHION_BURST_MAX_US);
-    expect(capUs({}, target)).toBe(RENDER_CUSHION_BURST_MAX_US);
+    expect(capUs(cc('low-latency'), target)).toBe(400_000);
+    expect(capUs({ ...cc('low-latency'), targetLatencyMs: 600 }, target)).toBe(600_000);
+    expect(capUs({ ...cc('low-latency'), targetLatencyMs: 2000 }, target)).toBe(RENDER_CUSHION_MAX_US);
+    for (const mode of EXPANDING) expect(capUs(cc(mode), target)).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
+  it('the smooth ceiling takes the burst cap unless low latency is requested', () => {
+    expect(session({ latencyMode: 'smooth', ...cc('low-latency') }).result.latencyPolicy?.stats.ceilingMs).toBe(2000);
+    for (const mode of EXPANDING) {
+      expect(session({ latencyMode: 'smooth', ...cc(mode) }).result.latencyPolicy?.stats.ceilingMs)
+        .toBe(RENDER_CUSHION_BURST_MAX_US / 1000);
+    }
   });
 
   it('a sustained high gap timeout slews the cushion up to the burst cap and no further', () => {
@@ -874,46 +903,83 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
     expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
   });
 
-  it('a clean steady stream keeps the cushion at the floor under the burst cap', () => {
+  it('a clean steady stream keeps the cushion at the floor', () => {
     const s = session({}, () => 120_000);
-    for (let t = 0; t <= 600; t++) {
-      s.at(t * 100_000);
-      expect(s.schedule()).toBe(200_000);
+    s.anchor();
+    for (let i = 0; i <= 600; i++) {
+      const captureUs = 1_000_000 + i * 33_333;
+      s.at(baseRenderUs(captureUs) + 5_000);   // on time, inside the cushion
+      expect(s.frame(captureUs)).toBe(baseRenderUs(captureUs) + 200_000);
+      expect(s.cushionUs()).toBe(200_000);
+    }
+  });
+
+  it('live: late arrivals raise the cushion by their lateness to the cap; steady arrival lets it fall slowly', () => {
+    const s = session({});
+    s.anchor();
+    s.at(200_000);
+    s.frame(1_100_000);
+    expect(s.cushionUs()).toBe(200_000);
+    // Each arrival 1 s apart in wall time but only 0.6 s apart in capture: 400 ms later than the last.
+    let prevUs = 200_000;
+    const seen: number[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const nowUs = 3_200_000 + i * 1_000_000;
+      const captureUs = 1_000_000 + nowUs - 100_000 - (i * 400_000 + 300_000);
+      s.at(nowUs);
+      s.frame(captureUs);
+      const us = s.cushionUs();
+      expect(us).toBeGreaterThanOrEqual(prevUs);
+      expect(us).toBeLessThanOrEqual(RENDER_CUSHION_BURST_MAX_US);
+      seen.push(us);
+      prevUs = us;
+    }
+    expect(seen[0]).toBe(200_000 + 500_000 + SMOOTH_MARGIN_US);   // 500 ms past its slot
+    expect(seen.some((us) => us > 2_000_000 && us < RENDER_CUSHION_BURST_MAX_US)).toBe(true);
+    expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
+    // Steady on-time arrival: the smoother's fall rate, not a step.
+    const t0 = 3_200_000 + 10 * 1_000_000;
+    s.at(t0 + 1_000_000);
+    s.schedule();
+    expect(s.cushionUs()).toBe(RENDER_CUSHION_BURST_MAX_US - RENDER_CUSHION_FALL_US_PER_SEC);
+  });
+
+  it('live: lateness inside the startup grace does not raise the cushion', () => {
+    const s = session({});
+    s.anchor();
+    s.at(200_000);
+    s.frame(1_100_000);
+    s.at(2_000_000);
+    s.frame(1_100_000);   // 1.7 s late, 1.8 s after the first arrival
+    expect(s.cushionUs()).toBe(200_000);
+  });
+
+  it('low latency: late arrivals never raise the live cushion', () => {
+    {
+      const s = session(cc('low-latency'));
+      s.anchor();
+      s.at(200_000);
+      s.frame(1_100_000);
+      for (let i = 1; i <= 5; i++) {
+        s.at(3_200_000 + i * 1_000_000);
+        s.frame(1_100_000 + i * 100_000);
+      }
+      expect(s.cushionUs()).toBe(200_000);
     }
   });
 
   it('smooth: repeated late arrivals raise the cushion to the burst cap, never past it', () => {
-    let nowUs = 0;
-    const clock: ClockSource = { now: () => nowUs };
-    const videoDecoder = {
-      configure: vi.fn(), decode: vi.fn(), flush: vi.fn(), close: vi.fn(), reset: vi.fn(),
-      state: 'configured', decodeQueueSize: 0, ondequeue: null,
-      onFrame: null as ((frame: unknown, renderTimeUs: number) => void) | null,
-      onError: null as ((error: Error) => void) | null,
-    };
-    const renderer = {
-      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
-      onFirstFrame: null, onFrameRendered: null, onStall: null,
-    };
-    const result = createPipelines(minimalConfig({
-      latencyMode: 'smooth',
-      createVideoDecoder: () => videoDecoder as any,
-      createRenderer: () => renderer as any,
-    }), clock, { video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined }, mockCallbacks());
-    Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', { get: () => 0, configurable: true });
-    expect(result.latencyPolicy?.stats.ceilingMs).toBe(RENDER_CUSHION_BURST_MAX_US / 1000);
-
-    nowUs = 100_000;
-    result.syncController.setAudioReference(1_000_000n);   // capture 1.0 s renders at 0.1 s
-    nowUs = 200_000;
-    videoDecoder.onFrame?.({ timestamp: 1_100_000, close: vi.fn() } as any, 0);
-    // Past the startup grace, each frame arrives 400 ms later than the last relative to its slot.
-    let prevUs = result.getRenderCushionUs!();
+    const s = session({ latencyMode: 'smooth' });
+    s.anchor();
+    s.at(200_000);
+    s.frame(1_100_000);
+    let prevUs = s.cushionUs();
     const seen: number[] = [];
     for (let i = 1; i <= 10; i++) {
-      nowUs = 3_200_000 + i * 1_000_000;
-      videoDecoder.onFrame?.({ timestamp: 1_100_000 + nowUs - 200_000 - i * 400_000 - 1_000_000, close: vi.fn() } as any, 0);
-      const us = result.getRenderCushionUs!();
+      const nowUs = 3_200_000 + i * 1_000_000;
+      s.at(nowUs);
+      s.frame(1_100_000 + nowUs - 200_000 - i * 400_000 - 1_000_000);
+      const us = s.cushionUs();
       expect(us).toBeGreaterThanOrEqual(prevUs);
       expect(us).toBeLessThanOrEqual(RENDER_CUSHION_BURST_MAX_US);
       seen.push(us);
@@ -921,6 +987,24 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
     }
     expect(seen.some((us) => us > 2_000_000 && us < RENDER_CUSHION_BURST_MAX_US)).toBe(true);
     expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
+  it('a burst arriving inside the cushion presents at even frame spacing, not at arrival', () => {
+    for (const mode of EXPANDING) {
+      // A 500 ms cushion; each 15-frame burst lands 20 ms after its last frame's base render time,
+      // so its head is ~490 ms behind base time (past the 100 ms drop threshold) yet inside the cushion.
+      const s = session({ renderCushionFloorMs: 500, ...cc(mode) });
+      s.anchor();
+      const times: number[] = [];
+      for (let burst = 0; burst < 4; burst++) {
+        const captures = Array.from({ length: 15 }, (_, k) => 1_000_000 + (burst * 15 + k) * 33_333);
+        s.at(baseRenderUs(captures.at(-1)!) + 20_000);
+        for (const c of captures) times.push(s.frame(c));
+      }
+      const spacing = times.slice(1).map((t, i) => t - times[i]!);
+      expect(Math.min(...spacing)).toBeGreaterThanOrEqual(33_000);
+      expect(Math.max(...spacing)).toBeLessThanOrEqual(33_700);
+    }
   });
 });
 

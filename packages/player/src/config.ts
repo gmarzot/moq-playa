@@ -373,9 +373,10 @@ export interface PlaybackTuningConfig {
   readonly renderCushionMaxMs?: number;
 
   /**
-   * The congestion control requested of the transport. `'low-latency'` keeps
-   * the LOC render cushion cap at the live bound; anything else, or unset,
-   * favors smooth playback. Set it to what the transport was asked for.
+   * The congestion control requested of the transport. `'low-latency'` holds
+   * the LOC render cushion at the live cap. Anything else, or unset, favors
+   * smooth playback: a late arrival raises the cushion by its lateness, up to
+   * the cap, in live mode too. Set it to what the transport was asked for.
    */
   readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 }
