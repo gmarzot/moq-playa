@@ -17,8 +17,22 @@ import {
   FreezeWatch, noteSeq, rebaseSeqs, stallsCell, SETTLE_WINDOW_MS, type ObjSeq,
 } from './counters.js';
 import {
+  catalogIsLive, latencyReadout, migrateLatencyQuery, nextLiveState, parseLatencySettings, playbackLatency,
+  postureLabel, targetText, type LiveState,
+} from './latency-settings.js';
+import {
   readMdhdTimescale, readSegmentTimeRanges, readTrexDefaults, type TrexDefaults,
 } from '../../packages/browser/src/mp4-box.js';
+
+/** The retired latency params as they arrived, when the URL was rewritten without them. */
+const migratedLatencyQuery: string | null = (() => {
+  const before = location.search;
+  const next = migrateLatencyQuery(new URLSearchParams(before));
+  if (!next) return null;
+  const qs = next.toString();
+  history.replaceState(history.state, '', location.pathname + (qs ? `?${qs}` : '') + location.hash);
+  return before;
+})();
 
 /** `?status=1` shows the playback state over the picture (off by default). */
 let showStatus = new URLSearchParams(location.search).get('status') === '1';
@@ -40,15 +54,8 @@ function playbackParams(p: URLSearchParams) {
     return Number.isFinite(v) && v > 0 ? v : undefined;
   };
   const catchUp = Number(p.get('catchUp'));
-  const smoothCeilingMs = positiveMs('latencyMax');
-  const rawMin = p.get('latencyMin');
-  const min = rawMin === null || rawMin.trim() === '' ? NaN : Number(rawMin);
   return {
-    latencyMode: (p.get('latency') === 'smooth' ? 'smooth' : 'live') as 'live' | 'smooth',
-    targetLatencyMs: positiveMs('targetLatency'),
-    smoothCeilingMs,
-    smoothFloorMs: Number.isFinite(min) && min >= 0 && (smoothCeilingMs === undefined || min <= smoothCeilingMs)
-      ? min : undefined,
+    targetLatencyMs: parseLatencySettings(p).targetLatencyMs,
     renderCushionFloorMs: positiveMs('cushion'),
     renderCushionMaxMs: positiveMs('cushionMax'),
     catchUpRate: Number.isFinite(catchUp) && catchUp >= 1 ? catchUp : undefined,
@@ -60,11 +67,8 @@ const initialPlayback = playbackParams(new URLSearchParams(location.search));
 /** `?catchUp=1.1`: max playback rate for chasing the catalog targetLatency (>= 1). */
 let catchUpRate = initialPlayback.catchUpRate;
 
-/** `?latency=live|smooth`; Live edge by default. */
-let latencyMode = initialPlayback.latencyMode;
-
-/** `?targetLatency=MS`: catch-up set point; on CMAF also where live-edge
- *  and gap-jump seeks land. Overrides the catalog's targetLatency. */
+/** `?targetLatency=MS`: Target latency, the catalog's when absent. The catch-up set
+ *  point and the adaptive floor; on CMAF also where live-edge and gap-jump seeks land. */
 let targetLatencyOverrideMs = initialPlayback.targetLatencyMs;
 
 /** `?cushion=MS` / `?cushionMax=MS`: LOC render-cushion floor and cap. */
@@ -79,7 +83,7 @@ let debug = initialPlayback.debug;
 let applyPlaybackQuery: ((query: URLSearchParams) => void) | null = null;
 
 /** The gear popup's hooks for quick choices made outside its fields. */
-let gearPopup: { closeUnlessEditing(): void; syncLatencyFields(q: URLSearchParams): void } | null = null;
+let gearPopup: { closeUnlessEditing(): void } | null = null;
 
 /** Fatal media errors only a fresh tune-in recovers: wedged element, unrecoverable gap, dead pipeline. */
 const REJOIN_CODES = new Set([0x1102, 0x1104, 0x1105]);
@@ -104,17 +108,10 @@ const storedAudio: { volume?: number; muted?: boolean } = (() => {
   } catch { return {}; }
 })();
 
-/** `?latencyMax=`: ceiling of the smooth playout delay (ms). */
-let smoothCeilingMs = initialPlayback.smoothCeilingMs;
-/** `?latencyMin=`: floor of the smooth playout delay (ms), where it starts; 0 starts at the target. */
-let smoothFloorMs = initialPlayback.smoothFloorMs;
-
-/** `?congestionControl=low-latency|throughput`: a hint to the browser's QUIC
- *  congestion controller. Unset leaves the browser default. */
-const congestionControl: 'low-latency' | 'throughput' | undefined = (() => {
-  const v = new URLSearchParams(location.search).get('congestionControl');
-  return v === 'low-latency' || v === 'throughput' ? v : undefined;
-})();
+/** `?congestionControl=low-latency|throughput`: the QUIC hint, and the posture
+ *  (latency-settings.ts): Low latency holds the target; Browser default and Smooth
+ *  (`throughput`) let the buffer grow. Unset leaves the browser default. */
+const congestionControl = parseLatencySettings(new URLSearchParams(location.search)).congestionControl;
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 import { attachRelayPicker, DEFAULT_RELAY } from '../shared/relay-list.js';
 import { attachSettingsPopup, rememberOpen, rememberedOpen } from '../shared/settings-popup.js';
@@ -279,7 +276,7 @@ const CELL_TIPS: Record<string, string> = {
   'underruns': 'Audio ran dry. Small: total silence.',
   'late/snap': 'Audio dropped late before decode / snapped to the live edge.',
   'dropped': "Video frames the browser didn't draw.",
-  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH when playing behind live (LIVE(+1s) or LIVE(+2s)); they are not counted as lost.',
+  'obj lost a/v': 'Objects that never arrived, audio/video. Fixed by FETCH: audio datagrams lost in transit and recovered with FETCH when the buffer adapts (Browser default or Smooth); they are not counted as lost.',
   'stalls': 'Time playback was interrupted.',
 };
 
@@ -297,10 +294,10 @@ function log(msg: string): void {
 {
   /** Rewritten on apply. Every other param in the URL is carried over, so
    *  multi-valued and unlisted ones (nsField) survive a round trip. */
-  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'latencyMin', 'latencyMax', 'cushion', 'cushionMax',
-    'catchUp', 'catalogBootstrap', 'warmStart', 'autoResume', 'congestionControl', 'authority', 'hash', 'status', 'debug'];
+  const MANAGED = ['url', 'ns', 'v', 'targetLatency', 'congestionControl',
+    'catalogBootstrap', 'warmStart', 'autoResume', 'authority', 'hash', 'status', 'debug'];
   /** Applied to the running session without a reload. */
-  const LIVE_KEYS = ['targetLatency', 'latencyMin', 'latencyMax', 'cushion', 'cushionMax', 'catchUp', 'debug', 'status'];
+  const LIVE_KEYS = ['targetLatency', 'debug', 'status'];
 
   const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
   const fUrl = byId<HTMLInputElement>('s-url');
@@ -308,11 +305,6 @@ function log(msg: string): void {
   const fNs = byId<HTMLInputElement>('s-ns');
   const fV = byId<HTMLSelectElement>('s-v');
   const fTarget = byId<HTMLInputElement>('s-target');
-  const fLatencyMin = byId<HTMLInputElement>('s-latency-min');
-  const fLatencyMax = byId<HTMLInputElement>('s-latency-max');
-  const fCushion = byId<HTMLInputElement>('s-cushion');
-  const fCushionMax = byId<HTMLInputElement>('s-cushion-max');
-  const fCatchUp = byId<HTMLInputElement>('s-catchup');
   const fBootstrap = byId<HTMLSelectElement>('s-bootstrap');
   const fWarmStart = byId<HTMLInputElement>('s-warm-start');
   const fAutoResume = byId<HTMLInputElement>('s-auto-resume');
@@ -330,11 +322,6 @@ function log(msg: string): void {
     fNs.value = p.get('ns') ?? '';
     fV.value = p.get('v') ?? '';
     fTarget.value = p.get('targetLatency') ?? '';
-    fLatencyMin.value = p.get('latencyMin') ?? '';
-    fLatencyMax.value = p.get('latencyMax') ?? '';
-    fCushion.value = p.get('cushion') ?? '';
-    fCushionMax.value = p.get('cushionMax') ?? '';
-    fCatchUp.value = p.get('catchUp') ?? '';
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
     fWarmStart.checked = p.get('warmStart') !== '0';
     fAutoResume.checked = p.get('autoResume') !== '0';
@@ -344,7 +331,7 @@ function log(msg: string): void {
     fStatus.checked = p.get('status') === '1';
     fDebug.checked = p.get('debug') === '1';
     // Unless this tab chose otherwise, Advanced opens when anything in it is set.
-    if (rememberedOpen('g5-settings:advanced') === null && MANAGED.slice(3).some((k) => p.has(k))) advSec.open = true;
+    if (rememberedOpen('g5-settings:advanced') === null && MANAGED.slice(MANAGED.indexOf('catalogBootstrap')).some((k) => p.has(k))) advSec.open = true;
   }
 
   /** The query the fields describe; every unmanaged param carries over. */
@@ -359,11 +346,6 @@ function log(msg: string): void {
     if (ns && ns !== 'live') next.set('ns', ns);
     set('v', fV.value);
     set('targetLatency', fTarget.value.trim());
-    set('latencyMin', fLatencyMin.value.trim());
-    set('latencyMax', fLatencyMax.value.trim());
-    set('cushion', fCushion.value.trim());
-    set('cushionMax', fCushionMax.value.trim());
-    set('catchUp', fCatchUp.value.trim());
     set('catalogBootstrap', fBootstrap.value);
     if (!fWarmStart.checked) next.set('warmStart', '0');
     if (!fAutoResume.checked) next.set('autoResume', '0');
@@ -425,10 +407,6 @@ function log(msg: string): void {
       if (changedKeys(fieldsQuery()).length === 0) popup.close();
       else popup.refresh();
     },
-    syncLatencyFields: (q) => {
-      fLatencyMin.value = q.get('latencyMin') ?? '';
-      fLatencyMax.value = q.get('latencyMax') ?? '';
-    },
   };
 
   // The overlay and verbose logging apply as soon as they are ticked.
@@ -472,6 +450,9 @@ function formatTime(ms: number): string {
 
 async function main(): Promise<void> {
   initBuildInfo(log);
+  if (migratedLatencyQuery !== null) {
+    log(`URL: retired latency params rewritten (${migratedLatencyQuery} → ${location.search || 'none'})`);
+  }
   try {
     const reason = sessionStorage.getItem(REJOIN_REASON_KEY);
     if (reason !== null) {
@@ -535,6 +516,9 @@ async function main(): Promise<void> {
     if (!debug || (e.type !== 'control_message_created' && e.type !== 'control_message_parsed')) return;
     log(`MOQT ${e.type === 'control_message_created' ? 'send' : 'recv'}: ${describeControlMessage(e.message)}`);
   };
+  /** The latency options in force; the catalog target fills an adaptive floor once known. */
+  let latency = playbackLatency({ targetLatencyMs: targetLatencyOverrideMs, congestionControl });
+  const startLatency = latency;
   const player = new Player(playerContainer, {
     url: relayUrl,
     namespace,
@@ -544,15 +528,14 @@ async function main(): Promise<void> {
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {}),
     ...(congestionControl ? { congestionControl } : {}),
-    ...(targetLatencyOverrideMs ? { targetLatencyMs: targetLatencyOverrideMs } : {}),
-    ...(latencyMode === 'smooth' ? { latencyMode } : {}),
-    ...(smoothCeilingMs ? { smoothCeilingMs } : {}),
-    ...(smoothFloorMs !== undefined ? { smoothFloorMs } : {}),
+    ...(startLatency.targetLatencyMs ? { targetLatencyMs: startLatency.targetLatencyMs } : {}),
+    ...(startLatency.latencyMode === 'smooth' ? { latencyMode: 'smooth' as const } : {}),
+    ...(startLatency.smoothCeilingMs ? { smoothCeilingMs: startLatency.smoothCeilingMs } : {}),
+    ...(startLatency.smoothFloorMs !== undefined ? { smoothFloorMs: startLatency.smoothFloorMs } : {}),
     moqtPlayerConfig: { ...engineConfig, onQlogEvent: noteControlMessage },
   });
   const optionSummary = Object.entries({
-    ...engineConfig, targetLatencyMs: targetLatencyOverrideMs,
-    latencyMode: latencyMode === 'smooth' ? latencyMode : undefined, smoothFloorMs, smoothCeilingMs,
+    ...engineConfig, ...startLatency,
   })
     .filter(([, v]) => v !== undefined)
     .map(([k, v]) => `${k}=${String(v)}`)
@@ -578,28 +561,37 @@ async function main(): Promise<void> {
       rejoinAtMs = null;
     }
   };
-  /** The delay the badge shows, in tenths of a second; null when it shows none. */
-  const badgeTenths = (held: { heldMs: number } | null): number | null =>
-    held && latencyMode === 'smooth' && player.state === 'playing' && pictureFrozenSinceMs === null
-      ? Math.round(held.heldMs / 100) : null;
-  let badgeDelayTenths: number | null = null;
+  /** From the catalog's isLive; null before the first catalog. */
+  let liveState: LiveState | null = null;
+  /** Measured latency for the badge (ms); null while not measurable. */
+  let measuredLatencyMs: number | null = null;
+  /** The badge's target, e.g. "target 205 ms (catalog)". */
+  let targetLabel = targetText(targetLatencyOverrideMs, undefined);
+  /** What the badge shows next to its state while playing; null when nothing. */
+  const badgeReadout = (): string | null =>
+    player.state === 'playing' && pictureFrozenSinceMs === null && liveState !== 'ended'
+      ? latencyReadout(measuredLatencyMs, targetLabel)
+      : null;
+  let shownReadout: string | null = null;
   const renderStateBadge = (): void => {
     const state = player.state;
     const frozen = state === 'playing' && pictureFrozenSinceMs !== null;
-    const held = player.stats.latency;
-    badgeDelayTenths = badgeTenths(held);
-    if (held && badgeDelayTenths !== null) {
-      // "live +1.0 s": the delay in force; it rises when media arrives late.
-      const delay = document.createElement('span');
-      delay.className = 'delay';
-      delay.textContent = `+${(badgeDelayTenths / 10).toFixed(1)} s`;
-      stateBadge.replaceChildren('live ', delay);
-      stateBadge.title = `${Math.round(held.heldMs)} ms behind live; late media raises it up to ${held.ceilingMs} ms`;
+    const ended = liveState === 'ended' && state !== 'error';
+    const word = ended ? 'ended' : frozen ? 'frozen' : state === 'playing' ? (liveState === 'vod' ? 'vod' : 'live') : state;
+    shownReadout = badgeReadout();
+    if (shownReadout !== null) {
+      const readout = document.createElement('span');
+      readout.className = 'delay';
+      readout.textContent = shownReadout;
+      stateBadge.replaceChildren(`${word} `, readout);
     } else {
-      stateBadge.textContent = frozen ? 'frozen' : state === 'playing' ? 'live' : state;
-      stateBadge.title = '';
+      stateBadge.textContent = word;
     }
-    stateBadge.className = `state-badge ${frozen ? 'loading' : state}`;
+    stateBadge.title = ended ? "The catalog's isLive turned false: the broadcast ended"
+      : shownReadout !== null ? `Measured latency (capture to screen) and the target; ${postureLabel(congestionControl)}`
+        + (latency.latencyMode === 'smooth' ? `, the buffer may grow to ${latency.smoothCeilingMs} ms` : ', holding the target')
+      : '';
+    stateBadge.className = `state-badge ${ended ? 'ended' : frozen ? 'loading' : state}`;
   };
   /** Per UI tick. `stalledSinceMs`: the freeze watch's verdict (engine stall, MSE playhead). */
   const updatePictureFrozen = (nowMs: number, hidden: boolean, stalledSinceMs: number | null): void => {
@@ -2170,18 +2162,17 @@ async function main(): Promise<void> {
     drawSpark2(latSpark, tickNowMs, latP50Samples, chartColors.p50, latP95Samples, chartColors.p95, 0, undefined,
       peakAt >= 0 ? { atMs: sampleAtMs[peakAt]!, value: peakMs! } : null);
     drawSpark(jitSpark, tickNowMs, jitSamples, chartColors.jitter);
-    // Smooth moves the delay: show the one in force (the LOC cushion, else the MSE hold).
+    // An adaptive posture moves the buffer: show the one in force (the LOC cushion, else the MSE hold).
     const smooth = player.stats.latency;
     const cushionTargetSec: number | undefined = eng?.mediaSource?.cushionTargetSec;
     const targetNowMs = smooth ? Math.round(renderCushionMs() ?? smooth.heldMs)
       : cushionTargetSec !== undefined ? Math.round(cushionTargetSec * 1000) : targetLatencyMs;
     if (smooth && (smooth.raises !== latencyRaises || smooth.lowers !== latencyLowers)) {
-      log(`Latency: delay ${smooth.raises !== latencyRaises ? 'raised' : 'lowered'} to `
-        + `${Math.round(smooth.heldMs)} ms (limit ${smooth.ceilingMs} ms; ${smooth.raises} raised, ${smooth.lowers} lowered)`);
+      log(`Latency: buffer ${smooth.raises !== latencyRaises ? 'raised' : 'lowered'} to `
+        + `${Math.round(smooth.heldMs)} ms (bound ${smooth.ceilingMs} ms; ${smooth.raises} raised, ${smooth.lowers} lowered)`);
       latencyRaises = smooth.raises;
       latencyLowers = smooth.lowers;
     }
-    if (badgeTenths(smooth) !== badgeDelayTenths) renderStateBadge();
     drawSpark2(cusSpark, tickNowMs, queuedASamples, chartColors.audio, queuedVSamples, chartColors.video,
                targetNowMs, stallMarks);
     cusAVal.textContent = aMs != null ? aMs.toFixed(0) : '—';
@@ -2282,6 +2273,12 @@ async function main(): Promise<void> {
       : cmafPlayoutMs != null ? `≈${shown(cmafPlayoutMs)}` : '—';
     latMax.textContent = frozen ? STALLED : clockFault ? CLOCK : peakMs?.toFixed(0) ?? '—';
     for (const el of [latVal, latP95, latMax, latScreen]) el.style.color = clockFault ? 'var(--warn)' : '';
+    // The badge reads E2E, else the MSE estimate, else arrival p50.
+    measuredLatencyMs = frozen || relativeDelay || clockFault ? null
+      : screenVals.length ? shownLatencyMs(percentile(screenVals, 0.5))
+      : cmafPlayoutMs != null ? shownLatencyMs(cmafPlayoutMs)
+      : latVals.length ? shownLatencyMs(percentile(latVals, 0.5)) : null;
+    if (badgeReadout() !== shownReadout) renderStateBadge();
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'
@@ -2335,6 +2332,34 @@ async function main(): Promise<void> {
     if (dt?.dataset['base'] !== undefined) dt.textContent = audioDetail(dt.dataset['base']);
   }
 
+  /** The catalog's target and isLive: the adaptive floor, the badge, the Target latency placeholder. */
+  function noteCatalogLatency(tracks: any[]): void {
+    const catalogMs = catalogTargetLatencyMs || undefined;
+    targetLabel = targetText(targetLatencyOverrideMs, catalogMs);
+    const targetField = document.getElementById('s-target') as HTMLInputElement | null;
+    if (targetField) targetField.placeholder = catalogMs ? `Catalog (${catalogMs} ms)` : 'Catalog';
+    const next = playbackLatency({ targetLatencyMs: targetLatencyOverrideMs, congestionControl }, catalogMs);
+    if (next.smoothFloorMs !== latency.smoothFloorMs || next.smoothCeilingMs !== latency.smoothCeilingMs) {
+      try {
+        player.updatePlayback({ smoothFloorMs: next.smoothFloorMs, smoothCeilingMs: next.smoothCeilingMs });
+        latency = next;
+        log(`Latency: buffer floor ${next.smoothFloorMs ?? 'default'} ms from the catalog, bound ${next.smoothCeilingMs} ms`);
+      } catch (err) {
+        log(`Latency: catalog floor not applied: ${(err as Error).message}`);
+      }
+    }
+    const isLive = catalogIsLive(tracks);
+    const state = nextLiveState(liveState, isLive);
+    if (state !== liveState) {
+      if (state === 'ended') log("Broadcast ENDED: the catalog's isLive turned false");
+      else if (state === 'vod') log('Catalog isLive false: VOD');
+      else if (liveState !== null) log('Broadcast LIVE again: catalog isLive true');
+      else if (isLive === undefined) log('Catalog tracks carry no isLive; treated as live');
+      liveState = state;
+    }
+    renderStateBadge();
+  }
+
   function renderCatalog(cat: any): void {
     const tracks: any[] = cat?.tracks ?? [];
     const videoTrack = tracks.find((t) => (t.role ?? t.name) === 'video');
@@ -2349,6 +2374,7 @@ async function main(): Promise<void> {
     // The engine runs at the URL override when one is given.
     catalogTargetLatencyMs = Math.max(0, ...tracks.map((t) => Number(t.targetLatency) || 0));
     targetLatencyMs = targetLatencyOverrideMs ?? catalogTargetLatencyMs;
+    noteCatalogLatency(tracks);
     // Same header as the broadcaster's catalog panel.
     catalogLabelText = catalogLabel(tracks.map((t) => t.packaging), cat?.version);
     renderCatalogStatus();
@@ -2586,72 +2612,33 @@ async function main(): Promise<void> {
   }
   applyPlaybackQuery = (query: URLSearchParams): void => {
     const p = playbackParams(query);
+    const catalogMs = catalogTargetLatencyMs || undefined;
+    const next = playbackLatency({ targetLatencyMs: p.targetLatencyMs, congestionControl }, catalogMs);
     player.updatePlayback({
-      latencyMode: p.latencyMode === 'smooth' ? 'smooth' : undefined,
-      targetLatencyMs: p.targetLatencyMs,
-      smoothFloorMs: p.smoothFloorMs,
-      smoothCeilingMs: p.smoothCeilingMs,
+      latencyMode: next.latencyMode === 'smooth' ? 'smooth' : undefined,
+      targetLatencyMs: next.targetLatencyMs,
+      smoothFloorMs: next.smoothFloorMs,
+      smoothCeilingMs: next.smoothCeilingMs,
       renderCushionFloorMs: p.renderCushionFloorMs,
       renderCushionMaxMs: p.renderCushionMaxMs,
       maxCatchUpRate: p.catchUpRate,
       logLevel: p.debug ? 'debug' : undefined,
     });
-    ({
-      latencyMode, smoothFloorMs, smoothCeilingMs, renderCushionFloorMs, renderCushionMaxMs, catchUpRate, debug,
-      targetLatencyMs: targetLatencyOverrideMs,
-    } = p);
+    latency = next;
+    ({ renderCushionFloorMs, renderCushionMaxMs, catchUpRate, debug, targetLatencyMs: targetLatencyOverrideMs } = p);
     targetLatencyMs = targetLatencyOverrideMs ?? catalogTargetLatencyMs;
-    syncLatencySelect(query);
+    targetLabel = targetText(targetLatencyOverrideMs, catalogMs);
     renderStateBadge();
-    const parts = [latencyMode === 'smooth' ? 'latency live + delay' : 'latency live',
-      `target ${targetLatencyMs > 0 ? `${targetLatencyMs} ms` : 'none'}`];
-    if (smoothFloorMs !== undefined) parts.push(`delay start ${smoothFloorMs} ms`);
-    if (smoothCeilingMs !== undefined) parts.push(`delay limit ${smoothCeilingMs} ms`);
+    const parts = [postureLabel(congestionControl), targetLabel];
+    if (latency.latencyMode === 'smooth') {
+      parts.push(`buffer from ${latency.smoothFloorMs ?? 'default'} ms up to ${latency.smoothCeilingMs} ms`);
+    }
     if (renderCushionFloorMs !== undefined) parts.push(`cushion ${renderCushionFloorMs} ms`);
     if (renderCushionMaxMs !== undefined) parts.push(`cushion max ${renderCushionMaxMs} ms`);
     if (catchUpRate !== undefined) parts.push(`catch-up ${catchUpRate}x`);
     if (debug) parts.push('debug');
     log(`Playback settings applied: ${parts.join(', ')}`);
   };
-  // Latency presets: Live, or a delay starting at 1 s or 2 s with 1 s of headroom.
-  // They apply to the running session and are recorded in the URL.
-  const latencySelect = document.getElementById('latency') as HTMLSelectElement;
-  const customLatency = latencySelect.querySelector<HTMLOptionElement>('option[value="custom"]')!;
-  function syncLatencySelect(q: URLSearchParams): void {
-    let preset = 'custom';
-    if (q.get('latency') !== 'smooth') preset = 'live';
-    else {
-      const min = q.get('latencyMin') ?? '1000';
-      const max = q.get('latencyMax') ?? '2000';
-      if (min === '1000' && max === '2000') preset = '1000';
-      else if (min === '2000' && max === '3000') preset = '2000';
-    }
-    customLatency.hidden = preset !== 'custom';
-    latencySelect.value = preset;
-  }
-  syncLatencySelect(new URLSearchParams(location.search));
-  latencySelect.addEventListener('change', () => {
-    const url = new URL(location.href);
-    const q = url.searchParams;
-    q.delete('latencyMin');
-    q.delete('latencyMax');
-    if (latencySelect.value === 'live') q.delete('latency');
-    else q.set('latency', 'smooth');
-    if (latencySelect.value === '2000') {
-      q.set('latencyMin', '2000');
-      q.set('latencyMax', '3000');
-    }
-    try {
-      applyPlaybackQuery!(q);
-    } catch (err) {
-      log(`Latency not applied: ${(err as Error).message}`);
-      syncLatencySelect(new URLSearchParams(location.search));
-      return;
-    }
-    history.replaceState(history.state, '', url.pathname + url.search + url.hash);
-    gearPopup?.syncLatencyFields(q);
-    gearPopup?.closeUnlessEditing();
-  });
   document.addEventListener('click', (e) => {
     if (!volumeGroup.contains(e.target as Node)) setVolumePopOpen(false);
   });
