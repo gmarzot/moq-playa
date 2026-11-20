@@ -42,6 +42,29 @@ let gain: GainNode | undefined;
 let analyser: AnalyserNode | undefined;
 let firstFrameTimestampUs: number | undefined;
 
+/** Playout rate of the active path: rate-up starts and time at a rate other than 1. */
+const rate = { value: 1, sinceMs: performance.now(), ups: 0, offMs: 0 };
+function noteRate(value: number): void {
+  if (value === rate.value) return;
+  const now = performance.now();
+  if (rate.value !== 1) rate.offMs += now - rate.sinceMs;
+  if (value > 1 && rate.value <= 1) rate.ups++;
+  rate.value = value;
+  rate.sinceMs = now;
+}
+// Web Audio output: the rate audio buffers are scheduled at. Otherwise the element's rate.
+if (webAudioOutput) {
+  const start = AudioBufferSourceNode.prototype.start;
+  AudioBufferSourceNode.prototype.start = function (this: AudioBufferSourceNode, ...args: Parameters<typeof start>) {
+    noteRate(this.playbackRate.value);
+    return Reflect.apply(start, this, args);
+  } as typeof start;
+} else {
+  video.addEventListener('ratechange', () => noteRate(video.playbackRate));
+}
+const congestionControl = (['default', 'throughput', 'low-latency'] as const)
+  .find((c) => c === params.get('congestionControl'));
+
 const player = new Player(null, {
   url: params.get('url')!, namespace: params.get('ns')!,
   video, canvas, ...(pin ? { certHash: pin } : {}), draftVersion: draft, autoQuality: params.get('auto') === '1',
@@ -49,6 +72,7 @@ const player = new Player(null, {
   startLevel: Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   ...(params.get('latency') === 'smooth' ? { latencyMode: 'smooth' as const } : {}),
+  ...(congestionControl ? { congestionControl } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : (['error', 'warn', 'info'] as const).find((l) => l === params.get('log')) ?? 'none',
     ...(params.get('warmStart') === '1' ? { warmStartCurrentGroup: true } : {}),
@@ -176,6 +200,8 @@ function sample(): void {
     paused: frameOutput ? player.state !== 'playing' : video.paused, seeking: frameOutput ? false : video.seeking,
     visibility: document.visibilityState,
     bufferedRanges: frameOutput ? null : Array.from({ length: ranges.length }, (_, i) => ({ start: ranges.start(i), end: ranges.end(i) })),
+    playbackRate: rate.value, rateUps: rate.ups,
+    rateOffMs: Math.round(rate.offMs + (rate.value !== 1 ? performance.now() - rate.sinceMs : 0)),
   });
 }
 

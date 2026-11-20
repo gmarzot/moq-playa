@@ -39,7 +39,9 @@ Evidence goes to `reports/player-soak/<run>/`: per case `samples.jsonl`,
 `summary.md`. Metrics: startup time, stalls and rebuffer ratio, frozen picture,
 audio gaps (count, total, longest, p99), frame rate per minute, latency p50/p95/max per minute and its
 drift, and the player's dropped frames, audio underruns, gaps, A/V skew and
-cushion. Report-only, except that the run fails when a case does not play, or
+cushion, and rate catch-up (`catchUp`): rate-up starts and time at a playout rate other
+than 1, from the video element on the MSE path and the rate audio buffers are scheduled at
+on the Web Audio path. Report-only, except that the run fails when a case does not play, or
 when its catalog lists an audio track that is never heard (`no-audio`).
 
 ## Adverse profiles
@@ -58,6 +60,10 @@ another, first play draft only) under a profile from `cases.json`:
 | `blackouts` | all relay traffic dropped for 3 s at 30 s and 10 s at 75 s |
 | `hidden-tab` | tab hidden for 5 s at 30 s and 20 s at 75 s |
 | `republish` | plays `…/<packaging>/restart`, whose broadcaster (`--variant restart`) stops and starts every `restartEveryS` |
+| `group-burst` | plays `…/<packaging>/burst`, unshaped; its broadcaster (`--variant burst`) makes 2.5 s groups and sends each whole group at once when the next starts (`groupBurst=1`); dispatch only, never scheduled |
+
+A profile with a `variant` has its own broadcaster, on `…/<packaging>/<variant>`, which
+adds the profile's `broadcastQuery` to the g5-broadcast page URL.
 
 `--ladder RELAY:ID[,…]` plays a moq-test-tracks ABR ladder from `cases.ladders`
 (MTT_API_KEY) under its profile, first play draft only: `ladder-cmaf` and
@@ -98,4 +104,12 @@ CI: `.github/workflows/player-soak.yml`, on demand and nightly; it needs the
 Each profile gets one runner for the `adverse.broadcasts`, and each ladder stream
 one runner (`ladder-player`); a pull request runs only the profiles marked
 `smoke`, and no ladder. A dispatch's `only` takes a comma-separated
-list, e.g. `bursty,bursty-smooth` plays both against the same broadcasts.
+list, e.g. `bursty,bursty-smooth` plays both against the same broadcasts. Its
+`player_query` (`--player-query`, `PLAYER_QUERY`) is appended to every player page URL,
+e.g. `congestionControl=throughput`; the acceptance page passes `congestionControl` to the
+player.
+
+```bash
+gh workflow run player-soak.yml -f only=group-burst -f adverse=true
+gh workflow run player-soak.yml -f only=group-burst -f adverse=true -f player_query=congestionControl=throughput
+```

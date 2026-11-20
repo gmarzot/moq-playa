@@ -162,6 +162,9 @@ const dynamicGroups = params.get('dynamicGroups') === '1';
 /** `?minGroup=ms`: youngest video group a NEW_GROUP_REQUEST may end. URL only. */
 const minGroupParam = parseInt(params.get('minGroup') ?? '', 10);
 const minGroupMs = Number.isFinite(minGroupParam) && minGroupParam >= 0 ? minGroupParam : 1000;
+/** `?groupBurst=1`: each video group, and the audio sent meanwhile, goes out at once when
+ *  the next group starts. URL only. */
+const groupBurst = params.get('groupBurst') === '1';
 /** Dynamic groups in effect: asked for and draft-18. */
 let videoDynamicGroups = false;
 /** Parameter carrying a NEW_GROUP_REQUEST (§10.2.13). */
@@ -1384,6 +1387,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       if (packaging === 'locmaf' && audioDatagrams) log('LOCMAF: audio stays on subgroups (no datagrams)');
       videoDynamicGroups = dynamicGroups && negotiatedDraft >= 18;
       if (dynamicGroups && !videoDynamicGroups) log(`Dynamic groups need draft 18 or later; off on draft-${negotiatedDraft}`);
+      if (groupBurst) log(`Group burst: each ${describeKeyframes()} group is held and sent when the next starts`);
       log(`Congestion control: requested ${congestionControl ?? 'browser default'}, `
         + `browser applied ${transport.congestionControl ?? 'not reported'}`);
 
@@ -1448,6 +1452,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
           onStatus: (track, message) => log(`${track}: ${message}`),
           onKeyframeNeeded: () => videoEncoder?.requestKeyframe(),
           minGroupMs,
+          ...(groupBurst ? { groupBurst: { onLog: log } } : {}),
         },
         dynamicGroups: videoDynamicGroups,
         log,
