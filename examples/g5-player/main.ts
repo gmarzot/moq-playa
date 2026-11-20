@@ -391,13 +391,13 @@ function log(msg: string): void {
     button: menuBtn,
     popup: menu,
     applyButton: byId<HTMLButtonElement>('set-apply'),
+    cancelButton: byId<HTMLButtonElement>('set-cancel'),
     advanced: advSec,
     storageKey: 'g5-settings',
     pending: () => {
       const changed = changedKeys(fieldsQuery());
       return changed.length === 0 ? 'none' : inPlace(changed) ? 'live' : 'reload';
     },
-    reloadLabel: 'Apply · reloads',
     onOpen: populate,
     onApply: (forceReload) => { if (applyQuery(fieldsQuery(), forceReload)) popup.close(); },
   });
@@ -409,16 +409,6 @@ function log(msg: string): void {
     },
   };
 
-  // The overlay and verbose logging apply as soon as they are ticked.
-  for (const [box, key] of [[fStatus, 'status'], [fDebug, 'debug']] as const) {
-    box.addEventListener('change', () => {
-      const next = new URLSearchParams(location.search);
-      if (box.checked) next.set(key, '1');
-      else next.delete(key);
-      if (!applyQuery(next, false)) box.checked = !box.checked;
-      popup.refresh();
-    });
-  }
 }
 
 /** Copy to the clipboard, confirming in the button itself. */

@@ -20,6 +20,7 @@ function fakeEl(inside: unknown[] = []) {
   const el = {
     ...fakeTarget(),
     hidden: true,
+    disabled: false,
     textContent: 'Apply' as string | null,
     attrs,
     setAttribute(name: string, value: string) { attrs[name] = value; },
@@ -43,15 +44,16 @@ function setup(pending: PendingChange = 'none') {
   const button = fakeEl();
   const popup = fakeEl([field]);
   const applyButton = fakeEl();
+  const cancelButton = fakeEl();
   const doc = fakeTarget();
   const state = { pending };
   const onOpen = vi.fn();
   const onApply = vi.fn();
   const p = attachSettingsPopup({
-    button, popup, applyButton, storageKey: 'test', pending: () => state.pending,
+    button, popup, applyButton, cancelButton, storageKey: 'test', pending: () => state.pending,
     reloadLabel: 'Apply · reloads', onOpen, onApply,
   }, doc, fakeStorage());
-  return { p, button, popup, applyButton, doc, field, state, onOpen, onApply };
+  return { p, button, popup, applyButton, cancelButton, doc, field, state, onOpen, onApply };
 }
 
 describe('attachSettingsPopup', () => {
@@ -77,20 +79,31 @@ describe('attachSettingsPopup', () => {
     expect(s.p.isOpen).toBe(false);
   });
 
-  it('shows Apply only while an edit is pending, labelled for a reload', () => {
+  it('always shows Cancel and Apply; Apply greys out with nothing changed and carries a reload label only when given one', () => {
     const s = setup();
     s.p.open();
-    expect(s.applyButton.hidden).toBe(true);
+    expect(s.applyButton.hidden).toBe(false);
+    expect(s.cancelButton.hidden).toBe(false);
+    expect(s.applyButton.disabled).toBe(true);
     s.state.pending = 'live';
     s.popup.fire('input', { target: s.field });
-    expect(s.applyButton.hidden).toBe(false);
+    expect(s.applyButton.disabled).toBe(false);
     expect(s.applyButton.textContent).toBe('Apply');
     s.state.pending = 'reload';
     s.popup.fire('change', { target: s.field });
     expect(s.applyButton.textContent).toBe('Apply · reloads');
     s.state.pending = 'none';
     s.popup.fire('click', { target: s.field });                 // a picker set the field back
-    expect(s.applyButton.hidden).toBe(true);
+    expect(s.applyButton.textContent).toBe('Apply');
+    expect(s.applyButton.disabled).toBe(true);
+  });
+
+  it('Cancel closes without applying', () => {
+    const s = setup('live');
+    s.p.open();
+    s.cancelButton.fire('click', { target: s.cancelButton });
+    expect(s.p.isOpen).toBe(false);
+    expect(s.onApply).not.toHaveBeenCalled();
   });
 
   it('Apply and Enter in a field apply; Ctrl/⌘ asks for a reload', () => {
