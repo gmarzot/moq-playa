@@ -61,7 +61,7 @@ Forward State change, capture gaps, and the per-minute capture drift.
 Controls: play/pause, timeline, speaker (on phones it opens a volume slider
 with mute), ⚙ (View: every view of the catalog, grouped by program; Quality;
 Audio: the program's audio feeds; Language: the languages of the feed playing;
-Latency: LIVE, or LIVE(+1s) / LIVE(+2s) behind live; Connection settings), catalog panel.
+Target latency and Congestion control, then Connection settings), catalog panel.
 A view this browser cannot decode is listed as "not supported here" and
 cannot be chosen.
 
@@ -75,7 +75,9 @@ repair (`audio order restored/missing/late`) and catch-up starts.
 ### URL parameters
 
 The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
-`compat=` and `clockUrl=` are set in the URL only. The page log prints
+`compat=`, `clockUrl=`, `cushion=`, `cushionMax=` and `catchUp=` are set in the
+URL only. A URL with the retired `latency=smooth&latencyMin=X` is rewritten at
+load to `targetLatency=X`; `latency=` and `latencyMax=` are dropped. The page log prints
 `Options: …` at load with what reached the engine.
 
 | Param | Meaning | Default |
@@ -83,17 +85,14 @@ The Connection settings dialog edits most of these; `nsField=`, `locmaf=`,
 | `url=` | relay WebTransport URL | this host's relay, else moqx-main |
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | `live` |
 | `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
-| `targetLatency=` | overrides the catalog target (ms); see below | catalog value |
-| `latency=` | `live`, or `smooth` to play behind live (⚙ → Latency LIVE(+1s) / LIVE(+2s) sets it for this tab) | live |
-| `latencyMin=` | with `latency=smooth`: where the delay starts and the lowest it steps back to (ms); 0 starts at the target | 1000 |
-| `latencyMax=` | with `latency=smooth`: the most late media raises the delay to (ms) | 2000 |
-| `cushion=` / `cushionMax=` | LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
-| `catchUp=` | LOC max playback rate chasing the target | 1.0 (off) |
+| `targetLatency=` | Target latency (ms); see below | Catalog: the catalog's `targetLatency` |
+| `cushion=` / `cushionMax=` | URL only: LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
+| `catchUp=` | URL only: LOC max playback rate chasing the target | 1.0 (off) |
 | `catalogBootstrap=` | auto, joining-fetch, strict, subscribe, fetch | auto |
 | `warmStart=0` | off: LOC no longer fetches the current group, CMAF/LOCMAF no longer ask for a new one | on |
 | `autoResume=0` | off: a hidden tab waits until it is viewed, retries after a relay refusal included | on |
 | `locmaf=frame` | LOCMAF through WebCodecs instead of MSE | MSE |
-| `congestionControl=` | `low-latency` / `throughput` hint to the browser's QUIC | browser default |
+| `congestionControl=` | `low-latency` (Low latency) / `throughput` (Smooth): the QUIC hint and the latency posture; see below | browser default |
 | `compat=` | `request-credit`, `empty-objects`: leniency for non-conformant relays | none |
 | `authority=` | CLIENT_SETUP AUTHORITY for tenant-routed relays | none |
 | `hash=` | relay certificate hash (hex) | none |
@@ -114,13 +113,19 @@ a reload.
 - LOC plays a render cushion between a floor and a cap, and the target only
   caps it. To run 2 s behind live on LOC, raise the floor too:
   `targetLatency=2000&cushion=2000`.
-- ⚙ → Latency: **Live** (default) keeps the target and skips media that
-  arrives late. **1 s** and **2 s** start that far behind live
-  (`latency=smooth&latencyMin=`), raise the delay when media arrives late, by
-  how late it was plus 50 ms, up to 1 s more (`latencyMax=`), and step back
-  toward the start after 30 s with nothing late. The badge reads
-  `LIVE +1.0 s` with the delay in force, TARGET shows it too, and the log
-  records each raise and step-down. The choice applies without a reload.
+- ⚙ → Target latency: blank is **Catalog** (the catalog's `targetLatency`,
+  else the player default); a typed value (`targetLatency=`) replaces it and
+  applies without a reload.
+- ⚙ → Congestion control sets the posture. **Low latency** holds the target
+  and skips media that arrives late. **Browser default** and **Smooth**
+  (`congestionControl=throughput`) start the buffer at the target, raise it
+  when media arrives late, by how late it was plus 50 ms, up to 3 s, and step
+  back toward the target after 30 s with nothing late; Smooth also sends the
+  throughput hint. TARGET shows the buffer in force and the log records each
+  raise and step-down. Changing it reloads.
+- The badge (`status=1`) reads LIVE while the catalog's `isLive` is true,
+  ENDED once it turns false (logged), VOD when it was false from the start,
+  then measured latency and the target: `LIVE 1.0 s · target 205 ms (catalog)`.
 
 ## Samples to play
 
@@ -201,7 +206,7 @@ the clock stream above is the LOC sample anyone can generate.
 - Target 200 → 150 → 100 (broadcaster setting, or `targetLatency=` on a
   single viewer). Watch QUEUED against TARGET, STALLS and the catch-up line.
   CMAF and LOCMAF hold 140 ms at the lowest, which TARGET shows.
-- 2 s behind live: see [Latency target and cushion](#latency-target-and-cushion).
+- 2 s behind live: `targetLatency=2000`; see [Latency target and cushion](#latency-target-and-cushion).
 - 60 fps: Screen with capture rate 60 (check the `Video:` log line).
 
 ### G7 — drafts
