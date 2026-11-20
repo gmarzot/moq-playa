@@ -16,7 +16,7 @@ player (files, OBS over SRT, HLS/DASH) are in aiomoqt's
 
 | Relay | WebTransport URL | Drafts |
 |---|---|---|
-| aiomoqt-relay | https://aiomoqt-relay.marzresearch.net:4443/ | 14, 16, 18, 22 |
+| aiomoqt-relay | https://aiomoqt-relay.marzresearch.net:4443/ | 16, 18, 22 |
 | moqx-main | https://moqx-main.ci.openmoq.org:4433/moq-relay | 16, 18 |
 
 - Clocks: both pages correct this machine's clock against the page host's
@@ -84,7 +84,7 @@ load to `targetLatency=X`; `latency=` and `latencyMax=` are dropped. The page lo
 |---|---|---|
 | `url=` | relay WebTransport URL | this host's relay, else moqx-main |
 | `ns=` | namespace, split on `/` (`nsField=` repeatable for literal fields) | `live` |
-| `v=` | draft 14, 16, 18 or 22 | auto (offers 16) |
+| `v=` | draft 16, 18 or 22 | auto (offers 16) |
 | `targetLatency=` | Target latency (ms); see below | Catalog: the catalog's `targetLatency` |
 | `cushion=` / `cushionMax=` | URL only: LOC render-cushion floor / cap (ms) | 200 (50 under 5 ms RTT) / min(target, 750) |
 | `catchUp=` | URL only: LOC max playback rate chasing the target | 1.0 (off) |
@@ -210,7 +210,7 @@ the clock stream above is the LOC sample anyone can generate.
 - 60 fps: Screen with capture rate 60 (check the `Video:` log line).
 
 ### G7 — drafts
-- Draft 14 or 16 broadcaster: the viewer link adds
+- Draft 16 broadcaster: the viewer link adds
   `catalogBootstrap=subscribe`; SUB_NS stays grey (not sent before 18).
 - Draft 22: on aiomoqt-relay only (moqx-main speaks 16 and 18).
 
