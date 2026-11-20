@@ -468,10 +468,9 @@ export function createPipelines(
         if (playout?.raisesOnLate && !fromHoldQueue) {
           playbackDelayUs = playout!.noteSlack(timing.renderTimeUs + playbackDelayUs - clock.now());
         }
-        // When late arrivals raise the cushion, a frame behind its base render
-        // time but inside the cushion renders at its slot; rendering it now
-        // would bunch it with the frames queued ahead. Low latency renders it now.
-        if (timing.shouldDrop && (!playout?.raisesOnLate || timing.renderTimeUs + playbackDelayUs < clock.now())) {
+        // A frame behind its base render time but inside the cushion renders at
+        // its slot; rendering it now would bunch it with the frames queued ahead.
+        if (timing.shouldDrop && timing.renderTimeUs + playbackDelayUs < clock.now()) {
           return clock.now();
         }
 

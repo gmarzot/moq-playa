@@ -313,7 +313,7 @@ describe('createPipelines', () => {
     expect(renderer.enqueue).toHaveBeenCalledTimes(2);
   });
 
-  it('smooth latency: a late frame raises the shared cushion and renders at its new slot; low-latency live renders it now', () => {
+  it('a frame decoded past its cushioned slot renders now in low latency; smooth raises the cushion and renders it at its new slot', () => {
     const run = (latencyMode: 'live' | 'smooth') => {
       let nowUs = 0;
       const clock: ClockSource = { now: () => nowUs };
@@ -1071,8 +1071,8 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
     expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
   });
 
-  it('a burst arriving inside the cushion presents at even frame spacing, not at arrival', () => {
-    for (const mode of EXPANDING) {
+  it('a burst arriving inside the cushion presents at even frame spacing, not at arrival, in every mode', () => {
+    for (const mode of ALL_MODES) {
       // A 500 ms cushion; each 15-frame burst lands 20 ms after its last frame's base render time,
       // so its head is ~490 ms behind base time (past the 100 ms drop threshold) yet inside the cushion.
       const s = session({ renderCushionFloorMs: 500, ...cc(mode) });
