@@ -27,7 +27,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
 const bytes = (n: number) => new Uint8Array(n);
 
 describe('GroupBurstConnection', () => {
-  it('holds calls until flush, then replays them in order on real stream IDs', async () => {
+  it('holds calls until flush, then replays them in order per stream on real stream IDs', async () => {
     const inner = fakeConnection();
     const burst = new GroupBurstConnection(inner);
     const s = await burst.openSubgroup(1n, 7n, 0n, {});
@@ -41,7 +41,9 @@ describe('GroupBurstConnection', () => {
     expect(burst.bytesHeld).toBe(25);
     burst.flush();
     await settle();
-    expect(inner.calls).toEqual([['open', 7n], ['send', 100n, 0n], ['send', 100n, 1n], ['datagram', 9n], ['close', 100n]]);
+    expect(inner.calls.filter((c) => c[0] !== 'datagram'))
+      .toEqual([['open', 7n], ['send', 100n, 0n], ['send', 100n, 1n], ['close', 100n]]);
+    expect(inner.calls.filter((c) => c[0] === 'datagram')).toEqual([['datagram', 9n]]);
     expect(burst.bytesHeld).toBe(0);
   });
 
@@ -63,6 +65,22 @@ describe('GroupBurstConnection', () => {
     await burst.sendObject(s, 3n, bytes(1));
     await settle();
     expect(inner.calls).toHaveLength(4);
+  });
+
+  it('replays separate streams concurrently, not one after another', async () => {
+    let pending = 0;
+    let peak = 0;
+    const slow: MediaPublishConnection = {
+      openSubgroup: async () => { pending++; peak = Math.max(peak, pending); await settle(); pending--; return 1n; },
+      sendObject: async () => {},
+      closeSubgroup: async () => {},
+    };
+    const burst = new GroupBurstConnection(slow);
+    for (let i = 0n; i < 4n; i++) await burst.openSubgroup(1n, i, 0n, {});
+    burst.flush();
+    await settle();
+    await settle();
+    expect(peak).toBe(4);
   });
 
   it('reports a failed open and skips the sends on its stream', async () => {
