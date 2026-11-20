@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { MoqtConnection } from './adapter.js';
+import type { ControlMessage } from '@openmoq/transport';
 import { TransportSim, flush } from './testkit/stream-sim.js';
 import {
   createControlCodec,
@@ -166,18 +167,19 @@ describe('MoqtConnection(18) subgroup stream delivery', () => {
     expect(transport.closeInfo?.closeCode).toBe(0x8);
   });
 
-  it('cancels a stream whose type is still pending when the connection closes', async () => {
+  it.each(['clean', 'error'] as const)('leaves a pending stream type to its %s shutdown owner', async mode => {
     const { conn, transport } = await connected();
     const objects: MoqtObject[] = [];
     conn.onObject = (_sid, object) => objects.push(object);
     const pending = transport.openIncomingUni();
     await flush();
 
-    await conn.close();
+    await conn.close(mode === 'error' ? varint(1n) : undefined);
     await flush();
 
     expect(objects).toEqual([]);
-    expect(pending.readCancelled).toBe(true);
+    // The type is not yet known: this could still be a control stream.
+    expect(pending.readCancelled).toBe(mode === 'error');
   });
 
   it('delivers a subgroup object to onObject (unknown alias → raw onObject)', async () => {
@@ -268,6 +270,39 @@ describe('MoqtConnection(18) subgroup stream delivery', () => {
     expect(o.groupId).toBe(0x5678n);
     expect(o.objectId).toBe(9n);
     if (o.kind === 'data') expect(o.payload).toEqual(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+  });
+});
+
+describe('MoqtConnection(18) subgroup object timing', () => {
+  it('stamps each object\'s first-byte read apart from the wait before it', async () => {
+    const { conn, transport } = await connected();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objects.push(o);
+    let nowMs = 1000;
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+    try {
+      const second = subgroupObject(0n, [0x02, 0x03, 0x04, 0x05]);
+      const s = transport.openIncomingUni();
+      s.push(concat(subgroupHeader(7n, 42n), subgroupObject(0n, [0x01])));
+      await flush();
+      nowMs = 1100; // idle: the publisher has not sent the next object yet
+      await flush();
+      nowMs = 1200;
+      s.push(second.subarray(0, 3));
+      await flush();
+      nowMs = 1210;
+      s.push(second.subarray(3));
+      await flush();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(objects).toHaveLength(2);
+    const o = objects[1]!;
+    if (o.kind !== 'data') throw new Error('expected data');
+    expect(o.socketFirstMs).toBe(1000);
+    expect(o.socketStartMs).toBe(1200);
+    expect(o.socketLastMs).toBe(1210);
   });
 });
 
@@ -443,15 +478,17 @@ describe('MoqtConnection(18) FETCH data', () => {
     transport.pushIncomingUni(concat(
       fetchHeader(reqId),
       firstFetchObj(1n, 0n, 3, [0xaa]),
-      pack(0x8cn, 1n, 5n, 0n), // End of Non-Existent Range at {1,5}
+      pack(0x8cn, 1n, 5n), // End of Non-Existent Range at {1,5}
     ));
     await flush();
 
+    expect(objs).toHaveLength(2);
     expect(objs[0]!.kind).toBe('data');
     expect(objs[1]!.kind).toBe('gap');
     expect(objs[1]!.groupId).toBe(1n);
     expect(objs[1]!.objectId).toBe(5n);
-    if (objs[1]!.kind === 'gap') expect(objs[1]!.status).toBe(0x3n);
+    // §11.4.4.2: the objects do not exist; the group has not ended.
+    if (objs[1]!.kind === 'gap') expect(objs[1]!.status).toBe(0x1n);
   });
 
   it('reassembles a fragmented fetch stream (header + objects across chunks)', async () => {
@@ -816,6 +853,7 @@ describe('MoqtConnection(18) inbound PUBLISH (§10.10)', () => {
     transport.pushIncomingBidi().push(fetchReqBytes(1n));
     await flush();
 
+    expect(fetchReqId).toBe(1n);
     const sid = await conn.openFetchStream(1n);
     await conn.closeFetchStream(sid); // FIN the one response stream
     // §11.4.4: the single-stream limit survives the FIN — a reopen is still refused
@@ -1194,7 +1232,7 @@ describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
     const { conn, bidi } = await publishAccepted();
     const acceptLen = bidi.writtenBytes().length;
 
-    const p = conn.requestUpdate(1n, { forward: false });
+    const p = conn.requestUpdate(1n, { forward: 0 });
     await flush();
     // REQUEST_UPDATE (0x02) was written on the inbound stream after the accept OK.
     expect(bidi.writtenBytes()[acceptLen]).toBe(0x02);
@@ -1320,7 +1358,7 @@ describe('MoqtConnection(18) inbound request hardening', () => {
     await conn.acceptSubscribe(1n, 99n);
 
     // We are the publisher of this subscription — we cannot REQUEST_UPDATE it.
-    await expect(conn.requestUpdate(1n, { forward: false })).rejects.toThrow(/no open .*request stream/i);
+    await expect(conn.requestUpdate(1n, { forward: 0 })).rejects.toThrow(/no open .*request stream/i);
   });
 });
 
@@ -1369,6 +1407,48 @@ describe('MoqtConnection(18) publisher data send for accepted inbound SUBSCRIBE 
     expect(datagram.objectId).toBe(5n);
     expect(datagram.publisherPriority).toBe(3);
     expect(datagram.payload).toEqual(new Uint8Array([0x01, 0x02]));
+    // No Properties asked for, so the flag must be clear.
+    expect(datagram.extensions).toBeUndefined();
+  });
+
+  // Datagram media carries its LOC headers (a capture timestamp among them) in
+  // object Properties; without them a receiver has no sync reference at all.
+  it('sendDatagram carries object Properties and sets the PROPERTIES flag', async () => {
+    const { conn, transport } = await subscribed(7n);
+    const props = new Uint8Array([0x10, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+
+    await conn.sendDatagram(7n, 9n, 1n, new Uint8Array([0xaa]), {
+      publisherPriority: 4,
+      extensions: props,
+    });
+
+    expect(transport.sentDatagrams.length).toBe(1);
+    const raw = transport.sentDatagrams[0]!;
+    expect(raw[0]! & 0x01).toBe(0x01);   // DatagramFlags18.PROPERTIES
+    const { datagram } = decodeObjectDatagram18(raw, 0);
+    expect(datagram.trackAlias).toBe(7n);
+    expect(datagram.groupId).toBe(9n);
+    expect(datagram.objectId).toBe(1n);
+    expect(datagram.extensions).toEqual(props);
+    expect(datagram.payload).toEqual(new Uint8Array([0xaa]));
+  });
+
+  // A WritableStream admits ONE writer, so acquiring one per datagram throws
+  // "Cannot create writer when WritableStream is locked" the moment two sends
+  // overlap — which audio does routinely at 8 in flight.
+  it('concurrent sendDatagram calls share one writer', async () => {
+    const { conn, transport } = await subscribed(7n);
+
+    await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        conn.sendDatagram(7n, 1n, BigInt(i), new Uint8Array([i]))),
+    );
+
+    expect(transport.sentDatagrams.length).toBe(8);
+    const ids = transport.sentDatagrams
+      .map((b) => decodeObjectDatagram18(b, 0).datagram.objectId)
+      .sort((a, b) => Number(a - b));
+    expect(ids).toEqual([0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n]);
   });
 });
 
@@ -2147,7 +2227,7 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
   it('an omitted PUBLISH_OK FORWARD resumes an initially paused publish', async () => {
     const { conn, transport } = await connected();
     const changes: [bigint, boolean][] = [];
-    conn.onPublishForwardStateChange = (id, forward) => changes.push([id, forward]);
+    conn.onPublishForwardStateChange = (id, forward) => { changes.push([id, forward]); };
 
     const requestId = await conn.publish(ns('a'), nm('vid'), 42n, {
       parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
@@ -2201,7 +2281,7 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
       await original(id, message);
     });
     const changes: boolean[] = [];
-    conn.onPublishForwardStateChange = (_id, forward) => changes.push(forward);
+    conn.onPublishForwardStateChange = (_id, forward) => { changes.push(forward); };
 
     transport.bidi[0]!.push(codec18.encode({
       type: 'REQUEST_UPDATE', requestId: 3n,

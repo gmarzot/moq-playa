@@ -59,8 +59,8 @@ function createMockAudioDecoder(): AudioDecoderLike & {
     onData: null,
     onError: null,
     destroy: vi.fn(),
-    _triggerData(data: unknown, renderTimeUs: number) {
-      mock.onData?.(data, renderTimeUs);
+    _triggerData(data: unknown, renderTimeUs: number, captureUs?: number) {
+      mock.onData?.(data, renderTimeUs, captureUs);
     },
     _triggerError(err: Error) {
       mock.onError?.(err);
@@ -326,9 +326,10 @@ describe('CommandDispatcher', () => {
     const _dispatcher = new CommandDispatcher({ audioDecoder, audioOutput });
 
     const fakeAudioData = { sampleRate: 48000 };
-    audioDecoder._triggerData(fakeAudioData, 3000);
+    audioDecoder._triggerData(fakeAudioData, 3000, 7_000_000);
 
-    expect(audioOutput.schedule).toHaveBeenCalledWith(fakeAudioData, 3000);
+    // The chunk's capture timestamp rides along: decoders may rebase their own.
+    expect(audioOutput.schedule).toHaveBeenCalledWith(fakeAudioData, 3000, 7_000_000);
   });
 
   it('reports video decoder error via onError callback', () => {
@@ -450,6 +451,18 @@ describe('CommandDispatcher', () => {
       expect(errFb.mediaType).toBe('video');
       expect(errFb.message).toMatch(/decoder is closed/);
     }
+  });
+
+  it('reports an unsupported audio configuration without feeding recovery', () => {
+    const audioDecoder = createMockAudioDecoder();
+    const onError = vi.fn();
+    const feedbacks: DecoderFeedback[] = [];
+    new CommandDispatcher({ audioDecoder, onError, onFeedback: (fb) => feedbacks.push(fb) });
+
+    audioDecoder.onError!(Object.assign(new Error('audio decoder does not support opus'), { name: 'NotSupportedError' }));
+
+    expect(onError).toHaveBeenCalledWith('audio', expect.objectContaining({ name: 'NotSupportedError' }));
+    expect(feedbacks.filter((f) => f.type === 'decode_error')).toEqual([]);
   });
 
   it('catches synchronous throw from audioDecoder.decode() and routes to error callbacks', () => {
@@ -1001,7 +1014,7 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
       getPlaybackDelayUs: () => 200_000,
     });
     audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
-    expect(audioOutput.schedule).toHaveBeenCalledWith({ sampleRate: 48000 }, 203_000);
+    expect(audioOutput.schedule).toHaveBeenCalledWith({ sampleRate: 48000 }, 203_000, undefined);
   });
 
   it('adaptive cushion changes reach subsequent audio schedule() arguments (adoption at anchor/underrun is pinned in webaudio-output.test.ts)', () => {
@@ -1015,8 +1028,8 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
     audioDecoder._triggerData({ sampleRate: 48000 }, 1000);
     cushion = 400_000; // adaptive gap timeout grew under jitter
     audioDecoder._triggerData({ sampleRate: 48000 }, 2000);
-    expect(audioOutput.schedule).toHaveBeenNthCalledWith(1, expect.anything(), 201_000);
-    expect(audioOutput.schedule).toHaveBeenNthCalledWith(2, expect.anything(), 402_000);
+    expect(audioOutput.schedule).toHaveBeenNthCalledWith(1, expect.anything(), 201_000, undefined);
+    expect(audioOutput.schedule).toHaveBeenNthCalledWith(2, expect.anything(), 402_000, undefined);
   });
 
   it('without the hook, audio render times pass through unchanged (standalone back-compat)', () => {
@@ -1024,6 +1037,6 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
     const audioOutput = createMockAudioOutput();
     const _d = new CommandDispatcher({ audioDecoder, audioOutput });
     audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
-    expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000);
+    expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000, undefined);
   });
 });

@@ -20,6 +20,10 @@ export interface PlaybackSample {
   nativeDrawTimestampUs?: number;
   nativeDrawTimeMs?: number;
   videoPresentation?: { frameTimestampUs: string | null; timestampDomain: 'unknown'; renderedAtUs: number } | null;
+  /** Playout rate now, rate-up starts so far, and ms spent at a rate other than 1 so far. */
+  playbackRate?: number;
+  rateUps?: number;
+  rateOffMs?: number;
 }
 
 export interface ExpectedPlayback {

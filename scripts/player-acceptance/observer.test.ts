@@ -13,7 +13,7 @@ function observer(errorOnDestroy: boolean) {
     }
   }
   const video = {
-    requestVideoFrameCallback: () => 1, cancelVideoFrameCallback: () => {}, getAttribute: () => null,
+    requestVideoFrameCallback: () => 1, cancelVideoFrameCallback: () => {}, getAttribute: () => null, addEventListener: () => {},
     currentTime: 0, paused: true, readyState: 0, buffered: { length: 0 },
   };
   const source = readFileSync(new URL('../../examples/_tests/player-acceptance/main.ts', import.meta.url), 'utf8');

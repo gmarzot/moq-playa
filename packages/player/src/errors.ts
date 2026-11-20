@@ -88,6 +88,13 @@ export const PlayerErrorCode = {
    * MSE cannot be configured on this UA. Fatal.
    */
   CODEC_UNSUPPORTED: 0x1103,
+  /**
+   * The MSE pipeline died: the media element reported an error, or a
+   * SourceBuffer left its MediaSource (e.g. an init segment the browser's
+   * demuxer rejected). The message names the failed operation and the
+   * browser's reason. Only a MediaSource rebuild recovers. Fatal.
+   */
+  MEDIA_PIPELINE_FAILED: 0x1105,
 
   // ── Catalog (0x1200) ──────────────────────────────────────
   /** Initial catalog parse failed — cannot proceed. @see MSF §5.1 */

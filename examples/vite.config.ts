@@ -25,10 +25,22 @@ function buildId(): string {
  * bypassing dist/. No `pnpm build` needed during development — edit library
  * source, save, Vite hot-reloads via esbuild.
  */
+const BUILD = buildId();
+const BUILT_AT = new Date().toISOString();
+
 export default defineConfig({
   define: {
-    __PLAYA_BUILD__: JSON.stringify(buildId()),
+    __PLAYA_BUILD__: JSON.stringify(BUILD),
+    __PLAYA_BUILT_AT__: JSON.stringify(BUILT_AT),
   },
+  plugins: [{
+    // Deployed pages poll /VERSION to notice a newer build.
+    name: 'playa-version-file',
+    apply: 'build',
+    generateBundle() {
+      this.emitFile({ type: 'asset', fileName: 'VERSION', source: `moq-playa ${BUILD} ${BUILT_AT}\n` });
+    },
+  }],
   server: {
     // Default: localhost only. For mobile/device testing:
     //   VITE_HOST=0.0.0.0 npm run dev
@@ -57,7 +69,9 @@ export default defineConfig({
         connect: resolve(__dirname, 'connect/index.html'),
         player: resolve(__dirname, 'player/index.html'),
         simple: resolve(__dirname, 'simple/index.html'),
+        'g5-player': resolve(__dirname, 'g5-player/index.html'),
         broadcast: resolve(__dirname, 'broadcast/index.html'),
+        'g5-broadcast': resolve(__dirname, 'g5-broadcast/index.html'),
       },
     },
   },

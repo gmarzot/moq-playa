@@ -22,7 +22,7 @@ function fixture(fetchCatalog = false) {
   const nativeCloses = vi.fn();
   const context = createContext({
     AbortController, TextEncoder, TextDecoder, URLSearchParams, AggregateError, setTimeout, clearTimeout,
-    params: new URLSearchParams(fetchCatalog ? 'fetchCatalog=1' : ''), selectedVideoAltGroup: undefined,
+    params: new URLSearchParams(fetchCatalog ? 'fetchCatalog=1' : ''),
     playEpoch: 0, startupDiscovery: null, startupTransport: null, teardownBarrier: new TeardownBarrier(100),
     ensureAudio: () => ({ ctx: {}, clock: {} }), newStartupLatch: () => ({}),
     resolveRelayEndpoint: async () => 'https://test.invalid', log: vi.fn(),
@@ -43,6 +43,8 @@ function fixture(fetchCatalog = false) {
     player: null, externalConnection: null, mediaSourceRef: null, window: {}, isPlaying: false,
     setControlIcon() {}, flashCenter() {}, showPlayerControls() {}, hideTimer: null, parseVideoAltGroup,
     loadingSpinner: { style: {} }, controls: { style: {} },
+    clearPendingChoices() {}, closeTrackMenus: () => false,
+    videoTrackDropdown: { classList: { remove() {} } }, audioTrackDropdown: { classList: { remove() {} } },
   });
   class FakePlayer {
     constructor(readonly options: { createTransport(url: string): Promise<unknown> }) { instances.push(this); }

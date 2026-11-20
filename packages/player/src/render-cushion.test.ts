@@ -15,6 +15,7 @@ import { describe, it, expect } from 'vitest';
 import {
   RenderCushionSmoother,
   RENDER_CUSHION_MAX_US,
+  RENDER_CUSHION_BURST_MAX_US,
   RENDER_CUSHION_RISE_US_PER_SEC,
   RENDER_CUSHION_FALL_US_PER_SEC,
 } from './render-cushion.js';
@@ -25,6 +26,25 @@ function makeClock(startUs = 0) {
 }
 
 describe('RenderCushionSmoother', () => {
+  it('raiseTo steps up at once, clamps at the max and never lowers; a lower target then falls at the fall rate', () => {
+    const clock = makeClock();
+    const s = new RenderCushionSmoother({ floorUs: 200_000, maxUs: 2_000_000 }, clock);
+    s.update(200_000);
+    expect(s.raiseTo(600_000)).toBe(600_000);
+    expect(s.raiseTo(300_000)).toBe(600_000);
+    expect(s.raiseTo(5_000_000)).toBe(2_000_000);
+    clock.advance(1_000_000);
+    expect(s.update(200_000)).toBe(2_000_000 - RENDER_CUSHION_FALL_US_PER_SEC);
+  });
+
+  it('repeated raises reach the burst cap and clamp there', () => {
+    const clock = makeClock();
+    const s = new RenderCushionSmoother({ floorUs: 200_000, maxUs: RENDER_CUSHION_BURST_MAX_US }, clock);
+    s.update(0);
+    for (const us of [900_000, 1_800_000, 2_700_000]) expect(s.raiseTo(us)).toBe(us);
+    expect(s.raiseTo(4_000_000)).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
   it('first update snaps to the clamped target (no slew from fiction)', () => {
     const clock = makeClock();
     const s = new RenderCushionSmoother({ floorUs: 200_000 }, clock);
@@ -94,5 +114,21 @@ describe('RenderCushionSmoother', () => {
     const a = s.update(0);
     const b = s.update(0); // audio + video both call within the same instant
     expect(b).toBe(a);
+  });
+
+  it('setBounds keeps the current value and slews it into the new bounds at the usual rates', () => {
+    const clock = makeClock();
+    const s = new RenderCushionSmoother({ floorUs: 200_000, maxUs: 750_000 }, clock);
+    s.update(0);
+    s.setBounds(500_000, 1_000_000);
+    expect(s.currentUs).toBe(200_000);
+    clock.advance(1_000_000);
+    expect(s.update(0)).toBe(200_000 + RENDER_CUSHION_RISE_US_PER_SEC);
+    clock.advance(5_000_000);
+    expect(s.update(0)).toBe(500_000);
+    expect(s.raiseTo(5_000_000)).toBe(1_000_000);
+    s.setBounds(200_000, 400_000);
+    clock.advance(1_000_000);
+    expect(s.update(0)).toBe(1_000_000 - RENDER_CUSHION_FALL_US_PER_SEC);
   });
 });

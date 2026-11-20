@@ -16,7 +16,9 @@
  * Live catch-up: measures end-to-end latency by comparing CaptureTimestamp
  * (publisher wall-clock) to subscriber wall-clock. When latency exceeds
  * targetLatency + threshold, activates catch-up (playback rate > 1.0).
- * Hysteresis prevents oscillation near the threshold boundary.
+ * Hysteresis prevents oscillation near the threshold boundary. Decisions use
+ * the lowest latency over the recent arrival cycle, so objects arriving in
+ * bursts (late first, on time last) do not toggle catch-up within a burst.
  *
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp)
  * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
@@ -24,6 +26,7 @@
  */
 
 import type { ClockSource, CatchUpState } from './types.js';
+import { LowPointWindow } from './low-point-window.js';
 
 // ─── Render timing ──────────────────────────────────────────────────
 
@@ -100,6 +103,16 @@ export class SyncController {
     /** Accumulated drift measurement. */
     private _currentDriftUs = 0;
 
+    /** Shift added by bounded re-anchors and not yet walked back. Diagnostic. */
+    private _baselineDebtUs = 0;
+
+    /** Largest shift one bounded re-anchor may add. */
+    private static readonly MAX_REANCHOR_STEP_US = 100_000;
+
+    /** Largest shift one observation may lower the reference by, so a single
+     *  early stamp cannot collapse it. */
+    private static readonly MAX_LOWER_STEP_US = 20_000;
+
     /**
      * Video join offset — shifts video render times forward during live join.
      *
@@ -115,14 +128,16 @@ export class SyncController {
 
     // ── Catch-up state ─────────────────────────────────────────
     private readonly wallClock: WallClockSource;
-    private readonly targetLatencyMs: number | undefined;
-    private readonly maxCatchUpRate: number;
+    private targetLatencyMs: number | undefined;
+    private maxCatchUpRate: number;
     private readonly catchUpThresholdMs: number;
     private readonly catchUpRecoveryMs: number;
 
     private _catchUpActive = false;
     private _currentRate = 1.0;
     private _lastLatencyUs = 0;
+    /** Measured latencies (ms) by wall-clock time (s). */
+    private readonly latencyLows = new LowPointWindow();
 
     constructor(config: SyncControllerConfig) {
         this._driftThresholdUs = config.driftThresholdUs;
@@ -137,9 +152,20 @@ export class SyncController {
         this.catchUpRecoveryMs = config.catchUpRecoveryMs ?? 50;
     }
 
+    /** New catch-up target (ms) and max rate; either unset disables catch-up. */
+    setCatchUp(targetLatencyMs: number | undefined, maxCatchUpRate: number | undefined): void {
+        this.targetLatencyMs = targetLatencyMs;
+        this.maxCatchUpRate = maxCatchUpRate ?? 1.0;
+    }
+
     /** Whether a sync reference has been established. */
     get hasReference(): boolean {
         return this.localBaselineUs !== undefined;
+    }
+
+    /** Lateness beyond which a frame is considered late (µs). */
+    get lateThresholdUs(): number {
+        return this.dropThresholdUs;
     }
 
     /** Current drift magnitude in microseconds. */
@@ -205,6 +231,49 @@ export class SyncController {
         this.localBaselineUs = this.clock.now();
         this.captureBaselineUs = captureTimestampUs;
         this._currentDriftUs = 0;
+        this._baselineDebtUs = 0;
+    }
+
+    /** Reference delay added by late audio and not yet walked back. */
+    get baselineDebtUs(): number {
+        return this._baselineDebtUs;
+    }
+
+    /**
+     * Shift the reference later for late audio, by at most MAX_REANCHOR_STEP_US.
+     * The excess stays visible as lead and is retired by {@link lowerReference}.
+     *
+     * @param lateByUs how far behind its render time the frame is (positive)
+     * @returns the shift applied
+     */
+    reanchorAudioBounded(lateByUs: number): number {
+        if (this.localBaselineUs === undefined) return 0;
+        const step = Math.min(Math.max(0, lateByUs), SyncController.MAX_REANCHOR_STEP_US);
+        if (step <= 0) return 0;
+        this.localBaselineUs += step;
+        this._baselineDebtUs += step;
+        this._currentDriftUs = 0;
+        return step;
+    }
+
+    /**
+     * Walk the reference down toward a frame that arrived ahead of its render
+     * time, by at most MAX_LOWER_STEP_US per call. Late frames never move it, so
+     * it converges on the best delivery observed rather than the first.
+     *
+     * @param offsetUs how far ahead of its render time the frame arrived
+     * @param toleranceUs lookahead to leave in place rather than retire
+     * @returns the shift applied
+     */
+    lowerReference(offsetUs: number, toleranceUs = 0): number {
+        if (this.localBaselineUs === undefined) return 0;
+        const excess = offsetUs - toleranceUs;
+        if (excess <= 0) return 0;
+        const step = Math.min(excess, SyncController.MAX_LOWER_STEP_US);
+        this.localBaselineUs -= step;
+        // Lowering retires re-anchor debt too.
+        this._baselineDebtUs = Math.max(0, this._baselineDebtUs - step);
+        return step;
     }
 
     /**
@@ -353,7 +422,9 @@ export class SyncController {
      * Evaluate catch-up state based on current latency.
      *
      * Hysteresis: activates when latency > target + threshold,
-     * deactivates when latency <= target + recovery.
+     * deactivates when latency <= target + recovery. Latency here is the
+     * lowest measured over the recent arrival cycle; the state reports this
+     * object's own.
      *
      * Rate is proportional to overshoot, quantized to 0.05x increments.
      *
@@ -367,17 +438,27 @@ export class SyncController {
         if (latencyUs === null) return null;
 
         this._lastLatencyUs = latencyUs;
+        const nowSec = this.wallClock.now() / 1e6;
+        this.latencyLows.push(nowSec, latencyUs / 1000);
 
-        // Catch-up disabled?
-        if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) return null;
+        // Catch-up disabled. Ending a chase reports rate 1 once.
+        if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) {
+            if (!this._catchUpActive && this._currentRate === 1.0) return null;
+            this._catchUpActive = false;
+            this._currentRate = 1.0;
+            return {
+                active: false, currentRate: 1.0, latencyMs: latencyUs / 1000, targetMs: this.targetLatencyMs ?? 0,
+            };
+        }
 
         const latencyMs = latencyUs / 1000;
         const targetMs = this.targetLatencyMs;
+        const lowMs = this.latencyLows.min(nowSec) ?? latencyMs;
 
         // Hysteresis: activate/deactivate
-        if (!this._catchUpActive && latencyMs > targetMs + this.catchUpThresholdMs) {
+        if (!this._catchUpActive && lowMs > targetMs + this.catchUpThresholdMs) {
             this._catchUpActive = true;
-        } else if (this._catchUpActive && latencyMs <= targetMs + this.catchUpRecoveryMs) {
+        } else if (this._catchUpActive && lowMs <= targetMs + this.catchUpRecoveryMs) {
             this._catchUpActive = false;
             this._currentRate = 1.0;
             return { active: false, currentRate: 1.0, latencyMs, targetMs };
@@ -385,7 +466,7 @@ export class SyncController {
 
         if (this._catchUpActive) {
             // Proportional rate: scale linearly with overshoot
-            const overshoot = latencyMs - targetMs;
+            const overshoot = lowMs - targetMs;
             const ratio = Math.min(Math.max(overshoot / this.catchUpThresholdMs, 0), 1);
             const rawRate = 1.0 + (this.maxCatchUpRate - 1.0) * ratio;
             // Quantize to 0.05x increments
@@ -409,9 +490,11 @@ export class SyncController {
         this.localBaselineUs = undefined;
         this.captureBaselineUs = undefined;
         this._currentDriftUs = 0;
+        this._baselineDebtUs = 0;
         this._videoJoinOffsetUs = 0;
         this._catchUpActive = false;
         this._currentRate = 1.0;
+        this.latencyLows.clear();
     }
 
     // ─── Internal ───────────────────────────────────────────────────

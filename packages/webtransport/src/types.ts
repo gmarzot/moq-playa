@@ -47,6 +47,10 @@ export interface WebTransportLike {
    */
   readonly protocol?: string;
 
+  /** Congestion-control class the browser applied, where it reports one.
+   *  @see W3C WebTransport (congestionControl) */
+  readonly congestionControl?: string;
+
   /**
    * QUIC handshake RTT in milliseconds. Set by the transport factory.
    * Used by the startup buffer to classify network conditions.
@@ -63,6 +67,14 @@ export interface WebTransportLike {
    * and PATH carried in SETUP. WebTransport implementations omit this field.
    */
   readonly setupOptions?: MoqtSetupRouting;
+
+  /**
+   * Connection statistics, where the implementation has them: RTT, packet
+   * loss, send rate, stream and datagram counts. Optional — native QUIC
+   * adapters and test doubles may not implement it.
+   * @see W3C WebTransport §5.4 (WebTransportConnectionStats)
+   */
+  getStats?(): Promise<Record<string, unknown>>;
 
   /** Open a new client-initiated bidirectional stream. */
   createBidirectionalStream(): Promise<WebTransportBidirectionalStream>;

@@ -361,8 +361,8 @@ function renderCatalog(catalog: CatalogState, rawJson: string): void {
   // Header
   const thead = table.createTHead();
   const hr = thead.insertRow();
-  const cols = ['#', 'Name', 'Packaging', 'Role', 'Codec', 'Bitrate', 'Details', ''];
-  const colClasses = ['col-idx', '', '', '', '', '', '', 'col-expand'];
+  const cols = ['#', 'Name', 'Packaging', 'Role', 'Render group', 'Alt group', 'Codec', 'Bitrate', 'Details', ''];
+  const colClasses = ['col-idx', '', '', '', 'col-group', 'col-group', '', '', '', 'col-expand'];
   cols.forEach((text, i) => {
     const th = document.createElement('th');
     th.textContent = text;
@@ -399,6 +399,14 @@ function renderCatalog(catalog: CatalogState, rawJson: string): void {
       roleCell.appendChild(badge);
     } else {
       roleCell.innerHTML = '<span class="dim">—</span>';
+    }
+
+    // renderGroup (§5.1.18) and altGroup (§5.1.19)
+    for (const group of [track.renderGroup, track.altGroup]) {
+      const groupCell = row.insertCell();
+      groupCell.className = 'col-group';
+      if (group != null) groupCell.textContent = String(group);
+      else groupCell.innerHTML = '<span class="dim">—</span>';
     }
 
     // Codec

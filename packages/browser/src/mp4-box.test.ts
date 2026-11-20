@@ -14,6 +14,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+    readFirstCompositionOffset,
     readSegmentTimeRanges,
     readTrexDefaults,
     readMdhdTimescale,
@@ -462,6 +463,32 @@ describe('readSegmentTimeRanges', () => {
 });
 
 // ─── readTrexDefaults tests ───────────────────────────────────────
+
+describe('readFirstCompositionOffset', () => {
+    const segment = (trun: Uint8Array): Uint8Array => moof([traf([trun])]);
+
+    it('reads an unsigned offset past the per-sample fields', () => {
+        const trun = fullBox('trun', 0, 0x000f01, cat(u32(1), u32(0), u32(33), u32(100), u32(0), u32(66)));
+        expect(readFirstCompositionOffset(segment(trun))).toBe(66);
+    });
+
+    it('reads a signed offset in a version 1 trun', () => {
+        const trun = fullBox('trun', 1, 0x000800, cat(u32(1), u32(0xffffffff)));
+        expect(readFirstCompositionOffset(segment(trun))).toBe(-1);
+    });
+
+    it('skips an empty run to the first sample', () => {
+        const empty = fullBox('trun', 0, 0x000800, u32(0));
+        const trun = fullBox('trun', 0, 0x000800, cat(u32(1), u32(66)));
+        expect(readFirstCompositionOffset(moof([traf([empty, trun])]))).toBe(66);
+    });
+
+    it('is 0 without offsets, samples or a moof', () => {
+        expect(readFirstCompositionOffset(segment(fullBox('trun', 0, 0x000100, cat(u32(1), u32(33)))))).toBe(0);
+        expect(readFirstCompositionOffset(segment(fullBox('trun', 0, 0x000800, u32(0))))).toBe(0);
+        expect(readFirstCompositionOffset(new Uint8Array(0))).toBe(0);
+    });
+});
 
 describe('readTrexDefaults', () => {
     it('returns a single trex entry keyed by track_id', () => {

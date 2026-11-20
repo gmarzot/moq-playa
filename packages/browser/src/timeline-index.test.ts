@@ -208,3 +208,26 @@ describe('TimelineIndex — BigInt boundaries', () => {
         });
     });
 });
+
+describe('TimelineIndex — dropBefore', () => {
+    it('drops ranges ending at or before the point and clips one straddling it', () => {
+        const idx = new TimelineIndex();
+        idx.insert(0n, 10n);
+        idx.insert(20n, 30n);
+        idx.insert(40n, 50n);
+        idx.dropBefore(25n);
+        expect(idx.getRanges()).toEqual([{ start: 25n, end: 30n }, { start: 40n, end: 50n }]);
+        idx.dropBefore(30n);
+        expect(idx.getRanges()).toEqual([{ start: 40n, end: 50n }]);
+        expect(idx.containsRange(40n, 50n)).toBe(true);
+        idx.dropBefore(100n);
+        expect(idx.size).toBe(0);
+    });
+
+    it('leaves the index unchanged for a point before every range', () => {
+        const idx = new TimelineIndex();
+        idx.insert(10n, 20n);
+        idx.dropBefore(5n);
+        expect(idx.getRanges()).toEqual([{ start: 10n, end: 20n }]);
+    });
+});

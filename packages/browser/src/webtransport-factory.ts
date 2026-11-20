@@ -23,6 +23,9 @@
 
 import type { WebTransportLike } from '@openmoq/webtransport';
 
+/** Auto mode's offer, newest first. */
+const AUTO_PROTOCOLS = ['moqt-22', 'moqt-18', 'moqt-16'];
+
 /** Options for creating the WebTransport factory. */
 export interface WebTransportFactoryOptions {
   /** Cancels startup only; after readiness the caller owns transport shutdown. */
@@ -44,12 +47,19 @@ export interface WebTransportFactoryOptions {
    * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
-   * - undefined → `["moqt-16"]` (default, kept for backward compatibility)
+   * - undefined → `["moqt-22", "moqt-18", "moqt-16"]`: newest first, the server picks
    *
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
   readonly draftVersion?: 14 | 16 | 18 | 22;
+
+  /**
+   * Congestion-control preference for the WebTransport constructor. A hint the
+   * browser may ignore; what it applied is reported as `congestionControl` on
+   * the returned transport.
+   */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 }
 
 /**
@@ -65,9 +75,16 @@ export function createWebTransport(
   options?: WebTransportFactoryOptions,
 ): (url: string) => Promise<WebTransportLike> {
   return async (url: string): Promise<WebTransportLike> => {
+    if (!/^https:\/\//i.test(url)) {
+      const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1];
+      throw new Error(
+        'Relay URL must be an https:// WebTransport endpoint, got '
+        + (scheme ? `${scheme}://` : `"${url}"`),
+      );
+    }
     // Build options as a plain object — WebTransportOptions varies by environment.
     // §3.1: WT-Available-Protocols for MOQT version negotiation.
-    // Default: offer ['moqt-16']. Draft-14 does not send protocols —
+    // Default: offer every wired draft, newest first. Draft-14 does not send protocols —
     // it relies on h3 ALPN with in-band CLIENT_SETUP version list.
     const buildOpts = (withProtocols: boolean): any => {
       const opts: any = {};
@@ -77,6 +94,7 @@ export function createWebTransport(
           value: options.certHash,
         }];
       }
+      if (options?.congestionControl) opts.congestionControl = options.congestionControl;
       if (!withProtocols) return opts;
       // Protocol negotiation via WT-Available-Protocols (§3.1).
       // Draft-14 and below used "moq-00" ALPN over raw QUIC, but over WebTransport
@@ -86,9 +104,8 @@ export function createWebTransport(
       if (options?.draftVersion && options.draftVersion >= 15) {
         opts.protocols = [`moqt-${options.draftVersion}`];
       } else if (!options?.draftVersion) {
-        // Auto-negotiate: offer draft-16 protocol string.
-        // Don't offer moq-00/moqt-14 — servers reject unknown protocol strings.
-        opts.protocols = ['moqt-16'];
+        // Auto-negotiate. No moq-00/moqt-14: servers reject unknown protocol strings.
+        opts.protocols = [...AUTO_PROTOCOLS];
       }
       // draft-14: no protocols sent — h3 ALPN fallback with CLIENT_SETUP version list
       return opts;
@@ -146,14 +163,17 @@ export function createWebTransport(
       if (!firstOpts.protocols || options?.draftVersion === 22) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
-      // Preserve the older-draft compatibility retry for deployed endpoints
-      // without WT subprotocol negotiation. Draft 22 requires negotiation and
-      // cannot use this fallback; SETUP does not carry a version list.
-      //
-      // In auto mode, the fallback has no transport.protocol, so the adapter
-      // uses its default draft unless the caller passed draftVersion
-      // explicitly. Callers that need deterministic draft selection should
-      // pass draftVersion.
+      // Draft-16+ negotiate the version only via WT-Protocol. A session
+      // without it leaves the server with no draft, and a draft-18 uni
+      // control stream on such a session is a protocol violation (moqx
+      // segfaults on it). So an explicit 16/18 pin never retries bare.
+      if (options?.draftVersion && options.draftVersion >= 15) {
+        throw new Error(`WebTransport connection failed: ${detail}`);
+      }
+      // Strict UAs (Safari 26) fail the session when WT-Available-Protocols
+      // negotiation does not complete. In auto mode retry once without
+      // offering; the fallback has no transport.protocol, so the adapter
+      // uses its default draft.
       try {
         connected = await attempt(false);
       } catch (retryErr) {
@@ -200,8 +220,13 @@ export function createWebTransport(
     };
 
     const protocol = (transport as any).protocol as string | undefined;
+    const congestionControl = (transport as any).congestionControl as string | undefined;
+    // Absent when unsupported, so callers can tell that from empty stats.
+    const getStats = (transport as WebTransportLike).getStats;
     return {
       ...(protocol !== undefined ? { protocol } : {}),
+      ...(congestionControl !== undefined ? { congestionControl } : {}),
+      ...(getStats ? { getStats: () => getStats.call(transport) } : {}),
       ...wrappedTransport,
     } satisfies WebTransportLike;
   };

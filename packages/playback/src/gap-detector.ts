@@ -98,6 +98,20 @@ export class GapDetector {
         return this.trackEnded;
     }
 
+    /**
+     * Drop per-group state at or below `groupId`. evaluate() reads only later
+     * groups, so this keeps both collections at the groups still in flight
+     * instead of one entry per group for the life of the session.
+     */
+    private forgetThrough(groupId: bigint): void {
+        for (const g of this.groupFirstSeenUs.keys()) {
+            if (g <= groupId) this.groupFirstSeenUs.delete(g);
+        }
+        for (const g of this.endedGroups) {
+            if (g <= groupId) this.endedGroups.delete(g);
+        }
+    }
+
     /** Reset all state — used when resuming after pause on a live stream. */
     reset(): void {
         this.endedGroups.clear();
@@ -113,6 +127,8 @@ export class GapDetector {
      * @returns Decision: WAIT, SKIP_FORWARD, or TRACK_ENDED
      */
     evaluate(lastConsumedGroupId: bigint, availableGroupIds: bigint[]): GapDecision {
+        this.forgetThrough(lastConsumedGroupId);
+
         // Track ended → always report
         if (this.trackEnded) {
             return { action: GapAction.TRACK_ENDED };

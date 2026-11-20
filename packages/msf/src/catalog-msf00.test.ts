@@ -318,6 +318,17 @@ const EXAMPLE_TERMINATE = JSON.stringify({
 describe('parseMsfCatalog', () => {
     // ─── Valid catalogs (spec examples) ──────────────────────────────
 
+    it('leaves out a track with an unknown packaging and keeps the others', () => {
+        const catalog = parseMsfCatalog(JSON.stringify({ version: 1, tracks: [
+            { name: 'video', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1.42001f' },
+            { name: 'program-1', packaging: 'mpeg2ts', isLive: true },
+        ] }));
+        expect(catalog.tracks.map((t) => t.name)).toEqual(['video']);
+        expect(catalog.ignoredTracks).toEqual([{ name: 'program-1', packaging: 'mpeg2ts' }]);
+        expect(() => parseMsfCatalog(JSON.stringify({ version: 1, tracks: [{ name: 'x', isLive: true }] })))
+            .toThrow(/packaging is required/);
+    });
+
     it('parses minimal valid catalog', () => {
         const catalog = parseMsfCatalog('{"version": 1, "tracks": []}');
         expect(catalog.version).toBe(1);

@@ -10,7 +10,7 @@
 
 import fjp from 'fast-json-patch';
 const { applyPatch, validate } = fjp;
-import type { Catalog, CatalogTrack, Packaging } from './types.js';
+import type { Catalog, CatalogTrack, IgnoredTrack, Packaging } from './types.js';
 import { assertFiniteCatalogNumbers } from './catalog-validate.js';
 import { validateLocmafVersion } from './catalog-msf00.js';
 
@@ -170,9 +170,18 @@ function parseCf01Object(
     if (typeof obj['namespace'] === 'string') rootFields['namespace'] = obj['namespace'];
     if (typeof obj['name'] === 'string') rootFields['name'] = obj['name'];
 
-    const tracks = (obj['tracks'] as unknown[]).map((rawTrack, i) =>
-        parseCf01Track(rawTrack, i, commonFields, rootFields, catalogNamespace, options),
-    );
+    // A track whose packaging (its own or inherited) is unknown is left out so the others still play.
+    const ignoredTracks: IgnoredTrack[] = [];
+    const tracks = (obj['tracks'] as unknown[]).flatMap((rawTrack, i) => {
+        const own = typeof rawTrack === 'object' && rawTrack !== null ? rawTrack as Record<string, unknown> : {};
+        const name = own['name'] ?? rootFields['name'];
+        const packaging = own['packaging'] ?? commonFields['packaging'];
+        if (typeof name === 'string' && typeof packaging === 'string' && !VALID_PACKAGING.has(packaging)) {
+            ignoredTracks.push({ name, packaging });
+            return [];
+        }
+        return [parseCf01Track(rawTrack, i, commonFields, rootFields, catalogNamespace, options)];
+    });
 
     // Validate track name uniqueness per namespace
     validateTrackUniqueness(tracks);
@@ -180,7 +189,7 @@ function parseCf01Object(
     // Validate initTrack references (§3.2.16)
     validateInitTrackRefs(tracks);
 
-    const catalog: Catalog = { version: 1, tracks };
+    const catalog: Catalog = { version: 1, tracks, ...(ignoredTracks.length > 0 ? { ignoredTracks } : {}) };
     // Reject non-finite numbers (e.g. a 1e999 overflow exponent) on every CF-01
     // path — direct parse AND patch application both build through here.
     assertFiniteCatalogNumbers(catalog);

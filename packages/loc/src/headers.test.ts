@@ -23,7 +23,7 @@ import {
 } from './headers.js';
 import { LocExtensionId } from './types.js';
 import type { LocHeaders } from './types.js';
-import { LocEncodeError } from './errors.js';
+import { LocEncodeError, LocHeaderError } from './errors.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 

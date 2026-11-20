@@ -149,6 +149,30 @@ describe('AudioAlignedClock', () => {
     expect(t).toBe(5_100_000);
   });
 
+  it('re-anchors after a suspension: the clock follows wall time, not the stale offset', () => {
+    const clock = new AudioAlignedClock();
+    const ctx = createMockAudioContext({
+      state: 'running',
+      timestamp: { contextTime: 2.0, performanceTime: 5000 },
+    });
+    clock.attachAudioContext(ctx);
+    vi.spyOn(performance, 'now').mockReturnValue(5000);
+    expect(clock.now()).toBe(5_000_000);
+
+    // Suspended for 6 s: context time stands still.
+    (ctx as { state: AudioContextState }).state = 'suspended';
+    vi.spyOn(performance, 'now').mockReturnValue(11_000);
+    expect(clock.now()).toBe(11_000_000);
+
+    // Running again, context time resumes from where it stopped.
+    (ctx as { state: AudioContextState }).state = 'running';
+    (ctx.getOutputTimestamp as ReturnType<typeof vi.fn>).mockReturnValue({
+      contextTime: 2.1, performanceTime: 11_100,
+    });
+    vi.spyOn(performance, 'now').mockReturnValue(11_100);
+    expect(clock.now()).toBe(11_100_000);
+  });
+
   it('detachAudioContext() reverts to performance.now() fallback', () => {
     const clock = new AudioAlignedClock();
     const ctx = createMockAudioContext({

@@ -71,10 +71,14 @@ async function boot(options: {
     track: event.trackName, marker: event.payload?.[8],
     alias: (player as any).activeSubscriptions.get(ids.get(event.trackName))?.trackAlias,
   }));
-  const data = (alias: bigint, marker: number): MoqtObject => ({
-    kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
-    payload: Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker),
-  });
+  const packaging = options.warmStart || options.knownTracks ? 'loc' : 'cmaf';
+  const data = (alias: bigint, marker: number): MoqtObject => {
+    const payload = Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker);
+    return {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      payload,
+    };
+  };
   const send = (alias: bigint, marker: number, stream = 100n) => adapter.onObject?.(stream, data(alias, marker));
   const header = (requestId: bigint, stream = 200n) => adapter.onDataStream?.(stream, {
     type: 'fetch', header: { requestId: varint(requestId) },
@@ -82,7 +86,6 @@ async function boot(options: {
   await player.load();
   const catalogAlias = options.knownTracks ? 2n : 100n;
   if (!options.knownTracks) ack(ids.get('catalog')!, catalogAlias);
-  const packaging = options.warmStart || options.knownTracks ? 'loc' : 'cmaf';
   adapter.onObject?.(0n, {
     ...data(catalogAlias, 0), payload: new TextEncoder().encode(JSON.stringify({
       version: 1,

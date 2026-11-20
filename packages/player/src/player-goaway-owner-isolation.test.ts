@@ -17,11 +17,14 @@
  * Uses an internal relative testkit import by design — the testkit is not a
  * published export of @openmoq/webtransport.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtPlayer } from './player.js';
+
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
