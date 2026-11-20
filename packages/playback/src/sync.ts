@@ -16,7 +16,9 @@
  * Live catch-up: measures end-to-end latency by comparing CaptureTimestamp
  * (publisher wall-clock) to subscriber wall-clock. When latency exceeds
  * targetLatency + threshold, activates catch-up (playback rate > 1.0).
- * Hysteresis prevents oscillation near the threshold boundary.
+ * Hysteresis prevents oscillation near the threshold boundary. Decisions use
+ * the lowest latency over the recent arrival cycle, so objects arriving in
+ * bursts (late first, on time last) do not toggle catch-up within a burst.
  *
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp)
  * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
@@ -24,6 +26,7 @@
  */
 
 import type { ClockSource, CatchUpState } from './types.js';
+import { LowPointWindow } from './low-point-window.js';
 
 // ─── Render timing ──────────────────────────────────────────────────
 
@@ -133,6 +136,8 @@ export class SyncController {
     private _catchUpActive = false;
     private _currentRate = 1.0;
     private _lastLatencyUs = 0;
+    /** Measured latencies (ms) by wall-clock time (s). */
+    private readonly latencyLows = new LowPointWindow();
 
     constructor(config: SyncControllerConfig) {
         this._driftThresholdUs = config.driftThresholdUs;
@@ -417,7 +422,9 @@ export class SyncController {
      * Evaluate catch-up state based on current latency.
      *
      * Hysteresis: activates when latency > target + threshold,
-     * deactivates when latency <= target + recovery.
+     * deactivates when latency <= target + recovery. Latency here is the
+     * lowest measured over the recent arrival cycle; the state reports this
+     * object's own.
      *
      * Rate is proportional to overshoot, quantized to 0.05x increments.
      *
@@ -431,6 +438,8 @@ export class SyncController {
         if (latencyUs === null) return null;
 
         this._lastLatencyUs = latencyUs;
+        const nowSec = this.wallClock.now() / 1e6;
+        this.latencyLows.push(nowSec, latencyUs / 1000);
 
         // Catch-up disabled. Ending a chase reports rate 1 once.
         if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) {
@@ -444,11 +453,12 @@ export class SyncController {
 
         const latencyMs = latencyUs / 1000;
         const targetMs = this.targetLatencyMs;
+        const lowMs = this.latencyLows.min(nowSec) ?? latencyMs;
 
         // Hysteresis: activate/deactivate
-        if (!this._catchUpActive && latencyMs > targetMs + this.catchUpThresholdMs) {
+        if (!this._catchUpActive && lowMs > targetMs + this.catchUpThresholdMs) {
             this._catchUpActive = true;
-        } else if (this._catchUpActive && latencyMs <= targetMs + this.catchUpRecoveryMs) {
+        } else if (this._catchUpActive && lowMs <= targetMs + this.catchUpRecoveryMs) {
             this._catchUpActive = false;
             this._currentRate = 1.0;
             return { active: false, currentRate: 1.0, latencyMs, targetMs };
@@ -456,7 +466,7 @@ export class SyncController {
 
         if (this._catchUpActive) {
             // Proportional rate: scale linearly with overshoot
-            const overshoot = latencyMs - targetMs;
+            const overshoot = lowMs - targetMs;
             const ratio = Math.min(Math.max(overshoot / this.catchUpThresholdMs, 0), 1);
             const rawRate = 1.0 + (this.maxCatchUpRate - 1.0) * ratio;
             // Quantize to 0.05x increments
@@ -484,6 +494,7 @@ export class SyncController {
         this._videoJoinOffsetUs = 0;
         this._catchUpActive = false;
         this._currentRate = 1.0;
+        this.latencyLows.clear();
     }
 
     // ─── Internal ───────────────────────────────────────────────────

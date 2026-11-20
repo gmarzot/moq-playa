@@ -3,9 +3,13 @@
  * playhead exceeds the target, shedding latency debt too small for a seek.
  * A stall that begins during a chase raises the cushion the chase stops at,
  * so the chase never again drains the buffer into a level that stalled.
+ * A chase engages only when the cushion's low points over the recent arrival
+ * cycle are above the band too, so media arriving in bursts does not trigger it.
  *
  * @module
  */
+
+import { LowPointWindow } from './low-point-window.js';
 
 /** The element property the chase drives. */
 export interface ChasedElement {
@@ -25,10 +29,12 @@ export class SoftChase {
   /** Duration (s) of the latest video sample. */
   private sampleSec: number | null = null;
   private _starts = 0;
+  private readonly lows = new LowPointWindow();
 
   constructor(
     private readonly element: ChasedElement,
     private readonly targetSec: () => number,
+    private readonly nowMs: () => number = () => performance.now(),
   ) {}
 
   get chasing(): boolean {
@@ -50,10 +56,16 @@ export class SoftChase {
     return this.releaseSec + Math.max(SoftChase.ON_MIN_SEC, this.targetSec() * SoftChase.ON_RATIO);
   }
 
-  /** Cushion measured after new media lands: engage above the band, release at the release point. */
+  /**
+   * Cushion measured after new media lands: engage when it and the recent low
+   * points are above the band, release at the release point.
+   */
   onCushion(aheadSec: number): void {
-    if (aheadSec > this.engageSec) {
+    const engageSec = this.engageSec;
+    if (aheadSec > engageSec) {
       if (this.element.playbackRate === 1) {
+        const low = this.lows.min(this.nowMs() / 1000);
+        if (low !== null && low <= engageSec) return;
         this.element.playbackRate = SoftChase.RATE;
         this._starts++;
       }
@@ -64,6 +76,7 @@ export class SoftChase {
 
   /** Cushion measured before new media lands, its low point: release at the release point. */
   onLowPoint(aheadSec: number): void {
+    this.lows.push(this.nowMs() / 1000, aheadSec);
     if (this.chasing && aheadSec <= this.releaseSec) this.stop();
   }
 
@@ -89,9 +102,10 @@ export class SoftChase {
     if (this.element.playbackRate !== 1) this.element.playbackRate = 1;
   }
 
-  /** New session: forget the floor and the sample duration. */
+  /** New session: forget the floor, the sample duration and the low points. */
   reset(): void {
     this.floorSec = 0;
+    this.lows.clear();
     this.sampleSec = null;
   }
 }

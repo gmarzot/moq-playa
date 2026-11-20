@@ -528,6 +528,83 @@ describe('SyncController', () => {
             expect(sync.currentRate).toBe(1.0);
         });
 
+        describe('arrival cadence', () => {
+            function cadenceSync() {
+                const clock = new MockClock();
+                const wallClock = new MockWallClock();
+                const sync = new SyncController({
+                    driftThresholdUs: DRIFT_THRESHOLD,
+                    clock,
+                    targetLatencyMs: TARGET_MS,
+                    maxCatchUpRate: MAX_RATE,
+                    catchUpThresholdMs: THRESHOLD_MS,
+                    catchUpRecoveryMs: RECOVERY_MS,
+                    wallClock,
+                });
+                const at = (localUs: number, latencyMs: number) => {
+                    clock.set(localUs);
+                    wallClock.set(1_000_000_000 + localUs);
+                    return sync.evaluateCatchUp(BigInt(Math.round(1_000_000_000 + localUs - latencyMs * 1000)))!;
+                };
+                return { sync, at };
+            }
+
+            /** 2.5 s groups in one 20 ms burst: the first object reads a group late, the last on time. */
+            function burst(at: (us: number, ms: number) => unknown, startUs: number, baseMs: number) {
+                const states = [];
+                for (let k = 0; k < 75; k++) {
+                    states.push(at(startUs + Math.round(k * 20_000 / 75), baseMs + 2500 * (74 - k) / 75));
+                }
+                return states as ReturnType<SyncController['evaluateCatchUp']>[];
+            }
+
+            it('burst arrival on time at its low point does not toggle within a burst', () => {
+                const { at } = cadenceSync();
+                burst(at, 0, TARGET_MS);
+                for (let g = 1; g < 6; g++) {
+                    for (const state of burst(at, g * 2_500_000, TARGET_MS)) {
+                        expect(state!.active).toBe(false);
+                        expect(state!.currentRate).toBe(1);
+                    }
+                }
+            });
+
+            it('burst arrival late at its low point catches up for whole bursts', () => {
+                const { at } = cadenceSync();
+                burst(at, 0, TARGET_MS + 700);
+                for (let g = 1; g < 4; g++) {
+                    for (const state of burst(at, g * 2_500_000, TARGET_MS + 700)) {
+                        expect(state!.active).toBe(true);
+                        expect(state!.currentRate).toBe(MAX_RATE);
+                    }
+                }
+            });
+
+            it('steady arrival activates within the minimum window and releases at once', () => {
+                const { at } = cadenceSync();
+                const frameUs = 33_333;
+                let activatedUs: number | null = null;
+                let crossedUs: number | null = null;
+                for (let i = 0; i < 90; i++) {
+                    const latencyMs = 1300 + i * 5;
+                    if (crossedUs === null && latencyMs > TARGET_MS + THRESHOLD_MS) crossedUs = i * frameUs;
+                    if (at(i * frameUs, latencyMs).active && activatedUs === null) activatedUs = i * frameUs;
+                }
+                expect(activatedUs).not.toBeNull();
+                expect(activatedUs! - crossedUs!).toBeGreaterThan(0);
+                expect(activatedUs! - crossedUs!).toBeLessThanOrEqual(250_000 + frameUs);
+                expect(at(90 * frameUs, TARGET_MS + RECOVERY_MS + 1).active).toBe(true);
+                expect(at(91 * frameUs, TARGET_MS + RECOVERY_MS).active).toBe(false);
+            });
+
+            it('reset forgets measured latencies', () => {
+                const { sync, at } = cadenceSync();
+                at(0, TARGET_MS);
+                sync.reset();
+                expect(at(10_000, TARGET_MS + 700).active).toBe(true);
+            });
+        });
+
         it('latencyUs getter returns last measurement', () => {
             const wallClock = new MockWallClock();
             const sync = createCatchUpSync(wallClock);
