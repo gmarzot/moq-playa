@@ -331,7 +331,7 @@ function log(msg: string): void {
     fStatus.checked = p.get('status') === '1';
     fDebug.checked = p.get('debug') === '1';
     // Unless this tab chose otherwise, Advanced opens when anything in it is set.
-    if (rememberedOpen('g5-settings:advanced') === null && MANAGED.slice(MANAGED.indexOf('catalogBootstrap')).some((k) => p.has(k))) advSec.open = true;
+    if (rememberedOpen('g5-settings:advanced') === null && MANAGED.slice(MANAGED.indexOf('targetLatency')).some((k) => p.has(k))) advSec.open = true;
   }
 
   /** The query the fields describe; every unmanaged param carries over. */
