@@ -5,8 +5,11 @@
  *
  * The hold sits between the publisher and its connection: calls resolve at
  * once with stand-in stream IDs, and {@link GroupBurstConnection.flush} replays
- * them in order. A send failure there is reported, not returned to the
- * publisher, so the hold hides Forward State 0 refusals.
+ * a group's calls in order on each stream and on each track's datagrams, the
+ * streams concurrently as the publisher would send them; a group starts once
+ * the one before it is sent, so none overtakes an earlier group. A send failure
+ * there is reported, not returned to the publisher, so the hold hides Forward
+ * State 0 refusals.
  */
 import type { MediaPublishConnection } from './media-publisher.js';
 
@@ -19,7 +22,8 @@ export interface GroupBurstOptions {
 
 export const GROUP_BURST_MAX_BYTES = 8 * 1024 * 1024;
 
-type Op = { bytes: number; run: () => Promise<void> };
+/** `lane`: ops on one lane replay in order; lanes run concurrently. */
+type Op = { bytes: number; lane: string; run: () => Promise<void> };
 
 export class GroupBurstConnection implements MediaPublishConnection {
   private readonly inner: MediaPublishConnection;
@@ -50,27 +54,28 @@ export class GroupBurstConnection implements MediaPublishConnection {
     opts?: { publisherPriority?: number; extensions?: Uint8Array },
   ): Promise<void> {
     if (!this.inner.sendDatagram) return Promise.reject(new Error('datagrams not supported'));
-    return this.hold(payload.byteLength, () => this.inner.sendDatagram!(trackAlias, groupId, objectId, payload, opts));
+    return this.hold(payload.byteLength, `d${trackAlias}`,
+      () => this.inner.sendDatagram!(trackAlias, groupId, objectId, payload, opts));
   }
 
   openSubgroup(alias: unknown, groupId: unknown, subgroupId: unknown, options: Record<string, unknown>): Promise<bigint> {
     if (this.closed) return this.inner.openSubgroup(alias, groupId, subgroupId, options);
     const standIn = this.nextStandIn--;
-    void this.hold(0, async () => {
+    void this.hold(0, `s${standIn}`, async () => {
       this.streams.set(standIn, await this.inner.openSubgroup(alias, groupId, subgroupId, options));
     });
     return Promise.resolve(standIn);
   }
 
   sendObject(streamId: bigint, objectId: unknown, payload: Uint8Array, extensions?: Uint8Array): Promise<void> {
-    return this.hold(payload.byteLength + (extensions?.byteLength ?? 0), async () => {
+    return this.hold(payload.byteLength + (extensions?.byteLength ?? 0), `s${streamId}`, async () => {
       const real = this.real(streamId);
       if (real !== null) await this.inner.sendObject(real, objectId, payload, extensions);
     });
   }
 
   closeSubgroup(streamId: bigint): Promise<void> {
-    return this.hold(0, async () => {
+    return this.hold(0, `s${streamId}`, async () => {
       const real = this.real(streamId);
       this.streams.delete(streamId);
       if (real !== null) await this.inner.closeSubgroup(real);
@@ -102,12 +107,12 @@ export class GroupBurstConnection implements MediaPublishConnection {
     return streamId >= 0n ? streamId : this.streams.get(streamId) ?? null;
   }
 
-  private hold(bytes: number, run: () => Promise<void>): Promise<void> {
+  private hold(bytes: number, lane: string, run: () => Promise<void>): Promise<void> {
     if (this.closed) {
       this.chain = this.chain.then(() => this.execute(run));
       return this.chain;
     }
-    this.held.push({ bytes, run });
+    this.held.push({ bytes, lane, run });
     this.heldBytes += bytes;
     if (!this.passthrough && this.heldBytes > this.maxBytes) {
       this.passthrough = true;
@@ -124,7 +129,12 @@ export class GroupBurstConnection implements MediaPublishConnection {
     this.heldBytes = 0;
     if (ops.length === 0) return;
     this.chain = this.chain.then(async () => {
-      for (const op of ops) await this.execute(op.run);
+      const lanes = new Map<string, Promise<void>>();
+      await Promise.all(ops.map((op) => {
+        const next = (lanes.get(op.lane) ?? Promise.resolve()).then(() => this.execute(op.run));
+        lanes.set(op.lane, next);
+        return next;
+      }));
     });
   }
 
