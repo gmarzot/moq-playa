@@ -749,16 +749,16 @@
             cx="12" cy="12" r="3"/></svg>
         </button>
         <div id="menu" class="menu settings-popup" role="dialog" aria-label="Playback and connection settings" hidden>
-          <label class="sp-row" hidden>View <select id="view"></select></label>
-          <label class="sp-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
-          <label class="sp-row" hidden>Audio <select id="audio"></select></label>
-          <label class="sp-row" hidden>Language <select id="lang"></select></label>
+          <label class="sp-row" hidden title="Which view of the broadcast to play.">View <select id="view"></select></label>
+          <label class="sp-row" hidden title="Auto follows the network; pick one to pin it.">Quality <select id="quality" disabled><option>Auto</option></select></label>
+          <label class="sp-row" hidden title="Which audio track to play.">Audio <select id="audio"></select></label>
+          <label class="sp-row" hidden title="Audio language.">Language <select id="lang"></select></label>
           <hr class="sp-sep">
-          <div class="sp-field"><label for="s-url">Relay</label>
+          <div class="sp-field" title="Relay URL. Blank: this site's relay."><label for="s-url">Relay</label>
             <input id="s-url" type="text" placeholder="blank = discover on this host, else moqx-main"></div>
-          <div class="sp-field"><label for="s-ns">Namespace</label>
+          <div class="sp-field" title="The broadcast's namespace, as the publisher names it."><label for="s-ns">Namespace</label>
             <input id="s-ns" type="text" placeholder="live"></div>
-          <div class="sp-field"><label for="s-v">Draft</label>
+          <div class="sp-field" title="MoQT draft. Auto offers several and the relay picks."><label for="s-v">Draft</label>
             <select id="s-v">
               <option value="">Auto (offers moqt-16)</option>
               <option value="22">Draft 22</option>
@@ -769,17 +769,15 @@
           <details class="sp-adv" id="s-adv">
             <summary>Advanced</summary>
             <div class="sp-adv-body">
-              <div class="sp-field"><label for="s-target">Target latency (ms)</label>
-                <input id="s-target" type="number" min="1" placeholder="Catalog">
-                <div class="sp-hint">Blank: the catalog's targetLatency.</div></div>
-              <div class="sp-field"><label for="s-cc">Congestion control</label>
+              <div class="sp-field" title="Latency to aim for, in ms. Blank: the catalog's."><label for="s-target">Target latency (ms)</label>
+                <input id="s-target" type="number" min="1" placeholder="Catalog"></div>
+              <div class="sp-field" title="Low latency: stay at the target. Browser default, Smooth: buffer more to avoid stalls."><label for="s-cc">Congestion control</label>
                 <select id="s-cc">
                   <option value="">Browser default</option>
                   <option value="low-latency">Low latency</option>
                   <option value="throughput">Smooth</option>
-                </select>
-                <div class="sp-hint">Low latency holds the target. Browser default and Smooth let the buffer grow to 3 s to ride out bursts; Smooth also asks for throughput. The browser may ignore the hint; the log shows what it applied.</div></div>
-              <div class="sp-field"><label for="s-bootstrap">Catalog bootstrap</label>
+                </select></div>
+              <div class="sp-field" title="How to get the catalog. Keep Player default unless a relay needs another."><label for="s-bootstrap">Catalog bootstrap</label>
                 <select id="s-bootstrap">
                   <option value="">Player default</option>
                   <option value="subscribe">subscribe (publishers without FETCH)</option>
@@ -788,16 +786,16 @@
                   <option value="strict">strict</option>
                   <option value="fetch">fetch (relays that serve the catalog only by FETCH)</option>
                 </select></div>
-              <div class="sp-check" title="LOC: fetch the current group. CMAF/LOCMAF: ask for a new group (broadcaster needs dynamic groups).">
+              <div class="sp-check" title="Start from the current group instead of waiting for the next.">
                 <input id="s-warm-start" type="checkbox"><label for="s-warm-start">warm start</label></div>
-              <div class="sp-check" title="Recover media in a background tab. Off: a hidden tab waits until it is viewed.">
+              <div class="sp-check" title="Keep recovering while the tab is hidden.">
                 <input id="s-auto-resume" type="checkbox"><label for="s-auto-resume">auto-resume</label></div>
-              <div class="sp-field"><label for="s-authority">Authority</label>
+              <div class="sp-field" title="Authority sent at setup, if the relay asks for one."><label for="s-authority">Authority</label>
                 <input id="s-authority" type="text" placeholder="(none)"></div>
-              <div class="sp-field"><label for="s-hash">Certificate hash</label>
+              <div class="sp-field" title="Server certificate hash, for a relay with a self-signed certificate."><label for="s-hash">Certificate hash</label>
                 <input id="s-hash" type="text" placeholder="(none)"></div>
-              <div class="sp-check"><input id="s-status" type="checkbox"><label for="s-status">stats overlay</label></div>
-              <div class="sp-check"><input id="s-debug" type="checkbox"><label for="s-debug">verbose logging</label></div>
+              <div class="sp-check" title="Show latency and playback state on the video."><input id="s-status" type="checkbox"><label for="s-status">stats overlay</label></div>
+              <div class="sp-check" title="Log every MoQT message and more detail."><input id="s-debug" type="checkbox"><label for="s-debug">verbose logging</label></div>
             </div>
           </details>
           <div class="sp-actions">
