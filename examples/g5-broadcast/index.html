@@ -390,7 +390,7 @@
                         <option value="aac">AAC-LC</option>
                       </select>
                       <div class="sp-check" id="s-audio-datagram-row" title="Audio as unreliable datagrams instead of a stream per frame: less overhead, but a lost frame stays lost. Draft 18, LOC or CMAF.">
-                        <input id="s-audio-datagram" type="checkbox"><label for="s-audio-datagram">audio over datagrams</label></div>
+                        <input id="s-audio-datagram" type="checkbox"><label for="s-audio-datagram">Audio over datagrams</label></div>
                     </div></div>
                   <div class="sp-field"><label for="s-target" title="Published in the catalog as the viewer playout target (default 200).">Target playback latency (ms)</label>
                     <input id="s-target" type="number" min="1" placeholder="200" title="Published in the catalog as the viewer playout target (default 200)."></div>
@@ -419,25 +419,26 @@
                   <div class="sp-field"><label for="s-hash" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate.">Certificate hash</label>
                     <input id="s-hash" type="text" placeholder="(none)" title="SHA-256 of a self-signed relay certificate (serverCertificateHashes). Blank for relays with a public certificate."></div>
                   <div class="sp-check" id="s-dynamic-groups-row" title="A joining viewer can ask for a new group (NEW_GROUP_REQUEST), so it starts at once instead of waiting for the next keyframe. Draft 18 only.">
-                    <input id="s-dynamic-groups" type="checkbox"><label for="s-dynamic-groups">dynamic groups: a joining viewer may request a keyframe</label></div>
+                    <input id="s-dynamic-groups" type="checkbox"><label for="s-dynamic-groups">Dynamic groups: a joining viewer may request a keyframe</label></div>
                   <div class="sp-check" id="s-self-describing-row" title="For players that read no catalog. LOC: every object also carries the codec string and decoder config. CMAF: the CMAF header (init segment) rides the first object of a group, at most once a second per track.">
-                    <input id="s-self-describing" type="checkbox"><label for="s-self-describing">self-describing objects (catalog-less players)</label></div>
+                    <input id="s-self-describing" type="checkbox"><label for="s-self-describing">Self-describing objects (catalog-less players)</label></div>
                   <div class="sp-check" id="s-timescale-row" title="Adds Timescale 1000000 to every object. Timestamps then read as media time, so viewers lose end-to-end latency.">
                     <input id="s-timescale" type="checkbox"><label for="s-timescale">Timescale on LOC objects (players that require one)</label></div>
                   <div class="sp-check" id="s-voice-processing-row" title="Keeps the browser's call processing on camera audio: echo cancellation, noise suppression, automatic gain. For speech from a microphone; on music or film it pumps the level and gates sound out.">
-                    <input id="s-voice-processing" type="checkbox"><label for="s-voice-processing">voice processing (calls)</label></div>
+                    <input id="s-voice-processing" type="checkbox"><label for="s-voice-processing">Voice processing (calls)</label></div>
                   <div class="sp-check" id="s-annexb-row" title="Start codes instead of length prefixes, parameter sets in keyframes instead of the video config property. Only for relays that drop object properties with players that ignore catalog init data. Catalog codec avc3.">
                     <input id="s-annexb" type="checkbox"><label for="s-annexb">H.264 Annex B (start codes, parameter sets in keyframes)</label></div>
                   <div class="sp-check" title="State badge, relay time and send stats over the preview.">
-                    <input id="s-status" type="checkbox"><label for="s-status">stats overlay</label></div>
+                    <input id="s-status" type="checkbox"><label for="s-status">Stats overlay</label></div>
                   <div class="sp-check" title="Per-second ingest snapshots and catalog re-emissions in the log.">
-                    <input id="s-debug" type="checkbox"><label for="s-debug">verbose logging</label></div>
+                    <input id="s-debug" type="checkbox"><label for="s-debug">Verbose logging</label></div>
                 </div>
               </details>
               <div class="sp-actions">
                 <span class="sp-build">build <span data-build></span></span>
-                <button id="settings-apply" class="sp-apply" type="button" hidden
-                  title="Reloads the page with these settings, which restarts a running broadcast; Ctrl/⌘-Enter in a field reloads even with nothing changed">Apply</button>
+                <button id="settings-cancel" class="sp-cancel" type="button" title="Drop the changes (Esc)">Cancel</button>
+                <button id="settings-apply" class="sp-apply" type="button"
+                  title="Apply the changes (Enter); this reloads the page, which restarts a running broadcast">Apply</button>
               </div>
             </div>
           </div>

@@ -17,7 +17,7 @@
 .settings-popup .sp-field { display: flex; flex-direction: column; gap: 4px; }
 .settings-popup .sp-field[hidden] { display: none; }
 .settings-popup .sp-field > label, .settings-popup .sp-label {
-  font-size: .68rem; color: var(--text-faint, #8a8aa0); text-transform: uppercase; letter-spacing: .5px;
+  font-size: .74rem; color: var(--text-faint, #8a8aa0);
 }
 .settings-popup input[type=text], .settings-popup input[type=number], .settings-popup .sp-field select {
   width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
@@ -35,13 +35,26 @@
 .settings-popup .sp-adv > summary { cursor: pointer; font-size: .8rem; color: var(--text-soft, #b8b8c8); padding: 6px 0; }
 .settings-popup .sp-adv[open] > summary { color: var(--text-strong, #fff); }
 .settings-popup .sp-adv-body { display: flex; flex-direction: column; gap: 8px; padding-bottom: 4px; }
-.settings-popup .sp-actions { display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+/* Cancel and Apply stay in view while the popup scrolls. */
+.settings-popup .sp-actions {
+  display: flex; justify-content: flex-end; gap: 8px; align-items: center;
+  position: sticky; bottom: -10px; margin: 0 -12px -10px; padding: 8px 12px 10px;
+  background: var(--surface, #1c1c28); border-top: 1px solid var(--divider, #33334a);
+}
 .settings-popup .sp-apply {
   padding: 6px 16px; font-size: .82rem; border-radius: 6px;
   background: var(--active, #2a6); border: 1px solid var(--active, #2a6); color: var(--apply-fg, #fff);
 }
-.settings-popup .sp-apply:hover { background: var(--active-hover, #2b7); }
-.settings-popup .sp-apply[hidden] { display: none; }
+.settings-popup .sp-apply:hover:not(:disabled) { background: var(--active-hover, #2b7); }
+.settings-popup .sp-apply:disabled {
+  background: transparent; border-color: var(--input-border, #44445c); color: var(--text-dim, #707088); cursor: default;
+}
+.settings-popup .sp-apply[hidden], .settings-popup .sp-cancel[hidden] { display: none; }
+.settings-popup .sp-cancel {
+  padding: 6px 14px; font-size: .82rem; border-radius: 6px;
+  background: transparent; border: 1px solid var(--input-border, #44445c); color: var(--text-soft, #b8b8c8);
+}
+.settings-popup .sp-cancel:hover { color: var(--text, #e8e8f0); }
 .settings-popup .sp-build { font-size: .66rem; color: var(--text-dim, #707088); margin-right: auto; }
 /* The relay field's menu of known relays stays inside the popup's scroll box. */
 .settings-popup .relay-combo { position: relative; display: flex; gap: 6px; }
