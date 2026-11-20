@@ -17,7 +17,7 @@
 .settings-popup .sp-field { display: flex; flex-direction: column; gap: 4px; }
 .settings-popup .sp-field[hidden] { display: none; }
 .settings-popup .sp-field > label, .settings-popup .sp-label {
-  font-size: .68rem; color: var(--text-faint, #8a8aa0); text-transform: uppercase; letter-spacing: .5px;
+  font-size: .74rem; color: var(--text-faint, #8a8aa0);
 }
 .settings-popup input[type=text], .settings-popup input[type=number], .settings-popup .sp-field select {
   width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
