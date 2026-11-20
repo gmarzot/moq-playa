@@ -753,8 +753,6 @@
           <label class="sp-row" hidden>Quality <select id="quality" disabled><option>Auto</option></select></label>
           <label class="sp-row" hidden>Audio <select id="audio"></select></label>
           <label class="sp-row" hidden>Language <select id="lang"></select></label>
-          <label class="sp-row" title="Live holds the target and skips late media; 1 s and 2 s start the delay there and raise it up to 1 s more when media arrives late">Latency
-            <select id="latency"><option value="live">LIVE</option><option value="1000">LIVE(+1s)</option><option value="2000">LIVE(+2s)</option><option value="custom" disabled hidden>Custom</option></select></label>
           <hr class="sp-sep">
           <div class="sp-field"><label for="s-url">Relay</label>
             <input id="s-url" type="text" placeholder="blank = discover on this host, else moqx-main"></div>
@@ -772,21 +770,15 @@
             <summary>Advanced</summary>
             <div class="sp-adv-body">
               <div class="sp-field"><label for="s-target">Target latency (ms)</label>
-                <input id="s-target" type="number" min="1" placeholder="from catalog">
-                <div class="sp-hint">Overrides the catalog's targetLatency.</div></div>
-              <div class="sp-field"><label for="s-latency-min">Delay start / limit (ms)</label>
-                <div class="sp-inline">
-                  <input id="s-latency-min" type="number" min="0" placeholder="1000" title="Where the delay starts and the lowest it steps back to; 0 starts at the target">
-                  <input id="s-latency-max" type="number" min="1" placeholder="2000" title="How far late media may raise the delay; past it, late media is skipped as in Live">
-                </div></div>
-              <div class="sp-field"><label for="s-cushion">Render cushion floor / max (ms)</label>
-                <div class="sp-inline">
-                  <input id="s-cushion" type="number" min="1" placeholder="engine default">
-                  <input id="s-cushion-max" type="number" min="1" placeholder="cap" aria-label="Render cushion max (ms)">
-                </div></div>
-              <div class="sp-field"><label for="s-catchup">Catch-up rate</label>
-                <input id="s-catchup" type="number" min="1" step="0.01" placeholder="1 (off)">
-                <div class="sp-hint">Max playback rate while chasing the target.</div></div>
+                <input id="s-target" type="number" min="1" placeholder="Catalog">
+                <div class="sp-hint">Blank: the catalog's targetLatency.</div></div>
+              <div class="sp-field"><label for="s-cc">Congestion control</label>
+                <select id="s-cc">
+                  <option value="">Browser default</option>
+                  <option value="low-latency">Low latency</option>
+                  <option value="throughput">Smooth</option>
+                </select>
+                <div class="sp-hint">Low latency holds the target. Browser default and Smooth let the buffer grow to 3 s to ride out bursts; Smooth also asks for throughput. The browser may ignore the hint; the log shows what it applied.</div></div>
               <div class="sp-field"><label for="s-bootstrap">Catalog bootstrap</label>
                 <select id="s-bootstrap">
                   <option value="">Player default</option>
@@ -800,13 +792,6 @@
                 <input id="s-warm-start" type="checkbox"><label for="s-warm-start">warm start</label></div>
               <div class="sp-check" title="Recover media in a background tab. Off: a hidden tab waits until it is viewed.">
                 <input id="s-auto-resume" type="checkbox"><label for="s-auto-resume">auto-resume</label></div>
-              <div class="sp-field"><label for="s-cc">Congestion control (hint)</label>
-                <select id="s-cc">
-                  <option value="">Browser default</option>
-                  <option value="low-latency">Low latency</option>
-                  <option value="throughput">Throughput</option>
-                </select>
-                <div class="sp-hint">The browser may ignore it; the log shows what it applied.</div></div>
               <div class="sp-field"><label for="s-authority">Authority</label>
                 <input id="s-authority" type="text" placeholder="(none)"></div>
               <div class="sp-field"><label for="s-hash">Certificate hash</label>

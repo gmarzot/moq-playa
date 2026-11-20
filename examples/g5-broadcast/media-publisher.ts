@@ -37,6 +37,7 @@ import type { LocHeaders } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
 import { isRequestStreamDraft } from '@openmoq/transport';
 import { buildChunk } from '../shared/browser/cmaf-mux.js';
+import { GroupBurstConnection, type GroupBurstOptions } from './group-burst.js';
 import {
   LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject,
   type LocmafTrackContext,
@@ -206,6 +207,8 @@ export interface MediaPublisherOptions {
   /** A track's MoQT state changed in a way only a send revealed: Forward
    *  State, or a terminated subscription. Not an error. */
   onStatus?: (track: 'video' | 'audio', message: string) => void;
+  /** Hold each video group, and the audio sent meanwhile, until the next group starts. */
+  groupBurst?: GroupBurstOptions;
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
@@ -242,6 +245,7 @@ interface QueuedAudio { data: Uint8Array; meta: AudioChunkMeta }
 
 export class MediaPublisher {
   private readonly connection: MediaPublishConnection;
+  private readonly burst: GroupBurstConnection | null;
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
   private readonly wallClockUs: () => number;
@@ -379,7 +383,10 @@ export class MediaPublisher {
         && !(Number.isFinite(options.minGroupMs) && options.minGroupMs >= 0)) {
       throw new Error(`minGroupMs must be a non-negative number, got ${options.minGroupMs}`);
     }
-    this.connection = connection;
+    this.burst = options.groupBurst
+      ? new GroupBurstConnection(connection, { onError: (c, e) => this.report(c, e), ...options.groupBurst })
+      : null;
+    this.connection = this.burst ?? connection;
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
     this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
@@ -751,6 +758,8 @@ export class MediaPublisher {
     while (this.pendingCloses.size > 0) {
       await Promise.all([...this.pendingCloses]);
     }
+    // The held part of the last group is dropped.
+    await this.burst?.close();
     for (const track of ['video', 'audio'] as const) {
       for (const outlet of this.outlets[track].values()) {
         if (outlet.streamId === null) continue;
@@ -1083,6 +1092,7 @@ export class MediaPublisher {
       // IS tracked, so drain() waits for it. The slot is cleared BEFORE the
       // new open: a failed open must leave NO stream, not revive the old one.
       for (const outlet of this.outlets.video.values()) this.closeOutletStream(outlet);
+      this.burst?.flush();
       this.videoGroupId++;
       this.videoObjectId = 0n;
       this.videoLocmafState = new LocmafGroupState();
