@@ -7,7 +7,9 @@
  *   --broadcast-player RELAY:PACKAGING[,…]   wait for each broadcast in turn and play it
  *   --profile NAME   play under an adverse profile from cases.json (network shaping, blackouts,
  *                    hidden tab, publisher restarts); first play draft only
- *   --variant restart   the broadcaster restarts every cases.restartEveryS; players use its namespace
+ *   --variant NAME   the broadcaster of the profile with that variant, on its own namespace: `restart`
+ *                    restarts every cases.restartEveryS, others add the profile's broadcastQuery
+ *   --player-query Q   appended to every player page URL (default $PLAYER_QUERY)
  *   --adverse-minutes M   keep a broadcaster up for the adverse players too
  *   --ladder RELAY:ID[,…]   moq-test-tracks ABR ladders (cases.ladders) under their profile, with ABR
  *                    switches in the summary (MTT_API_KEY)
@@ -27,6 +29,7 @@ import { MttClient } from './mtt.mjs';
 import { assessSoak } from './assess.mjs';
 import { prepareCamera } from './fixture.mjs';
 import { Impairment } from './impair.mjs';
+import { broadcasterPageQuery, playerPageQuery, variantProfile } from './pages.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const { values: args } = parseArgs({ options: {
@@ -45,6 +48,7 @@ const { values: args } = parseArgs({ options: {
   variant: { type: 'string' },
   'adverse-minutes': { type: 'string', default: '0' },
   ladder: { type: 'string' },
+  'player-query': { type: 'string', default: process.env.PLAYER_QUERY ?? '' },
 } });
 
 // A player finds the broadcaster's namespace only by its tag.
@@ -162,16 +166,8 @@ async function playCase(browser, webUrl, c, impair = null) {
     if (abrLog && /downshift|upshift/.test(line.text)) abrLog.push(line);
   });
   page.on('pageerror', (e) => void appendFile(consoleFile, `${json({ t: Date.now(), type: 'pageerror', text: e.message })}\n`));
-  // Viewers play as G5 does: from the current group, following the namespace.
   // The player logs at info level into console.jsonl.
-  const query = new URLSearchParams({ url: c.url, ns: c.namespace, v: String(c.draft), soak: '1', warmStart: '1',
-    followNamespace: '1', log: 'info' });
-  if (c.packaging === 'loc') query.set('output', 'canvas');
-  if (c.packaging === 'locmaf') query.set('locmaf', 'mse');
-  const latency = c.latency ?? c.profile?.latency;
-  if (latency) query.set('latency', latency);
-  if (c.auto) query.set('auto', '1');
-  if (c.level !== undefined) query.set('level', String(c.level));
+  const query = playerPageQuery(c, args['player-query']);
   const startup = { attempts: 0 };
   const deadline = Date.now() + (c.waitS ?? 60) * 1000;
   // The disruption in progress; cleared only once its stop() succeeds.
@@ -239,6 +235,7 @@ async function playCase(browser, webUrl, c, impair = null) {
     if (impair) await writeFile(join(dir, 'tc.json'), `${json(await impair.stats())}\n`);
     const summary = { name: c.name, url: c.url, namespace: c.namespace, draft: c.draft, packaging: c.packaging,
       ...(c.profileName ? { profile: c.profileName } : {}),
+      ...(args['player-query'] ? { playerQuery: args['player-query'] } : {}),
       ...(publisherEnded ? { publisherEnded } : {}),
       ...assessSoak({ samples, ticks, expected: c.expected, startup, disruptions, adverse: Boolean(c.profile), abrLog }) };
     await writeFile(join(dir, 'summary.json'), `${json(summary)}\n`);
@@ -390,10 +387,7 @@ async function runBroadcaster(webUrl, b, totalMinutes, restartEveryS = 0, rejoin
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, permissions: ['camera', 'microphone'] });
   const page = await context.newPage();
   page.on('console', (m) => void appendFile(join(dir, 'console.jsonl'), `${json({ t: Date.now(), type: m.type(), text: m.text() })}\n`));
-  const p = b.params;
-  const query = new URLSearchParams({ url: b.relayInfo.url, ns: b.namespace, v: String(b.relayInfo.publishDraft),
-    packaging: b.packaging, height: String(p.height), fps: String(p.fps), bitrate: String(p.bitrate), target: String(p.target),
-    clockUrl: 'https://aiomoqt-relay.marzresearch.net/time' });
+  const query = broadcasterPageQuery(b, b.query);
   let wentLive = false;
   let viewer = null;
   try {
@@ -489,6 +483,7 @@ const abrRow = (r) => {
     + `| ${pb.audioGaps.count} / ${pb.audioGaps.totalMs} / ${pb.audioGaps.p99Ms ?? '—'} | ${r.player?.audioUnderruns ?? '—'} `
     + `| ${latencyCell(r, 'video')} | ${latencyCell(r, 'audio')} |`;
 };
+const catchUpCell = (c) => (c ? `${c.rateUps} / ${(c.timeAtRateMs / 1000).toFixed(1)} s` : '—');
 const startupCell = (b) => (b ? [b.transportConnectedMs, b.setupCompleteMs, b.catalogReceivedMs, b.firstObjectReceivedMs,
   b.firstFrameRenderedMs].map((v) => (v == null ? '—' : Math.round(v))).join(' / ') : '—');
 
@@ -500,17 +495,19 @@ async function report(results) {
       + `| ${pb ? `${pb.frozen.count} / ${pb.audioGaps.count}` : '—'} | ${pb?.fps.mean ?? '—'} `
       + `| ${lat ? `${Math.round(lat.p50)} / ${Math.round(lat.p95)} / ${Math.round(lat.driftMs)}` : '—'} `
       + `| ${r.player ? `${r.player.framesDropped} / ${r.player.audioUnderruns}` : '—'} `
-      + `| ${recoveryCell(r.recovery)} | ${startupCell(r.startup?.breakdownMs)} `
+      + `| ${recoveryCell(r.recovery)} | ${catchUpCell(r.catchUp)} | ${startupCell(r.startup?.breakdownMs)} `
       + `| ${r.error ? r.error.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 80)
         : r.publisherEnded ? `publisher ended at ${r.publisherEnded.atS} s`
           : r.rejoin ? `paused ${r.rejoin.pausedAfterLiveS} s after live; `
             + `click → resume ${r.rejoin.clickToResumeMs ?? '—'} ms, resume → playing ${r.rejoin.resumeToPlayingMs ?? '—'} ms`
             : ''} |`;
   });
-  const md = [`### Player soak ${runId} (${minutes} min per case)`, '',
+  const md = [`### Player soak ${runId} (${minutes} min per case`
+    + `${args['player-query'] ? `, player ${args['player-query']}` : ''})`, '',
     '| case | verdict | ready ms | stalls / time | frozen / audio gaps | fps | video latency p50 / p95 / drift ms '
-      + '| dropped / underruns | recovery: events, max fresh / settled ms | startup: connect / setup / catalog / object / frame ms | error |',
-    '|---|---|---|---|---|---|---|---|---|---|---|', ...rows, ''];
+      + '| dropped / underruns | recovery: events, max fresh / settled ms | catch-up: starts / time at rate ≠ 1 '
+      + '| startup: connect / setup / catalog / object / frame ms | error |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|', ...rows, ''];
   const ladders = results.filter((r) => r.abr);
   if (ladders.length) {
     md.push('#### ABR ladders', '', '| case | time at each level | down / up shifts | first downshift s '
@@ -532,7 +529,8 @@ try {
   await buildOnce();
   const webUrl = await startPages();
   if (args.broadcaster) {
-    const b = { ...broadcastCase(cases, args.broadcaster, args.variant), params: cases.broadcastParams };
+    const b = { ...broadcastCase(cases, args.broadcaster, args.variant), params: cases.broadcastParams,
+      query: args.variant ? variantProfile(cases, args.variant).broadcastQuery : undefined };
     const adverseMinutes = Number(args['adverse-minutes']);
     const adverse = adverseMinutes > 0 && cases.adverse.broadcasts.includes(args.broadcaster)
       ? cases.adverse.broadcasts.length * (adverseMinutes + 2) : 0;

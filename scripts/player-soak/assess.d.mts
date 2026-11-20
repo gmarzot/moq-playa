@@ -42,6 +42,17 @@ export interface AbrReport {
   logged: { downshifts: number; upshifts: number; reasons: Record<string, number>; switches: (AbrSwitch & { atS: number })[] };
 }
 
+export interface CatchUpReport {
+  /** Rate rising above 1: catch-up starts. */
+  rateUps: number;
+  /** Time at a rate other than 1. */
+  timeAtRateMs: number;
+  maxRate: number;
+  /** The page's running counters, or the 250 ms sampled rate. */
+  source: 'counters' | 'samples';
+}
+
+export function catchUpReport(samples: PlaybackSample[]): CatchUpReport | null;
 export function abrSwitch(text: string): AbrSwitch | null;
 export function abrReport(ticks: SoakTick[], log?: { t: number; text: string }[], startEpochMs?: number): AbrReport;
 export function quietIntervals(samples: PlaybackSample[], active: (s: PlaybackSample) => boolean, minMs: number): Interval[];
@@ -81,6 +92,7 @@ export function assessSoak(input: {
     resolutionMatches: boolean | null;
   };
   latency: Record<string, LatencyKeyReport>;
+  catchUp: CatchUpReport | null;
   abr?: AbrReport;
   player: Record<string, unknown>;
   events: Record<string, number>;

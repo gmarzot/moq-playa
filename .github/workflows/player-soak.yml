@@ -24,6 +24,9 @@ on:
       adverse_minutes:
         description: Minutes per broadcast under an adverse profile
         default: '3'
+      player_query:
+        description: 'Query appended to every player page URL, e.g. congestionControl=throughput'
+        default: ''
   schedule:
     # On time or at GitHub's usual 7-8.5 h delay, 01:17 starts inside the guard's 01:00-11:00 window.
     - cron: '17 1 * * *'
@@ -47,6 +50,7 @@ env:
   MINUTES: ${{ inputs.minutes || (github.event_name == 'pull_request' && '1') || '5' }}
   ADVERSE_MINUTES: ${{ inputs.adverse_minutes || (github.event_name == 'pull_request' && '2') || '3' }}
   SOAK_TAG: ${{ github.run_id }}
+  PLAYER_QUERY: ${{ inputs.player_query }}
 
 jobs:
   # The matrices come from scripts/player-soak/cases.json; `only` must name one of its
@@ -59,7 +63,7 @@ jobs:
       broadcaster: ${{ steps.cases.outputs.broadcaster }}
       player: ${{ steps.cases.outputs.player }}
       adverse: ${{ steps.cases.outputs.adverse }}
-      restart: ${{ steps.cases.outputs.restart }}
+      variants: ${{ steps.cases.outputs.variants }}
       adverse_broadcasts: ${{ steps.cases.outputs.adverse_broadcasts }}
       ladder: ${{ steps.cases.outputs.ladder }}
     steps:
@@ -115,7 +119,8 @@ jobs:
             const adverse = pick(profiles);
             const needed = new Set(player);
             if (adverse.some((p) => !c.profiles[p].variant)) c.adverse.broadcasts.forEach((b) => needed.add(b));
-            const restart = adverse.some((p) => c.profiles[p].variant === "restart") ? c.adverse.broadcasts : [];
+            const variants = [...new Set(adverse.map((p) => c.profiles[p].variant).filter(Boolean))]
+              .flatMap((variant) => c.adverse.broadcasts.map((b) => ({ variant, case: b })));
             // Ladders on one stream share its test-track job, so they play on one runner.
             const streams = {};
             for (const k of pick(ladders)) {
@@ -123,7 +128,7 @@ jobs:
               (streams[`${l.relay} ${l.namespace}`] ??= []).push(k);
             }
             const out = { mtt: pick(mtt), broadcaster: c.broadcast.map(key).filter((b) => needed.has(b)), player, adverse,
-              restart, adverse_broadcasts: c.adverse.broadcasts.join(","), ladder: Object.values(streams).map((g) => g.join(",")) };
+              variants, adverse_broadcasts: c.adverse.broadcasts.join(","), ladder: Object.values(streams).map((g) => g.join(",")) };
             require("fs").appendFileSync(process.env.GITHUB_OUTPUT,
               Object.entries(out).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}\n`).join(""));
           '
@@ -226,16 +231,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # A broadcaster that stops and starts again every restartEveryS, on its own namespace.
-  restart-broadcaster:
+  # A profile's own broadcaster on its own namespace: `restart` stops and starts every
+  # restartEveryS; others publish with the profile's broadcastQuery.
+  variant-broadcaster:
     needs: cases
-    if: needs.cases.outputs.restart != '[]'
+    if: needs.cases.outputs.variants != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        case: ${{ fromJSON(needs.cases.outputs.restart) }}
+        include: ${{ fromJSON(needs.cases.outputs.variants) }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -245,14 +251,14 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chrome
-      - name: Broadcast ${{ matrix.case }} with restarts
+      - name: Broadcast ${{ matrix.case }} as ${{ matrix.variant }}
         run: |
-          node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --variant restart \
+          node scripts/player-soak/run.mjs --broadcaster "${{ matrix.case }}" --variant "${{ matrix.variant }}" \
             --minutes "$MINUTES" --adverse-minutes "$ADVERSE_MINUTES"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: player-soak-${{ github.run_id }}-restart-broadcaster-${{ strategy.job-index }}
+          name: player-soak-${{ github.run_id }}-${{ matrix.variant }}-broadcaster-${{ strategy.job-index }}
           path: reports/player-soak/
           if-no-files-found: warn
           retention-days: 30

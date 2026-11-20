@@ -186,6 +186,31 @@ export function abrReport(ticks, log = [], startEpochMs = ticks[0]?.wallEpochMs 
   };
 }
 
+/**
+ * Rate catch-up over the run: rate-up starts (rate rising above 1) and time at a
+ * rate other than 1, from the page's running counters, or from the sampled rate
+ * where a sample has none. Null when no sample carries a rate.
+ */
+export function catchUpReport(samples) {
+  const rated = samples.filter((s) => Number.isFinite(s.playbackRate));
+  if (rated.length === 0) return null;
+  const first = rated[0];
+  const last = rated.at(-1);
+  const maxRate = Math.max(...rated.map((s) => s.playbackRate));
+  if (rated.every((s) => Number.isFinite(s.rateUps) && Number.isFinite(s.rateOffMs))) {
+    return { rateUps: last.rateUps - first.rateUps, timeAtRateMs: Math.round(last.rateOffMs - first.rateOffMs),
+      maxRate, source: 'counters' };
+  }
+  let rateUps = 0;
+  let timeAtRateMs = 0;
+  for (let i = 1; i < rated.length; i++) {
+    const prev = rated[i - 1];
+    if (prev.playbackRate !== 1) timeAtRateMs += rated[i].wallMs - prev.wallMs;
+    if (rated[i].playbackRate > 1 && prev.playbackRate <= 1) rateUps++;
+  }
+  return { rateUps, timeAtRateMs: Math.round(timeAtRateMs), maxRate, source: 'samples' };
+}
+
 const COUNTERS = ['stallCount', 'stallDurationMs', 'framesDropped', 'audioUnderruns', 'gapCount', 'framesRendered'];
 
 export function assessSoak({ samples, ticks, expected = {}, startup = {}, disruptions = [], adverse = false, abrLog = null }) {
@@ -271,6 +296,7 @@ export function assessSoak({ samples, ticks, expected = {}, startup = {}, disrup
       resolutionMatches: expected.videoWidth ? resolution?.width === expected.videoWidth && resolution?.height === expected.videoHeight : null,
     },
     latency: latencyReport(ticks),
+    catchUp: catchUpReport(samples),
     ...(abrLog ? { abr: abrReport(ticks, abrLog, startup.clickedEpochMs) } : {}),
     player,
     events,
