@@ -479,6 +479,7 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     button: settingsBtn,
     popup: settingsMenu,
     applyButton: applyBtn,
+    cancelButton: document.getElementById('settings-cancel') as HTMLButtonElement,
     advanced: sAdvanced,
     storageKey: 'g5-broadcast-settings',
     pending: () => (changed() ? 'reload' : 'none'),

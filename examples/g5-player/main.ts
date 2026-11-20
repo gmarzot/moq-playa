@@ -17,7 +17,7 @@ import {
   FreezeWatch, noteSeq, rebaseSeqs, stallsCell, SETTLE_WINDOW_MS, type ObjSeq,
 } from './counters.js';
 import {
-  catalogIsLive, latencyReadout, migrateLatencyQuery, nextLiveState, parseLatencySettings, playbackLatency,
+  catalogIsLive, migrateLatencyQuery, nextLiveState, overlayLine, parseLatencySettings, playbackLatency,
   postureLabel, targetText, type LiveState,
 } from './latency-settings.js';
 import {
@@ -199,17 +199,13 @@ function applyTheme(): void {
   prefersLight.addEventListener('change', () => { if (!themeChoice) applyTheme(); });
 }
 const stateBadge = document.getElementById('state')!;
-const statusClock = document.getElementById('status-clock')!;
 const statusStats = document.getElementById('status-stats')!;
 const statusOverlay = document.getElementById('status-overlay')!;
 statusOverlay.hidden = !showStatus;
-/** Starts the overlay's clock loop; main() sets it once the reference clock exists. */
-let startStatusClock = (): void => {};
 /** Shows or hides the status overlay without a reload. */
 function setShowStatus(on: boolean): void {
   showStatus = on;
   statusOverlay.hidden = !on;
-  if (on) startStatusClock();
 }
 const diagGrid = document.getElementById('diag-grid')!;
 const advGrid = document.getElementById('adv-grid')!;
@@ -391,13 +387,13 @@ function log(msg: string): void {
     button: menuBtn,
     popup: menu,
     applyButton: byId<HTMLButtonElement>('set-apply'),
+    cancelButton: byId<HTMLButtonElement>('set-cancel'),
     advanced: advSec,
     storageKey: 'g5-settings',
     pending: () => {
       const changed = changedKeys(fieldsQuery());
       return changed.length === 0 ? 'none' : inPlace(changed) ? 'live' : 'reload';
     },
-    reloadLabel: 'Apply · reloads',
     onOpen: populate,
     onApply: (forceReload) => { if (applyQuery(fieldsQuery(), forceReload)) popup.close(); },
   });
@@ -409,16 +405,6 @@ function log(msg: string): void {
     },
   };
 
-  // The overlay and verbose logging apply as soon as they are ticked.
-  for (const [box, key] of [[fStatus, 'status'], [fDebug, 'debug']] as const) {
-    box.addEventListener('change', () => {
-      const next = new URLSearchParams(location.search);
-      if (box.checked) next.set(key, '1');
-      else next.delete(key);
-      if (!applyQuery(next, false)) box.checked = !box.checked;
-      popup.refresh();
-    });
-  }
 }
 
 /** Copy to the clipboard, confirming in the button itself. */
@@ -565,33 +551,43 @@ async function main(): Promise<void> {
   let liveState: LiveState | null = null;
   /** Measured latency for the badge (ms); null while not measurable. */
   let measuredLatencyMs: number | null = null;
-  /** The badge's target, e.g. "target 205 ms (catalog)". */
+  /** The settings log line's target, e.g. "target 205 ms (catalog)". */
   let targetLabel = targetText(targetLatencyOverrideMs, undefined);
-  /** What the badge shows next to its state while playing; null when nothing. */
-  const badgeReadout = (): string | null =>
-    player.state === 'playing' && pictureFrozenSinceMs === null && liveState !== 'ended'
-      ? latencyReadout(measuredLatencyMs, targetLabel)
-      : null;
-  let shownReadout: string | null = null;
   const renderStateBadge = (): void => {
     const state = player.state;
     const frozen = state === 'playing' && pictureFrozenSinceMs !== null;
     const ended = liveState === 'ended' && state !== 'error';
-    const word = ended ? 'ended' : frozen ? 'frozen' : state === 'playing' ? (liveState === 'vod' ? 'vod' : 'live') : state;
-    shownReadout = badgeReadout();
-    if (shownReadout !== null) {
-      const readout = document.createElement('span');
-      readout.className = 'delay';
-      readout.textContent = shownReadout;
-      stateBadge.replaceChildren(`${word} `, readout);
-    } else {
-      stateBadge.textContent = word;
-    }
+    const vod = liveState === 'vod' && state === 'playing' && !frozen;
+    stateBadge.textContent = ended ? 'ended' : frozen ? 'frozen' : state === 'playing' ? (vod ? 'vod' : 'live') : state;
     stateBadge.title = ended ? "The catalog's isLive turned false: the broadcast ended"
-      : shownReadout !== null ? `Measured latency (capture to screen) and the target; ${postureLabel(congestionControl)}`
-        + (latency.latencyMode === 'smooth' ? `, the buffer may grow to ${latency.smoothCeilingMs} ms` : ', holding the target')
-      : '';
-    stateBadge.className = `state-badge ${ended ? 'ended' : frozen ? 'loading' : state}`;
+      : vod ? "The catalog's isLive is false" : '';
+    // VOD and ENDED stay neutral; green is live playback.
+    stateBadge.className = `state-badge ${ended ? 'ended' : frozen ? 'loading' : vod ? 'vod' : state}`;
+  };
+  /** Buffer ahead of the playhead, the posture's bound and the target in force (ms), from the UI tick. */
+  let overlayBufferMs: number | null = null;
+  let overlayBoundMs: number | null = null;
+  let overlayTargetMs: number | null = null;
+  let overlayLatencyInPlayer = false;
+  const renderOverlayLine = (): void => {
+    if (!showStatus) return;
+    const frozen = pictureFrozenSinceMs !== null;
+    // VOD has no capture time; live without a usable capture clock falls back to time in the player.
+    const inPlayer = liveState === 'vod' || measuredLatencyMs === null || overlayLatencyInPlayer;
+    const latencyMs = frozen ? null : liveState === 'vod' || measuredLatencyMs === null ? overlayBufferMs : measuredLatencyMs;
+    const typed = targetLatencyOverrideMs;
+    const catalogMs = catalogTargetLatencyMs || undefined;
+    let line = overlayLine({
+      latencyMs, inPlayer,
+      targetMs: typed ?? catalogMs ?? overlayTargetMs,
+      targetSource: typed !== undefined ? 'manual' : catalogMs !== undefined ? 'catalog' : 'default',
+      cc: congestionControl, bufferMs: overlayBufferMs, boundMs: overlayBoundMs,
+    });
+    const r = repairStats();
+    if (r && r.fetches > 0) {
+      line += ` repairs: ${r.fetchesFilled}/${r.fetches}${r.fillP50Ms === null ? '' : ` fill: ${fmtFillMs(r)}`}`;
+    }
+    statusStats.textContent = line;
   };
   /** Per UI tick. `stalledSinceMs`: the freeze watch's verdict (engine stall, MSE playhead). */
   const updatePictureFrozen = (nowMs: number, hidden: boolean, stalledSinceMs: number | null): void => {
@@ -1157,17 +1153,6 @@ async function main(): Promise<void> {
       stallCount: s.stallCount ?? 0, stallDurationMs: s.stallDurationMs ?? 0,
       ongoingStallMs: s.ongoingStallMs ?? 0, freezes: videoFreezes, frozenSec: videoFrozenSec, locPath,
     });
-    if (showStatus) {
-      const video = playerContainer.querySelector('video');
-      const height = video?.videoHeight || playerContainer.querySelector('canvas')?.height;
-      statusStats.textContent = `E2E ${latScreen.textContent}${latScreen.dataset.clock === 'unshared' ? '*' : ''} · ${height ? `${height}p · ` : ''}`
-        + `stalls ${stallsNow.faults}${stallsNow.sec > 0 ? ` (${stallsNow.sec.toFixed(1)} s)` : ''}`;
-      const r = repairStats();
-      if (r && r.fetches > 0) {
-        statusStats.textContent += ` · repairs ${r.fetchesFilled}/${r.fetches}`
-          + `${r.fillP50Ms === null ? '' : ` · fill ${fmtFillMs(r)}`}`;
-      }
-    }
     // TTFF runs from connection start; the connect share goes in its tooltip.
     const connectMs: number | null = (player as any).engine?.stats?.ttffBreakdown?.setupCompleteMs ?? null;
     noteAudioDatagrams();
@@ -1311,21 +1296,6 @@ async function main(): Promise<void> {
   const wallNowMs = (): number => referenceClock.nowMs();
   void calibrateClock();
   setInterval(() => { void calibrateClock(); }, 300_000);
-  let statusClockRunning = false;
-  const paintStatusClock = (): void => {
-    if (!showStatus) { statusClockRunning = false; return; }
-    statusClock.textContent = referenceClock.offset !== null
-      ? new Date(referenceClock.nowMs()).toISOString().slice(11, 23) : '';
-    // About 30 updates a second; the timer requests no frames between them.
-    setTimeout(() => requestAnimationFrame(paintStatusClock), 26);
-  };
-  // One loop at a time; it ends at its first tick with the overlay hidden.
-  startStatusClock = (): void => {
-    if (statusClockRunning) return;
-    statusClockRunning = true;
-    requestAnimationFrame(paintStatusClock);
-  };
-  if (showStatus) startStatusClock();
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void calibrateClock(); });
   let clockDriftApplied = false;
   document.addEventListener('visibilitychange', () => {
@@ -2181,6 +2151,11 @@ async function main(): Promise<void> {
     cusDVal.textContent = (vMs != null && aMs != null)
       ? `${aMs - vMs >= 0 ? '+' : ''}${(aMs - vMs).toFixed(0)}` : '—';
     cusTarget.textContent = targetNowMs ? `${targetNowMs}` : '—';
+    const both = [aMs, vMs].filter((x): x is number => x != null && Number.isFinite(x));
+    overlayBufferMs = both.length ? Math.min(...both) : null;
+    // Adaptive postures may grow the buffer to their ceiling; Low latency holds the target.
+    overlayBoundMs = latency.latencyMode === 'smooth' ? (latency.smoothCeilingMs ?? null) : (targetNowMs || null);
+    overlayTargetMs = targetNowMs || null;
     // One measurement (queued) against one setting (target). The render
     // cushion is a third name for the same region and pub_media pins it equal
     // to the target anyway, so it is not shown; rate and chase state are.
@@ -2278,7 +2253,8 @@ async function main(): Promise<void> {
       : screenVals.length ? shownLatencyMs(percentile(screenVals, 0.5))
       : cmafPlayoutMs != null ? shownLatencyMs(cmafPlayoutMs)
       : latVals.length ? shownLatencyMs(percentile(latVals, 0.5)) : null;
-    if (badgeReadout() !== shownReadout) renderStateBadge();
+    overlayLatencyInPlayer = latScreen.dataset.clock === 'unshared';
+    renderOverlayLine();
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
       ? 'The stream carries media time, not a capture clock: delay above the lowest seen.'

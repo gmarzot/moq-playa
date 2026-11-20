@@ -87,10 +87,35 @@ export function targetText(typedMs: number | undefined, catalogMs: number | unde
   return 'target default';
 }
 
-/** "1.0 s · target 205 ms (catalog)"; "—" while latency is not measurable. */
-export function latencyReadout(measuredMs: number | null, target: string): string {
-  const shown = measuredMs === null || !Number.isFinite(measuredMs) ? '—' : `${(measuredMs / 1000).toFixed(1)} s`;
-  return `${shown} · ${target}`;
+export type TargetSource = 'manual' | 'catalog' | 'default';
+
+/** The congestion-control choice as the overlay names it. */
+export function ccLabel(cc: CongestionControl | undefined): 'default' | 'smooth' | 'low-latency' {
+  return cc === 'throughput' ? 'smooth' : cc ?? 'default';
+}
+
+export interface OverlayValues {
+  /** Measured latency (ms); null when not measurable. */
+  readonly latencyMs: number | null;
+  /** The latency is time spent in the player, not capture to screen. */
+  readonly inPlayer: boolean;
+  readonly targetMs: number | null;
+  readonly targetSource: TargetSource;
+  readonly cc: CongestionControl | undefined;
+  /** Media buffered ahead of the playhead (ms), and the most the posture lets it hold. */
+  readonly bufferMs: number | null;
+  readonly boundMs: number | null;
+}
+
+const ms = (v: number | null): string => (v === null || !Number.isFinite(v) ? '—' : String(Math.round(v)));
+
+/** "latency: 300 ms (target: 250 ms [catalog]) cc-algo: default buffer: 300/3000 ms"; `*` marks time in the player. */
+export function overlayLine(v: OverlayValues): string {
+  const latency = v.latencyMs === null || !Number.isFinite(v.latencyMs) ? '—'
+    : `${ms(v.latencyMs)}${v.inPlayer ? '*' : ''} ms`;
+  const target = v.targetMs === null ? '—' : `${ms(v.targetMs)} ms`;
+  return `latency: ${latency} (target: ${target} [${v.targetSource}]) cc-algo: ${ccLabel(v.cc)} `
+    + `buffer: ${ms(v.bufferMs)}/${ms(v.boundMs)} ms`;
 }
 
 /** LIVE while the catalog says live; ENDED once it stops; VOD when it never was. */

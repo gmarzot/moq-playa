@@ -1,8 +1,9 @@
 /**
  * The gear popup the G5 pages share: quick choices first, connection fields,
- * an Advanced section, and an Apply button that shows only when an edit is
- * pending. Esc and a click outside close it; Enter in a field applies, and
- * Ctrl/⌘ with it asks for a new session whatever changed.
+ * an Advanced section, and Cancel and Apply. Edits wait for Apply (or Enter in
+ * a field); Ctrl/⌘ with it asks for a new session whatever changed. Cancel, Esc
+ * and a click outside drop them: the fields refill from the page's settings on
+ * the next open.
  */
 
 /** What Apply would do with the edits in the popup now. */
@@ -19,6 +20,7 @@ export interface PopupElement {
 
 export interface PopupButton extends PopupElement {
   textContent: string | null;
+  disabled?: boolean;
   setAttribute(name: string, value: string): void;
 }
 
@@ -31,6 +33,7 @@ export interface SettingsPopupOptions {
   button: PopupButton;
   popup: PopupElement;
   applyButton: PopupButton;
+  cancelButton?: PopupElement;
   /** Advanced section; its open state is remembered per tab under `storageKey`. */
   advanced?: PopupDetails;
   storageKey: string;
@@ -47,7 +50,7 @@ export interface SettingsPopup {
   readonly isOpen: boolean;
   open(): void;
   close(): void;
-  /** Re-reads `pending()` for Apply's visibility and label. */
+  /** Re-reads `pending()` for Apply's state and label. */
   refresh(): void;
 }
 
@@ -80,9 +83,12 @@ export function attachSettingsPopup(
   const applyLabel = o.applyButton.textContent ?? 'Apply';
   if (o.advanced) rememberOpen(o.advanced, `${o.storageKey}:advanced`, storage);
 
+  o.applyButton.hidden = false;
+  if (o.cancelButton) o.cancelButton.hidden = false;
+  // Apply greys out until something changed.
   const refresh = (): void => {
     const pending = o.pending();
-    o.applyButton.hidden = pending === 'none';
+    o.applyButton.disabled = pending === 'none';
     o.applyButton.textContent = pending === 'reload' && o.reloadLabel ? o.reloadLabel : applyLabel;
   };
   const setOpen = (open: boolean): void => {
@@ -104,6 +110,7 @@ export function attachSettingsPopup(
   o.button.addEventListener('click', () => setOpen(o.popup.hidden));
   o.advanced?.addEventListener('toggle', () => { if (popup.isOpen) fitViewport(o.popup); });
   if (typeof window !== 'undefined') window.addEventListener('resize', () => { if (popup.isOpen) fitViewport(o.popup); });
+  o.cancelButton?.addEventListener('click', () => setOpen(false));
   o.applyButton.addEventListener('click', (e) => {
     const m = e as MouseEvent;
     o.onApply(m.ctrlKey === true || m.metaKey === true);
