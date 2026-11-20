@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  SMOOTH_CEILING_MS, catalogIsLive, latencyReadout, migrateLatencyQuery, nextLiveState,
+  SMOOTH_CEILING_MS, catalogIsLive, ccLabel, migrateLatencyQuery, nextLiveState, overlayLine,
   parseLatencySettings, playbackLatency, postureLabel, targetText,
 } from './latency-settings.js';
 
@@ -92,16 +92,23 @@ describe('retired latency params', () => {
   });
 });
 
-describe('readout', () => {
+describe('overlay line', () => {
   it('names where the target came from', () => {
     expect(targetText(500, 205)).toBe('target 500 ms');
     expect(targetText(undefined, 205)).toBe('target 205 ms (catalog)');
     expect(targetText(undefined, 0)).toBe('target default');
   });
   it('shows measured latency in seconds next to the target', () => {
-    expect(latencyReadout(1012, 'target 205 ms (catalog)')).toBe('1.0 s · target 205 ms (catalog)');
-    expect(latencyReadout(null, 'target 500 ms')).toBe('— · target 500 ms');
-    expect(latencyReadout(NaN, 'target 500 ms')).toBe('— · target 500 ms');
+    const base = { latencyMs: 300, inPlayer: false, targetMs: 250, targetSource: 'catalog' as const,
+      cc: undefined, bufferMs: 300, boundMs: 3000 };
+    expect(overlayLine(base)).toBe('latency: 300 ms (target: 250 ms [catalog]) cc-algo: default buffer: 300/3000 ms');
+    expect(overlayLine({ ...base, latencyMs: 4312.6, inPlayer: true, targetMs: 2000, targetSource: 'default',
+      cc: 'throughput', bufferMs: 4312.6 }))
+      .toBe('latency: 4313* ms (target: 2000 ms [default]) cc-algo: smooth buffer: 4313/3000 ms');
+    expect(overlayLine({ ...base, latencyMs: null, targetSource: 'manual', cc: 'low-latency', bufferMs: null, boundMs: 250 }))
+      .toBe('latency: — (target: 250 ms [manual]) cc-algo: low-latency buffer: —/250 ms');
+    expect(ccLabel(undefined)).toBe('default');
+    expect(ccLabel('low-latency')).toBe('low-latency');
   });
 });
 

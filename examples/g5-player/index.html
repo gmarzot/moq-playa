@@ -644,11 +644,10 @@
     .state-badge.loading { background: var(--overlay-loading-bg); color: var(--overlay-loading-fg); }
     .state-badge.error { background: var(--overlay-error-bg); color: var(--overlay-error-fg); }
     .status-line {
-      padding: 3px 10px; border-radius: 0 4px 4px 0;
+      padding: 3px 10px; border-radius: 0 4px 4px 0; text-transform: none; letter-spacing: .3px;
       background: rgba(0, 0, 0, .72); color: #e6edf5;
       contain: layout style paint;
     }
-    #status-clock:not(:empty) + #status-stats:not(:empty)::before { content: ' · '; }
     /* Until the data line has text, the badge stands alone. */
     .status-line:not(:has(> span:not(:empty))) { display: none; }
     .status-overlay:not(:has(.status-line > span:not(:empty))) .state-badge { border-radius: 4px; }
@@ -705,7 +704,7 @@
       <div id="player-container"></div>
       <div class="status-overlay" id="status-overlay" hidden>
         <span class="state-badge" id="state">idle</span>
-        <span class="status-line" id="status-line" title="Time on the relay's clock, to compare with a clock burned into the video"><span id="status-clock"></span><span id="status-stats"></span></span>
+        <span class="status-line" id="status-line" title="Latency and its target, the congestion-control choice, and the buffer against the most it may hold. * : time in the player (no capture clock)"><span id="status-stats"></span></span>
       </div>
     </div>
 
