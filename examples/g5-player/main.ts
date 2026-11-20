@@ -316,7 +316,10 @@ function log(msg: string): void {
     fUrl.value = p.get('url') ?? '';
     relayPicker.sync();
     fNs.value = p.get('ns') ?? '';
-    fV.value = p.get('v') ?? '';
+    const v = p.get('v') ?? '';
+    // A draft the picker no longer offers stays selected, so applying other settings keeps it.
+    if (v && ![...fV.options].some((o) => o.value === v)) fV.add(new Option(`Draft ${v}`, v));
+    fV.value = v;
     fTarget.value = p.get('targetLatency') ?? '';
     fBootstrap.value = p.get('catalogBootstrap') ?? '';
     fWarmStart.checked = p.get('warmStart') !== '0';

@@ -354,6 +354,8 @@ function saveLastCatalog(ns: string, catalog: CarriedCatalog): void {
     sNs.value = namespace;
     autoNamespace = namedNamespace === null ? namespace : null;
     sHash.value = params.get('hash') ?? '';
+    // A draft the picker no longer offers stays selected, so applying other settings keeps it.
+    if (![...sVersion.options].some((o) => o.value === String(broadcastDraft))) sVersion.add(new Option(`Draft ${broadcastDraft}`, String(broadcastDraft)));
     sVersion.value = String(broadcastDraft);
     sCc.value = congestionControl ?? '';
     sCodec.value = videoCodec;
