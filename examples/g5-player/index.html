@@ -754,16 +754,6 @@
           <label class="sp-row" hidden>Audio <select id="audio"></select></label>
           <label class="sp-row" hidden>Language <select id="lang"></select></label>
           <hr class="sp-sep">
-          <div class="sp-field"><label for="s-target">Target latency (ms)</label>
-            <input id="s-target" type="number" min="1" placeholder="Catalog">
-            <div class="sp-hint">Blank: the catalog's targetLatency.</div></div>
-          <div class="sp-field"><label for="s-cc">Congestion control</label>
-            <select id="s-cc">
-              <option value="">Browser default</option>
-              <option value="low-latency">Low latency</option>
-              <option value="throughput">Smooth</option>
-            </select>
-            <div class="sp-hint">Low latency holds the target. Browser default and Smooth let the buffer grow to 3 s to ride out bursts; Smooth also asks for throughput. The browser may ignore the hint; the log shows what it applied.</div></div>
           <div class="sp-field"><label for="s-url">Relay</label>
             <input id="s-url" type="text" placeholder="blank = discover on this host, else moqx-main"></div>
           <div class="sp-field"><label for="s-ns">Namespace</label>
@@ -779,6 +769,16 @@
           <details class="sp-adv" id="s-adv">
             <summary>Advanced</summary>
             <div class="sp-adv-body">
+              <div class="sp-field"><label for="s-target">Target latency (ms)</label>
+                <input id="s-target" type="number" min="1" placeholder="Catalog">
+                <div class="sp-hint">Blank: the catalog's targetLatency.</div></div>
+              <div class="sp-field"><label for="s-cc">Congestion control</label>
+                <select id="s-cc">
+                  <option value="">Browser default</option>
+                  <option value="low-latency">Low latency</option>
+                  <option value="throughput">Smooth</option>
+                </select>
+                <div class="sp-hint">Low latency holds the target. Browser default and Smooth let the buffer grow to 3 s to ride out bursts; Smooth also asks for throughput. The browser may ignore the hint; the log shows what it applied.</div></div>
               <div class="sp-field"><label for="s-bootstrap">Catalog bootstrap</label>
                 <select id="s-bootstrap">
                   <option value="">Player default</option>
