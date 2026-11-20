@@ -25,7 +25,7 @@ import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother, RENDER_CUSHION_MAX_US, RENDER_CUSHION_BURST_MAX_US } from './render-cushion.js';
-import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_MARGIN_US, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
+import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 import { usesMsePath } from './packaging.js';
@@ -225,15 +225,17 @@ function smoothBounds(config: MoqtPlayerConfig, cushionMaxUs: number): { floorUs
 /**
  * The LOC playout delay: the smoothed render cushion within its live bounds,
  * and in smooth mode the latency policy's hold above them. Unless low-latency
- * congestion control is requested, live late arrivals raise the cushion too.
- * Bounds and mode follow {@link LocPlayout.apply}.
+ * congestion control is requested, live late arrivals raise the cushion too,
+ * held the same way within the live bounds. Bounds and mode follow
+ * {@link LocPlayout.apply}.
  */
 class LocPlayout {
   private floorUs: number;
   private maxUs: number;
   private expands: boolean;
-  private firstArrivalUs: number | null = null;
   policy: LatencyPolicy | null = null;
+  /** Live without low latency: holds raises between the live floor and cap. */
+  private liveHold: LatencyPolicy | null = null;
   readonly cushion: RenderCushionSmoother;
 
   constructor(
@@ -251,14 +253,16 @@ class LocPlayout {
     this.maxUs = maxUs;
     this.expands = expandsCushion(config);
     this.policy = this.policyFor(config, null);
+    this.liveHold = this.liveHoldFor(null);
     this.cushion = new RenderCushionSmoother({ floorUs, maxUs: this.policy?.ceilingUs ?? maxUs }, clock);
     // Smooth starts at its held delay: audio scheduled before the first frame uses it too.
     if (this.policy) this.cushion.raiseTo(this.policy.heldUs);
   }
 
-  /** The cushion in force: the jitter estimate within the live cap, or the smooth hold above it. */
+  /** The cushion in force: the jitter estimate within the live cap, or the held raise above it. */
   cushionUs(): number {
-    return this.cushion.update(Math.max(Math.min(this.gapUs(), this.maxUs), this.policy?.heldUs ?? 0));
+    const heldUs = (this.policy ?? this.liveHold)?.heldUs ?? 0;
+    return this.cushion.update(Math.max(Math.min(this.gapUs(), this.maxUs), heldUs));
   }
 
   /** Smooth, or live without low latency: arrivals report their slack against the cushion. */
@@ -268,21 +272,13 @@ class LocPlayout {
 
   /**
    * An arrival `slackUs` past its slot raises the cushion at once, and audio
-   * realigns to it. Smooth holds the raise; live lets it fall at the smoother's rate.
+   * realigns to it. The raise holds until a clean window lets it step down.
    */
   noteSlack(slackUs: number): number {
-    if (this.policy) {
-      const raised = this.policy.noteArrival(slackUs, this.cushion.currentUs);
-      if (raised !== null) this.raiseTo(raised);
-      return this.cushion.currentUs;
-    }
-    if (!this.expands) return this.cushionUs();
-    const nowUs = this.clock.now();
-    this.firstArrivalUs ??= nowUs;
-    // Same grace as smooth: a join delivers its group's backlog.
-    if (slackUs < 0 && nowUs - this.firstArrivalUs >= SMOOTH_STARTUP_GRACE_US) {
-      this.raiseTo(this.cushion.currentUs - slackUs + SMOOTH_MARGIN_US);
-    }
+    const hold = this.policy ?? this.liveHold;
+    if (!hold) return this.cushionUs();
+    const raised = hold.noteArrival(slackUs, this.cushion.currentUs);
+    if (raised !== null) this.raiseTo(raised);
     return this.cushion.currentUs;
   }
 
@@ -292,6 +288,7 @@ class LocPlayout {
     this.maxUs = maxUs;
     this.expands = expandsCushion(config);
     this.policy = this.policyFor(config, this.policy);
+    this.liveHold = this.liveHoldFor(this.liveHold);
     this.cushion.setBounds(floorUs, this.policy?.ceilingUs ?? maxUs);
     if (this.policy) this.raiseTo(this.policy.heldUs);
     return this.policy ?? undefined;
@@ -301,6 +298,20 @@ class LocPlayout {
   private policyFor(config: MoqtPlayerConfig, current: LatencyPolicy | null): LatencyPolicy | null {
     if (config.latencyMode !== 'smooth') return null;
     const bounds = smoothBounds(config, this.maxUs);
+    if (current) {
+      current.setBase(this.floorUs);
+      current.setBounds(bounds);
+      return current;
+    }
+    return new LatencyPolicy({
+      mode: 'smooth', baseUs: this.floorUs, ...bounds, startupGraceUs: SMOOTH_STARTUP_GRACE_US,
+    }, this.clock);
+  }
+
+  /** Live without low latency: the existing hold re-bounded, else a new one; otherwise none. */
+  private liveHoldFor(current: LatencyPolicy | null): LatencyPolicy | null {
+    if (this.policy || !this.expands) return null;
+    const bounds = { floorUs: this.floorUs, ceilingUs: this.maxUs };
     if (current) {
       current.setBase(this.floorUs);
       current.setBounds(bounds);

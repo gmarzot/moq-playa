@@ -19,7 +19,7 @@ import {
   type TrackInfo,
 } from './player-pipeline.js';
 import type { MoqtPlayerConfig } from './config.js';
-import { SMOOTH_MARGIN_US } from './latency-policy.js';
+import { SMOOTH_CLEAN_WINDOW_US, SMOOTH_MARGIN_US } from './latency-policy.js';
 import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@openmoq/playback';
 import type { CommandDispatcher } from './command-dispatcher.js';
 import type { MediaSourceLike, VideoDecoderLike, VideoRendererLike } from './interfaces.js';
@@ -833,14 +833,17 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
       enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(), start: vi.fn(), stop: vi.fn(),
       onFirstFrame: null, onFrameRendered: null, onStall: null,
     };
+    const audioOutput = { schedule: vi.fn(), flush: vi.fn(), destroy: vi.fn(), currentPlayoutTimeUs: 0, realign: vi.fn() };
     const result = createPipelines(minimalConfig({
       createVideoDecoder: () => videoDecoder as any,
       createRenderer: () => renderer as any,
+      createAudioOutput: () => audioOutput as any,
       ...overrides,
     }), clock, trackInfo, mockCallbacks());
     Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', { get: gapUs, configurable: true });
     return {
       result,
+      realigns: () => audioOutput.realign.mock.calls.length,
       at: (us: number) => { nowUs = us; },
       schedule: (): number => (result.commandDispatcher as any)._getPlaybackDelayUs(),
       /** Reference: capture 1.0 s renders at 0.1 s. */
@@ -914,7 +917,7 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
     }
   });
 
-  it('live: late arrivals raise the cushion by their lateness to the cap; steady arrival lets it fall slowly', () => {
+  it('live: late arrivals raise the cushion by their lateness to the cap and the raise holds', () => {
     const s = session({});
     s.anchor();
     s.at(200_000);
@@ -937,11 +940,90 @@ describe('createPipelines — LOC cushion cap by requested congestion control', 
     expect(seen[0]).toBe(200_000 + 500_000 + SMOOTH_MARGIN_US);   // 500 ms past its slot
     expect(seen.some((us) => us > 2_000_000 && us < RENDER_CUSHION_BURST_MAX_US)).toBe(true);
     expect(prevUs).toBe(RENDER_CUSHION_BURST_MAX_US);
-    // Steady on-time arrival: the smoother's fall rate, not a step.
+    // The raise holds between arrivals.
     const t0 = 3_200_000 + 10 * 1_000_000;
     s.at(t0 + 1_000_000);
     s.schedule();
-    expect(s.cushionUs()).toBe(RENDER_CUSHION_BURST_MAX_US - RENDER_CUSHION_FALL_US_PER_SEC);
+    expect(s.cushionUs()).toBe(RENDER_CUSHION_BURST_MAX_US);
+  });
+
+  /**
+   * Bursty arrival from t = 0.2 s for `untilUs`: every `periodUs` the frames
+   * captured in that period arrive together, `tailLateUs` after the last one's
+   * base render time. Returns the cushion after each burst.
+   */
+  function bursts(s: ReturnType<typeof session>, periodUs: number, untilUs: number, tailLateUs = 20_000, fromUs = 0) {
+    const perBurst = Math.round(periodUs / 33_333);
+    const seen: Array<{ atUs: number; cushionUs: number }> = [];
+    for (let b = Math.round(fromUs / periodUs); (b + 1) * periodUs <= untilUs; b++) {
+      const captures = Array.from({ length: perBurst }, (_, k) => 1_100_000 + (b * perBurst + k) * 33_333);
+      const atUs = baseRenderUs(captures.at(-1)!) + tailLateUs;
+      s.at(atUs);
+      for (const c of captures) s.frame(c);
+      seen.push({ atUs, cushionUs: s.cushionUs() });
+    }
+    return seen;
+  }
+
+  it('live: a 450 ms burst pattern raises the cushion once to cover it, then holds', () => {
+    for (const mode of EXPANDING) {
+      const s = session(cc(mode));
+      s.anchor();
+      const seen = bursts(s, 450_000, 60_000_000);
+      const held = seen.filter((b) => b.atUs >= 5_000_000);
+      const heldUs = held[0]!.cushionUs;
+      expect(heldUs).toBeGreaterThan(14 * 33_333 + 20_000);   // covers the head's lateness
+      expect(heldUs).toBeLessThan(RENDER_CUSHION_BURST_MAX_US);
+      for (const b of held) expect(b.cushionUs).toBe(heldUs);
+      expect(s.realigns()).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it('live: a publisher sending each 2.5 s group at once raises the cushion once, then holds', () => {
+    const s = session({});
+    s.anchor();
+    const seen = bursts(s, 2_500_000, 60_000_000);
+    const held = seen.filter((b) => b.atUs >= 8_000_000);
+    const heldUs = held[0]!.cushionUs;
+    expect(heldUs).toBeGreaterThan(2_400_000);
+    expect(heldUs).toBeLessThanOrEqual(RENDER_CUSHION_BURST_MAX_US);
+    for (const b of held) expect(b.cushionUs).toBe(heldUs);
+    expect(s.realigns()).toBeLessThanOrEqual(2);
+  });
+
+  it('live: a held cushion steps down only after a clean window, never below the floor', () => {
+    const s = session({});
+    s.anchor();
+    bursts(s, 450_000, 20_000_000);
+    const heldUs = s.cushionUs();
+    // On-time arrival from 20 s.
+    const seen = bursts(s, 33_333, 200_000_000, 5_000, 20_000_000);
+    const before = seen.filter((b) => b.atUs < 20_000_000 + SMOOTH_CLEAN_WINDOW_US - 1_000_000);
+    for (const b of before) expect(b.cushionUs).toBe(heldUs);
+    const lowered = seen.find((b) => b.cushionUs < heldUs)!;
+    expect(lowered.atUs).toBeGreaterThanOrEqual(20_000_000 + SMOOTH_CLEAN_WINDOW_US);
+    const lastUs = seen.at(-1)!.cushionUs;
+    expect(lastUs).toBeLessThan(heldUs);
+    expect(lastUs).toBeGreaterThanOrEqual(200_000);
+  });
+
+  it('live: a later, larger lateness raises a held cushion again', () => {
+    const s = session({});
+    s.anchor();
+    bursts(s, 450_000, 20_000_000);
+    const heldUs = s.cushionUs();
+    const realigns = s.realigns();
+    // The next burst lands 1.2 s past its tail's base render time.
+    bursts(s, 450_000, 20_450_000, 1_200_000, 20_000_000);
+    expect(s.cushionUs()).toBeGreaterThan(heldUs + 500_000);
+    expect(s.realigns()).toBe(realigns + 1);
+  });
+
+  it('low latency: a 450 ms burst pattern leaves the live cushion at the floor', () => {
+    const s = session(cc('low-latency'));
+    s.anchor();
+    for (const b of bursts(s, 450_000, 30_000_000)) expect(b.cushionUs).toBe(200_000);
+    expect(s.realigns()).toBe(0);
   });
 
   it('live: lateness inside the startup grace does not raise the cushion', () => {
