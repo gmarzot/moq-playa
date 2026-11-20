@@ -171,9 +171,6 @@ try {
       { name: `locmaf-${decoding}-frozen-picture-control`, fixture: 'frozen', silent: false, expectedFailure: 'picture-frozen' },
       { name: `locmaf-${decoding}-missing-audio-control`, fixture: 'moving', silent: true, expectedFailure: 'audio-missing' },
     ].map((scenario) => ({ ...scenario, locmaf: decoding,
-      // Known failure in this fork: frame mode drops frames at loopback slack.
-      // Pinned so the run fails once it passes.
-      ...(decoding === 'frame' ? { knownFailures: ['presentation-rate'] } : {}),
       expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: decoding === 'frame' ? 'canvas' : 'video' },
     }))),
   ];

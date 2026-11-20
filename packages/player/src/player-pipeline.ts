@@ -24,7 +24,7 @@ import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
-import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
+import { RenderCushionSmoother, RENDER_CUSHION_MAX_US, RENDER_CUSHION_BURST_MAX_US } from './render-cushion.js';
 import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
@@ -182,6 +182,11 @@ export function computePlaybackDelayUs(
 
 // ─── LOC playout delay ───────────────────────────────────────────────
 
+/** Unless low-latency congestion control is requested, late arrival may grow the LOC cushion up to the burst cap. */
+function expandsCushion(config: MoqtPlayerConfig): boolean {
+  return config.congestionControl !== 'low-latency';
+}
+
 /** LOC render-cushion floor and cap (µs) for a config and target latency. */
 function cushionBounds(
   config: MoqtPlayerConfig,
@@ -194,12 +199,14 @@ function cushionBounds(
     ? config.renderCushionFloorMs * 1000
     : computePlaybackDelayUs(undefined, handshakeRttMs,
       targetLatencyMs !== undefined ? targetLatencyMs * 1000 : undefined);
-  // The cap follows the target latency when one is known (config, else
-  // catalog), so jitter cannot grow the cushion past the latency the
-  // publisher asked for; an explicit cap wins. A floor above the cap lifts it.
-  const defaultMaxUs = targetLatencyMs !== undefined
-    ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
-    : RENDER_CUSHION_MAX_US;
+  // Low-latency congestion control holds the target: the live cap, or the
+  // target latency (config, else catalog) if lower. Otherwise the cap leaves
+  // room for bursty arrival. An explicit cap wins; a floor above the cap lifts it.
+  const defaultMaxUs = expandsCushion(config)
+    ? RENDER_CUSHION_BURST_MAX_US
+    : targetLatencyMs !== undefined
+      ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
+      : RENDER_CUSHION_MAX_US;
   const maxUs = Math.max(
     config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : defaultMaxUs,
     floorUs,
@@ -207,23 +214,33 @@ function cushionBounds(
   return { floorUs, maxUs };
 }
 
-/** Smooth floor and ceiling (µs): late media raises the cushion past the live cap, up to the ceiling. */
+/**
+ * Smooth floor and ceiling (µs): late media raises the cushion past the live cap,
+ * up to the ceiling. An explicit ceiling holds; the default one covers the live cap.
+ */
 function smoothBounds(config: MoqtPlayerConfig, cushionMaxUs: number): { floorUs: number; ceilingUs: number } {
   return {
     floorUs: (config.smoothFloorMs ?? SMOOTH_FLOOR_MS) * 1000,
-    ceilingUs: Math.max((config.smoothCeilingMs ?? SMOOTH_CEILING_MS) * 1000, cushionMaxUs),
+    ceilingUs: config.smoothCeilingMs !== undefined
+      ? config.smoothCeilingMs * 1000
+      : Math.max(SMOOTH_CEILING_MS * 1000, cushionMaxUs),
   };
 }
 
 /**
  * The LOC playout delay: the smoothed render cushion within its live bounds,
- * and in smooth mode the latency policy's hold above them. Bounds and mode
- * follow {@link LocPlayout.apply}.
+ * and in smooth mode the latency policy's hold above them. Unless low-latency
+ * congestion control is requested, live late arrivals raise the cushion too,
+ * held the same way within the live bounds. Bounds and mode follow
+ * {@link LocPlayout.apply}.
  */
 class LocPlayout {
   private floorUs: number;
   private maxUs: number;
+  private expands: boolean;
   policy: LatencyPolicy | null = null;
+  /** Live without low latency: holds raises between the live floor and cap. */
+  private liveHold: LatencyPolicy | null = null;
   readonly cushion: RenderCushionSmoother;
 
   constructor(
@@ -239,30 +256,52 @@ class LocPlayout {
     const { floorUs, maxUs } = cushionBounds(config, catalogTargetMs, handshakeRttMs);
     this.floorUs = floorUs;
     this.maxUs = maxUs;
+    this.expands = expandsCushion(config);
     this.policy = this.policyFor(config, null);
+    this.liveHold = this.liveHoldFor(null);
     this.cushion = new RenderCushionSmoother({ floorUs, maxUs: this.policy?.ceilingUs ?? maxUs }, clock);
     // Smooth starts at its held delay: audio scheduled before the first frame uses it too.
     if (this.policy) this.cushion.raiseTo(this.policy.heldUs);
   }
 
-  /** The cushion in force: the jitter estimate within the live cap, or the smooth hold above it. */
+  /** The cushion in force: the jitter estimate within the live cap, or the held raise above it. */
   cushionUs(): number {
-    return this.cushion.update(Math.max(Math.min(this.gapUs(), this.maxUs), this.policy?.heldUs ?? 0));
+    const heldUs = (this.policy ?? this.liveHold)?.heldUs ?? 0;
+    return this.cushion.update(Math.max(Math.min(this.gapUs(), this.maxUs), heldUs));
   }
 
-  /** Smooth: an arrival `slackUs` past its slot raises the cushion at once, and audio realigns to it. */
+  /** Smooth, or live without low latency: arrivals report their slack against the cushion. */
+  get raisesOnLate(): boolean {
+    return this.policy !== null || this.expands;
+  }
+
+  /**
+   * An arrival `slackUs` past its slot raises the cushion at once, and audio
+   * realigns to it. The raise holds until a clean window lets it step down.
+   */
   noteSlack(slackUs: number): number {
-    if (!this.policy) return this.cushionUs();
-    const raised = this.policy.noteArrival(slackUs, this.cushion.currentUs);
+    const hold = this.policy ?? this.liveHold;
+    if (!hold) return this.cushionUs();
+    // While the cushion slews down to a lowered hold, measure slack against the hold.
+    const aboveHoldUs = Math.max(0, this.cushion.currentUs - hold.heldUs);
+    const raised = hold.noteArrival(slackUs - aboveHoldUs, this.cushion.currentUs - aboveHoldUs);
     if (raised !== null) this.raiseTo(raised);
     return this.cushion.currentUs;
+  }
+
+  /** The ceiling armed hold allows: audio later than this is dropped before decode. */
+  get armedCeilingUs(): number | undefined {
+    const hold = this.policy ?? this.liveHold;
+    return hold?.armed ? hold.ceilingUs : undefined;
   }
 
   apply(config: MoqtPlayerConfig, catalogTargetMs: number | undefined): LatencyPolicy | undefined {
     const { floorUs, maxUs } = cushionBounds(config, catalogTargetMs, this.handshakeRttMs);
     this.floorUs = floorUs;
     this.maxUs = maxUs;
+    this.expands = expandsCushion(config);
     this.policy = this.policyFor(config, this.policy);
+    this.liveHold = this.liveHoldFor(this.liveHold);
     this.cushion.setBounds(floorUs, this.policy?.ceilingUs ?? maxUs);
     if (this.policy) this.raiseTo(this.policy.heldUs);
     return this.policy ?? undefined;
@@ -282,10 +321,24 @@ class LocPlayout {
     }, this.clock);
   }
 
+  /** Live without low latency: the existing hold re-bounded, else a new one; otherwise none. */
+  private liveHoldFor(current: LatencyPolicy | null): LatencyPolicy | null {
+    if (this.policy || !this.expands) return null;
+    const bounds = { floorUs: this.floorUs, ceilingUs: this.maxUs };
+    if (current) {
+      current.setBase(this.floorUs);
+      current.setBounds(bounds);
+      return current;
+    }
+    return new LatencyPolicy({
+      mode: 'smooth', baseUs: this.floorUs, ...bounds, startupGraceUs: SMOOTH_STARTUP_GRACE_US,
+    }, this.clock);
+  }
+
+  /** Realigns audio only when the clamped cushion actually grew. */
   private raiseTo(heldUs: number): void {
-    if (heldUs <= this.cushion.currentUs) return;
-    this.cushion.raiseTo(heldUs);
-    this.realign();
+    const beforeUs = this.cushion.currentUs;
+    if (this.cushion.raiseTo(heldUs) > beforeUs) this.realign();
   }
 }
 
@@ -418,7 +471,6 @@ export function createPipelines(
         // swings cannot step render times (a stepwise collapse froze video
         // in the field).
         let playbackDelayUs = cushionUs();
-        const latencyPolicy = playout?.policy;
 
         // Sync reference is guaranteed here — CommandDispatcher holds frames
         // until hasSyncReference() returns true, so this callback only fires
@@ -426,11 +478,12 @@ export function createPipelines(
         const timing = syncController.computeVideoRenderTime(captureTimestampUs);
         if (!timing) return clock.now() + playbackDelayUs; // safety: shouldn't happen
         // Frames held for the sync reference waited on the player, not the network.
-        if (latencyPolicy && !fromHoldQueue) {
+        if (playout?.raisesOnLate && !fromHoldQueue) {
           playbackDelayUs = playout!.noteSlack(timing.renderTimeUs + playbackDelayUs - clock.now());
         }
-        // Smooth renders a raised frame at its slot; past the ceiling it renders now, as in live.
-        if (timing.shouldDrop && (!latencyPolicy || timing.renderTimeUs + playbackDelayUs < clock.now())) {
+        // A frame behind its base render time but inside the cushion renders at
+        // its slot; rendering it now would bunch it with the frames queued ahead.
+        if (timing.shouldDrop && timing.renderTimeUs + playbackDelayUs < clock.now()) {
           return clock.now();
         }
 
@@ -440,7 +493,7 @@ export function createPipelines(
         return timing.renderTimeUs + playbackDelayUs;
       },
       hasSyncReference: () => syncController.hasReference,
-      getPlaybackDelayUs: (renderTimeUs?: number) => playout?.policy && renderTimeUs !== undefined
+      getPlaybackDelayUs: (renderTimeUs?: number) => playout?.raisesOnLate && renderTimeUs !== undefined
         ? playout.noteSlack(renderTimeUs + cushionUs() - clock.now())
         : cushionUs(),
     }));
@@ -475,9 +528,8 @@ export function createPipelines(
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
       // The cushion the dispatcher adds to audio render times (peek only).
-      // Armed Smooth drops before decode only audio late past the ceiling; the rest raises the cushion.
-      getPlaybackDelayUs: () => (playout?.policy?.armed ? playout.policy.ceilingUs : undefined)
-        ?? playout?.cushion.currentUs ?? cushionUs(),
+      // An armed hold drops before decode only audio late past its ceiling; the rest raises the cushion.
+      getPlaybackDelayUs: () => playout?.armedCeilingUs ?? playout?.cushion.currentUs ?? cushionUs(),
     });
   }
 

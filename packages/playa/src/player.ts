@@ -778,6 +778,7 @@ export class Player {
       url: opts.url,
       namespace: opts.namespace,
       ...(draftVersion !== undefined ? { draftVersion } : {}),
+      ...(opts.congestionControl ? { congestionControl: opts.congestionControl } : {}),
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,

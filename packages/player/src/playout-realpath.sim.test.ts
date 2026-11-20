@@ -457,7 +457,7 @@ function runRealPath(
       cushionSamples.push(cushionUs);
       const timing = sync.computeVideoRenderTime(captureTimestampUs);
       if (!timing) return clock.now() + cushionUs;
-      if (timing.shouldDrop) return clock.now();
+      if (timing.shouldDrop && timing.renderTimeUs + cushionUs < clock.now()) return clock.now();
       return timing.renderTimeUs + cushionUs;
     },
     hasSyncReference: () => sync.hasReference,
@@ -1096,6 +1096,8 @@ function runFactoryPath(
     driftThresholdMs: harness.driftThresholdUs / 1000,
     maxBufferDepth: harness.maxBufferDepth,
     lateFrameThresholdMs: harness.dropThresholdUs / 1000,
+    // The manual arm models the gap-driven cushion under the live cap.
+    congestionControl: 'low-latency',
     createVideoDecoder: () => decoder,
     createRenderer: () => renderer,
   };
@@ -1216,10 +1218,9 @@ function runFactoryPath(
 }
 
 /**
- * Parity is asserted on BOTH canonical traces. A clean trace alone is too
- * benign: no frame is late enough for `lateFrameThresholdMs` to act on, so a
- * config divergence in the factory arm would go undetected (found by mutating
- * the factory's drop threshold and watching parity still pass).
+ * Parity is asserted on both canonical traces: on the clean one no frame is late
+ * enough for `lateFrameThresholdMs` to act, so only the stressed one exercises the
+ * late-frame path the factory arm must match.
  */
 const parityTraces: { name: string; opts: Parameters<typeof freezeTrace>[0] }[] = [
   { name: 'regime 1 (8Mbps keyframe burst)', opts: { capacityMbps: 8, seconds: 12 } },
@@ -1236,11 +1237,11 @@ const parityTraces: { name: string; opts: Parameters<typeof freezeTrace>[0] }[] 
 /**
  * Production-default results.
  *
- * Everything above runs this suite's historical harness tuning — not a coherent
- * "core default" set. The shipping player differs materially, most
- * consequentially `lateFrameThresholdMs: 100` versus `SyncController`'s implicit
- * 500 ms default, so tuned numbers must never be presented as default-player
- * behaviour. These are gated, not merely logged.
+ * Everything above runs this suite's harness tuning, not the shipping player
+ * config (gap timeout, drift, buffer depth and `lateFrameThresholdMs: 100`
+ * versus `SyncController`'s implicit 500 ms all differ), so tuned numbers must
+ * never be presented as default-player behaviour. These are gated, not merely
+ * logged.
  */
 describe('real-class playout composition — production defaults', () => {
   const report = (name: string, floor: RunResult, adaptive: RunResult) => {
@@ -1267,7 +1268,7 @@ describe('real-class playout composition — production defaults', () => {
     expect(dA.latencyP50Us).toBeGreaterThan(dF.latencyP50Us + 100_000);
   });
 
-  it('regime 2: adaptation reduces starvation but costs MORE total freeze', () => {
+  it('regime 2: adaptation trades starvation for less hold and less total freeze than the floor', () => {
     const trace = freezeTrace({
       capacityMbps: 20, seconds: 40,
       jitterUs: (i) => (i >= 180 && i % 90 === 0 ? 500_000 : 0),
@@ -1277,30 +1278,29 @@ describe('real-class playout composition — production defaults', () => {
     for (const arm of [floor, adaptive]) assertLosslessRun(trace, arm);
     const { dF, dA } = report('regime 2 (repeating 500ms impairment)', floor, adaptive);
 
-    // Adaptation does buy readiness...
+    // Adaptation buys readiness...
     expect(dA.starvationUs).toBeLessThan(dF.starvationUs / 2);
-    // ...but converts it into MORE policy hold than it saves, so the visible
-    // freeze burden is worse than the fixed floor — the reversal versus the
-    // tuned config, where adaptive won this regime.
-    expect(dA.holdUs).toBeGreaterThan(dF.holdUs * 2);
-    expect(dA.totalFreezeExcessUs).toBeGreaterThan(dF.totalFreezeExcessUs * 1.2);
-    // ...and it still charges latency for it.
+    // ...and adds less hold than the starvation it saves, so total freeze
+    // falls well below the fixed floor's...
+    expect(dA.holdUs - dF.holdUs).toBeLessThan(dF.starvationUs - dA.starvationUs);
+    expect(dA.totalFreezeExcessUs).toBeLessThan(dF.totalFreezeExcessUs / 2);
+    // ...at a latency cost.
     expect(dA.latencyP50Us).toBeGreaterThan(dF.latencyP50Us + 100_000);
   });
 });
 
 /**
- * One-factor attribution for the production-default reversal.
+ * One-factor attribution: each shipping default applied alone to the tuned
+ * config on regime 2.
  *
- * The shipping 500 ms `gapTimeoutUs` is not the cause: with
- * `adaptiveTolerance` enabled,
+ * The gap timeout cannot matter: with `adaptiveTolerance` enabled,
  * `PlaybackPipeline.effectiveGapTimeoutUs` returns the ADAPTIVE value and every
- * `tick()` overwrites `gapDetector.gapTimeoutUs` with it, so the configured gap
- * timeout is largely replaced by observed jitter. This isolates each factor
- * instead of inferring.
+ * `tick()` overwrites `gapDetector.gapTimeoutUs` with it. Nor can the drop
+ * threshold: a frame past it still renders at its cushioned slot, or now when
+ * that slot is past, which the renderer does with a past slot anyway.
  */
 describe('real-class playout composition — one-factor attribution', () => {
-  it('identifies which shipping default actually reverses regime 2', () => {
+  it('no shipping default changes the regime 2 outcome', () => {
     const trace = freezeTrace({
       capacityMbps: 20, seconds: 40,
       jitterUs: (i) => (i >= 180 && i % 90 === 0 ? 500_000 : 0),
@@ -1324,9 +1324,8 @@ describe('real-class playout composition — one-factor attribution', () => {
     const rows: string[] = [];
     const reversed: string[] = [];
     const results = new Map<string, {
-      // BOTH arms: a neutral factor could shift the floor decomposition without
-      // crossing the reversal boundary, and adaptive-only equality would miss it
-      //.
+      // BOTH arms: a factor could shift the floor decomposition without
+      // changing which arm wins, and adaptive-only equality would miss it.
       outcome: { floor: ReturnType<typeof shape>; adaptive: ReturnType<typeof shape> };
       gapSamples: number[];
       cushionSamples: number[];
@@ -1358,28 +1357,18 @@ describe('real-class playout composition — one-factor attribution', () => {
     console.log('\nONE-FACTOR ATTRIBUTION (regime 2):\n' + rows.join('\n')
       + `\n\nfactors that reverse the result: ${reversed.join(', ') || 'none'}\n`);
 
-    // 1. EXACTLY these factors reverse the outcome.
-    expect(reversed).toEqual(['drop threshold 500->100', 'all shipping defaults']);
+    // 1. Adaptive beats the floor under every factor.
+    expect(reversed).toEqual([]);
 
     const baseline = results.get('tuned baseline')!;
-    const neutralFactors = ['gap timeout 200->500', 'drift 100->200', 'buffer 240->500'];
-
-    for (const name of neutralFactors) {
+    for (const { name } of factors.slice(1)) {
       const r = results.get(name)!;
-      // 2. The cushion SIGNAL trajectory is untouched — the evidence that the
-      //    configured gap timeout never reaches the render cushion.
+      // 2. The cushion signal trajectory is untouched.
       expect(r.gapSamples).toEqual(baseline.gapSamples);
       expect(r.cushionSamples).toEqual(baseline.cushionSamples);
       // 3. ...and so is the whole outcome decomposition, for BOTH arms.
       expect(r.outcome).toEqual(baseline.outcome);
     }
-
-    // 4. The drop-threshold factor alone reproduces the full shipping-default
-    //    outcome, which is what makes it the sole cause.
-    expect(results.get('drop threshold 500->100')!.outcome)
-      .toEqual(results.get('all shipping defaults')!.outcome);
-    // 5. And it genuinely differs from baseline.
-    expect(results.get('drop threshold 500->100')!.outcome).not.toEqual(baseline.outcome);
   });
 });
 
@@ -1596,14 +1585,14 @@ describe('real-class adverse matrix — shipping defaults', () => {
       gate: ({ a, f }) => {
         // Stimulus is real...
         expect(f.freeze).toBeGreaterThan(1_000_000);
-        // ...adaptation genuinely cuts starvation...
+        // ...adaptation cuts starvation and adds less hold than it saves, so
+        // total freeze halves, the worst freeze is no longer and quarter-second
+        // freezes are fewer, at a latency cost.
         expect(a.starve).toBeLessThan(f.starve / 2);
-        // ...but converts it into hold, so total and worst freeze get WORSE,
-        // quarter-second freezes multiply, and latency rises.
-        expect(a.hold).toBeGreaterThan(f.hold);
-        expect(a.freeze).toBeGreaterThan(f.freeze);
-        expect(a.maxFreeze).toBeGreaterThan(f.maxFreeze);
-        expect(a.over250).toBeGreaterThan(f.over250);
+        expect(a.hold - f.hold).toBeLessThan(f.starve - a.starve);
+        expect(a.freeze).toBeLessThan(f.freeze / 2);
+        expect(a.maxFreeze).toBeLessThanOrEqual(f.maxFreeze);
+        expect(a.over250).toBeLessThan(f.over250);
         expect(a.latP50).toBeGreaterThan(f.latP50);
       },
     },
@@ -1837,7 +1826,7 @@ describe('real-class adverse matrix — shipping defaults', () => {
   });
 
   // Separate the initial impairment from repetitions to measure learned headroom.
-  it('pins the repeated-impairment tradeoff between starvation and policy hold', () => {
+  it('on repeated impairments, learned headroom saves more starvation than it adds hold', () => {
     // The first impaired GOP starts at 6s and ends before 8s.
     const FIRST_EPISODE_END_US = 8_000_000;
     const trace = freezeTrace({
@@ -1879,10 +1868,9 @@ describe('real-class adverse matrix — shipping defaults', () => {
       + `\n    starvation saved=${(starvationSaved / 1000).toFixed(0)}ms; hold added=${(holdAdded / 1000).toFixed(0)}ms\n`);
 
     expect(a.starve).toBeLessThan(f.starve * 0.5);
-    expect(a.hold).toBeGreaterThan(f.hold);
-    expect(a.freeze).toBeGreaterThan(f.freeze);
-    expect(a.over250).toBeGreaterThan(f.over250);
-    expect(holdAdded).toBeGreaterThan(starvationSaved);
+    expect(holdAdded).toBeLessThan(starvationSaved);
+    expect(a.freeze).toBeLessThan(f.freeze);
+    expect(a.over250).toBeLessThanOrEqual(f.over250);
     expect(a.presented).toBe(f.presented);
   });
 });

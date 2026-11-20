@@ -366,9 +366,19 @@ export interface PlaybackTuningConfig {
 
   /**
    * Cap of the LOC render cushion in milliseconds; bounds how far arrival
-   * jitter can raise the playout delay. Default: 750. Never below the floor.
+   * jitter can raise the playout delay. Never below the floor. Default: 750
+   * (or the target latency, if lower) when `congestionControl` is
+   * `'low-latency'`, else 3000 to ride out bursty arrival.
    */
   readonly renderCushionMaxMs?: number;
+
+  /**
+   * The congestion control requested of the transport. `'low-latency'` holds
+   * the LOC render cushion at the live cap. Anything else, or unset, favors
+   * smooth playback: a late arrival raises the cushion by its lateness, up to
+   * the cap, in live mode too. Set it to what the transport was asked for.
+   */
+  readonly congestionControl?: 'default' | 'throughput' | 'low-latency';
 }
 
 /** Latency and catch-up options. */
@@ -940,6 +950,12 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     );
   }
 
+  if (config.congestionControl !== undefined
+      && !['default', 'throughput', 'low-latency'].includes(config.congestionControl)) {
+    throw new RangeError(
+      `congestionControl must be 'default', 'throughput' or 'low-latency', got ${String(config.congestionControl)}`,
+    );
+  }
   if (config.latencyMode !== undefined && config.latencyMode !== 'live' && config.latencyMode !== 'smooth') {
     throw new RangeError(`latencyMode must be 'live' or 'smooth', got ${String(config.latencyMode)}`);
   }
