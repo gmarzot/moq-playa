@@ -214,11 +214,16 @@ function cushionBounds(
   return { floorUs, maxUs };
 }
 
-/** Smooth floor and ceiling (µs): late media raises the cushion past the live cap, up to the ceiling. */
+/**
+ * Smooth floor and ceiling (µs): late media raises the cushion past the live cap,
+ * up to the ceiling. An explicit ceiling holds; the default one covers the live cap.
+ */
 function smoothBounds(config: MoqtPlayerConfig, cushionMaxUs: number): { floorUs: number; ceilingUs: number } {
   return {
     floorUs: (config.smoothFloorMs ?? SMOOTH_FLOOR_MS) * 1000,
-    ceilingUs: Math.max((config.smoothCeilingMs ?? SMOOTH_CEILING_MS) * 1000, cushionMaxUs),
+    ceilingUs: config.smoothCeilingMs !== undefined
+      ? config.smoothCeilingMs * 1000
+      : Math.max(SMOOTH_CEILING_MS * 1000, cushionMaxUs),
   };
 }
 
@@ -277,9 +282,17 @@ class LocPlayout {
   noteSlack(slackUs: number): number {
     const hold = this.policy ?? this.liveHold;
     if (!hold) return this.cushionUs();
-    const raised = hold.noteArrival(slackUs, this.cushion.currentUs);
+    // While the cushion slews down to a lowered hold, measure slack against the hold.
+    const aboveHoldUs = Math.max(0, this.cushion.currentUs - hold.heldUs);
+    const raised = hold.noteArrival(slackUs - aboveHoldUs, this.cushion.currentUs - aboveHoldUs);
     if (raised !== null) this.raiseTo(raised);
     return this.cushion.currentUs;
+  }
+
+  /** The ceiling armed hold allows: audio later than this is dropped before decode. */
+  get armedCeilingUs(): number | undefined {
+    const hold = this.policy ?? this.liveHold;
+    return hold?.armed ? hold.ceilingUs : undefined;
   }
 
   apply(config: MoqtPlayerConfig, catalogTargetMs: number | undefined): LatencyPolicy | undefined {
@@ -322,10 +335,10 @@ class LocPlayout {
     }, this.clock);
   }
 
+  /** Realigns audio only when the clamped cushion actually grew. */
   private raiseTo(heldUs: number): void {
-    if (heldUs <= this.cushion.currentUs) return;
-    this.cushion.raiseTo(heldUs);
-    this.realign();
+    const beforeUs = this.cushion.currentUs;
+    if (this.cushion.raiseTo(heldUs) > beforeUs) this.realign();
   }
 }
 
@@ -515,9 +528,8 @@ export function createPipelines(
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
       // The cushion the dispatcher adds to audio render times (peek only).
-      // Armed Smooth drops before decode only audio late past the ceiling; the rest raises the cushion.
-      getPlaybackDelayUs: () => (playout?.policy?.armed ? playout.policy.ceilingUs : undefined)
-        ?? playout?.cushion.currentUs ?? cushionUs(),
+      // An armed hold drops before decode only audio late past its ceiling; the rest raises the cushion.
+      getPlaybackDelayUs: () => playout?.armedCeilingUs ?? playout?.cushion.currentUs ?? cushionUs(),
     });
   }
 
