@@ -2343,7 +2343,7 @@ async function main(): Promise<void> {
       try {
         player.updatePlayback({ smoothFloorMs: next.smoothFloorMs, smoothCeilingMs: next.smoothCeilingMs });
         latency = next;
-        log(`Latency: buffer floor ${next.smoothFloorMs ?? 'default'} ms from the catalog, bound ${next.smoothCeilingMs} ms`);
+        log(`Latency: buffer floor ${next.smoothFloorMs} ms from the catalog, bound ${next.smoothCeilingMs} ms`);
       } catch (err) {
         log(`Latency: catalog floor not applied: ${(err as Error).message}`);
       }
@@ -2631,7 +2631,7 @@ async function main(): Promise<void> {
     renderStateBadge();
     const parts = [postureLabel(congestionControl), targetLabel];
     if (latency.latencyMode === 'smooth') {
-      parts.push(`buffer from ${latency.smoothFloorMs ?? 'default'} ms up to ${latency.smoothCeilingMs} ms`);
+      parts.push(`buffer from ${latency.smoothFloorMs} ms up to ${latency.smoothCeilingMs} ms`);
     }
     if (renderCushionFloorMs !== undefined) parts.push(`cushion ${renderCushionFloorMs} ms`);
     if (renderCushionMaxMs !== undefined) parts.push(`cushion max ${renderCushionMaxMs} ms`);

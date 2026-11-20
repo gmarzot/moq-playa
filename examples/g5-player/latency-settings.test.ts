@@ -47,9 +47,9 @@ describe('settings to player options', () => {
     expect(fromUrl('', 205)).toEqual(smooth(undefined, 205));
     expect(fromUrl('congestionControl=throughput', 205)).toEqual(smooth(undefined, 205));
   });
-  it('with no target anywhere the engine default floor stays', () => {
-    expect(fromUrl('').smoothFloorMs).toBeUndefined();
-    expect(fromUrl('congestionControl=throughput', 0).smoothFloorMs).toBeUndefined();
+  it('with no target anywhere the buffer starts at the live hold', () => {
+    expect(fromUrl('').smoothFloorMs).toBe(0);
+    expect(fromUrl('congestionControl=throughput', 0).smoothFloorMs).toBe(0);
   });
   it('a target above the bound lifts the ceiling to it', () => {
     expect(fromUrl('congestionControl=throughput&targetLatency=5000').smoothCeilingMs).toBe(5000);

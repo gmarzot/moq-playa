@@ -57,18 +57,22 @@ export function migrateLatencyQuery(p: URLSearchParams): URLSearchParams | null 
   return next;
 }
 
-/** The player's latency options; `catalogTargetMs` is the adaptive floor when no target is typed. */
+/**
+ * The player's latency options. The adaptive floor is the typed target, else the
+ * catalog's; with neither it is 0, so the buffer starts at the live hold and only
+ * late media raises it.
+ */
 export function playbackLatency(s: LatencySettings, catalogTargetMs?: number): PlaybackLatency {
   if (s.congestionControl === 'low-latency') {
     return { latencyMode: 'live', targetLatencyMs: s.targetLatencyMs, smoothFloorMs: undefined, smoothCeilingMs: undefined };
   }
-  const floor = s.targetLatencyMs ?? (catalogTargetMs !== undefined && catalogTargetMs > 0 ? catalogTargetMs : undefined);
+  const floor = s.targetLatencyMs ?? (catalogTargetMs !== undefined && catalogTargetMs > 0 ? catalogTargetMs : 0);
   return {
     latencyMode: 'smooth',
     targetLatencyMs: s.targetLatencyMs,
     smoothFloorMs: floor,
     // The engine rejects a ceiling below the floor.
-    smoothCeilingMs: Math.max(SMOOTH_CEILING_MS, floor ?? 0),
+    smoothCeilingMs: Math.max(SMOOTH_CEILING_MS, floor),
   };
 }
 
