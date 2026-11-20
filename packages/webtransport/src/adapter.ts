@@ -1518,6 +1518,16 @@ export class MoqtConnection {
       // A peer FIN/reset of an outbound request stream (§11.4.1) terminates that
       // request — clean session AND adapter-owned state for it.
       this.uniPair.onRequestClosed = (requestId, disposition) => this.handleOutboundRequestClosed(requestId, disposition);
+      // Request-stream messages carry no QUIC stream id here; the control stream's stands in.
+      this.uniPair.onMessageEncoded = (message, length) => {
+        if (!this.onQlogEvent) return;
+        this.containObserver(() => this.onQlogEvent?.({
+          type: 'control_message_created',
+          stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+          length,
+          message,
+        }));
+      };
       // A GOAWAY on a request stream (§10.4) — a per-request migration signal,
       // surfaced for BOTH pending and already-established requests (empty queue).
       this.uniPair.onRequestGoaway = (err) => this.handleRequestStreamGoaway(err);

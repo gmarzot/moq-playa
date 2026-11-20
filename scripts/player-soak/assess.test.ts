@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { PlaybackSample } from '../player-acceptance/assessment.mjs';
-import { abrReport, abrSwitch, assessSoak, latencyReport, quietIntervals, recoveryReport } from './assess.mjs';
+import { abrReport, abrSwitch, assessSoak, catchUpReport, latencyReport, quietIntervals, recoveryReport } from './assess.mjs';
 import { MttClient } from './mtt.mjs';
 
 const T0 = 1_000_000;
@@ -190,6 +190,25 @@ describe('player soak ABR ladder', () => {
     expect(assessSoak({ samples: s, ticks: t }).abr).toBeUndefined();
     const r = assessSoak({ samples: s, ticks: t, abrLog: [], startup: { clickedEpochMs: T0 - 3000 } });
     expect(r.abr).toMatchObject({ downshifts: 1, firstDownshiftS: 8 });
+  });
+
+  it('counts catch-up starts and time at a rate other than 1 from the page counters', () => {
+    // A 1.05 chase from sample 8 to 16, a 0.95 slow-down from 24 to 28, another chase from 32 on.
+    const at = (i: number) => (i >= 8 && i < 16 ? 1.05 : i >= 24 && i < 28 ? 0.95 : i >= 32 ? 1.02 : 1);
+    const counted = samples(40, (i) => {
+      let ups = 0;
+      let off = 0;
+      for (let j = 1; j <= i; j++) {
+        if (at(j) > 1 && at(j - 1) <= 1) ups++;
+        if (at(j - 1) !== 1) off += 250;
+      }
+      return { playbackRate: at(i), rateUps: ups + 3, rateOffMs: off + 1000 };
+    });
+    expect(catchUpReport(counted)).toEqual({ rateUps: 2, timeAtRateMs: 4750, maxRate: 1.05, source: 'counters' });
+    const sampled = samples(40, (i) => ({ playbackRate: at(i) }));
+    expect(catchUpReport(sampled)).toEqual({ rateUps: 2, timeAtRateMs: 4750, maxRate: 1.05, source: 'samples' });
+    expect(assessSoak({ samples: sampled, ticks: [] }).catchUp?.rateUps).toBe(2);
+    expect(assessSoak({ samples: samples(10, () => ({})), ticks: [] }).catchUp).toBeNull();
   });
 
   it('gives the p99 audio gap', () => {

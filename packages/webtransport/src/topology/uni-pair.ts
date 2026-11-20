@@ -208,9 +208,24 @@ export class UniPairTopology {
    *  FIN — no half-open). */
   onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset' | 'goaway') => void | Promise<void>;
 
+  /** Called with each control message this endpoint encodes, on the control
+   *  stream and on every request stream, before it is written. */
+  onMessageEncoded?: (message: ControlMessage, length: number) => void;
+
   constructor(private readonly session: Session) {
     this.version = session.draftVersion === 22 ? 22 : 18;
-    this.codec = createControlCodec(this.version);
+    const codec = createControlCodec(this.version);
+    // Every send path encodes through this codec, request streams included.
+    this.codec = {
+      version: codec.version,
+      encode: (message) => {
+        const bytes = codec.encode(message);
+        this.onMessageEncoded?.(message, bytes.byteLength);
+        return bytes;
+      },
+      decode: (buf, offset) => codec.decode(buf, offset),
+      peekFrameSize: (buf) => codec.peekFrameSize(buf),
+    };
   }
 
   /**
