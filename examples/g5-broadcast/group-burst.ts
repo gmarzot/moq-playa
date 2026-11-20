@@ -5,10 +5,11 @@
  *
  * The hold sits between the publisher and its connection: calls resolve at
  * once with stand-in stream IDs, and {@link GroupBurstConnection.flush} replays
- * them, in order on each stream and on each track's datagrams, the streams
- * concurrently as the publisher would send them. A send failure there is
- * reported, not returned to the publisher, so the hold hides Forward State 0
- * refusals.
+ * a group's calls in order on each stream and on each track's datagrams, the
+ * streams concurrently as the publisher would send them; a group starts once
+ * the one before it is sent, so none overtakes an earlier group. A send failure
+ * there is reported, not returned to the publisher, so the hold hides Forward
+ * State 0 refusals.
  */
 import type { MediaPublishConnection } from './media-publisher.js';
 
@@ -35,8 +36,6 @@ export class GroupBurstConnection implements MediaPublishConnection {
   private passthrough = false;
   private closed = false;
   private chain: Promise<void> = Promise.resolve();
-  /** Each lane's last replayed op. */
-  private readonly lanes = new Map<string, Promise<void>>();
   /** Stand-in stream ID (negative) → the real one, once opened. */
   private readonly streams = new Map<bigint, bigint>();
   private nextStandIn = -1n;
@@ -129,13 +128,14 @@ export class GroupBurstConnection implements MediaPublishConnection {
     this.held = [];
     this.heldBytes = 0;
     if (ops.length === 0) return;
-    const replayed = ops.map((op) => {
-      const next = (this.lanes.get(op.lane) ?? Promise.resolve()).then(() => this.execute(op.run));
-      this.lanes.set(op.lane, next);
-      void next.then(() => { if (this.lanes.get(op.lane) === next) this.lanes.delete(op.lane); });
-      return next;
+    this.chain = this.chain.then(async () => {
+      const lanes = new Map<string, Promise<void>>();
+      await Promise.all(ops.map((op) => {
+        const next = (lanes.get(op.lane) ?? Promise.resolve()).then(() => this.execute(op.run));
+        lanes.set(op.lane, next);
+        return next;
+      }));
     });
-    this.chain = Promise.all([this.chain, ...replayed]).then(() => {});
   }
 
   private async execute(run: () => Promise<void>): Promise<void> {
