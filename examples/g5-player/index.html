@@ -760,7 +760,7 @@
             <input id="s-ns" type="text" placeholder="live"></div>
           <div class="sp-field" title="MoQT draft. Auto offers several and the relay picks."><label for="s-v">Draft</label>
             <select id="s-v">
-              <option value="">Auto (offers moqt-16)</option>
+              <option value="">Auto</option>
               <option value="22">Draft 22</option>
               <option value="18">Draft 18</option>
               <option value="16">Draft 16</option>
@@ -780,22 +780,22 @@
               <div class="sp-field" title="How to get the catalog. Keep Player default unless a relay needs another."><label for="s-bootstrap">Catalog bootstrap</label>
                 <select id="s-bootstrap">
                   <option value="">Player default</option>
-                  <option value="subscribe">subscribe (publishers without FETCH)</option>
-                  <option value="auto">auto</option>
-                  <option value="joining-fetch">joining-fetch</option>
-                  <option value="strict">strict</option>
-                  <option value="fetch">fetch (relays that serve the catalog only by FETCH)</option>
+                  <option value="subscribe">Subscribe only (publishers without FETCH)</option>
+                  <option value="auto">Auto</option>
+                  <option value="joining-fetch">Joining fetch</option>
+                  <option value="strict">Strict</option>
+                  <option value="fetch">Fetch only (relays that serve the catalog only by FETCH)</option>
                 </select></div>
               <div class="sp-check" title="Start from the current group instead of waiting for the next.">
-                <input id="s-warm-start" type="checkbox"><label for="s-warm-start">warm start</label></div>
+                <input id="s-warm-start" type="checkbox"><label for="s-warm-start">Warm start</label></div>
               <div class="sp-check" title="Keep recovering while the tab is hidden.">
-                <input id="s-auto-resume" type="checkbox"><label for="s-auto-resume">auto-resume</label></div>
+                <input id="s-auto-resume" type="checkbox"><label for="s-auto-resume">Auto-resume</label></div>
               <div class="sp-field" title="Authority sent at setup, if the relay asks for one."><label for="s-authority">Authority</label>
                 <input id="s-authority" type="text" placeholder="(none)"></div>
               <div class="sp-field" title="Server certificate hash, for a relay with a self-signed certificate."><label for="s-hash">Certificate hash</label>
                 <input id="s-hash" type="text" placeholder="(none)"></div>
-              <div class="sp-check" title="Show latency and playback state on the video."><input id="s-status" type="checkbox"><label for="s-status">stats overlay</label></div>
-              <div class="sp-check" title="Log every MoQT message and more detail."><input id="s-debug" type="checkbox"><label for="s-debug">verbose logging</label></div>
+              <div class="sp-check" title="Show latency and playback state on the video."><input id="s-status" type="checkbox"><label for="s-status">Stats overlay</label></div>
+              <div class="sp-check" title="Log every MoQT message and more detail."><input id="s-debug" type="checkbox"><label for="s-debug">Verbose logging</label></div>
             </div>
           </details>
           <div class="sp-actions">
