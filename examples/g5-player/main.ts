@@ -552,8 +552,6 @@ async function main(): Promise<void> {
   };
   /** From the catalog's isLive; null before the first catalog. */
   let liveState: LiveState | null = null;
-  /** Measured latency for the badge (ms); null while not measurable. */
-  let measuredLatencyMs: number | null = null;
   /** The settings log line's target, e.g. "target 205 ms (catalog)". */
   let targetLabel = targetText(targetLatencyOverrideMs, undefined);
   const renderStateBadge = (): void => {
@@ -567,28 +565,25 @@ async function main(): Promise<void> {
     // VOD and ENDED stay neutral; green is live playback.
     stateBadge.className = `state-badge ${ended ? 'ended' : frozen ? 'loading' : vod ? 'vod' : state}`;
   };
-  /** Buffer ahead of the playhead, the posture's bound and the target in force (ms), from the UI tick. */
-  let overlayBufferMs: number | null = null;
-  let overlayBoundMs: number | null = null;
+  /** Audio and video buffered ahead and the target in force (ms), from the UI tick. */
+  let overlayAudioMs: number | null = null;
+  let overlayVideoMs: number | null = null;
   let overlayTargetMs: number | null = null;
-  let overlayLatencyInPlayer = false;
+  /** The player's own starting target, when neither the viewer nor the catalog sets one. */
+  let overlayDefaultInitialMs: number | null = null;
   const renderOverlayLine = (): void => {
     if (!showStatus) return;
-    const frozen = pictureFrozenSinceMs !== null;
-    // VOD has no capture time; live without a usable capture clock falls back to time in the player.
-    const inPlayer = liveState === 'vod' || measuredLatencyMs === null || overlayLatencyInPlayer;
-    const latencyMs = frozen ? null : liveState === 'vod' || measuredLatencyMs === null ? overlayBufferMs : measuredLatencyMs;
     const typed = targetLatencyOverrideMs;
     const catalogMs = catalogTargetLatencyMs || undefined;
     let line = overlayLine({
-      latencyMs, inPlayer,
-      targetMs: typed ?? catalogMs ?? overlayTargetMs,
-      targetSource: typed !== undefined ? 'manual' : catalogMs !== undefined ? 'catalog' : 'default',
-      cc: congestionControl, bufferMs: overlayBufferMs, boundMs: overlayBoundMs,
+      targetMs: overlayTargetMs,
+      initialMs: typed ?? catalogMs ?? overlayDefaultInitialMs,
+      initialSource: typed !== undefined ? 'manual' : catalogMs !== undefined ? 'catalog' : 'default',
+      cc: congestionControl, audioMs: overlayAudioMs, videoMs: overlayVideoMs,
     });
     const r = repairStats();
     if (r && r.fetches > 0) {
-      line += ` repairs: ${r.fetchesFilled}/${r.fetches}${r.fillP50Ms === null ? '' : ` fill: ${fmtFillMs(r)}`}`;
+      line += ` · repairs: ${r.fetchesFilled}/${r.fetches}${r.fillP50Ms === null ? '' : ` fill ${fmtFillMs(r)}`}`;
     }
     statusStats.textContent = line;
   };
@@ -2154,11 +2149,10 @@ async function main(): Promise<void> {
     cusDVal.textContent = (vMs != null && aMs != null)
       ? `${aMs - vMs >= 0 ? '+' : ''}${(aMs - vMs).toFixed(0)}` : '—';
     cusTarget.textContent = targetNowMs ? `${targetNowMs}` : '—';
-    const both = [aMs, vMs].filter((x): x is number => x != null && Number.isFinite(x));
-    overlayBufferMs = both.length ? Math.min(...both) : null;
-    // Adaptive postures may grow the buffer to their ceiling; Low latency holds the target.
-    overlayBoundMs = latency.latencyMode === 'smooth' ? (latency.smoothCeilingMs ?? null) : (targetNowMs || null);
+    overlayAudioMs = aMs ?? null;
+    overlayVideoMs = vMs ?? null;
     overlayTargetMs = targetNowMs || null;
+    overlayDefaultInitialMs ??= overlayTargetMs;
     // One measurement (queued) against one setting (target). The render
     // cushion is a third name for the same region and pub_media pins it equal
     // to the target anyway, so it is not shown; rate and chase state are.
@@ -2251,12 +2245,6 @@ async function main(): Promise<void> {
       : cmafPlayoutMs != null ? `≈${shown(cmafPlayoutMs)}` : '—';
     latMax.textContent = frozen ? STALLED : clockFault ? CLOCK : peakMs?.toFixed(0) ?? '—';
     for (const el of [latVal, latP95, latMax, latScreen]) el.style.color = clockFault ? 'var(--warn)' : '';
-    // The badge reads E2E, else the MSE estimate, else arrival p50.
-    measuredLatencyMs = frozen || relativeDelay || clockFault ? null
-      : screenVals.length ? shownLatencyMs(percentile(screenVals, 0.5))
-      : cmafPlayoutMs != null ? shownLatencyMs(cmafPlayoutMs)
-      : latVals.length ? shownLatencyMs(percentile(latVals, 0.5)) : null;
-    overlayLatencyInPlayer = latScreen.dataset.clock === 'unshared';
     renderOverlayLine();
     // Drift details ride the label's hover; an empty title falls back to the chart's.
     latLabel.title = relativeDelay
