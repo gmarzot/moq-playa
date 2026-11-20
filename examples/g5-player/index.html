@@ -704,7 +704,7 @@
       <div id="player-container"></div>
       <div class="status-overlay" id="status-overlay" hidden>
         <span class="state-badge" id="state">idle</span>
-        <span class="status-line" id="status-line" title="latency: capture to screen. initial: the target playback started from (manual, catalog, or the player's default). target: the delay held now, raised by late arrival up to 3 s outside Low latency. buffer: media buffered ahead. *: an estimate (the publisher clock is not shared with this page, or time in the player when there is no capture time)"><span id="status-stats"></span></span>
+        <span class="status-line" id="status-line" title="target latency: the delay the player holds now; outside Low latency late arrival raises it, up to 3 s, and steady arrival lets it settle back. initial: where it started (manual, catalog, or the player's default). cc-algo: the congestion-control choice. buffer: audio/video buffered ahead."><span id="status-stats"></span></span>
       </div>
     </div>
 

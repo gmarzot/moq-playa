@@ -95,33 +95,24 @@ export function ccLabel(cc: CongestionControl | undefined): 'default' | 'smooth'
 }
 
 export interface OverlayValues {
-  /** Measured latency (ms); null when not measurable. */
-  readonly latencyMs: number | null;
-  /** The latency is time spent in the player, not capture to screen. */
-  readonly inPlayer: boolean;
+  /** The delay the player holds now: the initial target, raised by late arrival outside Low latency. */
+  readonly targetMs: number | null;
   /** The target playback started from, and where it came from. */
   readonly initialMs: number | null;
   readonly initialSource: TargetSource;
-  /** The delay the player holds now: the initial target, raised by late arrival outside Low latency. */
-  readonly targetMs: number | null;
   readonly cc: CongestionControl | undefined;
-  /** Media buffered ahead of the playhead (ms). */
-  readonly bufferMs: number | null;
+  /** Audio and video buffered ahead of the playhead (ms). */
+  readonly audioMs: number | null;
+  readonly videoMs: number | null;
 }
 
 const ms = (v: number | null): string => (v === null || !Number.isFinite(v) ? '—' : String(Math.round(v)));
-
 const msOrDash = (v: number | null): string => (v === null || !Number.isFinite(v) ? '—' : `${Math.round(v)} ms`);
 
-/**
- * "latency: 329 ms (initial: 250 ms [catalog]) target: 380 ms cc-algo: default buffer: 299 ms";
- * `*` marks an estimate.
- */
+/** "target latency: 380 ms (initial: 250 ms [catalog]) · cc-algo: default · buffer: 299/313 ms" (audio/video). */
 export function overlayLine(v: OverlayValues): string {
-  const latency = v.latencyMs === null || !Number.isFinite(v.latencyMs) ? '—'
-    : `${ms(v.latencyMs)}${v.inPlayer ? '*' : ''} ms`;
-  return `latency: ${latency} (initial: ${msOrDash(v.initialMs)} [${v.initialSource}]) target: ${msOrDash(v.targetMs)} `
-    + `cc-algo: ${ccLabel(v.cc)} buffer: ${msOrDash(v.bufferMs)}`;
+  return `target latency: ${msOrDash(v.targetMs)} (initial: ${msOrDash(v.initialMs)} [${v.initialSource}])`
+    + ` · cc-algo: ${ccLabel(v.cc)} · buffer: ${ms(v.audioMs)}/${ms(v.videoMs)} ms`;
 }
 
 /** LIVE while the catalog says live; ENDED once it stops; VOD when it never was. */
