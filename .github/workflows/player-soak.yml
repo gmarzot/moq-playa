@@ -114,7 +114,8 @@ jobs:
               console.error(`::error::unknown case ${unknown.join(",")}; cases: ${all.join(" ")}`);
               process.exit(1);
             }
-            const pick = (list) => (only ? list.filter((k) => only.includes(k)) : list);
+            // A dispatchOnly profile plays only when `only` names it.
+            const pick = (list) => (only ? list.filter((k) => only.includes(k)) : list.filter((k) => !c.profiles[k]?.dispatchOnly));
             const player = pick(broadcast);
             const adverse = pick(profiles);
             const needed = new Set(player);

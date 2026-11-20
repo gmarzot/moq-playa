@@ -60,7 +60,7 @@ another, first play draft only) under a profile from `cases.json`:
 | `blackouts` | all relay traffic dropped for 3 s at 30 s and 10 s at 75 s |
 | `hidden-tab` | tab hidden for 5 s at 30 s and 20 s at 75 s |
 | `republish` | plays `…/<packaging>/restart`, whose broadcaster (`--variant restart`) stops and starts every `restartEveryS` |
-| `group-burst` | plays `…/<packaging>/burst`, unshaped; its broadcaster (`--variant burst`) makes 2.5 s groups and sends each whole group at once when the next starts (`groupBurst=1`) |
+| `group-burst` | plays `…/<packaging>/burst`, unshaped; its broadcaster (`--variant burst`) makes 2.5 s groups and sends each whole group at once when the next starts (`groupBurst=1`); dispatch only, never scheduled |
 
 A profile with a `variant` has its own broadcaster, on `…/<packaging>/<variant>`, which
 adds the profile's `broadcastQuery` to the g5-broadcast page URL.
@@ -111,5 +111,5 @@ player.
 
 ```bash
 gh workflow run player-soak.yml -f only=group-burst -f adverse=true
-gh workflow run player-soak.yml -f only=group-burst -f player_query=congestionControl=throughput
+gh workflow run player-soak.yml -f only=group-burst -f adverse=true -f player_query=congestionControl=throughput
 ```

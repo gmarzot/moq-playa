@@ -232,6 +232,7 @@
     },
     "group-burst": {
       "variant": "burst",
+      "dispatchOnly": true,
       "broadcastQuery": {
         "groupBurst": "1",
         "keyframeSec": "2.5"
