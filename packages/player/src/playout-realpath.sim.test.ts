@@ -1218,10 +1218,9 @@ function runFactoryPath(
 }
 
 /**
- * Parity is asserted on BOTH canonical traces. A clean trace alone is too
- * benign: no frame is late enough for `lateFrameThresholdMs` to act on, so a
- * config divergence in the factory arm would go undetected (found by mutating
- * the factory's drop threshold and watching parity still pass).
+ * Parity is asserted on both canonical traces: on the clean one no frame is late
+ * enough for `lateFrameThresholdMs` to act, so only the stressed one exercises the
+ * late-frame path the factory arm must match.
  */
 const parityTraces: { name: string; opts: Parameters<typeof freezeTrace>[0] }[] = [
   { name: 'regime 1 (8Mbps keyframe burst)', opts: { capacityMbps: 8, seconds: 12 } },
