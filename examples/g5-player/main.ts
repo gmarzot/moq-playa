@@ -566,8 +566,9 @@ async function main(): Promise<void> {
   };
   /** Buffer ahead of the playhead, the posture's bound and the target in force (ms), from the UI tick. */
   let overlayBufferMs: number | null = null;
-  let overlayBoundMs: number | null = null;
   let overlayTargetMs: number | null = null;
+  /** The player's own starting target, when neither the viewer nor the catalog sets one. */
+  let overlayDefaultInitialMs: number | null = null;
   let overlayLatencyInPlayer = false;
   const renderOverlayLine = (): void => {
     if (!showStatus) return;
@@ -579,9 +580,9 @@ async function main(): Promise<void> {
     const catalogMs = catalogTargetLatencyMs || undefined;
     let line = overlayLine({
       latencyMs, inPlayer,
-      targetMs: typed ?? catalogMs ?? overlayTargetMs,
-      targetSource: typed !== undefined ? 'manual' : catalogMs !== undefined ? 'catalog' : 'default',
-      cc: congestionControl, bufferMs: overlayBufferMs, boundMs: overlayBoundMs,
+      initialMs: typed ?? catalogMs ?? overlayDefaultInitialMs,
+      initialSource: typed !== undefined ? 'manual' : catalogMs !== undefined ? 'catalog' : 'default',
+      targetMs: overlayTargetMs, cc: congestionControl, bufferMs: overlayBufferMs,
     });
     const r = repairStats();
     if (r && r.fetches > 0) {
@@ -2153,9 +2154,8 @@ async function main(): Promise<void> {
     cusTarget.textContent = targetNowMs ? `${targetNowMs}` : '—';
     const both = [aMs, vMs].filter((x): x is number => x != null && Number.isFinite(x));
     overlayBufferMs = both.length ? Math.min(...both) : null;
-    // Adaptive postures may grow the buffer to their ceiling; Low latency holds the target.
-    overlayBoundMs = latency.latencyMode === 'smooth' ? (latency.smoothCeilingMs ?? null) : (targetNowMs || null);
     overlayTargetMs = targetNowMs || null;
+    overlayDefaultInitialMs ??= overlayTargetMs;
     // One measurement (queued) against one setting (target). The render
     // cushion is a third name for the same region and pub_media pins it equal
     // to the target anyway, so it is not shown; rate and chase state are.

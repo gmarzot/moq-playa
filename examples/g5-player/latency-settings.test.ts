@@ -99,14 +99,14 @@ describe('overlay line', () => {
     expect(targetText(undefined, 0)).toBe('target default');
   });
   it('shows measured latency in seconds next to the target', () => {
-    const base = { latencyMs: 300, inPlayer: false, targetMs: 250, targetSource: 'catalog' as const,
-      cc: undefined, bufferMs: 300, boundMs: 3000 };
-    expect(overlayLine(base)).toBe('latency: 300 ms (target: 250 ms [catalog]) cc-algo: default buffer: 300/3000 ms');
-    expect(overlayLine({ ...base, latencyMs: 4312.6, inPlayer: true, targetMs: 2000, targetSource: 'default',
-      cc: 'throughput', bufferMs: 4312.6 }))
-      .toBe('latency: 4313* ms (target: 2000 ms [default]) cc-algo: smooth buffer: 4313/3000 ms');
-    expect(overlayLine({ ...base, latencyMs: null, targetSource: 'manual', cc: 'low-latency', bufferMs: null, boundMs: 250 }))
-      .toBe('latency: — (target: 250 ms [manual]) cc-algo: low-latency buffer: —/250 ms');
+    const base = { latencyMs: 329, inPlayer: false, initialMs: 250, initialSource: 'catalog' as const,
+      targetMs: 380, cc: undefined, bufferMs: 299 };
+    expect(overlayLine(base)).toBe('latency: 329 ms (initial: 250 ms [catalog]) target: 380 ms cc-algo: default buffer: 299 ms');
+    expect(overlayLine({ ...base, latencyMs: 4312.6, inPlayer: true, initialMs: 0, initialSource: 'default',
+      targetMs: 3000, cc: 'throughput', bufferMs: 4312.6 }))
+      .toBe('latency: 4313* ms (initial: 0 ms [default]) target: 3000 ms cc-algo: smooth buffer: 4313 ms');
+    expect(overlayLine({ ...base, latencyMs: null, initialMs: 250, initialSource: 'manual', targetMs: 250, cc: 'low-latency', bufferMs: null }))
+      .toBe('latency: — (initial: 250 ms [manual]) target: 250 ms cc-algo: low-latency buffer: —');
     expect(ccLabel(undefined)).toBe('default');
     expect(ccLabel('low-latency')).toBe('low-latency');
   });
