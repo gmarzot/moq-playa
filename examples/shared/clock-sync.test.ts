@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { ClockReference, describeClockOffset, measureClockOffset, offsetFromSamples, parseServerTime } from './clock-sync.js';
+import {
+  ClockReference, describeClockOffset, measureClockOffset, offsetFromSamples, pageTimerLagMs, parseServerTime, wallMsAt,
+} from './clock-sync.js';
 import type { ClockOffset } from './clock-sync.js';
 
 describe('clock-sync', () => {
@@ -65,5 +67,15 @@ describe('clock-sync', () => {
     await Promise.all([ref.calibrate(), ref.calibrate()]);
     expect(measure).toHaveBeenCalledTimes(1);
     expect(describeClockOffset(ref.offset!, ref.url)).toBe('this machine is 10 ms behind relay.example (±2 ms)');
+  });
+
+  it('reads a page-timer timestamp as Date.now() through the clocks paired now', () => {
+    // A frame presented 30 ms ago on the page timer.
+    expect(wallMsAt(9_970, 10_000, 1_800_000_000_000)).toBe(1_799_999_999_970);
+    // timeOrigin + perfMs would be 400 ms early with the page timer that far behind.
+    const timeOriginMs = 1_799_999_989_600;
+    expect(pageTimerLagMs(timeOriginMs, 10_000, 1_800_000_000_000)).toBe(400);
+    expect(wallMsAt(9_970, 10_000, 1_800_000_000_000) - (timeOriginMs + 9_970)).toBe(400);
+    expect(pageTimerLagMs(1_800_000_000_100 - 10_000, 10_000, 1_800_000_000_000)).toBe(-100);
   });
 });

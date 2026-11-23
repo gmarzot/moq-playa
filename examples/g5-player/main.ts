@@ -123,7 +123,7 @@ import type { BadgeTone } from '../shared/status-badge.js';
 import type { SubscriptionStatus } from '@openmoq/playa';
 import type { Level } from '@openmoq/playa';
 import { ClockDriftEstimator, clockAheadMs, shownLatencyMs } from '../shared/clock-drift.js';
-import { ClockReference, describeClockOffset } from '../shared/clock-sync.js';
+import { ClockReference, describeClockOffset, pageTimerLagMs, wallMsAt } from '../shared/clock-sync.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 
@@ -542,12 +542,20 @@ async function main(): Promise<void> {
   let pictureFrozenSinceMs: number | null = null;
   /** A return that resumed delivery paused while hidden, until its first frame. */
   let rejoinAtMs: number | null = null;
-  const noteFrameShown = (nowMs: number): void => {
+  /** CMAF: media time of the first frame presented after the return. */
+  let rejoinFirstMediaSec: number | null = null;
+  const noteFrameShown = (nowMs: number, mediaTimeSec?: number): void => {
     if (lastFrameShownMs === null || nowMs - lastFrameShownMs > FRAME_RUN_GAP_MS) frameRunSinceMs = nowMs;
     lastFrameShownMs = nowMs;
     if (rejoinAtMs !== null) {
+      // CMAF presents the old picture again on return: the first new frame has another media time.
+      if (mediaTimeSec !== undefined) {
+        rejoinFirstMediaSec ??= mediaTimeSec;
+        if (mediaTimeSec === rejoinFirstMediaSec) return;
+      }
       log(`Rejoined live: first frame ${((nowMs - rejoinAtMs) / 1000).toFixed(1)} s after return`);
       rejoinAtMs = null;
+      rejoinFirstMediaSec = null;
     }
   };
   /** From the catalog's isLive; null before the first catalog. */
@@ -1041,7 +1049,10 @@ async function main(): Promise<void> {
         ? `Page ${state}`
         : `Page ${state} after ${(awayMs / 1000).toFixed(1)}s away${rejoined ? ': rejoining live' : ''}`);
     }
-    if (rejoined) rejoinAtMs = performance.now();
+    if (rejoined) {
+      rejoinAtMs = performance.now();
+      rejoinFirstMediaSec = null;
+    }
     if (rejoined || (state === 'visible' && (awayMs ?? 0) > CLOCK_DRIFT_WINDOW_MS)) reanchorClock();
   });
   player.on('session_closed', ({ code, reason }) => {
@@ -1275,7 +1286,20 @@ async function main(): Promise<void> {
       log(`Clock: no reference at ${clockUrl}; latency uses this machine's clock`);
     },
   });
-  const calibrateClock = (): Promise<void> => referenceClock.calibrate();
+  /** Page timer against Date.now(): logged once when they differ by more than this (ms). */
+  const PAGE_TIMER_LAG_LOG_MS = 100;
+  let pageTimerLagLogged = false;
+  const notePageTimerLag = (): void => {
+    const lagMs = pageTimerLagMs(performance.timeOrigin, performance.now(), Date.now());
+    if (pageTimerLagLogged || Math.abs(lagMs) <= PAGE_TIMER_LAG_LOG_MS) return;
+    pageTimerLagLogged = true;
+    log(`Clock: this page's timer runs ${Math.abs(lagMs).toFixed(0)} ms `
+      + `${lagMs > 0 ? 'behind' : 'ahead of'} the system clock`);
+  };
+  const calibrateClock = (): Promise<void> => {
+    notePageTimerLag();
+    return referenceClock.calibrate();
+  };
   /** Drop the drift fit and measure this clock again. */
   const reanchorClock = (): void => {
     clockDrift.reset();
@@ -1331,9 +1355,10 @@ async function main(): Promise<void> {
     if (!('requestVideoFrameCallback' in video)) return;
     const onFrame = (_now: number, meta: VideoFrameCallbackMetadata): void => {
       if (watchedVideo !== video) return;
-      noteFrameShown(performance.now());
+      const perfNowMs = performance.now();
+      noteFrameShown(perfNowMs, meta.mediaTime);
       const captureUs = (player as any).engine?.cmafCaptureUsAt?.(meta.mediaTime) as number | null | undefined;
-      if (captureUs != null) noteFrameDrawn(captureUs, performance.timeOrigin + meta.presentationTime);
+      if (captureUs != null) noteFrameDrawn(captureUs, wallMsAt(meta.presentationTime, perfNowMs, Date.now()));
       video.requestVideoFrameCallback(onFrame);
     };
     video.requestVideoFrameCallback(onFrame);
