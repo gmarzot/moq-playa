@@ -88,6 +88,54 @@ function incomingJoiningFetch(requestId: bigint, joiningRequestId: bigint, fetch
 
 // ─── Outbound (subscriber side) ──────────────────────────────────────
 
+describe.each([14, 18] as const)('draft %i FETCH subscriber priority', draft => {
+  /** SUBSCRIBER_PRIORITY as sent and as the peer decodes it. */
+  function priorities(msg: Fetch): { sent: unknown; decoded: unknown } {
+    const codec = createControlCodec(draft);
+    const decoded = codec.decode(codec.encode(msg), 0).message as Fetch;
+    return {
+      sent: msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY),
+      decoded: decoded.parameters.get(MessageParam.SUBSCRIBER_PRIORITY),
+    };
+  }
+  // d14 has a mandatory byte (128 when omitted); d18 omits the parameter (§10.2.7: 128).
+  const omitted = draft === 14 ? [128n] : undefined;
+
+  it.each([0n, 126n, 255n, undefined])('a Joining FETCH carries priority %s', priority => {
+    const session = clientSession(draft);
+    const joiningRequestId = establishOutboundSubscription(session);
+    const { actions } = session.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId, joiningStart: 0n,
+      ...(priority === undefined ? {} : { subscriberPriority: varint(priority) }),
+    });
+    expect(priorities((actions[0] as SendControlAction).message as Fetch)).toEqual(priority === undefined
+      ? { sent: undefined, decoded: omitted } : { sent: [priority], decoded: [priority] });
+  });
+
+  it.each([126n, undefined])('a standalone FETCH carries priority %s', priority => {
+    const session = clientSession(draft);
+    const { actions } = session.fetch(NS, NAME, {
+      startGroup: 1n, startObject: 0n, endGroup: 2n, endObject: 0n,
+      ...(priority === undefined ? {} : { subscriberPriority: varint(priority) }),
+    });
+    expect(priorities((actions[0] as SendControlAction).message as Fetch)).toEqual(priority === undefined
+      ? { sent: undefined, decoded: omitted } : { sent: [priority], decoded: [priority] });
+  });
+
+  it('refuses a priority above 255 before allocating a request', () => {
+    const session = clientSession(draft);
+    const joiningRequestId = establishOutboundSubscription(session);
+    expect(() => session.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId, joiningStart: 0n, subscriberPriority: varint(256n),
+    })).toThrow('SUBSCRIBER_PRIORITY must be 0-255');
+    expect(() => session.fetch(NS, NAME, {
+      startGroup: 1n, startObject: 0n, endGroup: 2n, endObject: 0n, subscriberPriority: varint(256n),
+    })).toThrow('SUBSCRIBER_PRIORITY must be 0-255');
+    const { requestId } = session.fetch(NS, NAME, { startGroup: 1n, startObject: 0n, endGroup: 2n, endObject: 0n });
+    expect(requestId).toBe(joiningRequestId + 2n); // the refused requests took no Request ID
+  });
+});
+
 describe('session.joiningFetch (outbound)', () => {
   let session: Session;
 

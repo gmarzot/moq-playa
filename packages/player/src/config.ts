@@ -307,8 +307,12 @@ export interface PlaybackTuningConfig {
   readonly deliveryTimeoutMs?: number;
 
   /**
-   * Subscriber priority for media subscriptions. Range 0-255, lower = higher priority.
-   * Default: omitted (publisher uses 128).
+   * Base subscriber priority. Range 0-255, lower = higher priority. Default: 128.
+   * Video subscribes at the base and audio two steps ahead (clamped at 0). A
+   * video down-switch target goes one step ahead of the outgoing rendition while
+   * it stays behind audio, else ties it; an up-switch returns to the base.
+   * Timeline and event tracks carry the base only when it is configured;
+   * catalog and init tracks carry none.
    * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
    */
   readonly subscriberPriority?: number;
