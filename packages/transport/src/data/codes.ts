@@ -78,7 +78,7 @@ export const DatagramFlags = {
   EXTENSIONS: 0x01,
   /** No object with same Group ID and Object ID > current exists. */
   END_OF_GROUP: 0x02,
-  /** Object ID field omitted (Object ID = 1). */
+  /** Object ID field omitted (Object ID = 0). */
   ZERO_OBJECT_ID: 0x04,
   /** Priority field omitted (inherit from subscription). */
   DEFAULT_PRIORITY: 0x08,
