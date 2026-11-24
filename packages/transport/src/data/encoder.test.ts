@@ -382,7 +382,7 @@ describe('Data Plane Encoder', () => {
         typeByte: DatagramFlags.ZERO_OBJECT_ID, // 0x04
         trackAlias: varint(1n),
         groupId: varint(5n),
-        objectId: varint(1n), // Implicitly 1 when ZERO_OBJECT_ID
+        objectId: varint(0n), // Implicitly 0 when ZERO_OBJECT_ID
         publisherPriority: 128,
         isEndOfGroup: false,
         extensions: undefined,
@@ -393,7 +393,22 @@ describe('Data Plane Encoder', () => {
       const encoded = encodeObjectDatagram(datagram);
       const { datagram: decoded } = decodeObjectDatagram(encoded, 0);
 
-      expect(decoded.objectId).toBe(1n); // ZERO_OBJECT_ID → Object ID = 1
+      expect(decoded.objectId).toBe(0n); // ZERO_OBJECT_ID → Object ID = 0
+    });
+
+    it('throws when ZERO_OBJECT_ID is set with a non-zero objectId (§10.3.1)', () => {
+      const datagram: ObjectDatagram = {
+        typeByte: DatagramFlags.ZERO_OBJECT_ID,
+        trackAlias: varint(1n),
+        groupId: varint(5n),
+        objectId: varint(1n),
+        publisherPriority: 128,
+        isEndOfGroup: false,
+        extensions: undefined,
+        payload: new Uint8Array([0x01]),
+        status: undefined,
+      };
+      expect(() => encodeObjectDatagram(datagram)).toThrow(/ZERO_OBJECT_ID/);
     });
 
     it('encodes datagram with DEFAULT_PRIORITY', () => {

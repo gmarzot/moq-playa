@@ -231,6 +231,11 @@ export function encodeObjectDatagram(datagram: ObjectDatagram): Uint8Array {
     throw new Error('status field is present but STATUS flag is clear (would be silently dropped)');
   }
 
+  // ZERO_OBJECT_ID ⇒ objectId 0
+  if ((typeByte & DatagramFlags.ZERO_OBJECT_ID) !== 0 && datagram.objectId !== 0n) {
+    throw new Error('ZERO_OBJECT_ID flag set but objectId is not 0 (would decode as 0)');
+  }
+
   // Calculate size
   let size = varintEncodingLength(varint(typeByte));
   size += varintEncodingLength(datagram.trackAlias);

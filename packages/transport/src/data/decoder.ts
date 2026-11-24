@@ -684,10 +684,10 @@ export function decodeObjectDatagram(
   const { value: groupId, bytesRead: gidBytes } = readVarint(buf, pos);
   pos += gidBytes;
 
-  // Read object ID (unless ZERO_OBJECT_ID flag set)
+  // Read object ID; ZERO_OBJECT_ID omits it and means Object ID 0
   let objectId: Varint;
   if ((typeByte & DatagramFlags.ZERO_OBJECT_ID) !== 0) {
-    objectId = varint(1);
+    objectId = varint(0);
   } else {
     const { value: oid, bytesRead: oidBytes } = readVarint(buf, pos);
     pos += oidBytes;
