@@ -127,7 +127,7 @@ export interface ObjectDatagram {
   readonly trackAlias: bigint;
   /** Group ID. */
   readonly groupId: bigint;
-  /** Object ID (1 if ZERO_OBJECT_ID flag set). */
+  /** Object ID (0 if ZERO_OBJECT_ID flag set). */
   readonly objectId: bigint;
   /** Publisher priority, or undefined if DEFAULT_PRIORITY flag set. */
   readonly publisherPriority: number | undefined;

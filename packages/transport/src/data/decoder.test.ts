@@ -261,7 +261,7 @@ describe('decodeObjectDatagram', () => {
     );
 
     const { datagram } = decodeObjectDatagram(buf, 0);
-    expect(datagram.objectId).toBe(1n); // Implicit object ID = 1
+    expect(datagram.objectId).toBe(0n); // Implicit object ID = 0
   });
 
   it('decodes datagram with DEFAULT_PRIORITY flag', () => {
