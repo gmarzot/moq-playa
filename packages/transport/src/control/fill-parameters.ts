@@ -1,4 +1,4 @@
-import { decodeParameterSequence, DRAFT22_MESSAGE_PARAM_REGISTRY, type MessageParams18 } from './message-params-18.js';
+import { decodeMessageParams18, decodeParameterSequence, DRAFT22_MESSAGE_PARAM_REGISTRY, type MessageParams18 } from './message-params-18.js';
 import { decodeSubscriptionFilter, subscriptionWindow, type SubscriptionFilter, type SubscriptionWindow } from './subscription-filter.js';
 import type { GroupOrder } from '../data/types.js';
 import { ProtocolViolationError } from '../errors.js';
@@ -12,8 +12,21 @@ export interface FillOptions {
 const allowed = new Set([0x0an, 0x20n, 0x21n, 0x22n, 0x25n, 0x26n, 0x27n, 0x28n]);
 const repeatable = new Set([0x25n, 0x26n, 0x27n, 0x28n]);
 
+/**
+ * Read a FILL_PARAMETERS value: parameters encoded as for a separate message
+ * (9.20.15), whose Number of Parameters accounts for every byte. Some peers omit
+ * the count, so a value that doesn't read that way is read as bare parameters.
+ */
+function readFillBlock(bytes: Uint8Array): MessageParams18 {
+  try {
+    const { params, bytesRead } = decodeMessageParams18(bytes, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
+    if (bytesRead === bytes.length) return params;
+  } catch { /* not a counted block */ }
+  return decodeParameterSequence(bytes, DRAFT22_MESSAGE_PARAM_REGISTRY);
+}
+
 export function decodeFillParameters(bytes: Uint8Array): FillOptions & { parameters: MessageParams18 } {
-  const parameters = decodeParameterSequence(bytes, DRAFT22_MESSAGE_PARAM_REGISTRY);
+  const parameters = readFillBlock(bytes);
   const result: { filter?: SubscriptionFilter; groupOrder?: GroupOrder; parameters: MessageParams18 } = { parameters };
   for (const [type, values] of parameters) {
     if (!allowed.has(type)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} is not allowed in FILL_PARAMETERS (9.20.15)`);

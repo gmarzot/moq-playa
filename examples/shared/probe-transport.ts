@@ -3,7 +3,7 @@
  *
  * Acceptance behavior deliberately MIRRORS the shared factory in
  * packages/browser/src/webtransport-factory.ts — same cert-hash pinning,
- * same WT-Available-Protocols offer (`moqt-<v>` for v ≥ 15, `moqt-16` by
+ * same WT-Available-Protocols offer (`moqt-<v>` for v ≥ 15, moqt-22/18/16 by
  * default, none for draft 14), same strict-UA retry without protocols — so
  * probes and real connections apply the same compatibility rules.
  * The duplication is intentional: discovery is an example convenience, and
@@ -40,7 +40,7 @@ function buildOptions(options: ProbeOptions | undefined, withProtocols: boolean)
   if (options?.draftVersion && options.draftVersion >= 15) {
     opts.protocols = [`moqt-${options.draftVersion}`];
   } else if (!options?.draftVersion) {
-    opts.protocols = ['moqt-16'];
+    opts.protocols = ['moqt-22', 'moqt-18', 'moqt-16'];
   }
   // draft 14: no protocols — h3 ALPN with in-band CLIENT_SETUP negotiation.
   return opts;

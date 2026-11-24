@@ -20,6 +20,9 @@ import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/tran
 import { varint } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 
+// Immediate first resubscribes; the spread has its own test.
+beforeEach(() => { (MoqtPlayer as unknown as { RESUBSCRIBE_SPREAD_MS: number }).RESUBSCRIBE_SPREAD_MS = 0; });
+
 const VIDEO_ALIAS = 50n;
 const AUDIO_ALIAS = 51n;
 

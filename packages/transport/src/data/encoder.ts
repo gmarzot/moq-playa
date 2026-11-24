@@ -231,6 +231,11 @@ export function encodeObjectDatagram(datagram: ObjectDatagram): Uint8Array {
     throw new Error('status field is present but STATUS flag is clear (would be silently dropped)');
   }
 
+  // ZERO_OBJECT_ID ⇒ objectId 0
+  if ((typeByte & DatagramFlags.ZERO_OBJECT_ID) !== 0 && datagram.objectId !== 0n) {
+    throw new Error('ZERO_OBJECT_ID flag set but objectId is not 0 (would decode as 0)');
+  }
+
   // Calculate size
   let size = varintEncodingLength(varint(typeByte));
   size += varintEncodingLength(datagram.trackAlias);
@@ -425,8 +430,6 @@ export function encodeFetchEndOfRange(marker: FetchEndOfRange): Uint8Array {
   let size = varintEncodingLength(marker.flags);
   size += varintEncodingLength(marker.groupId);
   size += varintEncodingLength(marker.objectId);
-  // Payload length (always 0 for end of range)
-  size += varintEncodingLength(varint(0));
 
   const buf = new Uint8Array(size);
   let pos = 0;
@@ -434,7 +437,6 @@ export function encodeFetchEndOfRange(marker: FetchEndOfRange): Uint8Array {
   pos += writeVarint(marker.flags, buf, pos);
   pos += writeVarint(marker.groupId, buf, pos);
   pos += writeVarint(marker.objectId, buf, pos);
-  pos += writeVarint(varint(0), buf, pos); // zero-length payload
 
   return buf;
 }

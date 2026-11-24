@@ -133,23 +133,26 @@ describe('Debug Logging', () => {
     const spyInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
     const log = new ConsoleLogger('info');
     log.info('Session established');
-    expect(spyInfo).toHaveBeenCalledWith('[moqt]', 'Session established');
+    expect(spyInfo).toHaveBeenCalledWith('[moqt] Session established');
   });
 
   it('ConsoleLogger custom prefix', () => {
     const spyInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
     const log = new ConsoleLogger('info', 'myapp');
     log.info('hello');
-    expect(spyInfo).toHaveBeenCalledWith('[myapp]', 'hello');
+    expect(spyInfo).toHaveBeenCalledWith('[myapp] hello');
   });
 
   // ── ConsoleLogger passes through extra args ───────────────────
 
-  it('ConsoleLogger passes through extra args', () => {
+  // The prefix must stay INSIDE the format string: a console substitutes
+  // %s/%d only in its first argument, so a separate prefix argument would
+  // print every specifier literally.
+  it('ConsoleLogger keeps the format string first so %d substitutes', () => {
     const spyInfo = vi.spyOn(console, 'info').mockImplementation(() => {});
     const log = new ConsoleLogger('info');
     log.info('tracks=%d', 3);
-    expect(spyInfo).toHaveBeenCalledWith('[moqt]', 'tracks=%d', 3);
+    expect(spyInfo).toHaveBeenCalledWith('[moqt] tracks=%d', 3);
   });
 
   // ── NULL_LOGGER ───────────────────────────────────────────────

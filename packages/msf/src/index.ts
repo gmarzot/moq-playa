@@ -18,6 +18,7 @@ export type {
     TrackRole,
     CatalogTrack,
     Catalog,
+    IgnoredTrack,
     RemoveTrackRef,
     CatalogDelta,
     CatalogObject,

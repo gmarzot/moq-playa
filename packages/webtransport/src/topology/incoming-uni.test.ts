@@ -286,21 +286,117 @@ describe('IncomingUniRouter', () => {
     expect(h.violations).toEqual([expect.stringMatching(/FIN received mid-type/)]);
   });
 
-  it('bounds streams waiting for SETUP and cancels the excess stream', async () => {
+  it('with no bound, holds and routes 100 streams on either side of SETUP', async () => {
+    const input = streamSource();
+    const h = handlers();
+    const router = new IncomingUniRouter(h.callbacks);
+    const ready = router.start(input.source);
+    for (let i = 0; i < 50; i++) {
+      const early = controlledStream();
+      input.push(early.stream);
+      early.push(new Uint8Array([0x10, 0x01]));
+    }
+    const control = controlledStream();
+    input.push(control.stream);
+    control.push(setup);
+    control.close();
+    await ready;
+    router.releaseData();
+
+    // A stall's backlog: streams surfaced before their first bytes are readable.
+    const late = Array.from({ length: 50 }, () => controlledStream());
+    for (const s of late) input.push(s.stream);
+    await flush();
+    for (const s of late) s.push(new Uint8Array([0x10, 0x01]));
+
+    await vi.waitFor(() => expect(h.data).toHaveLength(100));
+    expect(h.violations).toEqual([]);
+  });
+
+  it('at the bound after SETUP, intake waits for a classification, then routes every stream', async () => {
+    const input = streamSource();
+    const h = handlers();
+    const router = new IncomingUniRouter(h.callbacks, { maxPendingStreams: 2 });
+    const ready = router.start(input.source);
+    const control = controlledStream();
+    input.push(control.stream);
+    control.push(setup);
+    control.close();
+    await ready;
+    router.releaseData();
+
+    const [a, b, c] = [controlledStream(), controlledStream(), controlledStream()];
+    input.push(a.stream);
+    input.push(b.stream);
+    input.push(c.stream);
+    await flush();
+    expect([a.stream.locked, b.stream.locked, c.stream.locked]).toEqual([true, true, false]);
+
+    a.push(new Uint8Array([0x10]));
+    await vi.waitFor(() => expect(c.stream.locked).toBe(true));
+    b.push(new Uint8Array([0x10]));
+    c.push(new Uint8Array([0x10]));
+
+    await vi.waitFor(() => expect(h.data).toHaveLength(3));
+    expect(h.violations).toEqual([]);
+    expect([a, b, c].some((s) => s.cancelled())).toBe(false);
+  });
+
+  it('data held at the bound after SETUP waits for releaseData()', async () => {
     const input = streamSource();
     const h = handlers();
     const router = new IncomingUniRouter(h.callbacks, { maxPendingStreams: 1 });
     const ready = router.start(input.source);
+    const control = controlledStream();
+    input.push(control.stream);
+    control.push(setup);
+    control.close();
+    await ready;
+
+    const held = controlledStream();
+    input.push(held.stream);
+    held.push(new Uint8Array([0x10]));
+    await flush();
+    const next = controlledStream();
+    input.push(next.stream);
+    next.push(new Uint8Array([0x10]));
+    await flush();
+    expect(next.stream.locked).toBe(false);
+
+    router.releaseData();
+    await vi.waitFor(() => expect(h.data).toHaveLength(2));
+    expect(h.violations).toEqual([]);
+    expect(next.cancelled()).toBe(false);
+  });
+
+  it('at the bound before SETUP, cancels an extra data stream and still completes SETUP', async () => {
+    const input = streamSource();
+    const h = handlers();
+    const abandoned: string[] = [];
+    const router = new IncomingUniRouter(
+      { ...h.callbacks, onAbandoned: (reason) => { abandoned.push(reason); } },
+      { maxPendingStreams: 1 },
+    );
+    const ready = router.start(input.source);
     const first = controlledStream();
-    const second = controlledStream();
     input.push(first.stream);
     first.push(new Uint8Array([0x10]));
     await flush();
+    const second = controlledStream();
     input.push(second.stream);
-
-    await expect(ready).rejects.toThrow(/too many incoming streams/);
+    second.push(new Uint8Array([0x10]));
+    await flush();
     expect(second.cancelled()).toBe(true);
-    expect(h.violations).toHaveLength(1);
+    expect(abandoned).toEqual([expect.stringMatching(/before SETUP cancelled/)]);
+
+    const control = controlledStream();
+    input.push(control.stream);
+    control.push(setup);
+    control.close();
+    await ready;
+    router.releaseData();
+    expect(h.data).toHaveLength(1);
+    expect(h.violations).toEqual([]);
   });
 
   it('surfaces stream-source failures separately from protocol violations', async () => {

@@ -53,9 +53,9 @@ export class DeferredAudioOutput implements AudioOutputLike {
     }
   }
 
-  schedule(data: unknown, renderTimeUs: number): void {
+  schedule(data: unknown, renderTimeUs: number, captureUs?: number): void {
     if (this.real && this._enabled) {
-      this.real.schedule(data, renderTimeUs);
+      this.real.schedule(data, renderTimeUs, captureUs);
       return;
     }
     // Drop audio — close AudioData to free native memory.
@@ -73,6 +73,10 @@ export class DeferredAudioOutput implements AudioOutputLike {
   /** Forward playhead observability to the real output once activated. */
   playheadCaptureUs(): number | null {
     return this.real?.playheadCaptureUs?.() ?? null;
+  }
+
+  realign(): void {
+    this.real?.realign?.();
   }
 
   setPlaybackRate(rate: number): void {

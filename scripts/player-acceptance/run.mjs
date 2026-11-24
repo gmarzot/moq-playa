@@ -326,8 +326,9 @@ try {
       assert.deepEqual(pageErrors, [], 'Uncaught browser error');
       if (!scenario.exampleViews) assert.ok(!caseResult.teardown.events.some((event) => event.type === 'error'), 'Player emitted an error, including during teardown');
       assert.ok(!relay.exited && !publisher.exited, 'Media process exited before test teardown');
-      if (scenario.expectedFailure) {
-        assert.deepEqual(caseResult.assessment.failures, [scenario.expectedFailure], 'Control must fail only its intended output check');
+      const expectedFailures = [scenario.expectedFailure, ...(scenario.knownFailures ?? [])].filter(Boolean).sort();
+      if (expectedFailures.length > 0) {
+        assert.deepEqual([...caseResult.assessment.failures].sort(), expectedFailures, 'Control must fail only its intended output check');
       } else assert.equal(caseResult.assessment.passed, true, `Playback failed: ${caseResult.assessment.failures.join(', ')}`);
     } catch (error) {
       caseResult.error = error.message;

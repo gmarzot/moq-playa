@@ -340,6 +340,12 @@ export interface SetupOptions {
    */
   authTokens?: Uint8Array[];
   /**
+   * Compat, client, draft-14/16: when SERVER_SETUP carries no MAX_REQUEST_ID,
+   * send requests uncapped until the peer sends one. §9.3.1.3 makes that a
+   * limit of 0 (no requests); some relays omit it yet accept requests.
+   */
+  requestsUncappedUntilMaxRequestId?: boolean;
+  /**
    * draft-22 §9.1.7: the MAX_REQUEST_UPDATES to advertise, the number of
    * unanswered REQUEST_UPDATEs per request stream we accept. Omitted (or 0)
    * means no limit; ignored before draft 22.
@@ -385,6 +391,11 @@ export interface SubscribeOptions extends AuthorizationOptions {
    */
   subscriptionFilter?: SubscriptionFilter;
   /**
+   * §10.2.13: NEW_GROUP_REQUEST — the largest Group ID known plus 1, or 0 when none
+   * is. MAY be sent without knowing the track has dynamic groups. Draft-16/18.
+   */
+  newGroupRequest?: bigint;
+  /**
    * draft-22 §3.4 only: FILL_PARAMETERS. The publisher delivers the fill range on
    * a fill fetch stream whose FETCH_HEADER carries this SUBSCRIBE's Request ID;
    * the stream ends with a FIN when complete, or is reset when the fill fails.
@@ -413,6 +424,8 @@ export interface RequestUpdateOptions extends AuthorizationOptions {
   objectDeliveryTimeout?: Varint;
   /** §8 / §10.2.3: SUBGROUP_DELIVERY_TIMEOUT (0x06), in ms — MAY appear in REQUEST_UPDATE (draft-18 only). */
   subgroupDeliveryTimeout?: Varint;
+  /** §10.2.13: NEW_GROUP_REQUEST; only for a track with DYNAMIC_GROUPS=1. Draft-16/18. */
+  newGroupRequest?: bigint;
   /**
    * draft-18 §10.9.2 / §10.2.14: a new Track Namespace Prefix. Valid ONLY when
    * `existingRequestId` is an outbound SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS;
@@ -618,6 +631,14 @@ export class Session {
 
   /** Incoming subscriptions (as publisher). */
   private readonly incomingSubscriptions = new Map<bigint, SubscriptionStateMachine>();
+  /** Subscriptions we ended (PUBLISH_DONE, REQUEST_ERROR) whose UNSUBSCRIBE may still
+   *  be in flight, and ones the peer UNSUBSCRIBEd that our PUBLISH_DONE may still race.
+   *  Bounded, oldest dropped first. */
+  private readonly endedByPublisher = new Set<bigint>();
+  private readonly endedBySubscriber = new Set<bigint>();
+  /** Fetches we finished serving or refused, whose FETCH_CANCEL may still be in flight. */
+  private readonly endedFetches = new Set<bigint>();
+  private static readonly ENDED_RACE_MAX = 64;
 
   /** Incoming fetches (as publisher). */
   private readonly incomingFetches = new Map<bigint, FetchStateMachine>();
@@ -747,6 +768,8 @@ export class Session {
     ready: boolean;
   }>();
   private _goawayReceived: boolean = false;
+  /** SetupOptions.requestsUncappedUntilMaxRequestId, held until SERVER_SETUP. */
+  private requestsUncappedOptIn = false;
 
   constructor(
     private readonly _role: EndpointRoleValue,
@@ -788,6 +811,17 @@ export class Session {
   /** Peer's MAX_REQUEST_ID from setup. */
   get peerMaxRequestId(): Varint {
     return this._peerMaxRequestId;
+  }
+
+  /**
+   * Compat state (SetupOptions.requestsUncappedUntilMaxRequestId): whether the
+   * peer granted no request credit so requests went uncapped, whether that is
+   * still so, and how many requests were sent beyond the peer's limit.
+   */
+  get uncappedRequestCredit(): { engaged: boolean; active: boolean; requests: number } {
+    const requests = this.requestIdAllocator.uncappedAllocations;
+    const active = this.requestIdAllocator.isUncapped;
+    return { engaged: active || requests > 0, active, requests };
   }
 
   /**
@@ -891,6 +925,7 @@ export class Session {
     }
 
     const clientSetup = this.setupGate.createClientSetup(options);
+    this.requestsUncappedOptIn = options.requestsUncappedUntilMaxRequestId === true;
 
     // Set our MAX_REQUEST_ID so validateIncoming() knows what we advertised
     if (options.maxRequestId && options.maxRequestId > 0n) {
@@ -1148,6 +1183,8 @@ export class Session {
         // Only update allocator if MAX_REQUEST_ID was actually provided (> 0)
         if (result.peerMaxRequestId > 0n) {
           this.requestIdAllocator.updatePeerMaxRequestId(result.peerMaxRequestId);
+        } else if (this.requestsUncappedOptIn) {
+          this.requestIdAllocator.allowUncappedUntilMaxRequestId();
         }
         // §9.3.1.4: Store peer's cache size for our outbound alias registration
         if (result.peerMaxAuthTokenCacheSize !== undefined) {
@@ -2023,14 +2060,23 @@ export class Session {
       if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
       this.incomingSubscriptions.delete(msg.requestId as bigint);
     this.incomingJoiningLocations.delete(msg.requestId as bigint);
+      Session.noteEnded(this.endedBySubscriber, msg.requestId as bigint);
       return [];
     }
+
+    // An UNSUBSCRIBE crossing our own PUBLISH_DONE or REQUEST_ERROR names a valid request.
+    if (this.endedByPublisher.delete(msg.requestId as bigint)) return [];
 
     // §9.1: Unknown request ID
     return this.closeWithError(
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for UNSUBSCRIBE`,
     );
+  }
+
+  private static noteEnded(ended: Set<bigint>, requestId: bigint): void {
+    ended.add(requestId);
+    if (ended.size > Session.ENDED_RACE_MAX) ended.delete(ended.values().next().value as bigint);
   }
 
   /**
@@ -2588,6 +2634,9 @@ export class Session {
       return [];
     }
 
+    // A FETCH_CANCEL crossing our completed or refused response names a valid request.
+    if (this.endedFetches.delete(msg.requestId as bigint)) return [];
+
     return this.closeWithError(
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for FETCH_CANCEL`,
@@ -2997,6 +3046,7 @@ export class Session {
     }
 
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'SUBSCRIBE');
+    this.assertNewGroupRequestDraft(options.newGroupRequest);
     if (options.fill !== undefined && !isDraft22(this._draftVersion)) {
       throw new RangeError(`FILL_PARAMETERS needs draft 22; this session speaks draft ${this._draftVersion}`);
     }
@@ -3029,6 +3079,9 @@ export class Session {
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [options.groupOrder]);
       sub.requestedGroupOrder = options.groupOrder === 2n ? 'descending' : 'ascending';
+    }
+    if (options.newGroupRequest !== undefined) {
+      parameters.set(MessageParam.NEW_GROUP_REQUEST, [varint(options.newGroupRequest)]);
     }
     if (requestedForward !== undefined) {
       // §9.2.2.8: FORWARD MAY appear in SUBSCRIBE — initial forward state.
@@ -3263,6 +3316,7 @@ export class Session {
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+    this.assertNewGroupRequestDraft(options.newGroupRequest);
     // draft-22 §9.1.7: never more than the peer's MAX_REQUEST_UPDATES unanswered
     // updates on one request stream; each REQUEST_OK / REQUEST_ERROR restores one.
     if (isDraft22(this._draftVersion) && this._peerMaxRequestUpdates > 0n) {
@@ -3368,6 +3422,9 @@ export class Session {
     }
     if (options.subgroupDeliveryTimeout !== undefined) {
       parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
+    }
+    if (options.newGroupRequest !== undefined) {
+      parameters.set(MessageParam.NEW_GROUP_REQUEST, [varint(options.newGroupRequest)]);
     }
     if (fillBytes !== undefined) {
       parameters.set(FILL_PARAMETERS, [fillBytes]);
@@ -3785,7 +3842,12 @@ export class Session {
     const fetch = this.incomingFetches.get(requestId as bigint);
     if (!fetch) return;
     fetch.markDataFinished();
-    if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
+    if (fetch.isPublisherComplete) this.endIncomingFetch(requestId as bigint);
+  }
+
+  private endIncomingFetch(requestId: bigint): void {
+    this.incomingFetches.delete(requestId);
+    Session.noteEnded(this.endedFetches, requestId);
   }
 
   // ─── Track Alias Operations ───────────────────────────────────────────
@@ -4096,6 +4158,13 @@ export class Session {
    * throw rather than being silently encoded. Returns the map to attach (possibly
    * empty).
    */
+  /** NEW_GROUP_REQUEST (§10.2.13) does not exist on draft-14. */
+  private assertNewGroupRequestDraft(value: bigint | undefined): void {
+    if (value !== undefined && this._draftVersion === 14) {
+      throw new SessionError('newGroupRequest (NEW_GROUP_REQUEST, 0x32) needs draft-16 or later', 'INVALID_STATE');
+    }
+  }
+
   private resolveTrackProperties(trackProperties: TrackProperties | undefined, context: string): TrackProperties {
     const props = trackProperties ?? new Map();
     if (!isRequestStreamDraft(this._draftVersion) && props.size > 0) {
@@ -4219,9 +4288,7 @@ export class Session {
   handleNamespaceStreamClosed(requestId: bigint): SessionOutboundAction[] {
     const nsSm = this.namespaceSubscriptions.get(requestId as bigint);
     if (!nsSm) return [];
-    if (nsSm.isActive) {
-      nsSm.handleNamespaceDone(); // ACTIVE → TERMINATED (treat actives as done)
-    }
+    if (nsSm.isActive) nsSm.terminate();
     this.namespaceSubscriptions.delete(requestId as bigint);
     return [];
   }
@@ -4276,7 +4343,8 @@ export class Session {
             `NAMESPACE_DONE for suffix not previously announced via NAMESPACE (§6.1)`,
           );
         }
-        nsSm.handleNamespaceDone();
+        // §10.17: withdraws this suffix only; the subscription continues.
+        nsSm.withdrawNamespace(ndMsg.trackNamespaceSuffix);
         return [];
       }
 
@@ -4506,12 +4574,8 @@ export class Session {
 
   /**
    * Publisher-side: emit NAMESPACE_DONE for a previously announced suffix on an
-   * accepted incoming SUBSCRIBE_NAMESPACE stream (§10.18). Locally this is a
-   * PER-SUFFIX withdrawal from our publisher bookkeeping (via `withdrawNamespace`,
-   * NOT the terminal `NamespaceStateMachine.sendNamespaceDone()`), so our incoming
-   * machine stays ACTIVE and may emit further NAMESPACE / NAMESPACE_DONE. The
-   * RECEIVING subscriber, however, treats NAMESPACE_DONE as TERMINATING its
-   * namespace subscription (§6.1, `handleNamespaceDone`).
+   * accepted incoming SUBSCRIBE_NAMESPACE stream (§10.17). A per-suffix
+   * withdrawal on both sides; the stream stays ACTIVE for further updates.
    */
   sendNamespaceDone(requestId: bigint, suffix: Uint8Array[]): SessionOutboundAction[] {
     const nsSm = this.requireActiveIncomingNamespaceSub(requestId, 'sendNamespaceDone');
@@ -4966,8 +5030,7 @@ export class Session {
       trackNamespacePrefix: nsSm.namespacePrefix,
     };
 
-    // Terminate the state machine
-    nsSm.handleNamespaceDone();
+    nsSm.terminate();
 
     return [this.sendControl(unsubMsg)];
   }
@@ -5168,6 +5231,7 @@ export class Session {
     // unique requests the application rejects). The adapter's stream teardown seals
     // the context, so its later close callback will not run this cleanup.
     this.incomingSubscriptions.delete(requestId as bigint);
+    Session.noteEnded(this.endedByPublisher, requestId as bigint);
     this.incomingJoiningLocations.delete(requestId as bigint);
 
     // PUBLISH-initiated subscriptions respond with a publish-rejection message:
@@ -5272,6 +5336,9 @@ export class Session {
     if (options.subgroupDeliveryTimeout !== undefined) {
       parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
     }
+    if (options.newGroupRequest !== undefined) {
+      parameters.set(MessageParam.NEW_GROUP_REQUEST, [varint(options.newGroupRequest)]);
+    }
 
     // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
     this.pendingUpdates.set(requestId as bigint, {
@@ -5304,6 +5371,8 @@ export class Session {
     const sub = this.incomingSubscriptions.get(requestId as bigint)
       ?? this.outgoingPublishes.get(requestId as bigint);
     if (!sub) {
+      // The peer's UNSUBSCRIBE got there first: the subscription is over, nothing to send.
+      if (this.endedBySubscriber.delete(requestId as bigint)) return [];
       throw new SessionError(
         `Unknown incoming subscription ${requestId} for PUBLISH_DONE`,
         'INVALID_STATE',
@@ -5316,6 +5385,7 @@ export class Session {
     this.outgoingPublishes.delete(requestId as bigint);
     this.incomingSubscriptions.delete(requestId as bigint);
     this.incomingJoiningLocations.delete(requestId as bigint);
+    Session.noteEnded(this.endedByPublisher, requestId as bigint);
 
     const publishDoneMsg: PublishDone = {
       type: 'PUBLISH_DONE',
@@ -5365,7 +5435,7 @@ export class Session {
     // §10.13: the response stream may have closed BEFORE this FETCH_OK. If so, both
     // are now done — reclaim the served fetch; otherwise keep it (reclaimServedFetch
     // reclaims when the data stream later closes).
-    if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
+    if (fetch.isPublisherComplete) this.endIncomingFetch(requestId as bigint);
 
     return [this.sendControl(fetchOk)];
   }
@@ -5388,7 +5458,7 @@ export class Session {
     // REQUEST_ERROR is terminal — RECLAIM the incoming fetch state (bounded; a peer
     // cannot grow incomingFetches with valid unique rejected requests). The adapter
     // seals the request context, so its close callback will not run this cleanup.
-    this.incomingFetches.delete(requestId as bigint);
+    this.endIncomingFetch(requestId as bigint);
 
     const requestError: RequestErrorMsg = {
       type: 'REQUEST_ERROR',

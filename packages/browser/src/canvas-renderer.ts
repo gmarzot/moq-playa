@@ -49,8 +49,10 @@ const FALLBACK_INTERVAL_MS = 16;
 export class CanvasRenderer implements VideoRendererLike {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly queue: QueuedFrame[] = [];
+  private framesDropped = 0;
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
+  private readonly followFrameSize: boolean;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
   /**
@@ -89,6 +91,12 @@ export class CanvasRenderer implements VideoRendererLike {
    * drift — it already includes the playout cushion applied to this frame.
    */
   onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null = null;
+  /**
+   * Observer for each frame drawn: its capture timestamp (µs) and the wall
+   * clock when it was drawn (ms), so capture-to-screen latency can be measured.
+   * Never used for playout.
+   */
+  onFrameDrawn: ((captureTimestampUs: number, drawnAtWallMs: number) => void) | null = null;
   onStall: ((durationMs: number) => void) | null = null;
 
   /**
@@ -98,7 +106,18 @@ export class CanvasRenderer implements VideoRendererLike {
 
   constructor(
     canvas: HTMLCanvasElement,
-    options?: { stallThresholdMs?: number; clock?: ClockSource },
+    options?: {
+      stallThresholdMs?: number;
+      clock?: ClockSource;
+      /**
+       * Resize the canvas backing store to each frame's display size, so a
+       * resolution or aspect change (e.g. a landscape → portrait view switch)
+       * is never stretched; CSS (`object-fit: contain`) then letterboxes the
+       * element. Default true. Pass false for a canvas whose size the caller
+       * owns: frames are then drawn stretched to the canvas.
+       */
+      followFrameSize?: boolean;
+    },
   ) {
     // Validate before acquiring any browser state, so an invalid option
     // cannot leave a half-constructed renderer holding a 2d context.
@@ -107,6 +126,7 @@ export class CanvasRenderer implements VideoRendererLike {
       : validateStallThresholdMs(options.stallThresholdMs);
     this.ctx = canvas.getContext('2d')!;
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
+    this.followFrameSize = options?.followFrameSize ?? true;
   }
 
   /**
@@ -121,6 +141,24 @@ export class CanvasRenderer implements VideoRendererLike {
       return;
     }
     this.queue.push({ frame: frame as VideoFrame, renderTimeUs });
+  }
+
+  /** Decoded video held for presentation: newest queued render time ahead of now, in ms. */
+  /** Frames discarded without being painted. */
+  get droppedCount(): number {
+    return this.framesDropped;
+  }
+
+  get queuedAheadMs(): number | null {
+    if (this.queue.length === 0) return null;
+    let newest = this.queue[0]!.renderTimeUs;
+    for (const e of this.queue) if (e.renderTimeUs > newest) newest = e.renderTimeUs;
+    return Math.max(0, (newest - this.clock.now()) / 1000);
+  }
+
+  /** Decoded frames waiting for their render time. */
+  get queueLength(): number {
+    return this.queue.length;
   }
 
   /**
@@ -163,9 +201,21 @@ export class CanvasRenderer implements VideoRendererLike {
         const revision = ++this.drawRevision;
 
         try {
+          // Follow the frame's size so a resolution or aspect change (e.g. a
+          // switch from a landscape to a portrait view) is not stretched into
+          // the previous geometry; CSS object-fit letterboxes the element.
+          const canvas = this.ctx.canvas;
+          // Coded size for frames that report no display size.
+          const displayWidth = entry.frame.displayWidth ?? entry.frame.codedWidth;
+          const displayHeight = entry.frame.displayHeight ?? entry.frame.codedHeight;
+          if (this.followFrameSize && displayWidth && displayHeight
+            && (canvas.width !== displayWidth || canvas.height !== displayHeight)) {
+            canvas.width = displayWidth;
+            canvas.height = displayHeight;
+          }
           this.drawDepth++;
           try {
-            this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+            this.ctx.drawImage(entry.frame, 0, 0, canvas.width, canvas.height);
           } finally {
             this.drawDepth--;
             // A wrapper may reenter before or after its native draw. Neither
@@ -173,6 +223,9 @@ export class CanvasRenderer implements VideoRendererLike {
             if (revision !== this.drawRevision) this.lastVideoPresentation = null;
           }
           this.recordVideoPresentation(frameTimestampUs, revision);
+          try {
+            this.onFrameDrawn?.(frameTimestampUs, Date.now());
+          } catch { /* an observer must not break rendering */ }
         } finally {
           // Release even when drawing fails; only successful draws update evidence.
           entry.frame.close();
@@ -325,9 +378,28 @@ export class CanvasRenderer implements VideoRendererLike {
 
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;
+    // Becoming visible: drop the frames that fell due while painting was
+    // throttled, but the newest; frames still ahead keep the cushion.
+    if (!document.hidden) {
+      this.dropDueBacklog(this.clock.now());
+      // Throttled painting while hidden is not a stall: time the next one from
+      // now. A stall already detected before the page was hidden keeps running.
+      if (this.lastRenderTimeMs > 0) this.lastRenderTimeMs = performance.now();
+      if (this.stallEpisode !== null && !this.stallEpisode.detected) this.stallEpisode = null;
+    }
     this.cancelLoop();
     this.scheduleLoop();
   };
+
+  /** Close and discard the frames already due but the newest of them. */
+  private dropDueBacklog(nowUs: number): void {
+    let due = 0;
+    while (due < this.queue.length && this.queue[due]!.renderTimeUs <= nowUs) due++;
+    for (const q of this.queue.splice(0, Math.max(0, due - 1))) {
+      this.framesDropped++;
+      try { q.frame.close(); } catch { /* already closed */ }
+    }
+  }
 
   private scheduleLoop(): void {
     if (document.hidden) {

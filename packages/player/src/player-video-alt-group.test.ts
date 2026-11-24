@@ -206,15 +206,16 @@ describe('player video alternate groups', () => {
     } finally { await h.player.destroy(); }
   });
 
-  it('does not treat a different view as an aligned quality switch or disable ABR on rejection', async () => {
+  it('switches to a different view as a view change, not an aligned quality switch', async () => {
     const h = makePlayer();
     try {
       await h.player.load();
       const quality = (h.player as any).qualityController;
-      await expect(h.player.selectVideoTrack('portrait')).rejects.toThrow('different video altGroup');
-      expect(h.subscribed()).toEqual(['landscape-low', 'audio']);
+      await expect(h.player.selectVideoTrack('portrait')).resolves.toBeUndefined();
+      // Make-before-break: the old view keeps playing until the new one commits.
+      expect(h.subscribed()).toEqual(['landscape-low', 'audio', 'portrait']);
       expect(h.connection.unsubscribe).not.toHaveBeenCalled();
-      expect(quality.isAutoQuality).toBe(true);
+      expect((h.player as any).pendingVideoSwitch.viewChange).toEqual({ from: 7, to: 0 });
       expect(quality.currentVideoTrack.name).toBe('landscape-low');
     } finally { await h.player.destroy(); }
   });
@@ -279,9 +280,9 @@ describe('player video alternate groups', () => {
       (h.player as any).qualityController.selectInitialTracks(catalog);
       await expect(h.player.selectVideoTrack('portrait')).resolves.toBeUndefined();
       h.player.setAutoQuality(true);
-      await expect(h.player.selectVideoTrack('landscape-high')).rejects.toThrow('different video altGroup');
-      expect(h.subscribed()).toEqual(['catalog', 'portrait']);
-      expect((h.player as any).qualityController.isAutoQuality).toBe(true);
+      await expect(h.player.selectVideoTrack('landscape-high')).resolves.toBeUndefined();
+      expect(h.subscribed()).toEqual(['catalog', 'portrait', 'landscape-high']);
+      expect((h.player as any).pendingVideoSwitch.viewChange).toEqual({ from: 0, to: 7 });
     } finally { await h.player.destroy(); }
   });
 });

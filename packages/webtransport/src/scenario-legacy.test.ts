@@ -104,6 +104,23 @@ for (const version of [16, 14] as const) {
       expect(errors).toEqual([]);
     });
 
+    it('an inbound UNSUBSCRIBE reaches the publisher through onSubscribeClosed', async () => {
+      const { client, server, errors } = await connectedPair(version);
+      let rid = -1n;
+      server.onSubscribe = (r) => { rid = r; };
+      const closed: bigint[] = [];
+      server.onSubscribeClosed = (r) => { closed.push(r); };
+      const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => { /* none */ } });
+      await flush();
+      await server.acceptSubscribe(rid, 7n);
+      const sub = await subP;
+
+      await sub.unsubscribe();
+      await flush();
+      expect(closed).toEqual([rid]);
+      expect(errors).toEqual([]);
+    });
+
     it('reject leaves no ESTABLISHED state', async () => {
       const { client, server, errors } = await connectedPair(version);
       let rid = -1n;

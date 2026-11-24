@@ -24,7 +24,8 @@ import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
-import { RenderCushionSmoother } from './render-cushion.js';
+import { RenderCushionSmoother, RENDER_CUSHION_MAX_US, RENDER_CUSHION_BURST_MAX_US } from './render-cushion.js';
+import { LatencyPolicy, SMOOTH_CEILING_MS, SMOOTH_FLOOR_MS, SMOOTH_STARTUP_GRACE_US } from './latency-policy.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 import { usesMsePath } from './packaging.js';
@@ -73,6 +74,8 @@ export interface TrackInfo {
   } | undefined;
   /** Whether the stream is live. Gates bounded release + backlog shedding. */
   isLive?: boolean;
+  /** Catalog targetLatency of the selected tracks (ms); config overrides it. */
+  targetLatencyMs?: number;
 }
 
 /** Callbacks from pipeline to player. */
@@ -114,6 +117,15 @@ export interface PipelineSet {
    * smoother (only scheduling does). Absent for CMAF-only sessions.
    */
   getRenderCushionUs?: () => number;
+  /** The LOC smooth latency policy; undefined in live mode or without LOC media. */
+  readonly latencyPolicy?: LatencyPolicy | undefined;
+  /**
+   * Apply new latency settings to the running LOC playout: the cushion bounds,
+   * and the smooth policy, created, re-bounded or dropped. `targetMs` is the
+   * catalog's target latency, used when the config sets none. Returns the
+   * policy in force. A no-op without LOC media.
+   */
+  apply?: (config: MoqtPlayerConfig, targetMs: number | undefined) => LatencyPolicy | undefined;
 }
 
 /** Context for handlePipelineEvent. */
@@ -123,7 +135,8 @@ export interface PipelineEventContext {
   syncController: SyncController | null;
   syncResetThisTick: boolean;
   setSyncResetThisTick: (value: boolean) => void;
-  recoveryHook: (action: RecoveryAction) => RecoveryAction | null;
+  /** `localSkip`: the pipeline already moved to a buffered group. */
+  recoveryHook: (action: RecoveryAction, localSkip: boolean) => RecoveryAction | null;
   /**
    * Observability-only counter hook for LOC diagnostics (stats.loc).
    * `sync_reset` is recorded exactly when the reset is actually performed,
@@ -150,14 +163,183 @@ export interface RecoveryCallbacks {
  * `max(adaptive, static)`: the adaptive component is the video pipeline's
  * effective gap timeout (arrival-jitter EMA); the static floor is 200 ms,
  * or 50 ms when the WebTransport handshake RTT is under 5 ms (LAN/loopback).
+ *
+ * A declared target latency caps the result: the floor is a jitter estimate
+ * and must not exceed the latency the publisher asked for.
  */
 export function computePlaybackDelayUs(
   effectiveGapTimeoutUs: number | undefined,
   handshakeRttMs: number | undefined,
+  targetLatencyUs?: number,
 ): number {
   const staticDelayUs = handshakeRttMs !== undefined && handshakeRttMs < 5
     ? 50_000 : 200_000;
-  return Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+  const delayUs = Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+  return targetLatencyUs !== undefined && targetLatencyUs > 0
+    ? Math.min(delayUs, targetLatencyUs)
+    : delayUs;
+}
+
+// ─── LOC playout delay ───────────────────────────────────────────────
+
+/** Unless low-latency congestion control is requested, late arrival may grow the LOC cushion up to the burst cap. */
+function expandsCushion(config: MoqtPlayerConfig): boolean {
+  return config.congestionControl !== 'low-latency';
+}
+
+/** LOC render-cushion floor and cap (µs) for a config and target latency. */
+function cushionBounds(
+  config: MoqtPlayerConfig,
+  catalogTargetMs: number | undefined,
+  handshakeRttMs: number | undefined,
+): { floorUs: number; maxUs: number } {
+  // Resolved before the floor so it can cap it; an explicit floor still wins.
+  const targetLatencyMs = config.targetLatencyMs ?? catalogTargetMs;
+  const floorUs = config.renderCushionFloorMs !== undefined
+    ? config.renderCushionFloorMs * 1000
+    : computePlaybackDelayUs(undefined, handshakeRttMs,
+      targetLatencyMs !== undefined ? targetLatencyMs * 1000 : undefined);
+  // Low-latency congestion control holds the target: the live cap, or the
+  // target latency (config, else catalog) if lower. Otherwise the cap leaves
+  // room for bursty arrival. An explicit cap wins; a floor above the cap lifts it.
+  const defaultMaxUs = expandsCushion(config)
+    ? RENDER_CUSHION_BURST_MAX_US
+    : targetLatencyMs !== undefined
+      ? Math.min(targetLatencyMs * 1000, RENDER_CUSHION_MAX_US)
+      : RENDER_CUSHION_MAX_US;
+  const maxUs = Math.max(
+    config.renderCushionMaxMs !== undefined ? config.renderCushionMaxMs * 1000 : defaultMaxUs,
+    floorUs,
+  );
+  return { floorUs, maxUs };
+}
+
+/**
+ * Smooth floor and ceiling (µs): late media raises the cushion past the live cap,
+ * up to the ceiling. An explicit ceiling holds; the default one covers the live cap.
+ */
+function smoothBounds(config: MoqtPlayerConfig, cushionMaxUs: number): { floorUs: number; ceilingUs: number } {
+  return {
+    floorUs: (config.smoothFloorMs ?? SMOOTH_FLOOR_MS) * 1000,
+    ceilingUs: config.smoothCeilingMs !== undefined
+      ? config.smoothCeilingMs * 1000
+      : Math.max(SMOOTH_CEILING_MS * 1000, cushionMaxUs),
+  };
+}
+
+/**
+ * The LOC playout delay: the smoothed render cushion within its live bounds,
+ * and in smooth mode the latency policy's hold above them. Unless low-latency
+ * congestion control is requested, live late arrivals raise the cushion too,
+ * held the same way within the live bounds. Bounds and mode follow
+ * {@link LocPlayout.apply}.
+ */
+class LocPlayout {
+  private floorUs: number;
+  private maxUs: number;
+  private expands: boolean;
+  policy: LatencyPolicy | null = null;
+  /** Live without low latency: holds raises between the live floor and cap. */
+  private liveHold: LatencyPolicy | null = null;
+  readonly cushion: RenderCushionSmoother;
+
+  constructor(
+    config: MoqtPlayerConfig,
+    catalogTargetMs: number | undefined,
+    private readonly handshakeRttMs: number | undefined,
+    private readonly clock: ClockSource,
+    /** The video pipeline's raw adaptive gap timeout (µs). */
+    private readonly gapUs: () => number,
+    /** Audio realigns to a raised cushion. */
+    private readonly realign: () => void,
+  ) {
+    const { floorUs, maxUs } = cushionBounds(config, catalogTargetMs, handshakeRttMs);
+    this.floorUs = floorUs;
+    this.maxUs = maxUs;
+    this.expands = expandsCushion(config);
+    this.policy = this.policyFor(config, null);
+    this.liveHold = this.liveHoldFor(null);
+    this.cushion = new RenderCushionSmoother({ floorUs, maxUs: this.policy?.ceilingUs ?? maxUs }, clock);
+    // Smooth starts at its held delay: audio scheduled before the first frame uses it too.
+    if (this.policy) this.cushion.raiseTo(this.policy.heldUs);
+  }
+
+  /** The cushion in force: the jitter estimate within the live cap, or the held raise above it. */
+  cushionUs(): number {
+    const heldUs = (this.policy ?? this.liveHold)?.heldUs ?? 0;
+    return this.cushion.update(Math.max(Math.min(this.gapUs(), this.maxUs), heldUs));
+  }
+
+  /** Smooth, or live without low latency: arrivals report their slack against the cushion. */
+  get raisesOnLate(): boolean {
+    return this.policy !== null || this.expands;
+  }
+
+  /**
+   * An arrival `slackUs` past its slot raises the cushion at once, and audio
+   * realigns to it. The raise holds until a clean window lets it step down.
+   */
+  noteSlack(slackUs: number): number {
+    const hold = this.policy ?? this.liveHold;
+    if (!hold) return this.cushionUs();
+    // While the cushion slews down to a lowered hold, measure slack against the hold.
+    const aboveHoldUs = Math.max(0, this.cushion.currentUs - hold.heldUs);
+    const raised = hold.noteArrival(slackUs - aboveHoldUs, this.cushion.currentUs - aboveHoldUs);
+    if (raised !== null) this.raiseTo(raised);
+    return this.cushion.currentUs;
+  }
+
+  /** The ceiling armed hold allows: audio later than this is dropped before decode. */
+  get armedCeilingUs(): number | undefined {
+    const hold = this.policy ?? this.liveHold;
+    return hold?.armed ? hold.ceilingUs : undefined;
+  }
+
+  apply(config: MoqtPlayerConfig, catalogTargetMs: number | undefined): LatencyPolicy | undefined {
+    const { floorUs, maxUs } = cushionBounds(config, catalogTargetMs, this.handshakeRttMs);
+    this.floorUs = floorUs;
+    this.maxUs = maxUs;
+    this.expands = expandsCushion(config);
+    this.policy = this.policyFor(config, this.policy);
+    this.liveHold = this.liveHoldFor(this.liveHold);
+    this.cushion.setBounds(floorUs, this.policy?.ceilingUs ?? maxUs);
+    if (this.policy) this.raiseTo(this.policy.heldUs);
+    return this.policy ?? undefined;
+  }
+
+  /** Smooth: the existing policy re-bounded, else a new one; live: none. */
+  private policyFor(config: MoqtPlayerConfig, current: LatencyPolicy | null): LatencyPolicy | null {
+    if (config.latencyMode !== 'smooth') return null;
+    const bounds = smoothBounds(config, this.maxUs);
+    if (current) {
+      current.setBase(this.floorUs);
+      current.setBounds(bounds);
+      return current;
+    }
+    return new LatencyPolicy({
+      mode: 'smooth', baseUs: this.floorUs, ...bounds, startupGraceUs: SMOOTH_STARTUP_GRACE_US,
+    }, this.clock);
+  }
+
+  /** Live without low latency: the existing hold re-bounded, else a new one; otherwise none. */
+  private liveHoldFor(current: LatencyPolicy | null): LatencyPolicy | null {
+    if (this.policy || !this.expands) return null;
+    const bounds = { floorUs: this.floorUs, ceilingUs: this.maxUs };
+    if (current) {
+      current.setBase(this.floorUs);
+      current.setBounds(bounds);
+      return current;
+    }
+    return new LatencyPolicy({
+      mode: 'smooth', baseUs: this.floorUs, ...bounds, startupGraceUs: SMOOTH_STARTUP_GRACE_US,
+    }, this.clock);
+  }
+
+  /** Realigns audio only when the clamped cushion actually grew. */
+  private raiseTo(heldUs: number): void {
+    const beforeUs = this.cushion.currentUs;
+    if (this.cushion.raiseTo(heldUs) > beforeUs) this.realign();
+  }
 }
 
 // ─── createPipelines ─────────────────────────────────────────────────
@@ -226,11 +408,16 @@ export function createPipelines(
     catchUpRecoveryMs: config.catchUpRecoveryMs,
   }));
 
-  const recoveryController = config.createRecoveryController?.(clock)
-    ?? new DefaultRecoveryController({
+  // The default controller's windowed escalation — the only path by which
+  // stalls reduce quality — is disabled until it has a clock.
+  const recoveryController = config.createRecoveryController?.(clock) ?? (() => {
+    const recovery = new DefaultRecoveryController({
       gapEscalationThreshold: config.maxConsecutiveGaps!,
       maxDecodeErrors: config.maxDecodeErrors!,
     });
+    recovery.setClock(clock);
+    return recovery;
+  })();
 
   // ── CommandDispatcher + browser adapters ────────────────────────
   // Only create WebCodecs adapters for LOC media types — CMAF goes through MSE.
@@ -245,9 +432,13 @@ export function createPipelines(
   // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
-  const cushionFloorUs = handshakeRttMs !== undefined && handshakeRttMs < 5
-    ? 50_000 : 200_000;
-  const renderCushion = hasLoc ? new RenderCushionSmoother({ floorUs: cushionFloorUs }, clock) : null;
+  const playout = hasLoc
+    ? new LocPlayout(config, trackInfo.targetLatencyMs, handshakeRttMs, clock,
+      () => videoPipeline?.effectiveGapTimeoutUs ?? 0, () => audioOutput?.realign?.())
+    : null;
+  /** The cushion in force; without LOC media, the static floor. */
+  const cushionUs = (): number => playout?.cushionUs()
+    ?? cushionBounds(config, trackInfo.targetLatencyMs, handshakeRttMs).floorUs;
 
   if (videoDecoder || audioDecoder) {
     commandDispatcher = new CommandDispatcher(defined({
@@ -273,21 +464,28 @@ export function createPipelines(
       // are fresh relative to the current clock, not stale from pipeline processing.
       // Adds a playback delay cushion to absorb network jitter — frames are
       // scheduled slightly into the future so delivery stalls don't cause stutter.
-      recomputeVideoRenderTime: (captureTimestampUs: bigint) => {
+      recomputeVideoRenderTime: (captureTimestampUs: bigint, fromHoldQueue?: boolean) => {
         // The SMOOTHED shared playout cushion (the same smoothed value is
         // passed to audio scheduling via getPlaybackDelayUs; audio adopts it
         // at anchor/underrun boundaries) — slew-limited so raw gap-fuse
         // swings cannot step render times (a stepwise collapse froze video
         // in the field).
-        const playbackDelayUs = renderCushion?.update(videoPipeline?.effectiveGapTimeoutUs)
-          ?? cushionFloorUs;
+        let playbackDelayUs = cushionUs();
 
         // Sync reference is guaranteed here — CommandDispatcher holds frames
         // until hasSyncReference() returns true, so this callback only fires
         // after the reference is established. No speculative fallback needed.
         const timing = syncController.computeVideoRenderTime(captureTimestampUs);
         if (!timing) return clock.now() + playbackDelayUs; // safety: shouldn't happen
-        if (timing.shouldDrop) return clock.now();
+        // Frames held for the sync reference waited on the player, not the network.
+        if (playout?.raisesOnLate && !fromHoldQueue) {
+          playbackDelayUs = playout!.noteSlack(timing.renderTimeUs + playbackDelayUs - clock.now());
+        }
+        // A frame behind its base render time but inside the cushion renders at
+        // its slot; rendering it now would bunch it with the frames queued ahead.
+        if (timing.shouldDrop && timing.renderTimeUs + playbackDelayUs < clock.now()) {
+          return clock.now();
+        }
 
         // PTS-anchored render time + playback delay. No future cap — the
         // CaptureTimestamp spacing IS correct frame pacing. The maxFutureUs
@@ -295,8 +493,9 @@ export function createPipelines(
         return timing.renderTimeUs + playbackDelayUs;
       },
       hasSyncReference: () => syncController.hasReference,
-      getPlaybackDelayUs: () =>
-        renderCushion?.update(videoPipeline?.effectiveGapTimeoutUs) ?? cushionFloorUs,
+      getPlaybackDelayUs: (renderTimeUs?: number) => playout?.raisesOnLate && renderTimeUs !== undefined
+        ? playout.noteSlack(renderTimeUs + cushionUs() - clock.now())
+        : cushionUs(),
     }));
   }
 
@@ -328,6 +527,9 @@ export function createPipelines(
       onCommand: (cmd) => callbacks.onCommand(cmd),
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
+      // The cushion the dispatcher adds to audio render times (peek only).
+      // An armed hold drops before decode only audio late past its ceiling; the rest raises the cushion.
+      getPlaybackDelayUs: () => playout?.armedCeilingUs ?? playout?.cushion.currentUs ?? cushionUs(),
     });
   }
 
@@ -338,12 +540,14 @@ export function createPipelines(
     recoveryController,
     commandDispatcher,
     mediaSource,
-    ...(renderCushion ? {
+    ...(playout ? {
       // Observability contract: PEEK the smoothed value. Only the scheduling
       // paths (video recompute, audio getPlaybackDelayUs) advance the
       // smoother — polling player.stats must never mutate playback timing.
-      getRenderCushionUs: () => renderCushion.currentUs,
+      getRenderCushionUs: () => playout.cushion.currentUs,
     } : {}),
+    get latencyPolicy() { return playout?.policy ?? undefined; },
+    apply: (next, targetMs) => playout?.apply(next, targetMs),
   };
 }
 
@@ -435,7 +639,8 @@ export function handlePipelineEvent(
     case 'skip_forward':
       ctx.recordDiagnostic?.('skip_forward');
       ctx.log.warn('Skip forward %s group=%s→%s', mediaType, evt.fromGroupId, evt.toGroupId);
-      if (!ctx.syncResetThisTick && ctx.syncController) {
+      // Skipping a lost audio frame leaves the timeline where it was.
+      if (mediaType === 'video' && !ctx.syncResetThisTick && ctx.syncController) {
         ctx.syncController.reset();
         ctx.setSyncResetThisTick(true);
         ctx.recordDiagnostic?.('sync_reset');
@@ -443,6 +648,20 @@ export function handlePipelineEvent(
       ctx.emitEvent({
         type: 'skip_forward', mediaType,
         fromGroupId: evt.fromGroupId, toGroupId: evt.toGroupId,
+      });
+      break;
+    case 'timeline_jump':
+      ctx.log.info('Timeline jump %s group=%s→%s (+%ss): playing the newer group now',
+        mediaType, evt.fromGroupId, evt.toGroupId, (evt.jumpUs / 1e6).toFixed(1));
+      // The abandoned group's timeline anchored the shared reference.
+      if (!ctx.syncResetThisTick && ctx.syncController) {
+        ctx.syncController.reset();
+        ctx.setSyncResetThisTick(true);
+        ctx.recordDiagnostic?.('sync_reset');
+      }
+      ctx.emitEvent({
+        type: 'timeline_jump', mediaType,
+        fromGroupId: evt.fromGroupId, toGroupId: evt.toGroupId, jumpMs: evt.jumpUs / 1000,
       });
       break;
     case 'keyframe_waiting':
@@ -461,13 +680,25 @@ export function handlePipelineEvent(
       });
       break;
     case 'recovery': {
-      const action = ctx.recoveryHook(evt.action);
+      const action = ctx.recoveryHook(evt.action, evt.localSkip === true);
       if (action) {
         ctx.recordDiagnostic?.('recovery_action');
         ctx.emitEvent({ type: 'recovery_action', action });
       }
       break;
     }
+    case 'audio_reanchored':
+      ctx.recordDiagnostic?.('sync_reset');
+      ctx.log.warn('Audio late by %dms for a sustained run — sync reference re-anchored',
+        Math.round(evt.lateByUs / 1000));
+      break;
+    case 'sync_reference_fallback':
+      // warn, not debug: the catalog advertised audio that never arrived, and
+      // without this the picture would have stayed black indefinitely.
+      ctx.log.warn('No audio frame in %dms — video anchored the sync reference itself; '
+        + 'the advertised audio track has delivered nothing',
+        Math.round(evt.waitedUs / 1000));
+      break;
     case 'catch_up_changed':
       ctx.log.debug('Catch-up %s rate=%.2f latency=%dms target=%dms',
         evt.state.active ? 'active' : 'inactive',
@@ -532,9 +763,22 @@ export function handleRecoveryAction(
   qualityController: QualityController | null,
   log: LoggerLike,
   callbacks: RecoveryCallbacks,
+  localSkip = false,
 ): void {
   switch (action.type) {
     case 'skip_forward':
+      // Each audio group stands alone and the live subscription already
+      // carries the next one: skipping needs no REQUEST_UPDATE.
+      if (mediaType === 'audio') {
+        log.debug('Recovery: skip forward audio — continue at the next group');
+        break;
+      }
+      // Re-requesting the next group would cut short the buffered group the
+      // pipeline moved to.
+      if (localSkip) {
+        log.debug('Recovery: skip forward %s — continuing at the buffered group', mediaType);
+        break;
+      }
       log.warn('Recovery: skip forward %s — flush pipeline and resubscribe from live edge', mediaType);
       callbacks.onResubscribe(mediaType);
       break;

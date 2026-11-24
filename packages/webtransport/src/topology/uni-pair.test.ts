@@ -18,7 +18,7 @@ const okBytes = (alias: bigint): Uint8Array =>
   codec18.encode({ type: 'SUBSCRIBE_OK', requestId: 0n, trackAlias: alias, parameters: new Map(), trackExtensions: new Map() } as SubscribeOk);
 const reqOkBytes = (): Uint8Array => codec18.encode({ type: 'REQUEST_OK', requestId: 0n, parameters: new Map() } as RequestOk);
 function updateMessage(session: Session, existingRequestId: bigint): ControlMessage {
-  const r = session.requestUpdate(existingRequestId, { forward: false });
+  const r = session.requestUpdate(existingRequestId, { forward: 0 });
   return (r.actions.find((a) => a.type === 'send_control') as SendControlAction).message;
 }
 const errBytes = (): Uint8Array =>
@@ -49,6 +49,33 @@ function reqMessage(r: RequestResult): ControlMessage {
 }
 const ns = (s: string) => [new TextEncoder().encode(s)];
 const nm = (s: string) => new TextEncoder().encode(s);
+
+/**
+ * A transport whose next bidi stream records when close() is called, resolves it only when
+ * the test acknowledges the FIN, and can be stopped by the peer (STOP_SENDING on our writable).
+ */
+function heldFinTransport(): {
+  transport: TransportSim; stream: SimStream; finSent: () => boolean; ackFin: () => void; peerStop: () => void;
+} {
+  const transport = new TransportSim();
+  const stream = new SimStream();
+  let ack: (() => void) | undefined;
+  let ctrl!: WritableStreamDefaultController;
+  Object.defineProperty(stream, 'writable', {
+    value: new WritableStream<Uint8Array>({
+      start: (c) => { ctrl = c; },
+      write: (chunk) => { stream.written.push(chunk.slice()); },
+      close: () => new Promise<void>((res) => { ack = () => { stream.writeClosed = true; res(); }; }),
+    }),
+  });
+  transport.createBidirectionalStream = async () => { transport.bidi.push(stream); return stream; };
+  return {
+    transport, stream, finSent: () => ack !== undefined, ackFin: () => ack?.(),
+    peerStop: () => ctrl.error(new Error('STOP_SENDING')),
+  };
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 describe('UniPairTopology — control handshake', () => {
   it('sends SETUP on the uni control stream, reads peer SETUP, reaches ESTABLISHED', async () => {
@@ -82,7 +109,31 @@ describe('UniPairTopology — control handshake', () => {
     expect(violations).toEqual([]);
   });
 
-  it('leaves the aggregate source to a transport-closing owner', async () => {
+  it('a clean transport-closing shutdown leaves the aggregate source and the control streams', async () => {
+    // A control stream reset or stopped mid-session makes the peer close the
+    // session with an error (CLOSED_CONTROL_STREAM on draft 23, section 6.3).
+    // When the transport is closing, its close must be the only thing the peer sees.
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const violations: string[] = [];
+    topo.onControlStreamViolation = (reason) => violations.push(reason);
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await topo.establish(transport);
+
+    topo.shutdown({ transportClosing: true, graceful: true });
+    await flush();
+
+    expect(control.readCancelled).toBe(false);
+    expect(transport.uniOut[0]!.writeAborted).toBe(false);
+    expect(transport.uniOut[0]!.writeClosed).toBe(false);
+    expect(transport.incomingUniSourceCancelled).toBe(false);
+    expect(violations).toEqual([]);
+    expect(() => transport.closeIncomingSources()).not.toThrow();
+  });
+
+  it('an error transport-closing shutdown still resets both control streams', async () => {
     const client = new Session(EndpointRole.CLIENT, 18);
     const topo = createUniPairTopology(client);
     const transport = new TransportSim();
@@ -94,8 +145,23 @@ describe('UniPairTopology — control handshake', () => {
     await flush();
 
     expect(control.readCancelled).toBe(true);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
     expect(transport.incomingUniSourceCancelled).toBe(false);
-    expect(() => transport.closeIncomingSources()).not.toThrow();
+  });
+
+  it('a standalone shutdown still resets both control streams', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await topo.establish(transport);
+
+    topo.shutdown();
+    await flush();
+
+    expect(control.readCancelled).toBe(true);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
   });
 
   it('classifies an Object stream that arrives before SETUP without stealing the control stream', async () => {
@@ -573,6 +639,42 @@ describe('UniPairTopology — request streams (FETCH)', () => {
     await flush();
     expect(errors.some((e) => /FETCH_OK\/REQUEST_ERROR/i.test(e.message))).toBe(true);
   });
+
+  it('finishRequest sends STOP_SENDING first and FINs after a grace period', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const { transport, stream, finSent, ackFin } = heldFinTransport();
+    const f = session.fetch(ns('a'), nm('1'), fetchRange);
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
+    stream.push(fetchOkBytes());
+    await handle.response;
+
+    const finished = topo.finishRequest(handle.requestId);
+    await flush();
+    expect(stream.readCancelled).toBe(true);
+    expect(finSent()).toBe(false);
+    await sleep(300);
+    expect(finSent()).toBe(true);
+    ackFin();
+    await finished;
+    expect(stream.writeClosed).toBe(true);
+  });
+
+  it('finishRequest stops waiting once the peer answers STOP_SENDING', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const { transport, stream, peerStop } = heldFinTransport();
+    const f = session.fetch(ns('a'), nm('1'), fetchRange);
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
+    stream.push(fetchOkBytes());
+    await handle.response;
+
+    const finished = topo.finishRequest(handle.requestId);
+    await flush();
+    expect(stream.readCancelled).toBe(true);
+    peerStop();
+    await expect(Promise.race([finished.then(() => 'done'), sleep(100).then(() => 'waiting')])).resolves.toBe('done');
+  });
 });
 
 describe('UniPairTopology — request streams (TRACK_STATUS, §10.14)', () => {
@@ -776,6 +878,24 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
     expect(topo.hasContinuingRequest(requestId)).toBe(false);
   });
 
+  it('closeContinuingRequest sends STOP_SENDING first and FINs after a grace period', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const { transport, stream, finSent, ackFin } = heldFinTransport();
+    const sn = session.subscribeNamespace([new Uint8Array([1])]);
+    const { requestId } = await topo.openContinuingRequest(transport, nsRequestMessage(sn), () => {});
+
+    const closing = topo.closeContinuingRequest(requestId);
+    await flush();
+    expect(stream.readCancelled).toBe(true);
+    expect(finSent()).toBe(false);
+    await sleep(300);
+    expect(finSent()).toBe(true);
+    ackFin();
+    await closing;
+    expect(stream.writeClosed).toBe(true);
+  });
+
   it('a §10.9.2 prefix REQUEST_UPDATE response is matched (not misrouted as a continuation)', async () => {
     const { topo, transport, seen, p, requestId } = open();
     const handle = await p;
@@ -956,7 +1076,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const closed: bigint[] = [];
-    topo.onRequestClosed = (rid) => closed.push(rid);
+    topo.onRequestClosed = (rid) => { closed.push(rid); };
 
     const p = session.publish(ns('a'), nm('1'), 5n);
     const handle = await topo.openRequest(transport, reqMessage(p), () => {});
@@ -974,7 +1094,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const closed: bigint[] = [];
-    topo.onRequestClosed = (rid) => closed.push(rid);
+    topo.onRequestClosed = (rid) => { closed.push(rid); };
 
     const p = session.publish(ns('a'), nm('1'), 5n);
     const handle = await topo.openRequest(transport, reqMessage(p), () => {});

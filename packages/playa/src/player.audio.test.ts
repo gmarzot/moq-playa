@@ -3,7 +3,7 @@
  *
  * Scoped to the audio activation surface: audioActivation, prepareAudio(),
  * unmute(), mute(), toggleMute(), and their interaction with the deferred
- * audio output.
+ * (gesture) and eagerly-wired (auto) audio outputs.
  *
  * Not using jsdom — the interesting logic here is the AudioContext lifecycle
  * and the deferred output wiring, neither of which jsdom implements. Pulling
@@ -37,6 +37,9 @@ class MockAudioContext {
     connect: vi.fn(),
   }));
   getOutputTimestamp = vi.fn(() => ({ contextTime: 0, performanceTime: 0 }));
+  // WebAudioOutput subscribes to statechange to re-anchor on resume.
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
 }
 
 // Capture constructor count so we can assert NO AudioContext is created before user gesture
@@ -241,6 +244,47 @@ describe('Player — audio activation', () => {
       await p.load();
       p.play();
       expect(audioContextConstructorCalls).toBe(1);
+    });
+
+    it('createAudioOutput factory returns a real output, not the deferred proxy', () => {
+      const p = new Player(mockElement() as HTMLElement, {
+        url: 'x', namespace: 'y',
+      });
+      const output = capturedAudioOutputFactory?.() as any;
+      expect(output.isActive).toBeUndefined();
+      expect(typeof output.scheduledAheadSec).toBe('number');
+      expect((p as any).audioOutput).toBe(output);
+    });
+
+    // The decoder feeds whatever the factory returned; replacing it here would
+    // leave every audio gauge reading an instance nothing schedules into.
+    it('prepareAudio() keeps the pipeline-wired output', async () => {
+      const p = new Player(mockElement() as HTMLElement, {
+        url: 'x', namespace: 'y',
+      });
+      const wired = capturedAudioOutputFactory?.() as any;
+      await p.prepareAudio();
+      expect((p as any).audioOutput).toBe(wired);
+    });
+
+    it('unmute() keeps the pipeline-wired output', async () => {
+      const p = new Player(mockElement() as HTMLElement, {
+        url: 'x', namespace: 'y', muted: true,
+      });
+      const wired = capturedAudioOutputFactory?.() as any;
+      await p.unmute();
+      expect((p as any).audioOutput).toBe(wired);
+      expect(p.muted).toBe(false);
+    });
+
+    it('unmute() leaves cushionMs reading the live output', async () => {
+      const p = new Player(mockElement() as HTMLElement, {
+        url: 'x', namespace: 'y', muted: true,
+      });
+      const wired = capturedAudioOutputFactory?.() as any;
+      Object.defineProperty(wired, 'scheduledAheadSec', { get: () => 0.25 });
+      await p.unmute();
+      expect(p.stats.cushionMs).toBe(250);
     });
   });
 

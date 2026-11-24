@@ -1,0 +1,148 @@
+/**
+ * Network impairment for a soak player on a disposable CI runner (Linux tc
+ * netem, through sudo). With SOAK_NETNS set, the player runs in that network
+ * namespace (netns.sh) and the veth pair is shaped: veth-host egress is the
+ * player's downlink, veth-ns egress its uplink. Otherwise only traffic to and
+ * from the relays' addresses is shaped: ingress through an IFB device, egress
+ * through a filtered prio band.
+ */
+import { execFile } from 'node:child_process';
+import { lookup } from 'node:dns/promises';
+
+const IFB = 'ifbsoak';
+const PASS = 'delay 0ms';
+
+const sudo = (argv) => new Promise((resolve, reject) => {
+  execFile('sudo', argv, (error, stdout, stderr) => {
+    if (error) reject(new Error(`${argv.join(' ')}: ${(stderr || error.message).trim()}`));
+    else resolve(stdout);
+  });
+});
+const split = (netem) => netem.trim().split(/\s+/);
+
+/** Shapes the namespace's veth pair; the host side is reached through pid 1's network namespace. */
+class VethImpairment {
+  constructor() {
+    this.dev = 'veth-ns';
+    this.addresses = ['all traffic of the namespace'];
+    this.profile = { down: PASS, up: PASS };
+    this.found = null;
+  }
+
+  async setup() {
+    await sudo(['nsenter', '-t', '1', '-n', 'tc', 'qdisc', 'add', 'dev', 'veth-host', 'root', 'netem', ...split(PASS)]);
+    await sudo(['tc', 'qdisc', 'add', 'dev', 'veth-ns', 'root', 'netem', ...split(PASS)]);
+  }
+
+  async apply(profile = {}) {
+    this.profile = { down: profile.down ?? profile.netem ?? PASS, up: profile.up ?? profile.netem ?? PASS };
+    await this.set(this.profile.down, this.profile.up);
+  }
+
+  async blackout() {
+    await this.set('loss 100%', 'loss 100%');
+  }
+
+  async restore() {
+    await this.set(this.profile.down, this.profile.up);
+  }
+
+  async set(down, up) {
+    await sudo(['nsenter', '-t', '1', '-n', 'tc', 'qdisc', 'replace', 'dev', 'veth-host', 'root', 'netem', ...split(down)]);
+    await sudo(['tc', 'qdisc', 'replace', 'dev', 'veth-ns', 'root', 'netem', ...split(up)]);
+  }
+
+  async stats() {
+    return {
+      down: (await sudo(['nsenter', '-t', '1', '-n', 'tc', '-s', 'qdisc', 'show', 'dev', 'veth-host'])).trim(),
+      up: (await sudo(['tc', '-s', 'qdisc', 'show', 'dev', 'veth-ns'])).trim(),
+    };
+  }
+}
+
+export class Impairment {
+  constructor(dev, addresses) {
+    this.dev = dev;
+    this.addresses = addresses;
+    this.profile = { down: PASS, up: PASS };
+    /** Links, qdiscs and ingress filters found at setup, for the case evidence. */
+    this.found = null;
+  }
+
+  /** Resolve the relays' IPv4 addresses and the uplink device that reaches them. */
+  static async forRelays(urls) {
+    if (process.env.SOAK_NETNS) return new VethImpairment();
+    const hosts = [...new Set(urls.map((u) => new URL(u).hostname))];
+    const addresses = [...new Set((await Promise.all(hosts.map((h) => lookup(h, { all: true, family: 4 }))))
+      .flat().map((a) => a.address))];
+    if (addresses.length === 0) throw new Error(`no IPv4 address for ${hosts.join(', ')}`);
+    const route = await new Promise((resolve, reject) => execFile('ip', ['-o', 'route', 'get', addresses[0]],
+      (e, out) => (e ? reject(e) : resolve(out))));
+    const dev = / dev (\S+)/.exec(route)?.[1];
+    if (!dev) throw new Error(`no route device for ${addresses[0]}: ${route.trim()}`);
+    return new Impairment(dev, addresses);
+  }
+
+  async setup() {
+    await sudo(['modprobe', 'ifb']).catch(async () => {
+      await sudo(['apt-get', 'install', '-y', '-q', `linux-modules-extra-${(await sudo(['uname', '-r'])).trim()}`]);
+      await sudo(['modprobe', 'ifb']);
+    });
+    await sudo(['ip', 'link', 'add', IFB, 'type', 'ifb']);
+    await sudo(['ip', 'link', 'set', IFB, 'up']);
+    // Hosted runners may already hook ingress with clsact; reuse it rather than replace it.
+    const qdiscs = await sudo(['tc', 'qdisc', 'show', 'dev', this.dev]);
+    this.found = {
+      links: (await sudo(['ip', '-o', 'link', 'show'])).trim(),
+      qdiscs: qdiscs.trim(),
+      ingressFilters: (await sudo(['tc', 'filter', 'show', 'dev', this.dev, 'ingress']).catch((e) => String(e))).trim(),
+    };
+    const ingress = /qdisc clsact ffff:/.test(qdiscs) ? 'ffff:fff2' : 'ffff:';
+    if (!/qdisc (clsact|ingress) ffff:/.test(qdiscs)) {
+      await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'handle', 'ffff:', 'ingress']);
+    }
+    await sudo(['tc', 'qdisc', 'add', 'dev', IFB, 'root', 'netem', ...split(PASS)]);
+    // Band 4 takes only the filtered relay traffic; the priomap keeps the rest in 1-3.
+    await sudo(['tc', 'qdisc', 'replace', 'dev', this.dev, 'root', 'handle', '1:', 'prio', 'bands', '4',
+      'priomap', '1', '2', '2', '2', '1', '2', '0', '0', '1', '1', '1', '1', '1', '1', '1', '1']);
+    await sudo(['tc', 'qdisc', 'add', 'dev', this.dev, 'parent', '1:4', 'handle', '40:', 'netem', ...split(PASS)]);
+    for (const a of this.addresses) {
+      // First in line: a filter already on the hook that ends classification would skip ours.
+      const redirect = ['u32', 'match', 'ip', 'src', `${a}/32`, 'action', 'mirred', 'egress', 'redirect', 'dev', IFB];
+      const head = ['tc', 'filter', 'add', 'dev', this.dev, 'parent', ingress, 'protocol', 'ip'];
+      await sudo([...head, 'pref', '1', ...redirect]).catch(() => sudo([...head, ...redirect]));
+      await sudo(['tc', 'filter', 'add', 'dev', this.dev, 'parent', '1:', 'protocol', 'ip', 'prio', '1', 'u32',
+        'match', 'ip', 'dst', `${a}/32`, 'flowid', '1:4']);
+    }
+  }
+
+  /** Shape relay traffic: `netem` both ways, or `down` / `up` per direction. */
+  async apply(profile = {}) {
+    this.profile = { down: profile.down ?? profile.netem ?? PASS, up: profile.up ?? profile.netem ?? PASS };
+    await this.set(this.profile.down, this.profile.up);
+  }
+
+  /** Drop all relay traffic until restore(). */
+  async blackout() {
+    await this.set('loss 100%', 'loss 100%');
+  }
+
+  async restore() {
+    await this.set(this.profile.down, this.profile.up);
+  }
+
+  async set(down, up) {
+    await sudo(['tc', 'qdisc', 'replace', 'dev', IFB, 'root', 'netem', ...split(down)]);
+    await sudo(['tc', 'qdisc', 'replace', 'dev', this.dev, 'parent', '1:4', 'handle', '40:', 'netem', ...split(up)]);
+  }
+
+  /** Kernel counters, for the case evidence. */
+  async stats() {
+    return {
+      down: (await sudo(['tc', '-s', 'qdisc', 'show', 'dev', IFB])).trim(),
+      up: (await sudo(['tc', '-s', 'qdisc', 'show', 'dev', this.dev, 'parent', '1:4'])).trim(),
+      ingressFilters: (await sudo(['tc', '-s', 'filter', 'show', 'dev', this.dev, 'ingress']).catch((e) => String(e))).trim(),
+      found: this.found,
+    };
+  }
+}

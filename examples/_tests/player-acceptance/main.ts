@@ -1,4 +1,4 @@
-import { Player } from '@openmoq/playa';
+import { Player, pickCaptureTime } from '@openmoq/playa';
 import { createWebTransport, WebCodecsVideoDecoder } from '@openmoq/browser';
 import { MoqtConnection, type WebTransportLike } from '@openmoq/webtransport';
 import type { PlaybackSample } from '../../../scripts/player-acceptance/assessment.mjs';
@@ -17,10 +17,14 @@ canvas.height = 360;
 const canvasObserver = frameOutput ? observeCanvas(canvas) : undefined;
 const audioObserver = webAudioOutput ? observeAudio() : undefined;
 const decodedSource = frameOutput ? observeDecodedSource() : undefined;
-const pinHex = params.get('hash')!;
-if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
-const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
-const createTransport = createWebTransport({ certHash: pin, draftVersion: 18 });
+// A local relay is pinned by ?hash=; a public relay (the soak) has none.
+const pinHex = params.get('hash');
+if (pinHex !== null && !/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Malformed certificate pin');
+const pin = pinHex === null ? undefined : Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
+const DRAFTS: Record<string, 14 | 16 | 18 | 22> = { '14': 14, '16': 16, '18': 18, '22': 22 };
+const soak = params.has('soak');
+const draft = DRAFTS[params.get('v') ?? '18'] ?? 18;
+const createTransport = createWebTransport({ ...(pin ? { certHash: pin } : {}), draftVersion: draft });
 const transports: WebTransportLike[] = [];
 const transportOutcomes: Promise<{ status: string; reason?: string }>[] = [];
 const events: { timeMs: number; type: string; data: unknown }[] = [];
@@ -38,19 +42,47 @@ let gain: GainNode | undefined;
 let analyser: AnalyserNode | undefined;
 let firstFrameTimestampUs: number | undefined;
 
+/** Playout rate of the active path: rate-up starts and time at a rate other than 1. */
+const rate = { value: 1, sinceMs: performance.now(), ups: 0, offMs: 0 };
+function noteRate(value: number): void {
+  if (value === rate.value) return;
+  const now = performance.now();
+  if (rate.value !== 1) rate.offMs += now - rate.sinceMs;
+  if (value > 1 && rate.value <= 1) rate.ups++;
+  rate.value = value;
+  rate.sinceMs = now;
+}
+// Web Audio output: the rate audio buffers are scheduled at. Otherwise the element's rate.
+if (webAudioOutput) {
+  const start = AudioBufferSourceNode.prototype.start;
+  AudioBufferSourceNode.prototype.start = function (this: AudioBufferSourceNode, ...args: Parameters<typeof start>) {
+    noteRate(this.playbackRate.value);
+    return Reflect.apply(start, this, args);
+  } as typeof start;
+} else {
+  video.addEventListener('ratechange', () => noteRate(video.playbackRate));
+}
+const congestionControl = (['default', 'throughput', 'low-latency'] as const)
+  .find((c) => c === params.get('congestionControl'));
+
 const player = new Player(null, {
   url: params.get('url')!, namespace: params.get('ns')!,
-  video, canvas, certHash: pin, draftVersion: 18, autoQuality: false,
+  video, canvas, ...(pin ? { certHash: pin } : {}), draftVersion: draft, autoQuality: params.get('auto') === '1',
   ...(params.has('gestureAudio') ? { audioActivation: 'gesture' as const } : {}),
   startLevel: Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
+  ...(params.get('latency') === 'smooth' ? { latencyMode: 'smooth' as const } : {}),
+  ...(congestionControl ? { congestionControl } : {}),
   moqtPlayerConfig: {
-    logLevel: params.has('debug') ? 'debug' : 'none',
+    logLevel: params.has('debug') ? 'debug' : (['error', 'warn', 'info'] as const).find((l) => l === params.get('log')) ?? 'none',
+    ...(params.get('warmStart') === '1' ? { warmStartCurrentGroup: true } : {}),
+    ...(params.get('followNamespace') === '1' ? { followNamespace: true } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
-    audioConstraints: { lang: params.get('lang') ?? 'en' },
+    // The fixtures label their audio `en`; a soak stream's audio may carry no language.
+    ...(soak && !params.has('lang') ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
     createConnection: () => {
-      const connection = new MoqtConnection(18);
+      const connection = new MoqtConnection(draft);
       if (locmafObserver) {
         observeConnectionObjects(connection, locmafObserver.record);
       }
@@ -70,6 +102,31 @@ const player = new Player(null, {
 
 for (const type of ['ready', 'playing', 'statechange', 'error', 'stall'] as const) {
   player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
+}
+
+// ?soak: the session and recovery events too, and per-object latency from the
+// objects' capture times, drained by the soak runner each second.
+const latencyMs = new Map<string, number[]>();
+if (soak) {
+  for (const type of ['stall_recovered', 'session_closed', 'session_reconnecting', 'session_established',
+    'session_migrated', 'namespace_state', 'track_unsubscribed', 'track_subscribe_failed', 'qualitychange',
+    'catalog_received', 'catalog_updated', 'lifecycle'] as const) {
+    player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
+  }
+  player.on('media_object', (object) => {
+    const picked = pickCaptureTime(object.captureTimes);
+    if (!picked) return;
+    const key = `${object.mediaType}/${picked.source}`;
+    let list = latencyMs.get(key);
+    if (!list) latencyMs.set(key, list = []);
+    list.push(Date.now() - picked.us / 1000);
+  });
+}
+
+function summarize(values: number[]): { n: number; min: number; p50: number; p95: number; max: number } {
+  const sorted = [...values].sort((a, b) => a - b);
+  const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
+  return { n: sorted.length, min: sorted[0]!, p50: at(0.5), p95: at(0.95), max: sorted.at(-1)! };
 }
 player.on('ready', () => {
   const expectedOutput = frameOutput ? 'canvas' : 'video';
@@ -143,6 +200,8 @@ function sample(): void {
     paused: frameOutput ? player.state !== 'playing' : video.paused, seeking: frameOutput ? false : video.seeking,
     visibility: document.visibilityState,
     bufferedRanges: frameOutput ? null : Array.from({ length: ranges.length }, (_, i) => ({ start: ranges.start(i), end: ranges.end(i) })),
+    playbackRate: rate.value, rateUps: rate.ups,
+    rateOffMs: Math.round(rate.offMs + (rate.value !== 1 ? performance.now() - rate.sinceMs : 0)),
   });
 }
 
@@ -194,6 +253,13 @@ const acceptance = {
       decodedSource: decodedSource?.snapshot() ?? null,
       ...(locmafDelivery ? { locmafDelivery, locmafFailures: assessLocmafDelivery(locmafDelivery) } : {}),
       levels: player.levels, videoGroups: player.videoGroups, audioTracks: player.audioTracks };
+  },
+  /** Soak: everything recorded since the last drain, and the player's stats now. */
+  drain() {
+    const latency = Object.fromEntries([...latencyMs].map(([key, values]) => [key, summarize(values)]));
+    latencyMs.clear();
+    return { samples: samples.splice(0), events: events.splice(0), latency, stats: player.stats,
+      state: player.state, wallEpochMs: Date.now() };
   },
   setVolume(value: number) { player.setVolume(value); },
   async setMuted(value: boolean) { if (value) player.mute(); else await player.unmute(); },
